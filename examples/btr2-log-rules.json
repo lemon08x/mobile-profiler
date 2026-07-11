@@ -1,0 +1,64 @@
+{
+  "timestamp": {
+    "regex": "^(?P<timestamp>\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}(?:[,.]\\d{3,6})?)",
+    "formats": [
+      "%Y-%m-%d %H:%M:%S,%f",
+      "%Y-%m-%d %H:%M:%S.%f",
+      "%Y-%m-%d %H:%M:%S"
+    ],
+    "timezone": "+08:00"
+  },
+  "rules": [
+    {
+      "regex": "Running test (?P<test>.+?) on phone (?P<phone>\\S+)",
+      "name": "{test}",
+      "phase": "test",
+      "kind": "start",
+      "key": "{test}"
+    },
+    {
+      "regex": "Test (?P<test>.+?) test done",
+      "name": "{test}",
+      "phase": "test",
+      "kind": "end",
+      "key": "{test}"
+    },
+    {
+      "regex": "Starting test sequence for (?P<phone>.+)$",
+      "name": "Sequence {phone}",
+      "phase": "sequence",
+      "kind": "state",
+      "key": "{phone}"
+    },
+    {
+      "regex": "Agent tap:",
+      "name": "Tap",
+      "phase": "action",
+      "kind": "instant"
+    },
+    {
+      "regex": "Agent swipe:",
+      "name": "Swipe",
+      "phase": "action",
+      "kind": "instant"
+    },
+    {
+      "regex": "Retry:",
+      "name": "Retry",
+      "phase": "action",
+      "kind": "instant"
+    },
+    {
+      "regex": "Action Complete",
+      "name": "Action complete",
+      "phase": "action",
+      "kind": "instant"
+    },
+    {
+      "regex": "Agent Complete",
+      "name": "Agent complete",
+      "phase": "agent",
+      "kind": "instant"
+    }
+  ]
+}

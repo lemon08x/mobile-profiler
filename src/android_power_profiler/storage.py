@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, TextIO, Tuple, Type, TypeVar
+
+from .models import ClockSyncPoint, ContextSample, ExternalEvent, SCHEMA_VERSION, Sample
+
+
+T = TypeVar("T")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def write_jsonl(path: Path, values: Iterable[object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for value in values:
+            payload = asdict(value) if hasattr(value, "__dataclass_fields__") else value
+            handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            handle.write("\n")
+
+
+def read_jsonl(path: Path, model: Type[T], strict: bool = False) -> List[T]:
+    if not path.exists():
+        return []
+    values: List[T] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+            values.append(model(**payload))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if strict:
+                raise RuntimeError(f"invalid {path.name} line {line_number}: {exc}") from exc
+    return values
+
+
+def load_contexts(output_dir: Path) -> List[ContextSample]:
+    return read_jsonl(output_dir / "contexts.jsonl", ContextSample)
+
+
+def load_clock_sync(output_dir: Path) -> List[ClockSyncPoint]:
+    return read_jsonl(output_dir / "clock-sync.jsonl", ClockSyncPoint)
+
+
+def load_events(output_dir: Path) -> List[ExternalEvent]:
+    return read_jsonl(output_dir / "events.jsonl", ExternalEvent)
+
+
+class RunJournal:
+    """Append-only run journal used while a long ADB session is active."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.raw_dir = output_dir / "raw"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self._sampler: Optional[TextIO] = None
+        self._stderr: Optional[TextIO] = None
+        self._contexts: Optional[TextIO] = None
+        self._clock_sync: Optional[TextIO] = None
+
+    def __enter__(self) -> "RunJournal":
+        self._sampler = (self.raw_dir / "sampler-stream.txt").open(
+            "a", encoding="utf-8", newline="\n"
+        )
+        self._stderr = (self.raw_dir / "sampler-stderr.txt").open(
+            "a", encoding="utf-8", newline="\n"
+        )
+        self._contexts = (self.output_dir / "contexts.jsonl").open(
+            "a", encoding="utf-8", newline="\n"
+        )
+        self._clock_sync = (self.output_dir / "clock-sync.jsonl").open(
+            "a", encoding="utf-8", newline="\n"
+        )
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        for handle in (self._sampler, self._stderr, self._contexts, self._clock_sync):
+            if handle is not None:
+                handle.flush()
+                handle.close()
+
+    @staticmethod
+    def _append_line(handle: Optional[TextIO], value: str) -> None:
+        if handle is None:
+            raise RuntimeError("run journal is not open")
+        handle.write(value.rstrip("\r\n"))
+        handle.write("\n")
+        handle.flush()
+
+    def append_sampler_line(self, line: str) -> None:
+        self._append_line(self._sampler, line)
+
+    def append_stderr_line(self, line: str) -> None:
+        self._append_line(self._stderr, line)
+
+    def append_context(self, context: ContextSample) -> None:
+        self._append_line(
+            self._contexts,
+            json.dumps(asdict(context), ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def append_clock_sync(self, point: ClockSyncPoint) -> None:
+        self._append_line(
+            self._clock_sync,
+            json.dumps(asdict(point), ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def write_metadata(self, metadata: Dict[str, object]) -> None:
+        _write_json_atomic(self.output_dir / "metadata.json", metadata)
+
+    def write_raw_output(self, name: str, value: str) -> None:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+        (self.raw_dir / f"{safe_name}.txt").write_text(
+            value, encoding="utf-8", errors="replace"
+        )
+
+    def checkpoint(self, state: Dict[str, object]) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "updated_at": _utc_now(),
+            **state,
+        }
+        _write_json_atomic(self.output_dir / "checkpoint.json", payload)
+
+
+def load_checkpoint(output_dir: Path) -> Dict[str, object]:
+    path = output_dir / "checkpoint.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sample_to_dict(sample: Sample) -> Dict[str, object]:
+    return {
+        "index": sample.index,
+        "elapsed_s": round(sample.elapsed_s, 4),
+        "uptime_s": round(sample.uptime_s, 4),
+        "current_ma": round(sample.current_ma, 4),
+        "signed_current_ma": round(sample.signed_current_ma, 4),
+        "voltage_mv": round(sample.voltage_mv, 4),
+        "power_mw": round(sample.power_mw, 4),
+        "direction": sample.direction,
+        "cpu_pct": round(sample.cpu_pct, 4) if sample.cpu_pct is not None else None,
+        "core_cpu_pct": {name: round(value, 4) for name, value in sample.core_cpu_pct.items()},
+        "cluster_cpu_pct": {
+            name: round(value, 4) for name, value in sample.cluster_cpu_pct.items()
+        },
+        "frequencies_mhz": {
+            name: round(value, 4) for name, value in sample.frequencies_mhz.items()
+        },
+        "gpu_frequency_mhz": (
+            round(sample.gpu_frequency_mhz, 4) if sample.gpu_frequency_mhz is not None else None
+        ),
+        "gpu_load_pct": round(sample.gpu_load_pct, 4) if sample.gpu_load_pct is not None else None,
+        "battery_temperature_c": (
+            round(sample.battery_temperature_c, 4)
+            if sample.battery_temperature_c is not None
+            else None
+        ),
+    }
+
+
+def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str, object]) -> None:
+    policy_names = [
+        str(item.get("name"))
+        for item in metadata.get("cpu_policies", [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    core_names = sorted(
+        {name for sample in samples for name in sample.core_cpu_pct},
+        key=lambda item: int(item),
+    )
+    fields = [
+        "index",
+        "elapsed_s",
+        "uptime_s",
+        "current_ma",
+        "signed_current_ma",
+        "voltage_mv",
+        "power_mw",
+        "direction",
+        "cpu_pct",
+        "battery_temperature_c",
+        "gpu_frequency_mhz",
+        "gpu_load_pct",
+    ]
+    fields.extend(f"core{core}_pct" for core in core_names)
+    fields.extend(f"{name}_load_pct" for name in policy_names)
+    fields.extend(f"{name}_mhz" for name in policy_names)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for sample in samples:
+            row: Dict[str, object] = {
+                "index": sample.index,
+                "elapsed_s": f"{sample.elapsed_s:.4f}",
+                "uptime_s": f"{sample.uptime_s:.4f}",
+                "current_ma": f"{sample.current_ma:.4f}",
+                "signed_current_ma": f"{sample.signed_current_ma:.4f}",
+                "voltage_mv": f"{sample.voltage_mv:.4f}",
+                "power_mw": f"{sample.power_mw:.4f}",
+                "direction": sample.direction,
+                "cpu_pct": "" if sample.cpu_pct is None else f"{sample.cpu_pct:.4f}",
+                "battery_temperature_c": (
+                    ""
+                    if sample.battery_temperature_c is None
+                    else f"{sample.battery_temperature_c:.4f}"
+                ),
+                "gpu_frequency_mhz": (
+                    "" if sample.gpu_frequency_mhz is None else f"{sample.gpu_frequency_mhz:.4f}"
+                ),
+                "gpu_load_pct": "" if sample.gpu_load_pct is None else f"{sample.gpu_load_pct:.4f}",
+            }
+            row.update(
+                {
+                    f"core{core}_pct": (
+                        f"{sample.core_cpu_pct[core]:.4f}" if core in sample.core_cpu_pct else ""
+                    )
+                    for core in core_names
+                }
+            )
+            row.update(
+                {
+                    f"{name}_load_pct": (
+                        f"{sample.cluster_cpu_pct[name]:.4f}"
+                        if name in sample.cluster_cpu_pct
+                        else ""
+                    )
+                    for name in policy_names
+                }
+            )
+            row.update(
+                {
+                    f"{name}_mhz": f"{sample.frequencies_mhz.get(name, 0.0):.4f}"
+                    for name in policy_names
+                }
+            )
+            writer.writerow(row)
+
+
+def _optional_float(row: Dict[str, str], key: str) -> Optional[float]:
+    value = row.get(key)
+    return float(value) if value not in (None, "") else None
+
+
+def read_samples_csv(path: Path) -> List[Sample]:
+    samples: List[Sample] = []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        frequency_fields = [
+            name
+            for name in fieldnames
+            if name.endswith("_mhz")
+            and name not in {"gpu_frequency_mhz"}
+            and not name.startswith("signed_")
+        ]
+        cluster_fields = [name for name in fieldnames if name.endswith("_load_pct")]
+        core_fields = [name for name in fieldnames if re.fullmatch(r"core\d+_pct", name)]
+        for row in reader:
+            stored_current = float(row["current_ma"])
+            signed = _optional_float(row, "signed_current_ma")
+            if signed is None:
+                signed = stored_current
+            current = abs(stored_current)
+            direction = row.get("direction") or (
+                "discharging" if signed < 0 else "charging" if signed > 0 else "idle"
+            )
+            samples.append(
+                Sample(
+                    index=int(row["index"]),
+                    elapsed_s=float(row["elapsed_s"]),
+                    uptime_s=float(row["uptime_s"]),
+                    current_ma=current,
+                    signed_current_ma=signed,
+                    voltage_mv=float(row["voltage_mv"]),
+                    power_mw=float(row["power_mw"]),
+                    direction=direction,
+                    cpu_pct=_optional_float(row, "cpu_pct"),
+                    core_cpu_pct={
+                        field[len("core") : -len("_pct")]: float(row[field])
+                        for field in core_fields
+                        if row.get(field)
+                    },
+                    cluster_cpu_pct={
+                        field[: -len("_load_pct")]: float(row[field])
+                        for field in cluster_fields
+                        if row.get(field)
+                    },
+                    frequencies_mhz={
+                        field[: -len("_mhz")]: float(row[field])
+                        for field in frequency_fields
+                        if row.get(field)
+                    },
+                    gpu_frequency_mhz=_optional_float(row, "gpu_frequency_mhz"),
+                    gpu_load_pct=_optional_float(row, "gpu_load_pct"),
+                    battery_temperature_c=_optional_float(row, "battery_temperature_c"),
+                )
+            )
+    return samples
+
+
+def load_raw_outputs(output_dir: Path) -> Dict[str, str]:
+    raw_dir = output_dir / "raw"
+    if not raw_dir.exists():
+        return {}
+    return {path.stem: path.read_text(encoding="utf-8", errors="replace") for path in raw_dir.glob("*.txt")}
+
+
+def write_run_artifacts(
+    output_dir: Path,
+    metadata: Dict[str, object],
+    analysis: Dict[str, object],
+    samples: Sequence[Sample],
+    raw_outputs: Optional[Dict[str, str]] = None,
+    contexts: Optional[Sequence[ContextSample]] = None,
+    clock_sync: Optional[Sequence[ClockSyncPoint]] = None,
+    events: Optional[Sequence[ExternalEvent]] = None,
+) -> Tuple[Path, Path]:
+    from .report import write_report_files
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_samples_csv(output_dir / "samples.csv", samples, metadata)
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "analysis.json").write_text(
+        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if contexts is not None:
+        write_jsonl(output_dir / "contexts.jsonl", contexts)
+    if clock_sync is not None:
+        write_jsonl(output_dir / "clock-sync.jsonl", clock_sync)
+    if events is not None:
+        write_jsonl(output_dir / "events.jsonl", events)
+    if raw_outputs:
+        raw_dir = output_dir / "raw"
+        raw_dir.mkdir(exist_ok=True)
+        for key, value in raw_outputs.items():
+            safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+            (raw_dir / f"{safe_key}.txt").write_text(
+                value, encoding="utf-8", errors="replace"
+            )
+    bundle = {
+        "schema_version": SCHEMA_VERSION,
+        "metadata": metadata,
+        "analysis": analysis,
+        "samples": [sample_to_dict(sample) for sample in samples],
+        "contexts": [asdict(item) for item in (contexts or [])],
+        "clock_sync": [asdict(item) for item in (clock_sync or [])],
+        "events": [asdict(item) for item in (events or [])],
+    }
+    return write_report_files(output_dir, bundle)
+
+
+def load_existing_run(output_dir: Path) -> Tuple[Dict[str, object], Dict[str, object], List[Sample]]:
+    metadata_path = output_dir / "metadata.json"
+    analysis_path = output_dir / "analysis.json"
+    samples_path = output_dir / "samples.csv"
+    missing = [path.name for path in (metadata_path, analysis_path, samples_path) if not path.exists()]
+    if missing:
+        raise RuntimeError(f"run directory is missing: {', '.join(missing)}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    samples = read_samples_csv(samples_path)
+    return metadata, analysis, samples
+
+
+def load_run_metadata(output_dir: Path) -> Dict[str, object]:
+    path = output_dir / "metadata.json"
+    if not path.exists():
+        raise RuntimeError("run directory is missing metadata.json")
+    return json.loads(path.read_text(encoding="utf-8"))
