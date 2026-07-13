@@ -45,7 +45,8 @@ mobile-power-profiler/
 The profiler and BTR2 are independent processes and repositories.
 
 ```text
-Android/HarmonyOS device <-- ADB --> Mobile Power Profiler --> run directory
+Android device  <-- ADB -->+
+HarmonyOS phone <-- HDC -->+--> Mobile Power Profiler --> run directory
              ^
              |
 robot/camera
@@ -61,13 +62,13 @@ a user-selected JSON regex rule file.
 
 ## Platform sidecar boundary
 
-The core package stays standard-library-only. Android and ADB-compatible
-HarmonyOS devices run through `collector.py`; iOS runs in a separate Python
-interpreter containing `pymobiledevice3`.
+The core package stays standard-library-only. Android runs through
+`collector.py`, native HarmonyOS runs through `harmony.py`, and iOS runs in a
+separate Python interpreter containing `pymobiledevice3`.
 
 ```text
-                    ADB devices: S| / CTX|
-Android/HarmonyOS <-- ADB ----------------------+
+Android <-- ADB -------- S| / CTX| -------------+
+HarmonyOS <-- HDC ------ N| + JSONL ------------+
                                                   |
                                                   v
                                       normalized Sample / Context /
@@ -85,39 +86,67 @@ The sidecar supports `list`, `pair`, `probe`, and `record`. Streaming events are
 `end`. A normalized sample is persisted as `N|{json}` in the same append-only
 sampler stream used by the ADB collector.
 
-The normalized boundary deliberately contains no ADB or Apple transport types.
-A future native HarmonyOS adapter can implement the same commands and events
-for devices without an ADB-compatible debugging path while keeping its runtime
-dependencies outside the core.
+The normalized boundary deliberately contains no ADB, HDC, or Apple transport
+types. `harmony.py` computes CPU deltas on the host and persists normalized
+`N|{json}` samples, so finalization, recovery, live UI, analysis, and reports
+share the same contracts as iOS and future adapters.
 
 ## Collection lifecycle
 
-### ADB lifecycle (Android/HarmonyOS)
+### Android ADB lifecycle
 
-1. Probe BatteryService current, cpufreq policies, and optional GPU nodes.
+1. Probe BatteryService current, cpufreq policies, optional GPU nodes, display modes,
+   SurfaceFlinger refresh residency/renderer identity, and touchscreen capabilities.
 2. Persist initial metadata and battery/GPU snapshots before recording.
-3. Start one persistent `adb shell` sampler with framed output:
-   - `S|...` for numeric telemetry.
-   - `CTX|...` for foreground/display context.
-4. Start an independent low-frequency system-monitor worker. It captures
+3. Start one persistent `adb shell` sampler with `S|...` framed numeric telemetry.
+   `CTX|...` remains a recovery-compatible fallback for callers that explicitly
+   disable the Android performance-context worker.
+4. Start an independent performance-context worker. Every 10 seconds it captures
+   foreground/window state, display modes, brightness, and cumulative foreground
+   `gfxinfo` frame counters; SurfaceFlinger refresh-duration counters and GLES renderer
+   identity are sampled every 30 seconds and once more during finalization.
+5. Start an independent low-frequency system-monitor worker. It captures
    processes every 10 seconds, hot threads every 30 seconds, ThermalService
    every 10 seconds, and cpuset/ActivityManager/ADPF state every 30 seconds.
    Expensive `top -H` and `dumpsys` calls therefore never block the one-second
    battery sampler.
-5. Read stdout and stderr on dedicated threads and flush every line to the run
+6. Read stdout and stderr on dedicated threads and flush every line to the run
    journal before parsing it in memory.
-6. Record host/device clock midpoint pairs at start, checkpoints, reconnects,
+7. Record host/device clock midpoint pairs at start, checkpoints, reconnects,
    and end.
-7. Restart the sampler after a recoverable ADB disconnect while keeping the
+8. Restart the sampler after a recoverable ADB disconnect while keeping the
    original wall-clock session deadline.
-8. Capture post-run BatteryStats, GPU, CPU, thermal, display, and Power Profile
+9. Capture post-run BatteryStats, GPU, CPU, thermal, display, and Power Profile
    evidence.
-9. Convert raw counters, correlate system/thermal/scheduler snapshots on device
+10. Convert raw counters, correlate system/thermal/scheduler snapshots on device
    uptime, analyze valid intervals, and generate artifacts.
 
 If collection stops early, `recover` rebuilds samples from
 `raw/sampler-stream.txt` and uses existing snapshots. It does not require the
 device.
+
+### HarmonyOS HDC lifecycle
+
+1. Discover USB/TCP targets with `hdc list targets -v`; public identifiers use
+   the `harmony:` prefix so automatic platform selection cannot confuse HDC and
+   ADB addresses.
+2. Probe `BatteryService`, `hidumper -c base`, `/proc/stat`,
+    `hidumper --cpufreq`, `ThermalService`, `PowerManagerService`, AbilityManager,
+    RenderService, WindowManagerService, MultimodalInput, and `top`/`ps`.
+3. Start one persistent HDC shell that frames device realtime, BatteryService,
+   and `/proc/stat` rows. The host computes global/per-core deltas and appends
+   normalized `N|{json}` samples.
+4. At lower cadence, append foreground/power contexts with display modes,
+   `fpsCount` counters, recent compositor timestamps, focused window, delivered
+   touch events, and window hitch counters. Process/thermal/scheduler snapshots
+   remain separate. Full CPU-frequency dumps are limited to at least 10 seconds
+   because they are comparatively expensive on 12-core devices.
+5. If a TCP sampler exits, issue `hdc tconn`, relaunch against the same target,
+   deduplicate by device timestamp, and retain the original session deadline.
+6. Final BatteryService state is saved in metadata. Android-only BatteryStats,
+   ActivityManager, ADPF, and dumpsys GPU sources remain explicitly unavailable.
+7. Finalization consumes the same normalized journal and artifact pipeline used
+   by iOS; no Harmony-specific report fork is required.
 
 ### iOS lifecycle
 
@@ -186,28 +215,30 @@ replaces an existing output directory.
 
 ## Time domains
 
-Device uptime is the canonical telemetry clock. Android reads `/proc/uptime`;
-iOS converts Mach absolute time with the device-reported timebase. Each
+The device clock is canonical within a run. Android reads `/proc/uptime`;
+HarmonyOS uses `date +%s.%N` device realtime because production HDC shells can
+deny `/proc/uptime`; iOS converts Mach absolute time with the device-reported
+timebase. Each
 synchronization point is:
 
 ```text
 host midpoint epoch
 host midpoint monotonic
-device uptime
-ADB round-trip time
+device clock value
+transport round-trip time
 ```
 
 External host timestamps are converted by interpolating the host-minus-device
 offset between adjacent synchronization points. Midpoint timing reduces, but
-does not eliminate, uncertainty from ADB latency. The original host timestamp,
+does not eliminate, uncertainty from ADB/HDC/RemoteXPC latency. The original host timestamp,
 line number, source log, and regex are retained in event metadata.
 
 ## Long-session persistence
 
 | Artifact | Write policy | Purpose |
 |---|---|---|
-| `raw/sampler-stream.txt` | Flush every line | Source of truth for Android `S|`/`CTX|` and normalized sidecar `N|` recovery |
-| `contexts.jsonl` | Flush every context frame | App/display timeline |
+| `raw/sampler-stream.txt` | Flush every line | Source of truth for Android `S|`/`CTX|` and HarmonyOS/iOS normalized `N|` recovery |
+| `contexts.jsonl` | Flush every context frame | App/display/window timeline plus optional refresh/FPS/frame/touch performance payload |
 | `clock-sync.jsonl` | Flush every sync point | Offline log alignment |
 | `system-snapshots.jsonl` | Flush every process/thread snapshot | Whole-system CPU, GC/kworker/kernel groups, and watched DEX/update activity |
 | `thermal-snapshots.jsonl` | Flush every ThermalService snapshot | Sensor, severity, cooling, and threshold history |
@@ -249,6 +280,9 @@ observed power-source names, physical-sample age, and collector CPU overhead.
 - cpufreq policy frequency and load-weighted residency.
 - GPU devfreq/load when readable.
 - GPU UID active-duration deltas and per-PID memory snapshots otherwise.
+- Android SurfaceFlinger refresh-rate duration deltas and GLES renderer identity.
+- Android foreground-window `gfxinfo` rendered-frame, deadline, jank, missed-vsync,
+  and frame-duration histogram deltas without clearing global graphics statistics.
 - Periodic whole-system `top`/`ps` snapshots for apps, Android services, native
   services, kernel tasks, and hot threads.
 - Name-based activity grouping for ART/GC, kworker workqueues (including
@@ -341,8 +375,9 @@ per-process rail, or unavailable thermal/scheduler state.
 - Per-test aggregation of energy, mWh/min, average/P95/peak power, CPU/GPU,
   temperature, top processes, classified activity, DEX/update overlap,
   thermal-throttling overlap, and visible-system-CPU share.
-- A six-lane long-session view aligning power, foreground app, test spans,
-  classified system activity, Thermal status, and ADPF/scheduler state.
+- A long-session view aligning power, foreground app, test spans and available
+  platform-interference evidence, plus a compact performance-context view for
+  refresh residency, sampled frame pacing and touch interaction.
 - Transition counts and context coverage.
 - Low-confidence marking when a phase is shorter than three sample periods or
   has less than 75 percent telemetry coverage.
@@ -373,6 +408,7 @@ same indices, preserving cross-chart alignment.
 |---|---|
 | `models.py` | Versioned data contracts |
 | `collector.py` | ADB execution, probing, framing, reconnects, clock capture, isolated system-monitor worker |
+| `harmony.py` | HDC discovery/TCP setup, HarmonyOS probing/parsing, framed normalized sampling, reconnects, RenderService/WindowManager/MultimodalInput performance context, platform snapshots |
 | `ios.py` | Optional sidecar process orchestration, endpoint cache, normalized event journaling, wireless reconnect |
 | `ios_bridge.py` | `pymobiledevice3` USB trust/RemotePairing, RSD, DiagnosticsService and DVT collection |
 | `parsers.py` | Android text-to-structure conversion |

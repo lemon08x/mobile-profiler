@@ -25,12 +25,13 @@ if defined IOS_PYTHON if exist "%IOS_PYTHON%" set "IOS_PYTHON_EXE=%IOS_PYTHON%"
 if not defined IOS_PYTHON_EXE if exist ".venv-ios\Scripts\python.exe" set "IOS_PYTHON_EXE=%CD%\.venv-ios\Scripts\python.exe"
 
 echo Starting Mobile Power Profiler UI...
+echo Dashboard port: automatically select an available local port.
 if defined IOS_PYTHON_EXE echo iOS sidecar runtime: %IOS_PYTHON_EXE%
 echo.
 if defined IOS_PYTHON_EXE (
-    "%PYTHON_EXE%" -m mobile_power_profiler --ios-python "%IOS_PYTHON_EXE%" ui %*
+    "%PYTHON_EXE%" -m mobile_power_profiler --ios-python "%IOS_PYTHON_EXE%" ui --port 0 %*
 ) else (
-    "%PYTHON_EXE%" -m mobile_power_profiler ui %*
+    "%PYTHON_EXE%" -m mobile_power_profiler ui --port 0 %*
 )
 set "EXIT_CODE=%ERRORLEVEL%"
 

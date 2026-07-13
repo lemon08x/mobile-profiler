@@ -522,11 +522,20 @@ def analyze_gpu(
         reason = gpu_probe.get("reason")
     if not reason and platform == "ios" and not load_values:
         reason = "本次会话未恢复到 DVT Graphics 利用率事件。"
+    if not reason and platform == "harmony" and not frequency_values and not load_values:
+        reason = (
+            "HarmonyOS production builds restrict GPU frequency/load sysfs nodes from the HDC shell; "
+            "no Android dumpsys GPU fallback exists."
+        )
     limitations = (
         "iOS DVT Graphics reports relative GPU utilization counters. It does not expose an "
         "electrical GPU rail or a public per-application GPU energy measurement."
         if platform == "ios"
         else (
+            "HarmonyOS HDC does not expose a readable GPU frequency/load node or a public per-application "
+            "GPU energy counter on this production build. GPU activity is therefore explicitly unavailable."
+            if platform == "harmony"
+            else
             "GPU frequency/load is reported only when a readable OEM sysfs/devfreq node exists. "
             "Qualcomm KGSL is commonly permission-restricted on production builds. UID active "
             "durations and GPU memory are driver evidence, not an electrical power rail."
@@ -2056,15 +2065,21 @@ def analyze_test_items(
             activity = context.foreground_activity if context else None
             return package or "前台活动", activity or package or "未知前台活动"
 
-        def append_context_window(key: Tuple[str, str], start: float, end: float) -> None:
+        def append_context_window(
+            key: Tuple[str, str],
+            start: float,
+            end: float,
+            context: Optional[ContextSample],
+        ) -> None:
             if end <= start:
                 return
+            context_source = context.source if context and context.source else "platform_context_sampler"
             occurrence = {
                 "phase": key[0],
                 "name": key[1],
                 "start_uptime_s": start,
                 "end_uptime_s": end,
-                "source": "ActivityManager context sampler",
+                "source": context_source,
                 "metadata": {},
             }
             occurrences.append(occurrence)
@@ -2074,7 +2089,7 @@ def analyze_test_items(
                     "phase": key[0],
                     "name": key[1],
                     "comparison_key": key[1],
-                    "source": "ActivityManager context sampler",
+                    "source": context_source,
                     "windows": [],
                 },
             )
@@ -2086,11 +2101,11 @@ def analyze_test_items(
             if next_key == current_key:
                 current = following
                 continue
-            append_context_window(current_key, cursor, following.uptime_s)
+            append_context_window(current_key, cursor, following.uptime_s, current)
             current = following
             current_key = next_key
             cursor = following.uptime_s
-        append_context_window(current_key, cursor, session_end)
+        append_context_window(current_key, cursor, session_end, current)
 
     activity_groups = system_analysis.get("activity_groups", {})
     classified_rows = (
@@ -2546,7 +2561,7 @@ def analyze_test_items(
         "available": bool(rows),
         "source_mode": source_mode,
         "source_label": (
-            "导入的持续测试事件" if source_mode == "external_events" else "前台 Activity 区间"
+            "导入的持续测试事件" if source_mode == "external_events" else "前台应用 / Ability 区间"
         ),
         "minimum_reliable_duration_s": minimum_reliable_duration_s,
         "row_count": len(rows),
@@ -2566,8 +2581,481 @@ def analyze_test_items(
         ],
         "limitations": (
             "Energy and power are whole-device measurements integrated inside each test window. "
-            "GC, kworker, DEX/update and thermal columns report sampled temporal overlap and relative influence, "
+            "GC, kworker, platform background activity and thermal columns report sampled temporal overlap and relative influence, "
             "not exclusive per-process rail power. Overlapping test rows are not additive."
+        ),
+    }
+
+
+def analyze_performance_contexts(
+    contexts: Sequence[ContextSample],
+    metadata: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    ordered = sorted(contexts, key=lambda item: item.uptime_s)
+    metadata = metadata or {}
+    probe = metadata.get("performance_probe", {})
+    probe = probe if isinstance(probe, dict) else {}
+    touch_probe = metadata.get("touch", {})
+    touch_probe = touch_probe if isinstance(touch_probe, dict) else {}
+
+    performance_contexts = [
+        item for item in ordered if isinstance(item.performance, dict) and item.performance
+    ]
+    latest_context = performance_contexts[-1] if performance_contexts else None
+    latest = latest_context.performance if latest_context is not None else probe
+    platform = str(metadata.get("platform") or latest.get("platform") or "").lower()
+    is_android = platform == "android"
+
+    refresh_values = [
+        float(item.refresh_rate_hz)
+        for item in ordered
+        if isinstance(item.refresh_rate_hz, (int, float)) and item.refresh_rate_hz > 0
+    ]
+    current_refresh = refresh_values[-1] if refresh_values else None
+    if current_refresh is None and isinstance(latest.get("refresh_rate_hz"), (int, float)):
+        current_refresh = float(latest["refresh_rate_hz"])
+
+    supported_refresh_rates = set()
+    for source in [probe, *[item.performance for item in performance_contexts]]:
+        values = source.get("supported_refresh_rates_hz", []) if isinstance(source, dict) else []
+        if isinstance(values, list):
+            supported_refresh_rates.update(
+                float(value)
+                for value in values
+                if isinstance(value, (int, float)) and float(value) > 0
+            )
+
+    refresh_residency: List[Dict[str, object]] = []
+    residency_source = None
+    duration_counter_contexts = [
+        item
+        for item in performance_contexts
+        if isinstance(item.performance.get("refresh_rate_durations_s"), dict)
+        and item.performance.get("refresh_rate_durations_s")
+    ]
+    if len(duration_counter_contexts) >= 2:
+        first_durations = duration_counter_contexts[0].performance[
+            "refresh_rate_durations_s"
+        ]
+        last_durations = duration_counter_contexts[-1].performance[
+            "refresh_rate_durations_s"
+        ]
+        assert isinstance(first_durations, dict) and isinstance(last_durations, dict)
+        duration_rows = []
+        for key in set(first_durations) | set(last_durations):
+            try:
+                rate = float(key)
+                start_duration = float(first_durations.get(key, 0.0))
+                end_duration = float(last_durations.get(key, 0.0))
+            except (TypeError, ValueError):
+                continue
+            delta = end_duration - start_duration
+            if rate > 0 and delta > 0:
+                duration_rows.append((rate, delta))
+        total_duration = sum(item[1] for item in duration_rows)
+        refresh_residency = [
+            {
+                "refresh_rate_hz": rate,
+                "count": None,
+                "estimated_duration_s": duration,
+                "share_pct": duration / total_duration * 100.0 if total_duration > 0 else 0.0,
+            }
+            for rate, duration in sorted(duration_rows)
+        ]
+        if refresh_residency:
+            residency_source = "Android SurfaceFlinger refresh-rate duration delta"
+
+    counter_contexts = [
+        item
+        for item in performance_contexts
+        if isinstance(item.performance.get("refresh_rate_counts"), dict)
+        and item.performance.get("refresh_rate_counts")
+    ]
+    if not refresh_residency and len(counter_contexts) >= 2:
+        first_counts = counter_contexts[0].performance["refresh_rate_counts"]
+        last_counts = counter_contexts[-1].performance["refresh_rate_counts"]
+        assert isinstance(first_counts, dict) and isinstance(last_counts, dict)
+        weighted_rows = []
+        for key in sorted(set(first_counts) | set(last_counts), key=lambda value: float(value)):
+            try:
+                rate = float(key)
+                start_count = int(first_counts.get(key, 0))
+                end_count = int(last_counts.get(key, 0))
+            except (TypeError, ValueError):
+                continue
+            delta = end_count - start_count
+            if rate <= 0 or delta <= 0:
+                continue
+            weighted_rows.append((rate, delta, delta / rate))
+        total_weight = sum(row[2] for row in weighted_rows)
+        for rate, count, estimated_duration in weighted_rows:
+            refresh_residency.append(
+                {
+                    "refresh_rate_hz": rate,
+                    "count": count,
+                    "estimated_duration_s": estimated_duration,
+                    "share_pct": (
+                        estimated_duration / total_weight * 100.0 if total_weight > 0 else 0.0
+                    ),
+                }
+            )
+        if refresh_residency:
+            residency_source = "HarmonyOS RenderService fpsCount delta"
+
+    if not refresh_residency and len(ordered) >= 2:
+        durations: Dict[float, float] = {}
+        for current, following in zip(ordered, ordered[1:]):
+            if not isinstance(current.refresh_rate_hz, (int, float)) or current.refresh_rate_hz <= 0:
+                continue
+            screen_state = str(current.screen_state or "").strip().lower()
+            if screen_state and screen_state not in {"awake", "on"}:
+                continue
+            delta = following.uptime_s - current.uptime_s
+            if 0 < delta <= 60.0:
+                rate = float(current.refresh_rate_hz)
+                durations[rate] = durations.get(rate, 0.0) + delta
+        total_duration = sum(durations.values())
+        refresh_residency = [
+            {
+                "refresh_rate_hz": rate,
+                "count": None,
+                "estimated_duration_s": duration,
+                "share_pct": duration / total_duration * 100.0 if total_duration > 0 else 0.0,
+            }
+            for rate, duration in sorted(durations.items())
+        ]
+        if refresh_residency:
+            residency_source = "context sample intervals"
+
+    frame_rows = [
+        item.performance
+        for item in performance_contexts
+        if isinstance(item.performance.get("frame_sample_count"), (int, float))
+        and float(item.performance.get("frame_sample_count") or 0) > 0
+    ]
+    frame_sample_count = sum(int(item.get("frame_sample_count") or 0) for item in frame_rows)
+
+    counter_frame_contexts = [
+        item
+        for item in performance_contexts
+        if isinstance(item.performance.get("frame_counter_total"), (int, float))
+    ]
+    counter_frame_count = 0
+    counter_frame_duration_s = 0.0
+    counter_frame_rates: List[float] = []
+    counter_deadline_missed = 0
+    counter_missed_vsync = 0
+    counter_janky = 0
+    counter_histogram: Dict[float, int] = {}
+    counter_pair_count = 0
+
+    for previous, current in zip(counter_frame_contexts, counter_frame_contexts[1:]):
+        previous_package = str(previous.foreground_package or "")
+        current_package = str(current.foreground_package or "")
+        previous_window = str(previous.performance.get("foreground_window_name") or "")
+        current_window = str(current.performance.get("foreground_window_name") or "")
+        if previous_package != current_package:
+            continue
+        if previous_window and current_window and previous_window != current_window:
+            continue
+        elapsed = current.uptime_s - previous.uptime_s
+        if elapsed <= 0 or elapsed > 60.0:
+            continue
+        previous_total = int(previous.performance.get("frame_counter_total") or 0)
+        current_total = int(current.performance.get("frame_counter_total") or 0)
+        delta_total = current_total - previous_total
+        if delta_total < 0:
+            continue
+        counter_pair_count += 1
+        counter_frame_count += delta_total
+        counter_frame_duration_s += elapsed
+        counter_frame_rates.append(delta_total / elapsed)
+
+        for source_key, target_name in (
+            ("frame_counter_deadline_missed", "deadline"),
+            ("frame_counter_missed_vsync", "vsync"),
+            ("frame_counter_janky", "janky"),
+        ):
+            previous_value = previous.performance.get(source_key)
+            current_value = current.performance.get(source_key)
+            if not isinstance(previous_value, (int, float)) or not isinstance(
+                current_value, (int, float)
+            ):
+                continue
+            delta = int(current_value) - int(previous_value)
+            if delta < 0:
+                continue
+            if target_name == "deadline":
+                counter_deadline_missed += delta
+            elif target_name == "vsync":
+                counter_missed_vsync += delta
+            else:
+                counter_janky += delta
+
+        previous_histogram = previous.performance.get("frame_histogram_ms")
+        current_histogram = current.performance.get("frame_histogram_ms")
+        if isinstance(previous_histogram, dict) and isinstance(current_histogram, dict):
+            for key in set(previous_histogram) | set(current_histogram):
+                try:
+                    bucket = float(key)
+                    delta = int(current_histogram.get(key, 0)) - int(
+                        previous_histogram.get(key, 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if bucket >= 0 and delta > 0:
+                    counter_histogram[bucket] = counter_histogram.get(bucket, 0) + delta
+
+    def histogram_percentile(histogram: Dict[float, int], percentile: float) -> Optional[float]:
+        total = sum(max(0, count) for count in histogram.values())
+        if total <= 0:
+            return None
+        threshold = total * percentile
+        cumulative = 0
+        for bucket, count in sorted(histogram.items()):
+            cumulative += max(0, count)
+            if cumulative >= threshold:
+                return bucket
+        return max(histogram) if histogram else None
+
+    histogram_count = sum(counter_histogram.values())
+    counter_frame_average_ms = (
+        sum(bucket * count for bucket, count in counter_histogram.items()) / histogram_count
+        if histogram_count > 0
+        else None
+    )
+    counter_frame_p95_ms = histogram_percentile(counter_histogram, 0.95)
+
+    def weighted_frame_value(key: str) -> Optional[float]:
+        values = [
+            (float(item[key]), int(item.get("frame_sample_count") or 0))
+            for item in frame_rows
+            if isinstance(item.get(key), (int, float))
+        ]
+        weight = sum(item[1] for item in values)
+        return sum(value * count for value, count in values) / weight if weight > 0 else None
+
+    fps_values = [
+        float(item["compositor_fps"])
+        for item in frame_rows
+        if isinstance(item.get("compositor_fps"), (int, float))
+    ]
+    p95_values = [
+        float(item["frame_interval_p95_ms"])
+        for item in frame_rows
+        if isinstance(item.get("frame_interval_p95_ms"), (int, float))
+    ]
+    missed_intervals = sum(
+        int(item.get("missed_vsync_interval_count") or 0) for item in frame_rows
+    )
+    severe_intervals = sum(
+        int(item.get("severe_frame_interval_count") or 0) for item in frame_rows
+    )
+    frozen_intervals = sum(
+        int(item.get("frozen_frame_interval_count") or 0) for item in frame_rows
+    )
+    compositor_fps = weighted_frame_value("compositor_fps")
+    compositor_minimum_fps = min(fps_values) if fps_values else None
+    compositor_frame_average_ms = weighted_frame_value("frame_interval_average_ms")
+    compositor_frame_p95_ms = max(p95_values) if p95_values else None
+    compositor_missed_pct = (
+        missed_intervals / frame_sample_count * 100.0 if frame_sample_count > 0 else None
+    )
+
+    if counter_pair_count > 0:
+        sampled_frame_rate = (
+            counter_frame_count / counter_frame_duration_s
+            if counter_frame_duration_s > 0
+            else 0.0
+        )
+        minimum_sampled_frame_rate = min(counter_frame_rates) if counter_frame_rates else 0.0
+        reported_frame_sample_count = counter_frame_count
+        frame_metric_average_ms = counter_frame_average_ms
+        frame_metric_p95_ms = counter_frame_p95_ms
+        frame_issue_count = counter_deadline_missed
+        frame_issue_pct = (
+            counter_deadline_missed / counter_frame_count * 100.0
+            if counter_frame_count > 0
+            else 0.0
+        )
+        frame_rate_source = "Android gfxinfo frame counter delta"
+        frame_rate_label = "应用 UI 帧提交速率"
+        frame_rate_unit = "帧/s"
+        frame_metric_label = "应用帧耗时 P95"
+        frame_issue_label = "超出帧截止时间"
+    else:
+        sampled_frame_rate = compositor_fps
+        minimum_sampled_frame_rate = compositor_minimum_fps
+        reported_frame_sample_count = frame_sample_count
+        frame_metric_average_ms = compositor_frame_average_ms
+        frame_metric_p95_ms = compositor_frame_p95_ms
+        frame_issue_count = missed_intervals
+        frame_issue_pct = compositor_missed_pct
+        if is_android:
+            frame_rate_source = None
+            frame_rate_label = "应用 UI 帧提交速率"
+            frame_rate_unit = "帧/s"
+            frame_metric_label = "应用帧耗时 P95"
+            frame_issue_label = "超出帧截止时间"
+        else:
+            frame_rate_source = (
+                "HarmonyOS RenderService composer fps sampled windows" if frame_rows else None
+            )
+            frame_rate_label = "合成器 FPS"
+            frame_rate_unit = "FPS"
+            frame_metric_label = "帧间隔 P95"
+            frame_issue_label = "跨越刷新槽位"
+
+    hitch_totals = {
+        "hitch_over_16_67ms": 0,
+        "hitch_over_33ms": 0,
+        "hitch_over_66ms": 0,
+    }
+    previous_hitches: Dict[str, Dict[str, int]] = {}
+    for item in performance_contexts:
+        values = item.performance
+        window = str(values.get("foreground_window_name") or "unknown")
+        current_hitches = {
+            key: int(values.get(key) or 0)
+            for key in hitch_totals
+            if isinstance(values.get(key), (int, float))
+        }
+        previous = previous_hitches.get(window)
+        if previous is not None:
+            for key, value in current_hitches.items():
+                delta = value - previous.get(key, 0)
+                if delta > 0:
+                    hitch_totals[key] += delta
+        if current_hitches:
+            previous_hitches[window] = current_hitches
+
+    touch_contexts = [
+        item
+        for item in performance_contexts
+        if isinstance(item.performance.get("touch_down_times_us"), list)
+    ]
+    new_touches = set()
+    if touch_contexts:
+        known_touches = {
+            int(value)
+            for value in touch_contexts[0].performance.get("touch_down_times_us", [])
+            if isinstance(value, (int, float))
+        }
+        for item in touch_contexts[1:]:
+            for value in item.performance.get("touch_down_times_us", []):
+                if not isinstance(value, (int, float)):
+                    continue
+                parsed = int(value)
+                if parsed not in known_touches:
+                    new_touches.add(parsed)
+                    known_touches.add(parsed)
+    context_duration_s = (
+        performance_contexts[-1].uptime_s - performance_contexts[0].uptime_s
+        if len(performance_contexts) >= 2
+        else 0.0
+    )
+    touch_interaction_count = len(new_touches) if len(touch_contexts) >= 2 else None
+    frame_overproduction_ratio = (
+        sampled_frame_rate / current_refresh
+        if isinstance(sampled_frame_rate, (int, float))
+        and isinstance(current_refresh, (int, float))
+        and current_refresh > 0
+        and counter_pair_count > 0
+        else None
+    )
+
+    gpu_probe = metadata.get("gpu_probe", {})
+    gpu_probe = gpu_probe if isinstance(gpu_probe, dict) else {}
+    touch_devices = touch_probe.get("devices", [])
+    touch_devices = touch_devices if isinstance(touch_devices, list) else []
+    switch_count = sum(
+        1
+        for previous, current in zip(refresh_values, refresh_values[1:])
+        if abs(current - previous) > 0.1
+    )
+    observed_rates = sorted(set(refresh_values))
+    available = bool(
+        refresh_values
+        or frame_rows
+        or refresh_residency
+        or latest
+        or probe
+    )
+    return {
+        "available": available,
+        "context_sample_count": len(ordered),
+        "current_refresh_rate_hz": current_refresh,
+        "peak_refresh_rate_hz": max(supported_refresh_rates) if supported_refresh_rates else None,
+        "supported_refresh_rates_hz": sorted(supported_refresh_rates),
+        "observed_refresh_rates_hz": observed_rates,
+        "refresh_switch_count": switch_count,
+        "refresh_residency": refresh_residency,
+        "refresh_residency_source": residency_source,
+        "sampled_compositor_fps": compositor_fps,
+        "minimum_sampled_compositor_fps": compositor_minimum_fps,
+        "frame_interval_average_ms": compositor_frame_average_ms,
+        "frame_interval_p95_ms": compositor_frame_p95_ms,
+        "sampled_frame_rate_fps": sampled_frame_rate,
+        "minimum_sampled_frame_rate_fps": minimum_sampled_frame_rate,
+        "frame_rate_label": frame_rate_label,
+        "frame_rate_unit": frame_rate_unit,
+        "frame_overproduction_ratio": frame_overproduction_ratio,
+        "frame_metric_average_ms": frame_metric_average_ms,
+        "frame_metric_p95_ms": frame_metric_p95_ms,
+        "frame_metric_label": frame_metric_label,
+        "frame_issue_count": frame_issue_count,
+        "frame_issue_pct": frame_issue_pct,
+        "frame_issue_label": frame_issue_label,
+        "frame_sample_count": reported_frame_sample_count,
+        "missed_vsync_interval_count": missed_intervals,
+        "missed_vsync_interval_pct": compositor_missed_pct,
+        "frame_deadline_missed_count": counter_deadline_missed if counter_pair_count else None,
+        "gfxinfo_janky_frame_count": counter_janky if counter_pair_count else None,
+        "gfxinfo_missed_vsync_count": counter_missed_vsync if counter_pair_count else None,
+        "severe_frame_interval_count": severe_intervals,
+        "frozen_frame_interval_count": frozen_intervals,
+        "missed_vsync_slot_count": sum(
+            int(item.get("missed_vsync_slot_count") or 0) for item in frame_rows
+        ),
+        **hitch_totals,
+        "touch_interaction_count": touch_interaction_count,
+        "touch_interactions_per_minute": (
+            touch_interaction_count / context_duration_s * 60.0
+            if touch_interaction_count is not None and context_duration_s > 0
+            else None
+        ),
+        "touch_sampling_rate_hz": None,
+        "touch_sampling_rate_available": False,
+        "touch_sampling_rate_reason": str(
+            latest.get("touch_sampling_rate_reason")
+            or touch_probe.get("sampling_rate_reason")
+            or "The platform does not expose the touch controller hardware scan rate."
+        ),
+        "touch_devices": touch_devices,
+        "foreground_window_name": latest.get("foreground_window_name"),
+        "foreground_window_id": latest.get("foreground_window_id"),
+        "foreground_window_pid": latest.get("foreground_window_pid"),
+        "display_width_px": latest.get("display_width_px"),
+        "display_height_px": latest.get("display_height_px"),
+        "brightness_raw": latest.get("brightness_raw"),
+        "gpu_renderer": latest.get("gpu_renderer") or probe.get("gpu_renderer") or gpu_probe.get("model"),
+        "gpu_vendor": latest.get("gpu_vendor") or probe.get("gpu_vendor") or gpu_probe.get("vendor"),
+        "frame_source": frame_rate_source,
+        "frame_unavailable_reason": latest.get("frame_unavailable_reason"),
+        "limitations": (
+            (
+                "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
+                "for the sampled foreground window. The rate is UI frame submissions per second, not visible "
+                "display FPS, and can exceed the panel refresh rate when an app submits redundant frames. "
+                if counter_pair_count > 0
+                else (
+                    "Android gfxinfo did not expose usable foreground-window frame counter deltas in this session. "
+                    if is_android
+                    else "Compositor FPS and frame intervals are periodic samples of recent RenderService submissions. "
+                )
+            )
+            + "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed "
+            "and is not inferred."
         ),
     }
 
@@ -2578,6 +3066,7 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
     cpu = analysis.get("cpu", {})
     gpu = analysis.get("gpu", {})
     display = analysis.get("display", {})
+    performance = analysis.get("performance", {})
     thermal = analysis.get("thermal", {})
     system = analysis.get("system", {})
     scheduler = analysis.get("scheduler", {})
@@ -2585,10 +3074,10 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
     findings: List[Dict[str, str]] = [
         {
             "level": "measured",
-            "title": "电池侧实测输出",
+            "title": "电池侧实测功率",
             "detail": (
                 f"平均功率 {float(summary.get('average_power_mw') or 0.0) / 1000.0:.3f} W，"
-                f"平均放电电流幅值 {float(summary.get('average_current_ma') or 0.0):.1f} mA；"
+                f"平均电流幅值 {float(summary.get('average_current_ma') or 0.0):.1f} mA；"
                 f"P95 功率 {float(summary.get('p95_power_mw') or 0.0) / 1000.0:.3f} W。"
             ),
         }
@@ -2638,7 +3127,11 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
                     "detail": (
                         "本次会话未恢复到 iOS DVT Graphics 利用率事件；报告不会据此推断 GPU 电源轨功耗。"
                         if platform == "ios"
-                        else "OEM 系统未向 ADB shell 暴露可读的 GPU 频率节点，报告使用可获得的 UID 工作时长证据。"
+                        else (
+                            "HarmonyOS 量产系统未向 HDC shell 暴露可读 GPU 频率或负载节点，且不存在 Android dumpsys GPU 回退证据。"
+                            if platform == "harmony"
+                            else "OEM 系统未向 ADB shell 暴露可读的 GPU 频率节点，报告使用可获得的 UID 工作时长证据。"
+                        )
                     ),
                 }
             )
@@ -2710,9 +3203,18 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
             )
         groups = system.get("activity_groups", {})
         group_rows = groups.get("rows", []) if isinstance(groups, dict) else []
-        if group_rows:
+        meaningful_group_rows = [
+            item
+            for item in group_rows
+            if float(item.get("maximum_cpu_pct") or 0.0) >= 5.0
+            and (
+                abs(float(item.get("power_delta_mw") or 0.0)) >= 100.0
+                or float(item.get("estimated_duration_s") or 0.0) >= 10.0
+            )
+        ]
+        if meaningful_group_rows:
             leading_group = max(
-                group_rows,
+                meaningful_group_rows,
                 key=lambda item: (
                     float(item.get("excess_energy_mwh") or 0.0),
                     float(item.get("maximum_cpu_pct") or 0.0),
@@ -2768,13 +3270,107 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
                     f"系统活动窗口重叠 {float(leading_test.get('system_activity_overlap_pct') or 0.0):.1f}%，"
                     f"GC {int((leading_test.get('gc') or {}).get('snapshot_count') or 0)} 个采样点，"
                     f"kworker {int((leading_test.get('kworker') or {}).get('snapshot_count') or 0)} 个采样点，"
-                    f"DEX/更新重叠 {float(leading_test.get('dex_update_overlap_s') or 0.0):.1f} s。"
+                    f"{'更新/安装/编译' if platform == 'harmony' else '系统/采集器' if platform == 'ios' else 'DEX/更新'}"
+                    f"重叠 {float(leading_test.get('dex_update_overlap_s') or 0.0):.1f} s。"
                 ),
             }
         )
 
     active_refresh = display.get("active_refresh_hz") if isinstance(display, dict) else None
-    if isinstance(active_refresh, (int, float)):
+    if isinstance(performance, dict) and performance.get("available"):
+        residency = performance.get("refresh_residency", [])
+        if isinstance(residency, list) and residency:
+            leading_refresh = max(
+                residency,
+                key=lambda item: float(item.get("share_pct") or 0.0),
+            )
+            findings.append(
+                {
+                    "level": "context",
+                    "title": "刷新率驻留",
+                    "detail": (
+                        f"当前 {float(performance.get('current_refresh_rate_hz') or 0.0):.0f} Hz；"
+                        f"会话内以 {float(leading_refresh.get('refresh_rate_hz') or 0.0):.0f} Hz 为主，"
+                        f"占已观测刷新档位时间的 {float(leading_refresh.get('share_pct') or 0.0):.1f}%。"
+                    ),
+                }
+            )
+        elif isinstance(active_refresh, (int, float)):
+            findings.append(
+                {
+                    "level": "context",
+                    "title": "显示模式",
+                    "detail": f"采集期间显示渲染刷新率为 {active_refresh:.0f} Hz。",
+                }
+            )
+
+        sampled_fps = performance.get("sampled_frame_rate_fps")
+        if not isinstance(sampled_fps, (int, float)):
+            sampled_fps = performance.get("sampled_compositor_fps")
+        frame_p95 = performance.get("frame_metric_p95_ms")
+        if not isinstance(frame_p95, (int, float)):
+            frame_p95 = performance.get("frame_interval_p95_ms")
+        missed_pct = performance.get("frame_issue_pct")
+        if not isinstance(missed_pct, (int, float)):
+            missed_pct = performance.get("missed_vsync_interval_pct")
+        frame_rate_label = str(performance.get("frame_rate_label") or "帧率")
+        frame_rate_unit = str(performance.get("frame_rate_unit") or "FPS")
+        frame_metric_label = str(performance.get("frame_metric_label") or "帧指标 P95")
+        frame_issue_label = str(performance.get("frame_issue_label") or "帧异常")
+        if isinstance(sampled_fps, (int, float)):
+            level = (
+                "measured"
+                if isinstance(missed_pct, (int, float)) and missed_pct >= 1.0
+                else "context"
+            )
+            frame_p95_text = (
+                f"{frame_metric_label} {float(frame_p95):.2f} ms，"
+                if isinstance(frame_p95, (int, float))
+                else f"{frame_metric_label}不可用，"
+            )
+            findings.append(
+                {
+                    "level": level,
+                    "title": frame_rate_label,
+                    "detail": (
+                        f"{frame_rate_label} {float(sampled_fps):.1f} {frame_rate_unit}，"
+                        f"{frame_p95_text}"
+                        f"{frame_issue_label}占 {float(missed_pct or 0.0):.2f}%。"
+                    ),
+                }
+            )
+            overproduction_ratio = performance.get("frame_overproduction_ratio")
+            if (
+                isinstance(overproduction_ratio, (int, float))
+                and overproduction_ratio > 1.1
+                and isinstance(performance.get("current_refresh_rate_hz"), (int, float))
+            ):
+                findings.append(
+                    {
+                        "level": "measured",
+                        "title": "帧提交速率高于显示刷新",
+                        "detail": (
+                            f"gfxinfo 记录到 {float(sampled_fps):.1f} 帧/s 的 UI 提交，"
+                            f"当前显示为 {float(performance.get('current_refresh_rate_hz') or 0.0):.0f} Hz。"
+                            "这不是可见 FPS，通常表示同一刷新周期内多次提交或多个渲染目标，"
+                            "可能增加 CPU/GPU 与合成开销。"
+                        ),
+                    }
+                )
+
+        touch_count = performance.get("touch_interaction_count")
+        if isinstance(touch_count, (int, float)):
+            findings.append(
+                {
+                    "level": "context",
+                    "title": "触控交互",
+                    "detail": (
+                        f"会话快照中新识别 {int(touch_count)} 次触摸按下交互。"
+                        "系统未公开面板硬件触控采样率，因此报告不推断 240/300 Hz 等规格。"
+                    ),
+                }
+            )
+    elif isinstance(active_refresh, (int, float)):
         findings.append(
             {
                 "level": "context",
@@ -2806,7 +3402,7 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
                 ),
             }
         )
-    elif thermal_status == 0:
+    elif thermal_status == 0 and platform != "harmony":
         findings.append(
             {
                 "level": "low",
@@ -2875,6 +3471,59 @@ def _analysis_data_sources(platform: str) -> List[Dict[str, str]]:
                 "metric": "Battery temperature",
                 "source": "iOS DiagnosticsService battery temperature",
                 "kind": "measured counters",
+            },
+        ]
+    if platform == "harmony":
+        return [
+            {
+                "metric": "Battery current, voltage and temperature",
+                "source": "HarmonyOS BatteryService via hidumper",
+                "kind": "measured",
+            },
+            {
+                "metric": "CPU utilization",
+                "source": "HarmonyOS /proc/stat via persistent HDC shell",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "CPU frequency",
+                "source": "HarmonyOS hidumper --cpufreq",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Foreground application and screen state",
+                "source": "HarmonyOS AbilityManager + PowerManagerService",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Refresh-rate residency and sampled compositor frame pacing",
+                "source": "HarmonyOS RenderService screen/fpsCount/composer fps",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Foreground window and delivered touch interactions",
+                "source": "HarmonyOS WindowManagerService + MultimodalInput",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "System processes",
+                "source": "HarmonyOS top + ps over HDC",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Thermal sensors",
+                "source": "HarmonyOS ThermalService via hidumper",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Power and scheduler context",
+                "source": "HarmonyOS PowerManagerService + cpufreq capability snapshots",
+                "kind": "context",
+            },
+            {
+                "metric": "Test phases and actions",
+                "source": "Imported timestamped logs aligned to HarmonyOS device realtime",
+                "kind": "context",
             },
         ]
     return [
@@ -3028,6 +3677,19 @@ def analyze_run(
         raw_outputs.get("screen_brightness", ""),
         raw_outputs.get("peak_refresh_rate", ""),
     )
+    performance_analysis = analyze_performance_contexts(contexts, metadata)
+    if not isinstance(display.get("active_refresh_hz"), (int, float)) and isinstance(
+        performance_analysis.get("current_refresh_rate_hz"), (int, float)
+    ):
+        display["active_refresh_hz"] = performance_analysis["current_refresh_rate_hz"]
+    if not isinstance(display.get("peak_refresh_hz"), (int, float)) and isinstance(
+        performance_analysis.get("peak_refresh_rate_hz"), (int, float)
+    ):
+        display["peak_refresh_hz"] = performance_analysis["peak_refresh_rate_hz"]
+    if not isinstance(display.get("brightness_raw"), (int, float)) and isinstance(
+        performance_analysis.get("brightness_raw"), (int, float)
+    ):
+        display["brightness_raw"] = performance_analysis["brightness_raw"]
     thermal_post_run = parse_thermal(raw_outputs.get("thermalservice", ""))
     processes = parse_cpu_processes(raw_outputs.get("cpuinfo", ""))
     wakelocks = extract_kernel_wakelocks(raw_outputs.get("batterystats", ""))
@@ -3039,6 +3701,12 @@ def analyze_run(
         power_profile,
         max_gap_s,
     )
+    if platform == "harmony":
+        cpu_analysis["source"] = "HarmonyOS /proc/stat + hidumper --cpufreq"
+        cpu_analysis["limitations"] = (
+            "CPU utilization and cluster frequency are measured counters. HarmonyOS does not expose an "
+            "Android Power Profile equivalent here, so no CPU rail power is modeled."
+        )
 
     target_package = metadata.get("target_package")
     if not target_package and not metadata.get("session_mode"):
@@ -3130,6 +3798,25 @@ def analyze_run(
     else:
         thermal = {**thermal_post_run, **thermal_history, "post_run": thermal_post_run}
     scheduler_analysis = analyze_scheduler_history(samples, scheduler_snapshots)
+    if platform == "harmony":
+        thermal["status"] = None
+        thermal["latest_status"] = None
+        thermal["maximum_status"] = None
+        thermal["latest_status_label"] = "unavailable"
+        thermal["maximum_status_label"] = "unavailable"
+        thermal["throttling_observed"] = None
+        for sensor in thermal.get("sensors", []) if isinstance(thermal.get("sensors"), list) else []:
+            if isinstance(sensor, dict):
+                sensor["maximum_status"] = None
+                sensor["maximum_status_label"] = "unavailable"
+        thermal["limitations"] = (
+            "HarmonyOS ThermalService exposes sensor temperatures through hidumper, but this adapter does "
+            "not receive Android thermal severity, cooling-device or threshold semantics."
+        )
+        scheduler_analysis["limitations"] = (
+            "HarmonyOS snapshots retain cpufreq and PowerManager state. Android cpuset, ActivityManager and "
+            "ADPF HintSession concepts are not present and remain explicitly unavailable."
+        )
     test_item_analysis = analyze_test_items(
         samples,
         contexts,
@@ -3210,6 +3897,7 @@ def analyze_run(
         "system": system_analysis,
         "wakelocks": wakelocks,
         "display": display,
+        "performance": performance_analysis,
         "thermal": thermal,
         "scheduler": scheduler_analysis,
         "applications": application_analysis,

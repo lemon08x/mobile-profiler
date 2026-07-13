@@ -74,6 +74,13 @@ METRIC_LABELS = {
     "Relative process power score": "进程相对功耗分数",
     "System processes and collector overhead": "系统进程与采集器开销",
     "Battery temperature": "电池温度",
+    "Battery current, voltage and temperature": "电池电流、电压与温度",
+    "CPU utilization": "CPU 利用率",
+    "CPU frequency": "CPU 频率",
+    "Foreground application and screen state": "前台应用与屏幕状态",
+    "System processes": "系统进程",
+    "Thermal sensors": "热传感器",
+    "Power and scheduler context": "电源与调度上下文",
     "Battery current": "电池电流",
     "Battery voltage": "电池电压",
     "CPU utilization/frequency": "CPU 利用率 / 频率",
@@ -110,6 +117,14 @@ SOURCE_LABELS = {
     "Periodic toybox top/ps snapshots": "周期性 toybox top / ps 快照",
     "Android ThermalService / thermal HAL": "Android ThermalService / Thermal HAL",
     "cgroup files + ActivityManager + performance_hint": "cgroup 文件 + ActivityManager + performance_hint",
+    "HarmonyOS BatteryService via hidumper": "HarmonyOS BatteryService · hidumper",
+    "HarmonyOS /proc/stat via persistent HDC shell": "HarmonyOS /proc/stat · 持久 HDC shell",
+    "HarmonyOS hidumper --cpufreq": "HarmonyOS hidumper --cpufreq",
+    "HarmonyOS AbilityManager + PowerManagerService": "HarmonyOS AbilityManager + PowerManagerService",
+    "HarmonyOS top + ps over HDC": "HarmonyOS top + ps · HDC",
+    "HarmonyOS ThermalService via hidumper": "HarmonyOS ThermalService · hidumper",
+    "HarmonyOS PowerManagerService + cpufreq capability snapshots": "HarmonyOS PowerManagerService + cpufreq 能力快照",
+    "Imported timestamped logs aligned to HarmonyOS device realtime": "按 HarmonyOS 设备实时时钟对齐的外部日志",
 }
 COMPONENT_LABELS = {
     "screen": "屏幕",
@@ -176,6 +191,14 @@ def _summary_cards(summary: Dict[str, object]) -> str:
     collector_cpu = summary.get("average_collector_cpu_pct")
     if isinstance(collector_cpu, (int, float)):
         cpu_context += f" · 采集器 {float(collector_cpu):.1f}%"
+    signed_current = summary.get("average_signed_current_ma")
+    current_context = (
+        "充电电流正幅值"
+        if isinstance(signed_current, (int, float)) and float(signed_current) > 0
+        else "放电电流正幅值"
+        if isinstance(signed_current, (int, float)) and float(signed_current) < 0
+        else "电流正幅值"
+    )
     cards = [
         (
             "平均功率",
@@ -188,7 +211,7 @@ def _summary_cards(summary: Dict[str, object]) -> str:
             "电池电流",
             f"{float(summary.get('average_current_ma') or 0.0):.1f}",
             "mA",
-            "放电电流正幅值",
+            current_context,
             "measured",
         ),
         (
@@ -213,6 +236,145 @@ def _summary_cards(summary: Dict[str, object]) -> str:
         f'<div class="metric-context">{_escape(context)}</div>'
         "</article>"
         for label, value, unit, context, kind in cards
+    )
+
+
+def _performance_cards(analysis: Dict[str, object]) -> str:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+
+    def shown(value: object, digits: int = 1) -> str:
+        return _number(value, digits) if isinstance(value, (int, float)) else "—"
+
+    refresh = performance.get("current_refresh_rate_hz")
+    peak = performance.get("peak_refresh_rate_hz")
+    fps = performance.get("sampled_frame_rate_fps")
+    if not isinstance(fps, (int, float)):
+        fps = performance.get("sampled_compositor_fps")
+    frame_p95 = performance.get("frame_metric_p95_ms")
+    if not isinstance(frame_p95, (int, float)):
+        frame_p95 = performance.get("frame_interval_p95_ms")
+    missed = performance.get("frame_issue_pct")
+    if not isinstance(missed, (int, float)):
+        missed = performance.get("missed_vsync_interval_pct")
+    frame_rate_label = str(performance.get("frame_rate_label") or "合成器抽样 FPS")
+    frame_rate_unit = str(performance.get("frame_rate_unit") or "FPS")
+    frame_metric_label = str(performance.get("frame_metric_label") or "最差抽样 P95")
+    frame_issue_label = str(performance.get("frame_issue_label") or "跨越刷新槽位")
+    frame_unavailable_reason = str(performance.get("frame_unavailable_reason") or "")
+    touches = performance.get("touch_interaction_count")
+    touch_rate = performance.get("touch_interactions_per_minute")
+    cards = [
+        (
+            "当前刷新率",
+            shown(refresh, 0),
+            "Hz",
+            f"设备最高 {shown(peak, 0)} Hz" if isinstance(peak, (int, float)) else "显示档位上下文",
+            "counter",
+        ),
+        (
+            frame_rate_label,
+            shown(fps, 1),
+            frame_rate_unit,
+            (
+                f"累计 {int(performance.get('frame_sample_count') or 0)} 帧"
+                if isinstance(fps, (int, float))
+                else frame_unavailable_reason or "当前会话没有可用帧计数"
+            ),
+            "counter",
+        ),
+        (
+            frame_metric_label,
+            shown(frame_p95, 2),
+            "ms",
+            (
+                f"{shown(missed, 2)}% {frame_issue_label}"
+                if isinstance(frame_p95, (int, float))
+                else frame_unavailable_reason or "当前会话没有可用帧耗时"
+            ),
+            "counter",
+        ),
+        (
+            "触摸交互",
+            shown(touches, 0),
+            "次",
+            (
+                f"{shown(touch_rate, 1)} 次/分钟 · 硬件触控采样率未公开"
+                if isinstance(touch_rate, (int, float))
+                else "硬件触控采样率未公开"
+            ),
+            "context",
+        ),
+    ]
+    return "".join(
+        '<article class="metric-card">'
+        f'<div class="metric-top"><span>{_escape(label)}</span><span class="source-tag {kind}">{_escape(_display_label(kind, SOURCE_KIND_LABELS))}</span></div>'
+        f'<div class="metric-value">{_escape(value)} <small>{_escape(unit)}</small></div>'
+        f'<div class="metric-context">{_escape(context)}</div>'
+        "</article>"
+        for label, value, unit, context, kind in cards
+    )
+
+
+def _refresh_residency_rows(analysis: Dict[str, object]) -> str:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    rows = []
+    for item in performance.get("refresh_residency", []) if isinstance(performance.get("refresh_residency"), list) else []:
+        share = max(0.0, min(100.0, float(item.get("share_pct") or 0.0)))
+        rows.append(
+            '<div class="residency-row">'
+            f'<div><strong>{_number(item.get("refresh_rate_hz"), 0)} Hz</strong><span>{_number(item.get("estimated_duration_s"), 1)} s</span></div>'
+            '<div class="stacked-bar" role="img" '
+            f'aria-label="{_number(item.get("refresh_rate_hz"), 0)} Hz 驻留 {share:.1f}%">'
+            f'<span class="band-balanced" style="width:{share:.3f}%"></span>'
+            "</div>"
+            f'<div class="residency-values"><span>{share:.1f}%</span></div>'
+            "</div>"
+        )
+    return "".join(rows) or '<div class="availability-note"><strong>刷新档位驻留不可用</strong><span>当前平台没有提供可计算的刷新档位计数变化。</span></div>'
+
+
+def _performance_context_rows(analysis: Dict[str, object]) -> str:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    thermal = analysis.get("thermal", {})
+    thermal = thermal if isinstance(thermal, dict) else {}
+    hottest = thermal.get("hottest_sensor")
+    hottest = hottest if isinstance(hottest, dict) else {}
+    width = performance.get("display_width_px")
+    height = performance.get("display_height_px")
+    resolution = (
+        f"{int(width)} × {int(height)}"
+        if isinstance(width, (int, float)) and isinstance(height, (int, float))
+        else "—"
+    )
+    supported = performance.get("supported_refresh_rates_hz", [])
+    supported_text = (
+        " / ".join(f"{float(value):g}" for value in supported if isinstance(value, (int, float))) + " Hz"
+        if isinstance(supported, list) and supported
+        else "—"
+    )
+    hottest_text = (
+        f"{_number(hottest.get('maximum_value', hottest.get('maximum_c')), 1)} {hottest.get('unit') or '°C'} · {hottest.get('name') or 'sensor'}"
+        if hottest
+        else "—"
+    )
+    rows = [
+        ("前台窗口", performance.get("foreground_window_name") or "—", f"Window #{performance.get('foreground_window_id') or '—'}"),
+        ("显示", resolution, f"亮度原始值 {_number(performance.get('brightness_raw'), 0)}"),
+        ("支持刷新率", supported_text, f"切换 {int(performance.get('refresh_switch_count') or 0)} 次"),
+        ("GPU", performance.get("gpu_renderer") or "—", performance.get("gpu_vendor") or "RenderService renderer"),
+        ("最高温度", hottest_text, "仅在严重度或温升异常时形成结论"),
+        ("触控边界", "硬件采样率不可用", "仅展示系统公开的触摸设备能力与已分发交互"),
+    ]
+    return "".join(
+        "<tr>"
+        f"<td><strong>{_escape(label)}</strong></td>"
+        f"<td>{_escape(value)}</td>"
+        f'<td><span class="cell-sub">{_escape(detail)}</span></td>'
+        "</tr>"
+        for label, value, detail in rows
     )
 
 
@@ -281,7 +443,7 @@ def _process_rows(analysis: Dict[str, object]) -> str:
 def _system_process_rows(analysis: Dict[str, object]) -> str:
     system = analysis.get("system", {})
     rows = []
-    for item in system.get("top_processes", [])[:20] if isinstance(system, dict) else []:
+    for item in system.get("top_processes", [])[:5] if isinstance(system, dict) else []:
         rows.append(
             "<tr>"
             f'<td><strong>{_escape(item.get("name") or item.get("command"))}</strong>'
@@ -335,6 +497,13 @@ def _priority_activity_content(analysis: Dict[str, object], platform: str) -> Tu
                 '<div class="priority-callout"><span class="status-dot good"></span><div>'
                 '<strong>未检测到 CPU 可见的重点系统或采集器活动</strong>'
                 f'<span>已观察到 {len(monitored)} 个受监控进程；相对功耗分数与整机物理功率分开解释。</span>'
+                "</div></div>"
+            )
+        elif platform == "harmony":
+            status = (
+                '<div class="priority-callout"><span class="status-dot good"></span><div>'
+                '<strong>未检测到 CPU 可见的 HarmonyOS 更新、安装或编译活动</strong>'
+                f'<span>已观察到 {len(monitored)} 个受监控进程；这里只报告与整机功率的时间重叠，不做进程独占归因。</span>'
                 "</div></div>"
             )
         else:
@@ -412,13 +581,22 @@ def _test_item_status(analysis: Dict[str, object]) -> str:
     return (
         '<div class="priority-callout"><span class="status-dot good"></span><div>'
         f'<strong>已按{_escape(test_items.get("source_label"))}生成 {int(test_items.get("row_count") or 0)} 个测试项</strong>'
-        f'<span>{_escape(overlap_note)} GC、kworker、DEX/更新与热限制均为时间重叠证据，不是进程独占功耗。</span>'
+        f'<span>{_escape(overlap_note)} GC、kworker、平台后台活动与热上下文均为时间重叠证据，不是进程独占功耗。</span>'
         "</div></div>"
     )
 
 
 def _test_item_rows(analysis: Dict[str, object]) -> str:
     test_items = analysis.get("test_items", {})
+    platform = str(analysis.get("platform") or "android").lower()
+    background_label = (
+        "更新/安装/编译"
+        if platform == "harmony"
+        else "系统/采集器"
+        if platform == "ios"
+        else "DEX/更新"
+    )
+    thermal_label = "热严重度未公开" if platform in {"harmony", "ios"} else None
     rows = []
     for item in test_items.get("rows", []) if isinstance(test_items, dict) else []:
         gc = item.get("gc", {}) if isinstance(item.get("gc"), dict) else {}
@@ -449,12 +627,12 @@ def _test_item_rows(analysis: Dict[str, object]) -> str:
             temperature_text = (
                 f'{_number(start_temperature)} → {_number(end_temperature)} °C'
                 f'<span class="cell-sub">传感器峰值 {_number(item.get("maximum_temperature_c"))} °C · '
-                f'Thermal {int(item.get("maximum_thermal_status") or 0)}</span>'
+                f'{_escape(thermal_label) if thermal_label else f"Thermal {int(item.get("maximum_thermal_status") or 0)}"}</span>'
             )
         else:
             temperature_text = (
                 f'传感器峰值 {_number(item.get("maximum_temperature_c"))} °C'
-                f'<span class="cell-sub">Thermal {int(item.get("maximum_thermal_status") or 0)}</span>'
+                f'<span class="cell-sub">{_escape(thermal_label) if thermal_label else f"Thermal {int(item.get("maximum_thermal_status") or 0)}"}</span>'
             )
         rows.append(
             f'<tr class="test-item-row" data-test-start="{_number(item.get("first_start_elapsed_s"), 3, "0")}" '
@@ -470,7 +648,7 @@ def _test_item_rows(analysis: Dict[str, object]) -> str:
             f'<td>{temperature_text}</td>'
             f'<td>{int(gc.get("snapshot_count") or 0)} 点<span class="cell-sub">{_number(gc.get("average_cpu_pct"))}% / {_number(gc.get("maximum_cpu_pct"))}% · {_number(gc.get("overlap_s"))} s</span></td>'
             f'<td>{int(kworker.get("snapshot_count") or 0)} 点<span class="cell-sub">{_number(kworker.get("average_cpu_pct"))}% / {_number(kworker.get("maximum_cpu_pct"))}% · {_number(kworker.get("overlap_s"))} s</span></td>'
-            f'<td>DEX/更新 {_number(item.get("dex_update_overlap_s"))} s<span class="cell-sub">热限制 {_number(item.get("thermal_throttling_overlap_s"))} s</span></td>'
+            f'<td>{_escape(background_label)} {_number(item.get("dex_update_overlap_s"))} s<span class="cell-sub">热上下文 {_number(item.get("thermal_throttling_overlap_s"))} s</span></td>'
             f'<td>{_escape(top_processes or "无进程快照")}<span class="cell-sub">{_escape(top_activities or "无重点系统活动")}</span></td>'
             f'<td>{_interference_tag(item.get("interference_level"))}<span class="cell-sub">活动重叠 {_number(item.get("system_activity_overlap_pct"))}% · 可见系统 CPU {_number(item.get("visible_system_cpu_share_pct"))}%</span></td>'
             f'<td><span class="source-tag {_escape(item.get("confidence", "low"))}">{_escape(_display_label(item.get("confidence"), CONFIDENCE_LABELS))}</span></td>'
@@ -548,7 +726,7 @@ def _cpuset_rows(analysis: Dict[str, object]) -> str:
             f'<td>{"是" if item.get("changed") else "否"}</td>'
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="4" class="empty-cell">cpuset CPU 范围不可用。</td></tr>'
+    return "".join(rows) or '<tr><td colspan="4" class="empty-cell">平台 CPU 分组 / cpuset 范围不可用。</td></tr>'
 
 
 def _scheduler_policy_rows(analysis: Dict[str, object]) -> str:
@@ -600,7 +778,7 @@ def _hint_session_rows(analysis: Dict[str, object]) -> str:
             f'<td>{int(item.get("snapshot_count") or 0)}</td>'
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">未观察到 ADPF 会话。</td></tr>'
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">未观察到平台 Performance Hint / 调度会话。</td></tr>'
 
 
 def _scheduler_process_rows(analysis: Dict[str, object]) -> str:
@@ -616,7 +794,7 @@ def _scheduler_process_rows(analysis: Dict[str, object]) -> str:
             f'<td>{"已冻结" if item.get("frozen") else "活动"}</td>'
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">ActivityManager 进程状态历史不可用。</td></tr>'
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">平台进程调度状态历史不可用。</td></tr>'
 
 
 def _gpu_content(analysis: Dict[str, object], platform: str) -> Tuple[str, str, str, str]:
@@ -657,6 +835,11 @@ def _gpu_content(analysis: Dict[str, object], platform: str) -> Tuple[str, str, 
                 f'<span class="status-dot warning"></span><span>{_escape(model)} 利用率流不可用</span>'
                 '<strong>未推断 GPU 电源轨功耗</strong>'
             )
+        elif platform == "harmony":
+            status = (
+                f'<span class="status-dot warning"></span><span>{_escape(model)} 实时遥测受限</span>'
+                '<strong>HarmonyOS GPU 活动明确标记为不可用</strong>'
+            )
         else:
             fallback = "UID 活跃时长和内存快照" if memory.get("available") else "UID 活跃时长"
             status = (
@@ -665,7 +848,7 @@ def _gpu_content(analysis: Dict[str, object], platform: str) -> Tuple[str, str, 
             )
         metric = (
             '<div class="availability-note"><strong>GPU 频率/负载数据源不可用</strong>'
-            f'<span>{_escape(gpu.get("unavailable_reason") or ("DVT Graphics 未返回可用事件。" if platform == "ios" else "ADB shell 无法读取 OEM GPU devfreq 节点；这通常是量产系统权限限制。"))}</span></div>'
+            f'<span>{_escape(gpu.get("unavailable_reason") or ("DVT Graphics 未返回可用事件。" if platform == "ios" else "HDC shell 无法读取 HarmonyOS GPU 频率/负载节点，且没有 Android dumpsys GPU 回退。" if platform == "harmony" else "ADB shell 无法读取 OEM GPU devfreq 节点；这通常是量产系统权限限制。"))}</span></div>'
         )
     memory = gpu.get("memory", {})
     memory = memory if isinstance(memory, dict) else {}
@@ -1195,8 +1378,7 @@ REPORT_FRAGMENT = r"""
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="test-items">测试项分析</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="applications">应用</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="cpu">CPU</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system">系统活动</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="thermal">热控 / 调度</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system">性能上下文</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="gpu">GPU</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="attribution">功耗归因</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="data">数据质量</button>
@@ -1258,7 +1440,7 @@ REPORT_FRAGMENT = r"""
           </div>
           <div class="chart-surface"><svg id="test-item-chart" role="img" aria-label="Per-test power, foreground activity, system activity, thermal and scheduler lanes"></svg></div>
         </section>
-        <section class="analysis-section"><h2>测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>DEX / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>单次执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th><th>系统干扰</th><th>前台应用</th></tr></thead><tbody>@@TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
         <div class="availability-note"><strong>解读边界</strong><span>@@TEST_ITEM_BOUNDARY@@</span></div>
       </section>
@@ -1281,23 +1463,15 @@ REPORT_FRAGMENT = r"""
       </section>
 
       <section class="app-view" data-panel="system" hidden>
-        <div class="view-heading"><div><h1>全系统活动</h1><p>@@SYSTEM_COPY@@</p></div><span class="source-tag counter">@@SYSTEM_SOURCE@@</span></div>
+        <div class="view-heading"><div><h1>性能与功耗上下文</h1><p>刷新率、平台帧节奏、触控交互和关键运行上下文优先展示；系统活动与热状态仅保留异常证据。</p></div><span class="source-tag counter">平台实测计数器</span></div>
+        <div class="metric-grid">@@PERFORMANCE_CARDS@@</div>
+        <div class="split-layout">
+          <section class="analysis-section"><h2>刷新档位驻留</h2><div class="residency-list">@@REFRESH_RESIDENCY_ROWS@@</div></section>
+          <section class="analysis-section"><h2>关键上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
+        </div>
         <section class="analysis-section">@@PRIORITY_STATUS@@</section>
-        <section class="analysis-section"><h2>@@SYSTEM_ACTIVITY_TITLE@@</h2><div class="data-table-wrap"><table><thead><tr><th>活动类型</th><th>检测点 / 窗口</th><th>估算持续时间</th><th>CPU 平均 / 峰值</th><th>同期功率 / 相对基线</th><th>功率相关性</th><th>平均 / 最高温度</th><th>线程 / 进程证据</th><th>置信度</th></tr></thead><tbody>@@ACTIVITY_GROUP_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>@@PRIORITY_ACTIVITY_TITLE@@</h2><div class="data-table-wrap"><table><thead><tr><th>活动</th><th>检测点 / 窗口</th><th>估算持续时间</th><th>CPU 平均 / 峰值</th><th>活动期间功率</th><th>相对基线</th><th>关联增量能量</th><th>置信度</th></tr></thead><tbody>@@PRIORITY_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>全程热点进程</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th><th>进入 Top 时平均</th><th>峰值</th><th>可见时功率 / 相对基线</th><th>功率相关性</th><th>相对功耗分数 平均 / 峰值</th><th>快照数</th></tr></thead><tbody>@@SYSTEM_PROCESS_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>热点线程</h2><div class="data-table-wrap"><table><thead><tr><th>线程 / 进程</th><th>PID / TID</th><th>可见时平均</th><th>峰值</th><th>快照数</th></tr></thead><tbody>@@SYSTEM_THREAD_ROWS@@</tbody></table></div></section>
-      </section>
-
-      <section class="app-view" data-panel="thermal" hidden>
-        <div class="view-heading"><div><h1>热控与调度状态</h1><p>@@THERMAL_COPY@@</p></div><span class="source-tag counter">系统可观测状态</span></div>
-        <section class="analysis-section"><h2>热传感器</h2><div class="data-table-wrap"><table><thead><tr><th>传感器</th><th>最低</th><th>平均</th><th>最高</th><th>最高级别</th><th>首个热阈值</th><th>阈值余量</th><th>功率相关性</th></tr></thead><tbody>@@THERMAL_SENSOR_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>冷却设备</h2><div class="data-table-wrap"><table><thead><tr><th>设备</th><th>最大值</th><th>激活快照数</th></tr></thead><tbody>@@COOLING_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>cpuset 边界</h2><div class="data-table-wrap"><table><thead><tr><th>分组</th><th>最新 CPU 范围</th><th>观测值</th><th>是否变化</th></tr></thead><tbody>@@CPUSET_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>CPU Policy</h2><div class="data-table-wrap"><table><thead><tr><th>Policy</th><th>CPU</th><th>Governor</th><th>最低频率</th><th>最高频率</th><th>core_ctl</th><th>可见性</th></tr></thead><tbody>@@SCHEDULER_POLICY_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>ADPF Performance Hint 会话</h2><div class="data-table-wrap"><table><thead><tr><th>PID / UID</th><th>TID</th><th>目标时长</th><th>标志</th><th>快照数</th></tr></thead><tbody>@@HINT_SESSION_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>ActivityManager 进程状态</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>PID / UID</th><th>Proc state / adj</th><th>Sched group</th><th>冻结状态</th></tr></thead><tbody>@@SCHEDULER_PROCESS_ROWS@@</tbody></table></div></section>
-        <div class="availability-note"><strong>可观测边界</strong><span>量产系统通常限制 sched_debug、运行时 Governor/uclamp 控制和完整 OEM 热控算法。本页只报告系统实际暴露的状态和阈值，不推断未公开的厂商策略。</span></div>
+        <section class="analysis-section"><h2>当前 CPU 热点（前 5 项）</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th><th>进入 Top 时平均</th><th>峰值</th><th>可见时功率 / 相对基线</th><th>功率相关性</th><th>相对功耗分数 平均 / 峰值</th><th>快照数</th></tr></thead><tbody>@@SYSTEM_PROCESS_ROWS@@</tbody></table></div></section>
+        <div class="availability-note"><strong>解读边界</strong><span>帧率与帧耗时来自平台公开的合成器或前台窗口统计，不等于应用内部渲染线程或最终可见 FPS；触摸次数来自已分发事件，不能代表面板硬件触控采样率。完整热控、调度和系统快照仍保留在原始 JSONL 中。</span></div>
       </section>
 
       <section class="app-view" data-panel="gpu" hidden>
@@ -1590,7 +1764,7 @@ REPORT_FRAGMENT = r"""
     if (!svg || !samples.length) return;
     const width = chartWidth(svg), left = width < 660 ? 108 : 146, right = 24;
     const powerTop = 22, powerBottom = 180, laneStart = 208, laneHeight = 48, bottom = 38;
-    const laneNames = ["前台应用", "测试项 / 阶段", "系统活动", "Thermal", "ADPF / 调度"];
+    const laneNames = ["前台应用", "测试项 / 阶段", "系统活动", "Thermal", "热 / 调度上下文"];
     const height = laneStart + laneHeight * laneNames.length + bottom;
     const rangeStart = testRange ? Math.max(0, Number(testRange[0])) : 0;
     const rangeEnd = testRange ? Math.min(maxTime(), Number(testRange[1])) : maxTime();
@@ -1886,6 +2060,60 @@ def _report_platform_profile(
                 "GPU 利用率和温度只表示同期证据。多个重叠测试项不可相加，也不能当作单进程独占功耗。"
             ),
         }
+    if platform == "harmony":
+        model = " ".join(
+            str(part) for part in (device.get("brand"), device.get("model")) if part
+        ) or "HarmonyOS 设备"
+        return {
+            "platform": "harmony",
+            "platform_name": "HarmonyOS",
+            "os_version": str(device.get("harmony") or device.get("openharmony") or "未知"),
+            "model": model,
+            "hardware": str(device.get("soc_model") or device.get("hardware") or "未知 SoC"),
+            "cpu_title": "CPU 活动与频率",
+            "cpu_copy": (
+                "使用 HDC 持久化 shell 采集 /proc/stat 利用率，并以较低频率读取 hidumper --cpufreq；"
+                "不套用 Android Power Profile，也不推断 CPU 电源轨功耗。"
+            ),
+            "cpu_tag_kind": "counter",
+            "cpu_tag": "HDC 实测计数器，非功率模型",
+            "cpu_timeline_copy": "展示 HarmonyOS CPU 集群利用率与频率上下文；频率刷新低于电流采样。",
+            "system_copy": (
+                "周期采集 HarmonyOS top / ps 进程快照，并标记可见的系统更新、安装和运行时编译活动。"
+            ),
+            "system_source": "HDC top + ps 快照",
+            "system_activity_title": "HarmonyOS 系统与内核活动聚合",
+            "priority_activity_title": "更新 / 安装 / 编译活动",
+            "thermal_copy": (
+                "展示 ThermalService 传感器温度、PowerManager 状态与 cpufreq 能力快照；"
+                "Android 热严重度、冷却设备、ActivityManager 和 ADPF 语义不适用并明确留空。"
+            ),
+            "gpu_copy": (
+                "当前量产 HarmonyOS 未向 HDC shell 暴露可读 GPU 频率或负载节点，"
+                "也没有 Android dumpsys GPU 的 UID 工作时长回退，因此不推断 GPU 活动或功耗。"
+            ),
+            "attribution_copy": (
+                "HarmonyOS 报告以 BatteryService 电流和电压计算电池侧整机功率；"
+                "进程、CPU、热传感器与前台 Ability 仅作为同期上下文，不转换为应用独占 mW。"
+            ),
+            "attribution_tag_kind": "context",
+            "attribution_tag": "整机实测 ≠ 进程独占功耗",
+            "attribution_note": (
+                '<div class="availability-note"><strong>HarmonyOS 归因边界</strong>'
+                '<span>Android BatteryStats、ADPF、ActivityManager 与 dumpsys GPU 在 HarmonyOS 上不存在。'
+                '报告不会用 Android 名称包装 HarmonyOS 数据，也不会把进程 CPU 快照当作电能归因。</span></div>'
+            ),
+            "test_item_copy": (
+                "按前台 Ability 或导入测试阶段计算电池侧整机能量，并同步检查进程、CPU、热传感器和电源状态。"
+            ),
+            "test_item_timeline_copy": (
+                "功率、前台 Ability、测试项、系统活动与 HarmonyOS 热 / 电源上下文共享设备实时时钟。"
+            ),
+            "test_item_boundary": (
+                "测试项能量来自 BatteryService 电流与电压的整机实测；进程 CPU、系统活动、频率与温度只表示同期证据。"
+                "重叠测试项不可相加，也不能当作单应用或单硬件电源轨功耗。"
+            ),
+        }
     model = " ".join(
         str(part) for part in (device.get("brand"), device.get("model")) if part
     ) or "Android 设备"
@@ -2004,6 +2232,9 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@HARDWARE@@": _escape(profile["hardware"]),
         "@@GENERATED@@": _escape(metadata.get("generated_at", "")),
         "@@SUMMARY_CARDS@@": _summary_cards(summary),
+        "@@PERFORMANCE_CARDS@@": _performance_cards(analysis),
+        "@@REFRESH_RESIDENCY_ROWS@@": _refresh_residency_rows(analysis),
+        "@@PERFORMANCE_CONTEXT_ROWS@@": _performance_context_rows(analysis),
         "@@GPU_METRIC_BUTTON@@": gpu_button,
         "@@SLIDER_MAX@@": str(max(0, len(samples) - 1)),
         "@@CPU_ROWS@@": cpu_rows,

@@ -3,10 +3,11 @@
 中文文档：[Mobile Power Profiler 使用指南（含 BTR2 联动）](docs/usage-zh.md)
 
 A standalone mobile battery and resource profiler for long, multi-application
-test sessions across Android, HarmonyOS, and iOS. Android and ADB-compatible
-HarmonyOS devices use the standard-library core collector. iOS support is
-implemented through an optional, separately installed `pymobiledevice3`
-sidecar. The profiler has no Python import, API, or runtime dependency on BTR2.
+test sessions across Android, HarmonyOS, and iOS. Android uses ADB, native
+HarmonyOS uses DevEco Studio's HDC, and both run inside the standard-library
+core collector. iOS support is implemented through an optional, separately
+installed `pymobiledevice3` sidecar. The profiler has no Python import, API, or
+runtime dependency on BTR2.
 
 ## Why this exists
 
@@ -21,7 +22,14 @@ is easier to audit after a one-hour robotic workflow:
   production builds fall back to `dumpsys gpu` UID work duration and per-PID
   GPU memory snapshots without confusing Qualcomm `gpubw` bus frequency with
   the GPU core clock.
-- Foreground package, activity, screen state, brightness, and refresh context.
+- Foreground package/activity/window, screen state, brightness, and refresh-rate
+  residency. Android adds SurfaceFlinger mode-duration deltas plus foreground-window
+  `gfxinfo` UI frame-submission, frame-duration, and deadline counters; HarmonyOS
+  adds sampled compositor pacing and delivered touch interactions.
+- Native HarmonyOS HDC support for BatteryService, `/proc/stat`,
+  `hidumper --cpufreq`, AbilityManager, PowerManagerService, `top`/`ps`, and
+  ThermalService, plus RenderService display/FPS counters, WindowManager and
+  MultimodalInput touch-device evidence. Android-only capabilities remain explicit.
 - Whole-system process and hot-thread snapshots spanning apps, Android services,
   native Linux services, and kernel tasks.
 - Activity-type aggregation for ART/GC, `kworker` workqueues, RCU,
@@ -33,7 +41,7 @@ is easier to audit after a one-hour robotic workflow:
 - Dedicated detection for update/compilation activity such as `dex2oat`,
   `dexopt`, `artd`, `installd`, `profman`, `odrefresh`, `otapreopt`,
   `update_engine`, and `apexd`, correlated with battery-side power in time.
-- Append-only raw data, checkpoints, ADB reconnects, and partial-run recovery.
+- Append-only raw data, checkpoints, ADB/HDC reconnects, and partial-run recovery.
 - A local runtime dashboard for device Probe, recording control, live telemetry,
   collector logs, report history, log import, recovery, evidence packaging,
   two-run comparison, and source-project portable builds.
@@ -54,8 +62,10 @@ battery output. They are diagnostic estimates, not physical power rails.
 
 ## Install
 
-Python 3.10+ is required. Android and HarmonyOS collection through the shared
-ADB path also needs an `adb` executable on `PATH`.
+Python 3.10+ is required. Android collection needs `adb`. HarmonyOS collection
+needs `hdc`, normally installed with DevEco Studio under the OpenHarmony SDK
+toolchains directory. The executable can also be supplied with global
+`--hdc PATH` or the `HDC` environment variable.
 
 ```powershell
 python -m venv .venv
@@ -64,8 +74,8 @@ python -m pip install -e .
 mobile-power-profiler --help
 ```
 
-The ADB/core profiler has no runtime dependency outside the Python standard
-library. iOS uses a separate Python environment described below.
+The Android/HarmonyOS core profiler has no Python runtime dependency outside
+the standard library. iOS uses a separate Python environment described below.
 
 ### Portable Windows bundle
 
@@ -80,7 +90,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\build-portable.ps1
 
 The output under `dist/` contains Python, the installed profiler package,
 launchers, documentation, and (when found) the required ADB Platform Tools
-files. On the target computer, extract the ZIP and run `start-ui.bat`.
+files. HDC is not redistributed; install DevEco Studio or pass an existing
+`hdc.exe` path. On the target computer, extract the ZIP and run `start-ui.bat`.
 The current portable builder does not bundle `pymobiledevice3`; point
 `--ios-python` at a separately prepared iOS runtime when iOS collection is
 needed.
@@ -107,7 +118,9 @@ mobile-power-profiler ui
 
 On Windows, you can also double-click `start-ui.bat` in the repository root.
 The script prefers `.venv`, falls back to the system Python, and runs the local
-source tree without requiring an editable install first.
+source tree without requiring an editable install first. The launcher selects
+an available local port automatically, avoiding stale UI processes or another
+local service occupying port 8765. Pass `--port PORT` to override it.
 
 The runtime UI provides device discovery and Probe, recording configuration,
 start/stop controls, live power/current/CPU/temperature charts, foreground
@@ -133,6 +146,50 @@ disconnect is disabled while recording.
 The same picker also shows iPhones discovered by the optional sidecar. The
 **iOS Wireless** action creates RemotePairing while the trusted USB cable is
 connected; after the Wi-Fi endpoint is cached, unplug USB before recording.
+
+HarmonyOS targets appear with a `harmony:` prefix. With a USB-authorized phone,
+**Harmony Wireless** reads `wlan0`, runs `hdc -t TARGET tmode port 8710`, and
+connects `IP:8710`. The address field also accepts
+`harmony:192.168.1.20:8710` and dispatches it to `hdc tconn`.
+
+## HarmonyOS HDC workflow
+
+Confirm HDC discovery and create a wireless endpoint while USB is connected:
+
+```powershell
+$hdc = "C:\Program Files\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe"
+& $hdc list targets -v
+& $hdc -t USB_SERIAL tmode port 8710
+& $hdc tconn PHONE_IP:8710
+```
+
+After `PHONE_IP:8710` is `Connected`, remove USB and verify BatteryService is
+discharging. Probe and record with the prefixed identifier:
+
+```powershell
+mobile-power-profiler --hdc $hdc probe `
+  --platform harmony --device harmony:PHONE_IP:8710 --json
+
+mobile-power-profiler --hdc $hdc record `
+  --platform harmony `
+  --device harmony:PHONE_IP:8710 `
+  --duration 120 `
+  --interval 1 `
+  --session-mode `
+  --require-unplugged `
+  --output power-runs\harmony-smoke
+```
+
+HarmonyOS uses BatteryService current/voltage/temperature, persistent HDC
+`/proc/stat`, low-frequency `hidumper --cpufreq`, AbilityManager,
+PowerManagerService, `top`/`ps`, and ThermalService. RenderService adds current
+and supported refresh modes, session `fpsCount` residency deltas, sampled
+compositor FPS/frame intervals and the GPU renderer; WindowManager adds the
+focused window; MultimodalInput adds touch-device axes and delivered interaction
+counts. The production interface does **not** expose the panel hardware touch
+sampling rate, so the report leaves it unavailable instead of inferring 240/300 Hz.
+Android BatteryStats, ActivityManager, ADPF, and `dumpsys gpu` are likewise not
+relabeled as HarmonyOS evidence.
 
 ## iOS wireless workflow
 
@@ -241,9 +298,11 @@ be aligned directly; capture BTR2's absolute-timestamp console output instead.
 See the [Chinese usage guide](docs/usage-zh.md) for the verified workflow, and
 adjust the timestamp format and regexes if BTR2's log format changes.
 
-The **Test Items** report view is designed for the full one-hour workflow. It
-shows a summary matrix plus aligned lanes for whole-device power, foreground
-app, BTR2 test span, classified system activity, Thermal status, and ADPF state.
+The **Performance Context** report view prioritizes refresh-rate residency,
+sampled compositor FPS/frame intervals, touch interactions, display/window/GPU
+context, and only the most relevant background or thermal anomalies. The
+**Test Items** view retains aligned lanes for whole-device power, foreground app,
+BTR2 spans and available platform interference evidence.
 Clicking a matrix/detail row zooms the chart to that item. If no duration events
 were imported, the analyzer falls back to foreground Activity intervals.
 
@@ -258,8 +317,8 @@ mobile-power-profiler recover power-runs\btr2-round-001
 ```
 
 Recovery needs only the run directory. It can finalize data after Ctrl+C,
-terminal loss, or an ADB failure without reconnecting to the phone. Missing ADB
-intervals are reported as coverage gaps and are excluded from energy
+terminal loss, or an ADB/HDC failure without reconnecting to the phone. Missing
+transport intervals are reported as coverage gaps and are excluded from energy
 integration rather than interpolated as if they were measured.
 
 ## Other commands
@@ -276,7 +335,7 @@ Useful recording options:
 - `--session-mode`: do not default to the starting foreground package.
 - `--interval 1`: current, CPU, and frequency sampling interval.
 - `--checkpoint-interval 30`: journal and clock-sync cadence.
-- `--reconnect-timeout 120`: maximum ADB outage before finalizing partial data.
+- `--reconnect-timeout 120`: maximum device-transport outage before finalizing partial data.
 - `--gpu-frequency-path PATH`: override an OEM-readable GPU frequency node.
 - `--no-reset`: keep existing BatteryStats history.
 - `--full-history`: enable detailed BatteryStats history where supported.
@@ -288,7 +347,8 @@ Useful recording options:
 - `--start-context desktop --start-note "BTR2 starts later"`: preserve the
   expected capture start and pre-roll note in metadata.
 
-Global `--adb PATH` must appear before the subcommand.
+Global `--adb PATH`, `--hdc PATH`, and `--ios-python PATH` must appear before
+the subcommand.
 
 ## Evidence archive and two-phone comparison
 
@@ -321,18 +381,27 @@ The default Android long-session schedule limits expensive services:
 |---|---:|---|
 | Current, `/proc/stat`, CPU/GPU frequency | 1 s | Persistent ADB shell |
 | Battery voltage | 5 s | BatteryService dump, held between reads |
-| Temperature and foreground context | 10 s | BatteryService/ActivityManager |
+| Temperature | 10 s | BatteryService |
+| Foreground, display modes, Android `gfxinfo` frame counters | 10 s | ActivityManager + Display + gfxinfo |
 | Whole-system processes + watched update/DEX services | 10 s | `top` + `ps -A` |
 | Hot threads + GC/kworker/kernel classification | 30 s | `top -H` |
 | Thermal sensors, severity, cooling, thresholds | 10 s | ThermalService / thermal HAL |
 | cpuset, process state, ADPF sessions | 30 s | cgroup + ActivityManager + `performance_hint` |
-| Active refresh rate | 30 s | Display service |
+| Refresh-rate residency + renderer identity | 30 s plus final snapshot | SurfaceFlinger |
 | Clock synchronization | 30 s plus lifecycle events | `/proc/uptime` + host midpoint |
 
 For iOS, DVT CPU/GPU/process rows use the selected sample interval, process
 snapshots default to 10 seconds, battery diagnostics are polled every 5
 seconds, and the underlying physical-power value typically changes about every
 20 seconds.
+
+For HarmonyOS, BatteryService and `/proc/stat` use the selected sample interval;
+`hidumper --cpufreq` is limited to at least 10 seconds, while process and
+ThermalService snapshots use their configured monitor intervals. The foreground
+context cadence (5–10 seconds) also samples RenderService screen/fpsCount/recent
+composer timestamps, WindowManager focus, and MultimodalInput delivered events.
+All HarmonyOS rows use the device realtime epoch because production HDC shells
+may deny `/proc/uptime`.
 
 ## Run directory
 
@@ -377,6 +446,9 @@ report remains responsive while preserving the original data files.
 | GPU frequency/load | OEM kernel counter only when readable to the ADB shell |
 | GPU UID work | Driver activity duration, not electrical energy |
 | Process/thread CPU | Periodic whole-system snapshots, not a continuous scheduler trace |
+| Refresh-rate residency | RenderService `fpsCount` delta, converted to approximate time by count/rate |
+| Sampled compositor FPS/frame pacing | Periodic recent RenderService submissions; not app-internal render-loop FPS |
+| Touch interactions | Delivered MultimodalInput events; not panel hardware sampling frequency |
 | GC/kworker/RCU/IRQ activity | Name-based aggregation of periodic hot-thread/process snapshots; short activity can be missed |
 | DEX/update power delta | Battery-side power during detected windows versus the session baseline; temporal association, not per-process attribution |
 | Thermal policy | Exposed status, sensors, cooling devices, and static thresholds; the complete OEM decision algorithm may remain private |

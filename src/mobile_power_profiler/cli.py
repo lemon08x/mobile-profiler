@@ -27,6 +27,7 @@ from .collector import (
     parse_context_samples,
     parse_normalized_samples,
     parse_raw_samples,
+    probe_android_performance,
     list_adb_devices,
     select_device,
 )
@@ -39,6 +40,15 @@ from .ios import (
     pair_ios_device,
     probe_ios_device,
     select_ios_device,
+)
+from .harmony import (
+    DEFAULT_HDC,
+    collect_harmony_session,
+    harmony_device_id,
+    harmony_target,
+    list_harmony_devices,
+    probe_harmony_device,
+    select_harmony_device,
 )
 from .comparison import build_run_comparison, write_comparison
 from .log_import import import_timestamped_log
@@ -88,12 +98,18 @@ def requested_platform(args: argparse.Namespace) -> str:
         return platform
     if device.lower().startswith("ios:"):
         return "ios"
+    if device.lower().startswith("harmony:"):
+        return "harmony"
     if device:
         return "android"
     android_devices, _ = list_adb_devices(args.adb)
     android_ready = [item for item in android_devices if item.get("state") == "device"]
+    harmony_devices, _ = list_harmony_devices(args.hdc)
+    harmony_ready = [item for item in harmony_devices if item.get("state") == "device"]
     ios_devices, _ = list_ios_devices(args.ios_python)
     ios_ready = [item for item in ios_devices if item.get("state") == "device"]
+    if not android_ready and harmony_ready:
+        return "harmony"
     if not android_ready and ios_ready:
         return "ios"
     return "android"
@@ -312,7 +328,73 @@ def finalize_run(
 
 
 def run_probe(args: argparse.Namespace) -> int:
-    if requested_platform(args) == "ios":
+    platform = requested_platform(args)
+    if platform == "harmony":
+        try:
+            info = probe_harmony_device(args.device, args.hdc)
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            return 0
+        device = info.get("device", {})
+        battery = info.get("battery", {})
+        monitor = info.get("system_monitor", {})
+        connection = info.get("connection", {})
+        performance = info.get("performance", {})
+        performance = performance if isinstance(performance, dict) else {}
+        touch = info.get("touch", {})
+        touch = touch if isinstance(touch, dict) else {}
+        print(
+            f"Device: {device.get('brand')} {device.get('model')} / "
+            f"{device.get('soc_model')} / HarmonyOS {device.get('harmony')}"
+        )
+        print(f"Serial: {info.get('device_id')}")
+        print(f"Connection: {connection.get('type')} / {connection.get('target')}")
+        print(f"Battery: {battery}")
+        print(f"Current: {info.get('current_command') or 'unavailable'}")
+        policies = info.get("cpu_policies", [])
+        print(
+            "CPU clusters: "
+            + (
+                ", ".join(
+                    f"{item.get('label')} cores {item.get('cores')} "
+                    f"max {float(item.get('max_khz') or 0.0) / 1000.0:.0f} MHz"
+                    for item in policies
+                    if isinstance(item, dict)
+                )
+                or "unavailable"
+            )
+        )
+        print(f"Foreground ability: {info.get('foreground_package') or 'unknown'}")
+        supported_refresh = performance.get("supported_refresh_rates_hz", [])
+        print(
+            "Display: "
+            f"{performance.get('display_width_px') or 'n/a'}x{performance.get('display_height_px') or 'n/a'}, "
+            f"current={performance.get('refresh_rate_hz') or 'n/a'} Hz, "
+            f"supported={supported_refresh or 'n/a'}"
+        )
+        print(
+            "Frame pacing: "
+            f"sampled FPS={float(performance.get('compositor_fps') or 0.0):.1f}, "
+            f"P95={float(performance.get('frame_interval_p95_ms') or 0.0):.2f} ms, "
+            f"window={performance.get('foreground_window_name') or 'unknown'}"
+        )
+        print(
+            "Touch: "
+            f"devices={len(touch.get('devices', [])) if isinstance(touch.get('devices'), list) else 0}, "
+            "hardware sampling rate=unavailable"
+        )
+        print(
+            "Interference monitor: "
+            f"processes={monitor.get('process_count') or 'n/a'}, "
+            f"temperature sensors={monitor.get('thermal_sensor_count') or 0}"
+        )
+        gpu_probe = info.get("gpu_probe") or {}
+        print(f"GPU renderer: {gpu_probe.get('model') or 'unknown'}; live telemetry unavailable ({gpu_probe.get('reason')})")
+        return 0
+    if platform == "ios":
         try:
             info = probe_ios_device(args.device, args.ios_python)
         except (RuntimeError, OSError) as exc:
@@ -360,6 +442,7 @@ def run_probe(args: argparse.Namespace) -> int:
     system_snapshot, system_error = collect_system_snapshot(args.adb, device, False)
     thermal_snapshot, thermal_error = collect_thermal_snapshot(args.adb, device)
     scheduler_snapshot, scheduler_warnings = collect_scheduler_snapshot(args.adb, device, set())
+    android_performance = probe_android_performance(args.adb, device)
     info = {
         "device": collect_device_info(args.adb, device),
         "battery": parse_battery(battery_text),
@@ -375,6 +458,10 @@ def run_probe(args: argparse.Namespace) -> int:
         "perfetto_sysfs_power": "linux.sysfs_power" in perfetto.stdout,
         "powerstats_dump_available": bool(powerstats.stdout.strip()),
         "foreground_package": collect_foreground_package(args.adb, device),
+        "performance": android_performance.get("performance", {}),
+        "touch": android_performance.get("touch", {}),
+        "capabilities": android_performance.get("capabilities", {}),
+        "performance_warnings": android_performance.get("warnings", []),
         "system_monitor": {
             "process_top_available": system_snapshot is not None and bool(system_snapshot.processes),
             "process_count": system_snapshot.process_count if system_snapshot else None,
@@ -449,6 +536,31 @@ def run_probe(args: argparse.Namespace) -> int:
         f"(total={info.get('gpu_memory_total_bytes')})"
     )
     print(f"Foreground package: {info['foreground_package'] or 'unknown'}")
+    performance = info.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    supported_refresh = performance.get("supported_refresh_rates_hz", [])
+    print(
+        "Display performance: "
+        f"{performance.get('display_width_px') or 'n/a'}x{performance.get('display_height_px') or 'n/a'}, "
+        f"current={performance.get('refresh_rate_hz') or 'n/a'} Hz, "
+        f"supported={supported_refresh or 'n/a'}"
+    )
+    print(
+        "Frame telemetry: Android gfxinfo cumulative counters; "
+        f"refresh residency={bool(performance.get('refresh_rate_durations_s'))}"
+    )
+    touch = info.get("touch", {})
+    touch = touch if isinstance(touch, dict) else {}
+    print(
+        "Touch: "
+        f"devices={len(touch.get('devices', [])) if isinstance(touch.get('devices'), list) else 0}, "
+        "hardware sampling rate=unavailable"
+    )
+    if performance.get("gpu_renderer"):
+        print(
+            f"SurfaceFlinger GPU renderer: {performance.get('gpu_renderer')} "
+            f"({performance.get('gpu_vendor') or 'unknown vendor'})"
+        )
     monitor = info["system_monitor"]
     print(
         "System monitor: "
@@ -666,8 +778,216 @@ def run_ios_record(args: argparse.Namespace) -> int:
     return 0 if final_status == "complete" else 6
 
 
+def run_harmony_record(args: argparse.Namespace) -> int:
+    output_dir = args.output or default_output_dir("harmony")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(
+            f"ERROR: output directory is not empty: {output_dir}. Use recover/report for it.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        selected = select_harmony_device(args.device, args.hdc)
+        probe = probe_harmony_device(selected["serial"], args.hdc)
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    device_info = probe.get("device")
+    device_info = device_info if isinstance(device_info, dict) else {}
+    battery_start = probe.get("battery")
+    battery_start = battery_start if isinstance(battery_start, dict) else {}
+    connection = probe.get("connection")
+    connection = connection if isinstance(connection, dict) else {}
+    policy_rows = probe.get("cpu_policies")
+    policy_rows = policy_rows if isinstance(policy_rows, list) else []
+    policies = [CpuPolicy(**item) for item in policy_rows if isinstance(item, dict)]
+    frequencies = probe.get("cpu_frequencies_mhz")
+    frequencies = frequencies if isinstance(frequencies, dict) else {}
+    foreground = probe.get("foreground_package")
+    target_package = args.package if args.session_mode else (args.package or foreground)
+    warnings: list[str] = [
+        "HarmonyOS samples use the device realtime epoch because /proc/uptime is restricted to the HDC shell; "
+        "all samples, contexts and snapshots remain in the same device clock domain.",
+        "HarmonyOS BatteryService reports whole-device battery current and voltage. Android BatteryStats, "
+        "ADPF and dumpsys GPU attribution are not available and are not inferred.",
+        "hidumper --cpufreq is sampled at a lower cadence than /proc/stat because a full 12-core dump is comparatively expensive.",
+    ]
+    if battery_start.get("powered"):
+        warnings.append(
+            "The HarmonyOS device is externally powered. Battery current is not a clean unplugged discharge measurement."
+        )
+        if args.require_unplugged:
+            print("ERROR: HarmonyOS device is powered; unplug it before recording", file=sys.stderr)
+            return 4
+    if not isinstance(battery_start.get("voltage_mv"), (int, float)):
+        print("ERROR: HarmonyOS BatteryService did not expose battery voltage", file=sys.stderr)
+        return 5
+    if not probe.get("current_command_ok"):
+        print("ERROR: HarmonyOS BatteryService did not expose nowCurrent", file=sys.stderr)
+        return 3
+
+    metadata: Dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "platform": "harmony",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "title": args.title
+        or (
+            "Multi-app HarmonyOS power session"
+            if args.session_mode and not target_package
+            else f"{target_package} power test"
+            if target_package
+            else "HarmonyOS Power Profiler"
+        ),
+        "device": device_info,
+        "device_id": selected["serial"],
+        "hdc_target": selected["hdc_target"],
+        "connection": connection,
+        "target_package": target_package,
+        "foreground_package": foreground,
+        "capture_start": {
+            "expected_context": args.start_context,
+            "note": args.start_note,
+            "host_epoch_s": datetime.now().timestamp(),
+            "observed_foreground_package": foreground,
+            "workflow_synchronization": "independent_start",
+        },
+        "session_mode": bool(args.session_mode),
+        "requested_duration_s": args.duration,
+        "sample_interval_s": args.interval,
+        "clock_domain": "harmony_device_realtime_epoch_s",
+        "sampling_schedule_s": {
+            "battery_current_proc_stat": args.interval,
+            "foreground_display_frame_touch": max(5.0, min(10.0, args.process_interval)),
+            "cpu_frequency": max(10.0, args.scheduler_interval),
+            "system_processes": args.process_interval,
+            "thermalservice": args.thermal_interval,
+            "scheduler_capabilities": max(10.0, args.scheduler_interval),
+        },
+        "system_monitor": {
+            "enabled": not args.no_system_monitor,
+            "process_interval_s": args.process_interval,
+            "thread_interval_s": None,
+            "thermal_interval_s": args.thermal_interval,
+            "scheduler_interval_s": max(10.0, args.scheduler_interval),
+            "priority_processes": [
+                "update_service",
+                "updater",
+                "bundle_daemon",
+                "compiler",
+                "appgallery",
+            ],
+        },
+        "checkpoint_interval_s": args.checkpoint_interval,
+        "reconnect_timeout_s": args.reconnect_timeout,
+        "current_unit": "ma",
+        "current_semantics": (
+            "current_ma is positive magnitude; signed_current_ma preserves HarmonyOS BatteryService nowCurrent"
+        ),
+        "power_semantics": "power_mw is abs(nowCurrent_mA) * voltage_mV / 1000",
+        "cpu_semantics": "/proc/stat deltas with low-frequency hidumper --cpufreq context",
+        "cpu_policies": [asdict(item) for item in policies],
+        "gpu_source": None,
+        "gpu_probe": probe.get("gpu_probe"),
+        "display": probe.get("display"),
+        "performance_probe": probe.get("performance"),
+        "touch": probe.get("touch"),
+        "capabilities": probe.get("capabilities"),
+        "battery_before": battery_start,
+        "battery_start": battery_start,
+        "collection_status": "collecting",
+        "collection_warnings": warnings,
+    }
+    print(
+        f"Recording {args.duration}s from {selected['serial']} over "
+        f"{connection.get('type') or selected.get('connection_type')} HDC...",
+        file=sys.stderr,
+    )
+
+    collection = None
+    try:
+        with RunJournal(output_dir) as journal:
+            journal.write_metadata(metadata)
+            journal.write_raw_output("harmony_probe", json.dumps(probe, ensure_ascii=False, indent=2))
+            collection = collect_harmony_session(
+                args.hdc,
+                selected["serial"],
+                args.duration,
+                args.interval,
+                policies,
+                journal,
+                initial_frequencies_mhz={
+                    str(name): float(value)
+                    for name, value in frequencies.items()
+                    if isinstance(value, (int, float))
+                },
+                checkpoint_interval_s=args.checkpoint_interval,
+                reconnect_timeout_s=args.reconnect_timeout,
+                system_monitor_enabled=not args.no_system_monitor,
+                process_interval_s=args.process_interval,
+                thermal_interval_s=args.thermal_interval,
+                scheduler_interval_s=args.scheduler_interval,
+            )
+            metadata["collection_stop_reason"] = collection.stop_reason
+            metadata["collection_host_elapsed_s"] = collection.host_elapsed_s
+            metadata["reconnect_count"] = collection.reconnect_count
+            metadata["sampler_launch_count"] = collection.sampler_launch_count
+            metadata["system_snapshot_count"] = collection.system_snapshot_count
+            metadata["thermal_snapshot_count"] = collection.thermal_snapshot_count
+            metadata["scheduler_snapshot_count"] = collection.scheduler_snapshot_count
+            metadata["battery_end"] = collection.battery_end or battery_start
+            metadata["collection_warnings"] = warnings + collection.warnings
+            metadata["collection_status"] = (
+                "collected" if collection.stop_reason == "completed" else "partial"
+            )
+            journal.write_metadata(metadata)
+            journal.write_raw_output(
+                "harmony_battery_end",
+                json.dumps(metadata["battery_end"], ensure_ascii=False, indent=2),
+            )
+    except (RuntimeError, OSError) as exc:
+        print(f"ERROR: HarmonyOS collector failed: {exc}", file=sys.stderr)
+        try:
+            analysis, report_path = finalize_run(
+                output_dir,
+                [f"HarmonyOS collection stopped because of an error: {exc}"],
+                "partial",
+            )
+        except (RuntimeError, OSError, ValueError, json.JSONDecodeError):
+            return 6
+        print_run_summary(output_dir, analysis, report_path)
+        return 6
+    except KeyboardInterrupt:
+        print("\nHarmonyOS collection interrupted; finalizing recoverable data...", file=sys.stderr)
+        try:
+            analysis, report_path = finalize_run(
+                output_dir,
+                ["HarmonyOS collection was interrupted; recoverable samples were retained."],
+                "interrupted",
+            )
+        except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Partial data kept in {output_dir.resolve()}: {exc}", file=sys.stderr)
+            return 130
+        print_run_summary(output_dir, analysis, report_path)
+        return 130
+
+    if collection is None or collection.sample_count < 2:
+        print(
+            f"ERROR: fewer than two HarmonyOS samples were collected; partial data is in {output_dir}",
+            file=sys.stderr,
+        )
+        return 7
+    final_status = "complete" if collection.stop_reason == "completed" else "partial"
+    analysis, report_path = finalize_run(output_dir, collection_status=final_status)
+    print_run_summary(output_dir, analysis, report_path)
+    return 0 if final_status == "complete" else 6
+
+
 def run_record(args: argparse.Namespace) -> int:
-    if requested_platform(args) == "ios":
+    platform = requested_platform(args)
+    if platform == "harmony":
+        return run_harmony_record(args)
+    if platform == "ios":
         return run_ios_record(args)
     output_dir = args.output or default_output_dir()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -685,6 +1005,7 @@ def run_record(args: argparse.Namespace) -> int:
     device_info = collect_device_info(args.adb, device)
     policies = collect_cpu_policies(args.adb, device)
     gpu_source, gpu_probe = detect_gpu_source(args.adb, device, args.gpu_frequency_path)
+    android_performance = probe_android_performance(args.adb, device)
     foreground = collect_foreground_package(args.adb, device)
     target_package = args.package if args.session_mode else (args.package or foreground)
     battery_before_text = collect_text(args.adb, device, ["dumpsys", "battery"], timeout_s=15)
@@ -701,6 +1022,11 @@ def run_record(args: argparse.Namespace) -> int:
         return 3
 
     warnings: list[str] = []
+    warnings.extend(
+        str(item)
+        for item in android_performance.get("warnings", [])
+        if str(item).strip()
+    )
     if battery_before.get("powered"):
         warnings.append(
             "设备处于外部供电状态。电量计电流是电池净流量，不代表设备总输入功率。"
@@ -736,6 +1062,7 @@ def run_record(args: argparse.Namespace) -> int:
 
     metadata: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
+        "platform": "android",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": args.title
         or (
@@ -761,7 +1088,8 @@ def run_record(args: argparse.Namespace) -> int:
             "current_cpu_frequency": args.interval,
             "voltage": 5.0,
             "temperature_context": 10.0,
-            "active_refresh_rate": 30.0,
+            "foreground_display_gfxinfo": 10.0,
+            "surfaceflinger_refresh_residency": 30.0,
             "system_processes": args.process_interval,
             "hot_threads": args.thread_interval,
             "thermalservice": args.thermal_interval,
@@ -793,6 +1121,9 @@ def run_record(args: argparse.Namespace) -> int:
         "cpu_policies": [asdict(item) for item in policies],
         "gpu_source": asdict(gpu_source) if gpu_source else None,
         "gpu_probe": gpu_probe,
+        "performance_probe": android_performance.get("performance", {}),
+        "touch": android_performance.get("touch", {}),
+        "capabilities": android_performance.get("capabilities", {}),
         "battery_before": battery_before,
         "battery_start": battery_start,
         "collection_status": "collecting",
@@ -816,6 +1147,10 @@ def run_record(args: argparse.Namespace) -> int:
             journal.write_raw_output("battery_before", battery_before_text)
             journal.write_raw_output("battery_start", battery_start_text)
             journal.write_raw_output("gpu_start", gpu_start)
+            journal.write_raw_output(
+                "android_performance_probe",
+                json.dumps(android_performance, ensure_ascii=False, indent=2),
+            )
             collection = collect_streaming_session(
                 args.adb,
                 device,
@@ -1536,6 +1871,7 @@ def run_ui(args: argparse.Namespace) -> int:
             open_browser=not args.no_browser,
             demo_mode=args.demo,
             ios_python=args.ios_python,
+            hdc=args.hdc,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1575,6 +1911,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Collect mobile-device power telemetry and generate an interactive analysis report."
     )
     parser.add_argument("--adb", default=DEFAULT_ADB, help="adb executable path")
+    parser.add_argument("--hdc", default=DEFAULT_HDC, help="HarmonyOS hdc executable path")
     parser.add_argument(
         "--ios-python",
         default=DEFAULT_IOS_PYTHON,
@@ -1583,15 +1920,23 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     probe = subparsers.add_parser("probe", help="show device power collection capabilities")
-    probe.add_argument("--platform", choices=("auto", "android", "ios"), default="auto")
-    probe.add_argument("--device", help="device identifier; iPhones use ios:UDID")
+    probe.add_argument(
+        "--platform", choices=("auto", "android", "harmony", "ios"), default="auto"
+    )
+    probe.add_argument(
+        "--device", help="device identifier; HarmonyOS uses harmony:HDC_TARGET and iPhones use ios:UDID"
+    )
     probe.add_argument("--gpu-frequency-path", help="override readable GPU frequency sysfs path")
     probe.add_argument("--json", action="store_true", help="print JSON")
     probe.set_defaults(handler=run_probe)
 
     record = subparsers.add_parser("record", help="record a test and generate a report")
-    record.add_argument("--platform", choices=("auto", "android", "ios"), default="auto")
-    record.add_argument("--device", help="device identifier; iPhones use ios:UDID")
+    record.add_argument(
+        "--platform", choices=("auto", "android", "harmony", "ios"), default="auto"
+    )
+    record.add_argument(
+        "--device", help="device identifier; HarmonyOS uses harmony:HDC_TARGET and iPhones use ios:UDID"
+    )
     record.add_argument(
         "--duration", type=positive_int, default=DEFAULT_DURATION_S, help="test duration in seconds"
     )

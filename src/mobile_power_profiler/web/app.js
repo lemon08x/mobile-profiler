@@ -132,7 +132,10 @@
   }
 
   function activePlatform(active) {
-    return String(active?.platform || active?.metadata?.platform || "android").toLowerCase();
+    const selected = Array.isArray(app.state?.devices)
+      ? app.state.devices.find(device => device.serial === selectedDevice())
+      : null;
+    return String(active?.platform || active?.metadata?.platform || selected?.platform || "android").toLowerCase();
   }
 
   function formatDuration(value) {
@@ -222,7 +225,8 @@
   }
 
   function switchView(view) {
-    const target = ["live", "system", "thermal", "device", "history", "tools"].includes(view) ? view : "live";
+    const requested = view === "thermal" ? "system" : view;
+    const target = ["live", "system", "device", "history", "tools"].includes(requested) ? requested : "live";
     app.activeView = target;
     location.hash = target;
     $$(".nav-item").forEach(button => {
@@ -238,8 +242,7 @@
     });
     $("#page-heading").textContent = {
       live: "实时监控",
-      system: "系统活动",
-      thermal: "热控与调度",
+      system: "性能上下文",
       device: "设备能力",
       history: "历史报告",
       tools: "工具与交付",
@@ -253,6 +256,10 @@
 
   function devicePlatform(device) {
     return String(device?.platform || "android").toLowerCase();
+  }
+
+  function platformLabel(platform) {
+    return { android: "Android", harmony: "HarmonyOS", ios: "iOS" }[String(platform || "").toLowerCase()] || "Mobile";
   }
 
   function deviceConnectionType(device) {
@@ -308,7 +315,7 @@
           option.dataset.connectionType = type;
           option.dataset.platform = devicePlatform(device);
           const name = [device.model, device.product].filter(Boolean).join(" / ");
-          const platform = devicePlatform(device) === "ios" ? "iOS" : "Android";
+          const platform = platformLabel(devicePlatform(device));
           option.textContent = `${platform} · ${name || "Device"} · ${device.serial} · ${device.state}`;
           option.disabled = device.state !== "device";
           group.appendChild(option);
@@ -331,9 +338,10 @@
     const deviceState = $("#device-state");
     deviceState.classList.toggle("online", Boolean(chosen?.state === "device"));
     deviceState.classList.toggle("error", Boolean(state.device_error || (chosen && chosen.state !== "device")));
-    deviceState.querySelector("span").textContent = chosen?.state === "device" ? `${chosenPlatform === "ios" ? "iOS" : "Android"} · ${deviceConnectionLabel(chosen)}在线` : state.device_error ? "设备运行时异常" : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
+    deviceState.querySelector("span").textContent = chosen?.state === "device" ? `${platformLabel(chosenPlatform)} · ${deviceConnectionLabel(chosen)}在线` : state.device_error ? "设备运行时异常" : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
     $("#start-record").disabled = !chosen || chosen.state !== "device" || Boolean(state.active?.running);
     $("#enable-tcpip").disabled = !chosen || chosenPlatform !== "android" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
+    $("#enable-harmony-tcpip").disabled = !chosen || chosenPlatform !== "harmony" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || Boolean(state.active?.running);
     $("#disconnect-wireless").disabled = !chosen || chosenPlatform !== "android" || chosenType !== "wireless" || Boolean(state.active?.running);
   }
@@ -417,13 +425,24 @@
 
   function renderContext(active) {
     const context = active?.context || {};
+    const performance = active?.performance || context.performance || {};
     const battery = active?.battery || {};
     $("#context-package").textContent = context.foreground_package || "--";
-    $("#context-activity").textContent = context.foreground_activity || "--";
+    $("#context-activity").textContent = [context.foreground_activity, performance.foreground_window_name].filter(Boolean).join(" / ") || "--";
     $("#context-screen").textContent = context.screen_state || "--";
-    const brightness = finite(context.brightness_raw) ? Number(context.brightness_raw).toFixed(0) : "--";
-    const refresh = finite(context.refresh_rate_hz) ? `${Number(context.refresh_rate_hz).toFixed(0)} Hz` : "--";
-    $("#context-display").textContent = `${brightness} / ${refresh}`;
+    const refresh = finite(performance.current_refresh_rate_hz) ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz` : finite(context.refresh_rate_hz) ? `${Number(context.refresh_rate_hz).toFixed(0)} Hz` : "--";
+    const sampledFrameRate = finite(performance.sampled_frame_rate_fps) ? performance.sampled_frame_rate_fps : performance.sampled_compositor_fps;
+    const frameRateUnit = performance.frame_rate_unit || "FPS";
+    const fps = finite(sampledFrameRate) ? `${Number(sampledFrameRate).toFixed(1)} ${frameRateUnit}` : "--";
+    $("#context-display").textContent = `${refresh} / ${fps}`;
+    const frameMetricP95 = finite(performance.frame_metric_p95_ms) ? performance.frame_metric_p95_ms : performance.frame_interval_p95_ms;
+    const frameIssuePct = finite(performance.frame_issue_pct) ? performance.frame_issue_pct : performance.missed_vsync_interval_pct;
+    const frameP95 = finite(frameMetricP95) ? `${Number(frameMetricP95).toFixed(2)} ms P95` : "--";
+    const missed = finite(frameIssuePct) ? `${Number(frameIssuePct).toFixed(2)}% 异常` : "--";
+    $("#context-frame").textContent = `${frameP95} / ${missed}`;
+    const touches = finite(performance.touch_interaction_count) ? `${Number(performance.touch_interaction_count).toFixed(0)} 次` : "--";
+    const touchRate = finite(performance.touch_interactions_per_minute) ? `${Number(performance.touch_interactions_per_minute).toFixed(1)}/min` : "采样率不可读";
+    $("#context-touch").textContent = `${touches} / ${touchRate}`;
     const voltage = finite(active?.latest?.voltage_mv) ? `${(Number(active.latest.voltage_mv) / 1000).toFixed(3)} V` : "--";
     const level = finite(battery.level_pct) ? `${Number(battery.level_pct).toFixed(0)}%` : "--";
     $("#context-battery").textContent = `${voltage} / ${level}`;
@@ -432,145 +451,102 @@
   }
 
   function renderSystem(active) {
-    const isIos = activePlatform(active) === "ios";
+    const platform = activePlatform(active);
+    const isIos = platform === "ios";
+    const isHarmony = platform === "harmony";
+    const performance = active?.performance || {};
     const monitor = active?.system_monitor || {};
     const processes = Array.isArray(monitor.processes) ? monitor.processes : [];
-    const threads = Array.isArray(monitor.threads) ? monitor.threads : [];
-    const watched = Array.isArray(monitor.watched_processes) ? monitor.watched_processes : [];
     const priority = Array.isArray(monitor.active_priority) ? monitor.active_priority : [];
-    const snapshotCount = Number(monitor.system_snapshot_count || 0);
-    $("#system-snapshot-status").textContent = snapshotCount ? `${snapshotCount} 个快照 · uptime ${formatNumber(monitor.system_uptime_s, 0)} s` : monitor.enabled ? "监控已启用，等待首个快照" : "本次采集未启用";
-    $("#system-process-count").textContent = finite(monitor.process_count) ? Number(monitor.process_count).toLocaleString("zh-CN") : "--";
-    $("#system-thread-count").textContent = finite(monitor.thread_count) ? Number(monitor.thread_count).toLocaleString("zh-CN") : "--";
-    $("#system-snapshot-count").textContent = String(snapshotCount);
-    $("#system-priority-count").textContent = String(priority.length);
+    const thermal = monitor.thermal || {};
+    const temperatures = Array.isArray(thermal.temperatures) ? thermal.temperatures : [];
+    const thermalTemperatures = temperatures.filter(isThermalTemperature);
+    const hottest = thermalTemperatures.length ? [...thermalTemperatures].sort((a, b) => Number(b.value_c || 0) - Number(a.value_c || 0))[0] : null;
+    const contextCount = Number(performance.context_sample_count || 0);
+    const systemCount = Number(monitor.system_snapshot_count || 0);
+    $("#performance-snapshot-status").textContent = contextCount
+      ? `${contextCount} 个性能上下文 · ${systemCount} 个进程快照`
+      : active?.running ? "等待首个性能上下文" : "尚无性能上下文";
+
+    const currentRefresh = finite(performance.current_refresh_rate_hz) ? Number(performance.current_refresh_rate_hz) : null;
+    const peakRefresh = finite(performance.peak_refresh_rate_hz) ? Number(performance.peak_refresh_rate_hz) : null;
+    $("#performance-refresh-value").textContent = currentRefresh === null ? "--" : `${currentRefresh.toFixed(0)} Hz`;
+    $("#performance-refresh-label").textContent = peakRefresh === null ? "当前显示档位" : `设备最高 ${peakRefresh.toFixed(0)} Hz`;
+    const sampledFrameRate = finite(performance.sampled_frame_rate_fps) ? performance.sampled_frame_rate_fps : performance.sampled_compositor_fps;
+    const minimumFrameRate = finite(performance.minimum_sampled_frame_rate_fps) ? performance.minimum_sampled_frame_rate_fps : performance.minimum_sampled_compositor_fps;
+    const frameRateUnit = performance.frame_rate_unit || "FPS";
+    const frameMetricP95 = finite(performance.frame_metric_p95_ms) ? performance.frame_metric_p95_ms : performance.frame_interval_p95_ms;
+    const frameIssuePct = finite(performance.frame_issue_pct) ? performance.frame_issue_pct : performance.missed_vsync_interval_pct;
+    $("#performance-fps-value").textContent = finite(sampledFrameRate) ? `${Number(sampledFrameRate).toFixed(1)}` : "--";
+    $("#performance-fps-label").textContent = finite(minimumFrameRate) ? `${performance.frame_rate_label || "帧率"} · 最低 ${Number(minimumFrameRate).toFixed(1)} ${frameRateUnit}` : (performance.frame_unavailable_reason || performance.frame_rate_label || "帧率抽样");
+    $("#performance-frame-value").textContent = finite(frameMetricP95) ? `${Number(frameMetricP95).toFixed(2)} ms` : "--";
+    $("#performance-frame-label").textContent = finite(frameIssuePct) ? `${Number(frameIssuePct).toFixed(2)}% ${performance.frame_issue_label || "异常"}` : (performance.frame_metric_label || "帧指标 P95");
+    $("#performance-touch-value").textContent = finite(performance.touch_interaction_count) ? String(Number(performance.touch_interaction_count).toFixed(0)) : "--";
+    $("#performance-touch-label").textContent = finite(performance.touch_interactions_per_minute) ? `${Number(performance.touch_interactions_per_minute).toFixed(1)} 次/分钟 · 硬件采样率未公开` : "硬件采样率未公开";
+
+    const residency = Array.isArray(performance.refresh_residency) ? performance.refresh_residency : [];
+    $("#performance-residency-source").textContent = performance.refresh_residency_source || "平台累计计数";
+    $("#performance-residency-list").innerHTML = residency.length ? residency.map(item => {
+      const share = clamp(Number(item.share_pct || 0), 0, 100);
+      const duration = finite(item.estimated_duration_s) ? `${Number(item.estimated_duration_s).toFixed(1)} s` : "--";
+      return `<div class="performance-residency-row">
+        <div><strong>${formatNumber(item.refresh_rate_hz, 0)} Hz</strong><small>${duration}</small></div>
+        <div class="performance-residency-track"><span style="width:${share.toFixed(2)}%"></span></div>
+        <b>${share.toFixed(1)}%</b>
+      </div>`;
+    }).join("") : '<div class="empty-row">当前平台尚未提供会话内刷新档位计数。</div>';
+
+    const resolution = finite(performance.display_width_px) && finite(performance.display_height_px)
+      ? `${Number(performance.display_width_px).toFixed(0)} × ${Number(performance.display_height_px).toFixed(0)}`
+      : "--";
+    const brightness = finite(performance.brightness_raw) ? Number(performance.brightness_raw).toFixed(0) : "--";
+    $("#performance-window-value").textContent = performance.foreground_window_name ? `${performance.foreground_window_name}${finite(performance.foreground_window_id) ? ` · #${performance.foreground_window_id}` : ""}` : "--";
+    $("#performance-display-value").textContent = `${resolution} / ${brightness}`;
+    $("#performance-gpu-value").textContent = performance.gpu_renderer || "--";
+    $("#performance-temperature-value").textContent = hottest && finite(hottest.value_c) ? `${Number(hottest.value_c).toFixed(1)} °C · ${hottest.name || "sensor"}` : finite(active?.latest?.temperature_c) ? `${Number(active.latest.temperature_c).toFixed(1)} °C · battery` : "--";
+    $("#performance-switch-value").textContent = `${Number(performance.refresh_switch_count || 0)} 次`;
+    $("#performance-frame-count").textContent = Number(performance.frame_sample_count || 0).toLocaleString("zh-CN");
 
     const banner = $("#system-priority-banner");
-    banner.classList.toggle("active", priority.length > 0);
-    banner.classList.toggle("idle", priority.length === 0);
+    const missedPct = finite(performance.frame_issue_pct) ? Number(performance.frame_issue_pct) : finite(performance.missed_vsync_interval_pct) ? Number(performance.missed_vsync_interval_pct) : 0;
+    const thermalStatus = finite(thermal.status) ? Number(thermal.status) : 0;
+    const hasFrameIssue = missedPct >= 2 || Number(performance.severe_frame_interval_count || 0) > 0;
+    const hasIssue = priority.length > 0 || hasFrameIssue || thermalStatus > 0;
+    banner.classList.toggle("active", hasIssue);
+    banner.classList.toggle("idle", !hasIssue);
     if (priority.length) {
       const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
       const names = priority.map(item => item.watch_label || item.watch_name || item.name).filter(Boolean);
       $("#system-priority-title").textContent = `检测到 ${names.join(" / ")}`;
       $("#system-priority-detail").textContent = `${leading.watch_impact || "后台系统活动可能同时影响性能、存储 I/O、温度与功耗。"} 当前最高 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
       $("#system-priority-badge").textContent = "ACTIVE";
+    } else if (hasFrameIssue) {
+      $("#system-priority-title").textContent = "检测到帧节奏异常";
+      $("#system-priority-detail").textContent = `${performance.frame_issue_label || "帧异常"}占 ${missedPct.toFixed(2)}%，累计异常帧 ${Number(performance.frame_issue_count || performance.severe_frame_interval_count || 0)} 个。`;
+      $("#system-priority-badge").textContent = "FRAME";
+    } else if (thermalStatus > 0) {
+      $("#system-priority-title").textContent = `检测到热状态 ${thermalStatus}`;
+      $("#system-priority-detail").textContent = `平台热严重度为 ${thermalStatusDefinitions[thermalStatus] || "升高"}；请结合温度与同期功率判断是否降频。`;
+      $("#system-priority-badge").textContent = "THERMAL";
     } else {
-      $("#system-priority-title").textContent = isIos ? "未检测到重点系统 / 采集器活动" : "未检测到 DEX / 系统更新高影响活动";
-      $("#system-priority-detail").textContent = isIos
-        ? (watched.length ? `已识别 ${watched.length} 个 iOS 采集器进程；相对 powerScore 不等于物理功率。` : "等待 DVT sysmontap 进程快照。")
-        : (watched.length ? `已识别 ${watched.length} 个受监控服务；常驻 daemon 只有在 CPU 可见时才标记为活动。` : "持续监控 dex2oat、dexopt、artd、installd、profman、odrefresh、update_engine 与 apexd。");
-      $("#system-priority-badge").textContent = "STANDBY";
+      $("#system-priority-title").textContent = "未检测到明显性能干扰";
+      $("#system-priority-detail").textContent = `${isHarmony ? "鸿蒙" : isIos ? "iOS" : "Android"} 后台活动、热状态与抽样帧节奏均未触发异常阈值。`;
+      $("#system-priority-badge").textContent = "CLEAR";
     }
 
-    $("#watched-process-body").innerHTML = watched.length ? watched.map(item => `<tr class="${item.activity_active ? "priority-row" : ""}">
+    $("#watched-process-body").innerHTML = priority.length ? priority.map(item => `<tr class="priority-row">
       <td><span class="process-identity"><strong>${escapeHtml(item.watch_label || item.watch_name || item.name || "unknown")}</strong><small title="${escapeHtml(item.command || "")}">${escapeHtml(item.command || item.name || "--")}</small></span></td>
       <td>${escapeHtml(item.pid ?? "--")}</td>
-      <td>${finite(item.cpu_pct) ? `${Number(item.cpu_pct).toFixed(1)}%` : "not in top"}</td>
-      <td>${escapeHtml(item.policy || "--")} / ${escapeHtml(item.state || "--")}</td>
-      <td><span class="activity-pill ${item.activity_active ? "active" : "monitored"}">${item.activity_active ? "ACTIVE" : "MONITORED"}</span></td>
-    </tr>`).join("") : `<tr><td colspan="5" class="table-empty">${isIos ? "尚未发现受监控的 iOS 采集器进程。" : "尚未发现受监控的 DEX、安装或更新服务。"}</td></tr>`;
+      <td>${finite(item.cpu_pct) ? `${Number(item.cpu_pct).toFixed(1)}%` : "--"}</td>
+      <td><span class="activity-pill active">ACTIVE</span></td>
+    </tr>`).join("") : '<tr><td colspan="4" class="table-empty">未检测到后台更新、安装或编译异常。</td></tr>';
 
-    $("#system-process-body").innerHTML = processes.length ? processes.slice(0, 16).map(item => `<tr>
+    $("#system-process-body").innerHTML = processes.length ? processes.slice(0, 5).map(item => `<tr>
       <td><span class="process-identity"><strong>${escapeHtml(item.name || item.command || "unknown")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${escapeHtml(item.user || "--")} · ${escapeHtml(item.category || "other")}</small></span></td>
       <td><strong class="cpu-value">${formatNumber(item.cpu_pct, 1)}%</strong></td>
       <td>${finite(item.mem_pct) ? `${formatNumber(item.mem_pct, 1)}%` : formatBytes(item.resident_bytes)}</td>
       <td>${escapeHtml(item.policy || "--")} / ${escapeHtml(item.state || "--")}</td>
-    </tr>`).join("") : '<tr><td colspan="4" class="table-empty">暂无进程快照；采集开始后默认每 10 秒更新。</td></tr>';
-
-    $("#system-thread-body").innerHTML = threads.length ? threads.slice(0, 16).map(item => `<tr>
-      <td><span class="process-identity"><strong>${escapeHtml(item.activity_label || item.name || "unknown")}</strong><small>${escapeHtml(item.name || "--")} · ${escapeHtml(item.process || "--")} · PID ${escapeHtml(item.pid ?? "--")}</small></span></td>
-      <td>${escapeHtml(item.tid ?? "--")}</td>
-      <td><strong class="cpu-value">${formatNumber(item.cpu_pct, 1)}%</strong></td>
-      <td>${escapeHtml(item.policy || "--")} / ${escapeHtml(item.state || "--")}</td>
-    </tr>`).join("") : `<tr><td colspan="4" class="table-empty">${isIos ? "当前 iOS DVT 适配未提供线程明细。" : "热点线程默认每 30 秒采集一次。"}</td></tr>`;
-  }
-
-  function firstThermalThreshold(thermal, sensorName) {
-    const thresholds = Array.isArray(thermal?.thresholds) ? thermal.thresholds : [];
-    const row = thresholds.find(item => item.name === sensorName);
-    const hot = Array.isArray(row?.hot_c) ? row.hot_c : [];
-    const value = hot.find(finite);
-    return finite(value) ? Number(value) : null;
-  }
-
-  function renderThermalScheduler(active) {
-    const isIos = activePlatform(active) === "ios";
-    const monitor = active?.system_monitor || {};
-    const thermal = monitor.thermal || {};
-    const scheduler = monitor.scheduler || {};
-    const temperatures = Array.isArray(thermal.temperatures) ? thermal.temperatures : [];
-    const cooling = Array.isArray(thermal.cooling_devices) ? thermal.cooling_devices : [];
-    const sessions = Array.isArray(scheduler.hint_sessions) ? scheduler.hint_sessions : [];
-    const status = finite(thermal.status) ? Number(thermal.status) : null;
-    const thermalTemperatures = temperatures.filter(isThermalTemperature);
-    const hottest = thermalTemperatures.length ? [...thermalTemperatures].sort((a, b) => Number(b.value_c || 0) - Number(a.value_c || 0))[0] : null;
-    $("#thermal-snapshot-status").textContent = Number(monitor.thermal_snapshot_count || 0) ? `${monitor.thermal_snapshot_count} 个热控快照 · ${monitor.scheduler_snapshot_count || 0} 个调度快照` : monitor.enabled ? "等待首个热控快照" : "本次采集未启用";
-    $("#thermal-status-value").textContent = status === null ? "--" : String(status);
-    $("#thermal-status-label").textContent = status === null ? (isIos ? "iOS 未公开严重度" : "ThermalService") : thermalStatusDefinitions[status] || "未知级别";
-    $("#thermal-hottest-value").textContent = hottest && finite(hottest.value_c) ? `${Number(hottest.value_c).toFixed(1)} °C` : "--";
-    $("#thermal-hottest-label").textContent = hottest?.name || "--";
-    $("#thermal-sensor-count").textContent = String(temperatures.length);
-    $("#adpf-session-count").textContent = String(sessions.length);
-
-    $("#thermal-sensor-body").innerHTML = temperatures.length ? temperatures.map(item => {
-      const threshold = firstThermalThreshold(thermal, item.name);
-      const thermalTemperature = isThermalTemperature(item);
-      const unit = thermalSensorUnit(item);
-      const status = Number(item.status || 0);
-      const statusText = thermalTemperature
-        ? `${status} · ${thermalStatusDefinitions[status] || "正常"}`
-        : "BCL · 不参与热级别";
-      return `<tr>
-        <td><span class="process-identity"><strong>${escapeHtml(item.name || "unknown")}</strong><small>type ${escapeHtml(item.type ?? "--")}</small></span></td>
-        <td><strong>${formatNumber(item.value_c, unit === "°C" ? 1 : 3)} ${escapeHtml(unit)}</strong></td>
-        <td><span class="thermal-pill level-${thermalTemperature ? escapeHtml(status) : "0"}">${escapeHtml(statusText)}</span></td>
-        <td>${threshold === null ? "--" : `${threshold.toFixed(1)} ${escapeHtml(unit)}`}</td>
-      </tr>`;
-    }).join("") : `<tr><td colspan="4" class="table-empty">${isIos ? "iOS 电池温度数据尚不可用。" : "ThermalService 温度数据尚不可用。"}</td></tr>`;
-
-    $("#cooling-device-body").innerHTML = cooling.length ? cooling.map(item => `<tr>
-      <td><strong>${escapeHtml(item.name || "unknown")}</strong></td>
-      <td>${formatNumber(item.value, 0)}</td>
-      <td><span class="activity-pill ${Number(item.value || 0) > 0 ? "active" : "monitored"}">${Number(item.value || 0) > 0 ? "ENGAGED" : "IDLE"}</span></td>
-    </tr>`).join("") : '<tr><td colspan="3" class="table-empty">未暴露冷却设备。</td></tr>';
-
-    const cpusets = scheduler.cpusets && typeof scheduler.cpusets === "object" ? Object.entries(scheduler.cpusets) : [];
-    const policies = Array.isArray(scheduler.cpu_policies) ? scheduler.cpu_policies : [];
-    const schedulingRows = [
-      ...cpusets.map(([name, cpus]) => `<tr><td><strong>cpuset/${escapeHtml(name)}</strong></td><td>CPU ${escapeHtml(cpus)}</td><td><span class="activity-pill monitored">VISIBLE</span></td></tr>`),
-      ...policies.map(item => {
-        const minimum = finite(item.scaling_min_khz) ? item.scaling_min_khz : item.cpuinfo_min_khz;
-        const maximum = finite(item.scaling_max_khz) ? item.scaling_max_khz : item.cpuinfo_max_khz;
-        const range = finite(minimum) || finite(maximum) ? `${finite(minimum) ? (Number(minimum) / 1000).toFixed(0) : "--"}–${finite(maximum) ? (Number(maximum) / 1000).toFixed(0) : "--"} MHz` : "--";
-        const cpuRange = item.related_cpus ? `CPU ${item.related_cpus} · ${range}` : range;
-        const coreCtl = finite(item.core_ctl_min_cpus) || finite(item.core_ctl_max_cpus)
-          ? ` · core_ctl ${item.core_ctl_enabled === false ? "off" : `${item.core_ctl_min_cpus ?? "--"}–${item.core_ctl_max_cpus ?? "--"}`}`
-          : "";
-        return `<tr><td><strong>${escapeHtml(item.name || "policy")}</strong></td><td>${escapeHtml(cpuRange)}</td><td>${item.governor ? escapeHtml(item.governor) : '<span class="activity-pill restricted">LIMITS ONLY</span>'}${escapeHtml(coreCtl)}</td></tr>`;
-      }),
-    ];
-    $("#scheduler-policy-body").innerHTML = schedulingRows.length ? schedulingRows.join("") : '<tr><td colspan="3" class="table-empty">cpuset / cpufreq 数据不可用。</td></tr>';
-
-    $("#adpf-session-body").innerHTML = sessions.length ? sessions.map(item => {
-      const flags = [item.graphics_pipeline ? "graphics" : "", item.power_efficient ? "efficient" : "", item.force_paused ? "paused" : ""].filter(Boolean).join(", ") || "standard";
-      return `<tr>
-        <td><span class="process-identity"><strong>PID ${escapeHtml(item.pid ?? "--")}</strong><small>UID ${escapeHtml(item.uid ?? "--")}</small></span></td>
-        <td>${escapeHtml((item.tids || []).join(", ") || "--")}</td>
-        <td>${finite(item.target_duration_ns) ? `${(Number(item.target_duration_ns) / 1e6).toFixed(2)} ms` : "--"}</td>
-        <td>${escapeHtml(flags)}</td>
-      </tr>`;
-    }).join("") : '<tr><td colspan="4" class="table-empty">当前没有可见的 ADPF HintSession。</td></tr>';
-
-    const processStates = Array.isArray(scheduler.watched_processes) ? scheduler.watched_processes : [];
-    $("#scheduler-process-body").innerHTML = processStates.length ? processStates.slice(0, 24).map(item => `<tr>
-      <td><strong>${escapeHtml(item.name || "unknown")}</strong></td>
-      <td>${escapeHtml(item.pid ?? "--")} / ${escapeHtml(item.uid ?? "--")}</td>
-      <td>${escapeHtml(item.current_proc_state ?? "--")} · ${escapeHtml(item.adj_type || "--")}</td>
-      <td>${escapeHtml(item.current_sched_group ?? "--")}</td>
-      <td><span class="activity-pill ${item.frozen ? "restricted" : "monitored"}">${item.frozen ? "FROZEN" : "RUNNABLE"}</span></td>
-    </tr>`).join("") : '<tr><td colspan="5" class="table-empty">ActivityManager 进程状态尚不可用。</td></tr>';
-    const powerState = Array.isArray(scheduler.power_hal) ? scheduler.power_hal : [];
-    $("#scheduler-power-state").innerHTML = powerState.length ? powerState.map(item => `<span>${escapeHtml(item)}</span>`).join("") : "<span>PowerManager 状态尚不可用</span>";
+    </tr>`).join("") : '<tr><td colspan="4" class="table-empty">暂无进程快照；只在这里显示当前前 5 项。</td></tr>';
   }
 
   function renderConsole(active) {
@@ -684,7 +660,6 @@
     renderClusters(active);
     renderContext(active);
     renderSystem(active);
-    renderThermalScheduler(active);
     renderConsole(active);
     renderChart();
     const warnings = Array.isArray(active?.warnings) ? active.warnings : [];
@@ -720,7 +695,9 @@
     $("#probe-device-name").textContent = [device.brand, device.model].filter(Boolean).join(" ") || "Unknown device";
     $("#probe-device-detail").textContent = platform === "ios"
       ? `${device.product_type || device.device || "iPhone"} · ${device.hardware || "--"} · iOS ${device.ios || "--"} · ${device.cpu_count || "--"} CPU`
-      : `${device.soc_manufacturer || ""} ${device.soc_model || device.hardware || "Unknown SoC"} · ${device.hardware || "--"}/${device.board_platform || "--"} · Android ${device.android || "--"}`.trim();
+      : platform === "harmony"
+        ? `${device.soc_model || device.hardware || "Unknown SoC"} · ${device.hardware || "--"} · HarmonyOS ${device.harmony || device.openharmony || "--"}`.trim()
+        : `${device.soc_manufacturer || ""} ${device.soc_model || device.hardware || "Unknown SoC"} · ${device.hardware || "--"}/${device.board_platform || "--"} · Android ${device.android || "--"}`.trim();
     $("#probe-serial").textContent = data.device?.serial || entry.device || "--";
     $("#probe-power-state").textContent = isUnplugged ? "电池供电" : `外部供电：${powered.join(", ")}`;
     $("#probe-current-state").textContent = `Current command: ${data.current_command || "unavailable"} · ${battery.voltage_mv ? `${battery.voltage_mv} mV` : "voltage n/a"}`;
@@ -730,12 +707,13 @@
     const gpuFrequencyAvailable = Boolean(data.gpu_source?.frequency_path);
     const gpuLoadAvailable = Boolean(data.gpu_source?.load_path);
     const gpuAvailable = gpuFrequencyAvailable || gpuLoadAvailable;
+    const gpuRendererAvailable = Boolean(data.capabilities?.gpu_renderer || data.performance?.gpu_renderer);
     const gpuModel = data.gpu_probe?.model || data.gpu_source?.name || "GPU";
-    $("#probe-gpu-state").textContent = gpuFrequencyAvailable ? `${gpuModel} 频率可读` : gpuLoadAvailable ? `${gpuModel} 负载可读` : data.gpu_work_duration_available ? `${gpuModel} 驱动证据` : "GPU 遥测不可用";
+    $("#probe-gpu-state").textContent = gpuFrequencyAvailable ? `${gpuModel} 频率可读` : gpuLoadAvailable ? `${gpuModel} 负载可读` : data.gpu_work_duration_available ? `${gpuModel} 驱动证据` : gpuRendererAvailable ? `${gpuModel} 已识别` : "GPU 遥测不可用";
     $("#probe-gpu-detail").textContent = gpuFrequencyAvailable ? data.gpu_source.frequency_path : gpuLoadAvailable ? data.gpu_source.load_path : data.gpu_probe?.reason || "No readable OEM node";
     const gpuBadge = $("#probe-gpu-badge");
-    gpuBadge.textContent = gpuFrequencyAvailable ? "DIRECT" : gpuLoadAvailable ? "LOAD" : data.gpu_work_duration_available ? "FALLBACK" : "UNAVAILABLE";
-    gpuBadge.className = `probe-badge ${gpuAvailable ? "" : "neutral"}`;
+    gpuBadge.textContent = gpuFrequencyAvailable ? "DIRECT" : gpuLoadAvailable ? "LOAD" : data.gpu_work_duration_available ? "FALLBACK" : gpuRendererAvailable ? "RENDERER" : "UNAVAILABLE";
+    gpuBadge.className = `probe-badge ${gpuAvailable || gpuRendererAvailable ? "" : "neutral"}`;
     $("#probe-foreground").textContent = data.foreground_package || "Unknown";
 
     const policies = Array.isArray(data.cpu_policies) ? data.cpu_policies : [];
@@ -753,6 +731,20 @@
       ["App state timeline", "DVT Running / Suspended notifications", Boolean(data.capabilities?.application_state_notifications)],
       ["Wireless RemoteXPC", `${data.connection?.host || "USB"}:${data.connection?.port || "--"}`, Boolean(data.capabilities?.remote_xpc)],
       ["Battery temperature", `${data.system_monitor?.thermal_sensor_count || 0} sensor`, Boolean(data.system_monitor?.thermalservice_available)],
+    ] : platform === "harmony" ? [
+      ["Battery current / voltage", "HarmonyOS BatteryService", Boolean(data.capabilities?.battery_service && data.current_command_ok)],
+      ["CPU utilization", "persistent HDC /proc/stat", Boolean(data.capabilities?.proc_stat)],
+      ["CPU frequency", "hidumper --cpufreq", Boolean(data.capabilities?.cpufreq)],
+      ["Foreground Ability", data.foreground_package || "AbilityManager", Boolean(data.capabilities?.ability_manager)],
+      ["Display refresh modes", `${data.display?.refresh_rate_hz || "--"} Hz · ${(data.display?.supported_refresh_rates_hz || []).join("/") || "modes n/a"}`, Boolean(data.capabilities?.display_modes)],
+      ["Compositor frame pacing", `${formatNumber(data.performance?.compositor_fps, 1)} FPS sampled`, Boolean(data.capabilities?.render_service_fps)],
+      ["Foreground window", data.performance?.foreground_window_name || "WindowManagerService", Boolean(data.capabilities?.window_manager)],
+      ["Touch devices", `${data.performance?.touch_device_count || 0} devices · axes/events`, Boolean(data.capabilities?.touch_devices)],
+      ["Touch hardware sampling rate", data.touch?.sampling_rate_reason || "not exposed", false],
+      ["GPU renderer", data.performance?.gpu_renderer || data.gpu_probe?.model || "renderer n/a", Boolean(data.capabilities?.gpu_renderer)],
+      ["Temperature sensors", `${data.system_monitor?.thermal_sensor_count || 0} sensors`, Boolean(data.capabilities?.thermal_service)],
+      ["Background interference", "HarmonyOS top + ps", Boolean(data.capabilities?.process_top)],
+      ["GPU frequency / load", data.gpu_probe?.reason || "HDC permission restricted", false],
     ] : [
       ["Fuel-gauge current", "cmd battery current_now", Boolean(data.current_command_ok)],
       ["GPU frequency", `${gpuModel} · ${data.gpu_probe?.provider || "OEM sysfs"}`, gpuFrequencyAvailable],
@@ -1010,21 +1002,23 @@
       event.preventDefault();
       const address = $("#adb-address-input").value.trim();
       if (!address) {
-        notify("请输入 ADB 地址", "例如 192.168.1.20:5555。", "error");
+        notify("请输入 ADB 或 HDC 地址", "例如 192.168.1.20:5555，或 harmony:192.168.1.20:8710。", "error");
         return;
       }
+      const isHarmony = /^harmony:/i.test(address);
       setBusy(true, `正在连接 ${address}...`);
       try {
-        const result = await api("/api/connect", {
+        const result = await api(isHarmony ? "/api/harmony/connect" : "/api/connect", {
           method: "POST",
           body: JSON.stringify({ address }),
         });
         localStorage.setItem("android-power-adb-address", address);
-        localStorage.setItem("android-power-device", address);
-        notify(result.connected ? "ADB 设备已连接" : "ADB 命令已执行", result.output || address, result.connected ? "success" : "error", 7000);
+        localStorage.setItem("android-power-device", result.serial || address);
+        const transport = isHarmony ? "HDC" : "ADB";
+        notify(result.connected ? `${transport} 设备已连接` : `${transport} 命令已执行`, result.output || address, result.connected ? "success" : "error", 7000);
         await refreshState();
       } catch (error) {
-        notify("ADB 连接失败", error.message, "error", 8000);
+        notify(`${isHarmony ? "HDC" : "ADB"} 连接失败`, error.message, "error", 8000);
       } finally {
         setBusy(false);
       }
@@ -1060,6 +1054,42 @@
         await refreshState();
       } catch (error) {
         notify("无法开启无线 ADB", error.message, "error", 10000);
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    $("#enable-harmony-tcpip").addEventListener("click", async () => {
+      const device = selectedDevice();
+      const selected = (app.state?.devices || []).find(item => item.serial === device);
+      if (!device || devicePlatform(selected) !== "harmony" || deviceConnectionType(selected) !== "usb") {
+        notify("请选择 USB 鸿蒙设备", "手机需要先通过 USB 完成 HDC 调试授权。", "error");
+        return;
+      }
+      if (!confirm(`将对 ${device} 执行 hdc tmode port 8710，并自动连接手机的 Wi-Fi 地址。\n\n确认当前没有正在进行的采集。`)) return;
+      setBusy(true, "正在开启鸿蒙无线 HDC 并读取 Wi-Fi 地址...");
+      try {
+        const result = await api("/api/harmony/tcpip", {
+          method: "POST",
+          body: JSON.stringify({ device, port: 8710, auto_connect: true }),
+        });
+        if (result.suggested_address) {
+          const prefixedAddress = `harmony:${result.suggested_address}`;
+          $("#adb-address-input").value = prefixedAddress;
+          localStorage.setItem("android-power-adb-address", prefixedAddress);
+          if (result.connected) {
+            localStorage.setItem("android-power-device", result.suggested_device || prefixedAddress);
+          }
+        }
+        const detail = result.connected
+          ? `${result.suggested_address} 已连接，可拔掉 USB。`
+          : result.suggested_address
+            ? `${result.suggested_address} 已填入；${result.connect_error || "请点击连接重试。"}`
+            : result.connect_error || result.tcpip_output;
+        notify(result.connected ? "鸿蒙无线 HDC 已开启并连接" : "鸿蒙无线 HDC 已开启", detail, "success", 10000);
+        await refreshState();
+      } catch (error) {
+        notify("无法开启鸿蒙无线 HDC", error.message, "error", 10000);
       } finally {
         setBusy(false);
       }
@@ -1152,7 +1182,7 @@
       event.preventDefault();
       const payload = recordPayload();
       if (!payload.device) {
-        notify("请选择设备", "需要一台处于 device 状态的 ADB 设备。", "error");
+        notify("请选择设备", "需要一台处于 device 状态的 Android、HarmonyOS 或 iOS 设备。", "error");
         return;
       }
       setBusy(true, "正在启动采集...");

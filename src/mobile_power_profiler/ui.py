@@ -23,10 +23,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
-from .analysis import convert_samples
+from .analysis import analyze_performance_contexts, convert_samples
 from .collector import adb_connection_type, adb_shell, list_adb_devices, parse_sampler_line
 from .evidence import create_evidence_archive
 from .ios import DEFAULT_IOS_PYTHON, list_ios_devices, pair_ios_device
+from .harmony import (
+    DEFAULT_HDC,
+    connect_harmony_device,
+    enable_harmony_tcp,
+    list_harmony_devices,
+)
 from .models import (
     ContextSample,
     CpuPolicy,
@@ -433,6 +439,7 @@ class LiveTelemetryReader:
             if latest_system is not None
             else []
         )
+        performance = analyze_performance_contexts(self.contexts, self.metadata)
 
         return {
             "metadata": self.metadata,
@@ -491,6 +498,7 @@ class LiveTelemetryReader:
             ],
             "clusters": clusters,
             "context": asdict(latest_context) if latest_context is not None else None,
+            "performance": performance,
             "battery": battery if isinstance(battery, dict) else {},
             "warnings": list(dict.fromkeys(warnings)),
             "system_monitor": {
@@ -688,8 +696,10 @@ class DashboardManager:
         output_root: Path,
         demo_mode: bool = False,
         ios_python: Optional[str] = None,
+        hdc: Optional[str] = None,
     ) -> None:
         self.adb = adb
+        self.hdc = hdc or DEFAULT_HDC
         self.ios_python = ios_python or DEFAULT_IOS_PYTHON
         self.output_root = output_root.resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -699,12 +709,15 @@ class DashboardManager:
         self._starting = False
         self._device_cache: List[Dict[str, str]] = []
         self._android_device_cache: List[Dict[str, str]] = []
+        self._harmony_device_cache: List[Dict[str, str]] = []
         self._ios_device_cache: List[Dict[str, str]] = []
         self._device_error: Optional[str] = None
         self._android_error: Optional[str] = None
+        self._harmony_error: Optional[str] = None
         self._ios_error: Optional[str] = None
         self._device_cache_at = 0.0
         self._android_device_cache_at = 0.0
+        self._harmony_device_cache_at = 0.0
         self._ios_device_cache_at = 0.0
         self._maintenance_operation: Optional[str] = None
         self._lock = threading.RLock()
@@ -718,6 +731,8 @@ class DashboardManager:
             "mobile_power_profiler",
             "--adb",
             self.adb,
+            "--hdc",
+            self.hdc,
             "--ios-python",
             self.ios_python,
         ]
@@ -879,16 +894,22 @@ class DashboardManager:
         force: bool = False,
         *,
         refresh_ios: Optional[bool] = None,
+        refresh_harmony: Optional[bool] = None,
     ) -> tuple[List[Dict[str, str]], Optional[str]]:
         now = time.time()
         with self._lock:
             refresh_android_now = force or now - self._android_device_cache_at >= 3.0
+            refresh_harmony_now = (
+                bool(refresh_harmony)
+                if refresh_harmony is not None
+                else force or now - self._harmony_device_cache_at >= 3.0
+            )
             refresh_ios_now = (
                 bool(refresh_ios)
                 if refresh_ios is not None
                 else force or now - self._ios_device_cache_at >= 15.0
             )
-            if not refresh_android_now and not refresh_ios_now:
+            if not refresh_android_now and not refresh_harmony_now and not refresh_ios_now:
                 return list(self._device_cache), self._device_error
 
         if refresh_android_now:
@@ -898,6 +919,16 @@ class DashboardManager:
             with self._lock:
                 android_cache = list(self._android_device_cache)
                 android_error = self._android_error
+
+        if refresh_harmony_now:
+            try:
+                harmony_cache, harmony_error = list_harmony_devices(self.hdc)
+            except Exception as exc:  # HDC is optional for Android/iOS-only hosts
+                harmony_cache, harmony_error = [], str(exc)
+        else:
+            with self._lock:
+                harmony_cache = list(self._harmony_device_cache)
+                harmony_error = self._harmony_error
 
         if refresh_ios_now:
             try:
@@ -909,16 +940,22 @@ class DashboardManager:
                 ios_cache = list(self._ios_device_cache)
                 ios_error = self._ios_error
 
-        devices = [*android_cache, *ios_cache]
+        devices = [*android_cache, *harmony_cache, *ios_cache]
         error = android_error if android_error and not devices else None
-        if not devices and ios_error:
-            error = " | ".join(value for value in (android_error, ios_error) if value)
+        if not devices and (harmony_error or ios_error):
+            error = " | ".join(
+                value for value in (android_error, harmony_error, ios_error) if value
+            )
         refreshed_at = time.time()
         with self._lock:
             if refresh_android_now:
                 self._android_device_cache = android_cache
                 self._android_error = android_error
                 self._android_device_cache_at = refreshed_at
+            if refresh_harmony_now:
+                self._harmony_device_cache = harmony_cache
+                self._harmony_error = harmony_error
+                self._harmony_device_cache_at = refreshed_at
             if refresh_ios_now:
                 self._ios_device_cache = ios_cache
                 self._ios_error = ios_error
@@ -955,7 +992,7 @@ class DashboardManager:
             token in lower for token in ("unable to connect", "failed to connect", "cannot connect")
         ):
             raise RuntimeError(output or f"adb connect {address} failed")
-        devices, error = self.devices(force=True, refresh_ios=False)
+        devices, error = self.devices(force=True, refresh_ios=False, refresh_harmony=False)
         connected_device = next(
             (
                 item
@@ -973,6 +1010,40 @@ class DashboardManager:
             "devices": devices,
             "device_error": error,
         }
+
+    def connect_harmony(self, payload: Dict[str, object]) -> Dict[str, object]:
+        address = str(payload.get("address") or "").strip()
+        if address.lower().startswith("harmony:"):
+            address = address[len("harmony:") :]
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("Stop the active recording before changing the HarmonyOS HDC connection")
+        result = connect_harmony_device(self.hdc, address)
+        devices, error = self.devices(force=True, refresh_ios=False, refresh_harmony=True)
+        result["devices"] = devices
+        result["device_error"] = error
+        return result
+
+    def enable_harmony_tcpip(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        if not device:
+            raise ValueError("Select a USB-connected HarmonyOS device before enabling wireless HDC")
+        port = _bounded_int(payload.get("port"), "HDC TCP port", 1, 65535, 8710)
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("Stop the active recording before changing HarmonyOS HDC transport")
+        result = enable_harmony_tcp(
+            self.hdc,
+            device,
+            port,
+            auto_connect=bool(payload.get("auto_connect", True)),
+        )
+        devices, error = self.devices(force=True, refresh_ios=False, refresh_harmony=True)
+        result["devices"] = devices
+        result["device_error"] = error
+        return result
 
     def disconnect_device(self, payload: Dict[str, object]) -> Dict[str, object]:
         address = str(payload.get("address") or "").strip()
@@ -1004,7 +1075,7 @@ class DashboardManager:
         ).strip()
         if result.returncode != 0:
             raise RuntimeError(output or f"adb disconnect {address} failed")
-        devices, error = self.devices(force=True, refresh_ios=False)
+        devices, error = self.devices(force=True, refresh_ios=False, refresh_harmony=False)
         return {
             "address": address,
             "disconnected": not any(item.get("serial") == address for item in devices),
@@ -1018,7 +1089,7 @@ class DashboardManager:
         if not device:
             raise ValueError("Select an authorized ADB device before enabling wireless ADB")
         port = _bounded_int(payload.get("port"), "ADB TCP port", 1, 65535, 5555)
-        devices, error = self.devices(force=True, refresh_ios=False)
+        devices, error = self.devices(force=True, refresh_ios=False, refresh_harmony=False)
         if error:
             raise RuntimeError(error)
         selected_device = next(
@@ -1098,7 +1169,9 @@ class DashboardManager:
                 "Wireless ADB was enabled, but no reachable Wi-Fi IPv4 address was detected"
             )
 
-        refreshed_devices, refreshed_error = self.devices(force=True, refresh_ios=False)
+        refreshed_devices, refreshed_error = self.devices(
+            force=True, refresh_ios=False, refresh_harmony=False
+        )
         return {
             "device": device,
             "port": port,
@@ -1121,6 +1194,7 @@ class DashboardManager:
         devices, error = self.devices(
             force=True,
             refresh_ios=device.lower().startswith("ios:"),
+            refresh_harmony=device.lower().startswith("harmony:"),
         )
         selected = next((item for item in devices if item.get("serial") == device), None)
         if selected is None:
@@ -1192,6 +1266,7 @@ class DashboardManager:
         devices, error = self.devices(
             force=True,
             refresh_ios=device.lower().startswith("ios:"),
+            refresh_harmony=device.lower().startswith("harmony:"),
         )
         if error:
             raise RuntimeError(error)
@@ -1781,10 +1856,12 @@ class DashboardManager:
         return {
             "server_time": time.time(),
             "adb": self.adb,
+            "hdc": self.hdc,
             "ios_python": self.ios_python,
             "output_root": str(self.output_root),
             "devices": devices,
             "device_error": error,
+            "harmony_error": self._harmony_error,
             "ios_error": self._ios_error,
             "probes": probes,
             "active": self.active_snapshot(),
@@ -1884,7 +1961,41 @@ class DashboardManager:
                 "screen_state": "Awake",
                 "brightness_raw": 118.0,
                 "refresh_rate_hz": 120.0,
+                "performance": {},
                 "source": "demo",
+            },
+            "performance": {
+                "available": True,
+                "context_sample_count": 24,
+                "current_refresh_rate_hz": 120.0,
+                "peak_refresh_rate_hz": 120.0,
+                "supported_refresh_rates_hz": [60.0, 90.0, 120.0],
+                "observed_refresh_rates_hz": [60.0, 120.0],
+                "refresh_switch_count": 2,
+                "refresh_residency": [
+                    {"refresh_rate_hz": 60.0, "estimated_duration_s": 32.0, "share_pct": 13.4},
+                    {"refresh_rate_hz": 120.0, "estimated_duration_s": 207.0, "share_pct": 86.6},
+                ],
+                "sampled_compositor_fps": 117.8,
+                "minimum_sampled_compositor_fps": 92.4,
+                "frame_interval_average_ms": 8.49,
+                "frame_interval_p95_ms": 16.72,
+                "frame_sample_count": 2140,
+                "missed_vsync_interval_count": 18,
+                "missed_vsync_interval_pct": 0.84,
+                "severe_frame_interval_count": 2,
+                "frozen_frame_interval_count": 0,
+                "touch_interaction_count": 37,
+                "touch_interactions_per_minute": 9.3,
+                "touch_sampling_rate_hz": None,
+                "touch_sampling_rate_available": False,
+                "touch_sampling_rate_reason": "硬件触控扫描率未通过系统接口公开。",
+                "foreground_window_name": "bili0",
+                "foreground_window_id": 108,
+                "display_width_px": 1320,
+                "display_height_px": 2856,
+                "brightness_raw": 23707,
+                "gpu_renderer": "Maleoon 920C",
             },
             "battery": {
                 "level_pct": 82.0,
@@ -2141,10 +2252,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.probe(payload)
             elif path == "/api/connect":
                 result = self.server.manager.connect_device(payload)
+            elif path == "/api/harmony/connect":
+                result = self.server.manager.connect_harmony(payload)
             elif path == "/api/disconnect":
                 result = self.server.manager.disconnect_device(payload)
             elif path == "/api/tcpip":
                 result = self.server.manager.enable_tcpip(payload)
+            elif path == "/api/harmony/tcpip":
+                result = self.server.manager.enable_harmony_tcpip(payload)
             elif path == "/api/ios/pair":
                 result = self.server.manager.pair_ios(payload)
             elif path == "/api/record":
@@ -2191,6 +2306,7 @@ def serve_dashboard(
     open_browser: bool = True,
     demo_mode: bool = False,
     ios_python: Optional[str] = None,
+    hdc: Optional[str] = None,
 ) -> int:
     if port < 0 or port > 65535:
         raise ValueError("port must be between 0 and 65535")
@@ -2199,6 +2315,7 @@ def serve_dashboard(
         output_root,
         demo_mode=demo_mode,
         ios_python=ios_python,
+        hdc=hdc,
     )
     try:
         server = DashboardHTTPServer((host, port), manager)

@@ -2240,6 +2240,56 @@ button.history-link:disabled {
   gap: 14px;
 }
 
+.performance-residency-list {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.performance-residency-row {
+  display: grid;
+  grid-template-columns: 76px minmax(100px, 1fr) 52px;
+  gap: 10px;
+  align-items: center;
+}
+
+.performance-residency-row > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.performance-residency-row strong,
+.performance-residency-row b {
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.performance-residency-row small {
+  color: var(--muted-2);
+  font-size: 8px;
+}
+
+.performance-residency-row b { text-align: right; }
+
+.performance-residency-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-deep);
+}
+
+.performance-residency-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--accent));
+}
+
+.performance-context-list { padding-top: 4px; }
+
 .power-state-strip {
   display: flex;
   flex-wrap: wrap;

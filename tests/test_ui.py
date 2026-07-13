@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
-from mobile_power_profiler.cli import build_parser
+from mobile_power_profiler.cli import build_parser, requested_platform
 from mobile_power_profiler.ui import (
     DashboardHTTPServer,
     DashboardManager,
@@ -121,7 +121,7 @@ class LiveTelemetryTests(unittest.TestCase):
 
 
 class UiServerTests(unittest.TestCase):
-    def test_ui_merges_android_and_ios_discovery(self) -> None:
+    def test_ui_merges_android_harmony_and_ios_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
             with (
@@ -144,11 +144,29 @@ class UiServerTests(unittest.TestCase):
                         None,
                     ),
                 ),
+                patch(
+                    "mobile_power_profiler.ui.list_harmony_devices",
+                    return_value=(
+                        [
+                            {
+                                "serial": "harmony:HDC-TARGET",
+                                "hdc_target": "HDC-TARGET",
+                                "state": "device",
+                                "platform": "harmony",
+                                "connection_type": "usb",
+                            }
+                        ],
+                        None,
+                    ),
+                ),
             ):
                 devices, error = manager.devices(force=True)
 
         self.assertIsNone(error)
-        self.assertEqual({item["serial"] for item in devices}, {"ANDROID", "ios:IPHONE"})
+        self.assertEqual(
+            {item["serial"] for item in devices},
+            {"ANDROID", "harmony:HDC-TARGET", "ios:IPHONE"},
+        )
         self.assertEqual(
             next(item for item in devices if item["serial"] == "ANDROID")["platform"],
             "android",
@@ -179,15 +197,19 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("Mobile Power Profiler", html)
             self.assertIn("ADB IP", html)
             self.assertIn("无线 ADB", html)
+            self.assertIn("鸿蒙无线", html)
             self.assertIn("iOS 无线", html)
             self.assertIn("断开无线", html)
-            self.assertIn("系统活动", html)
-            self.assertIn("热控与调度", html)
+            self.assertIn("性能上下文", html)
+            self.assertIn("FRAME RATE", html)
+            self.assertIn("硬件采样率未公开", html)
+            self.assertNotIn('data-view="thermal"', html)
             self.assertIn("工具与交付", html)
             self.assertIn("导入 BTR2 日志", html)
             self.assertTrue(state["active"]["is_demo"])
             self.assertIn("portable_build_available", state["tooling"])
             self.assertEqual(len(state["active"]["series"]), 240)
+            self.assertEqual(state["active"]["performance"]["current_refresh_rate_hz"], 120.0)
             self.assertEqual(
                 state["active"]["system_monitor"]["active_priority"][0]["watch_name"],
                 "dex2oat",
@@ -409,6 +431,48 @@ class UiServerTests(unittest.TestCase):
         )
         connect.assert_called_once_with({"address": "192.168.21.90:5555"})
 
+    def test_ui_can_enable_harmony_tcpip_and_refresh_hdc_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager(
+                "custom-adb",
+                Path(directory),
+                hdc="custom-hdc",
+            )
+            enabled = {
+                "tcpip_enabled": True,
+                "connected": True,
+                "suggested_address": "192.168.21.8:8710",
+                "suggested_device": "harmony:192.168.21.8:8710",
+            }
+            refreshed = [
+                {
+                    "serial": "harmony:192.168.21.8:8710",
+                    "state": "device",
+                    "platform": "harmony",
+                }
+            ]
+            with (
+                patch("mobile_power_profiler.ui.enable_harmony_tcp", return_value=enabled) as enable,
+                patch.object(manager, "devices", return_value=(refreshed, None)) as devices,
+            ):
+                result = manager.enable_harmony_tcpip(
+                    {"device": "harmony:USB123", "port": 8710, "auto_connect": True}
+                )
+
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["devices"], refreshed)
+        enable.assert_called_once_with(
+            "custom-hdc",
+            "harmony:USB123",
+            8710,
+            auto_connect=True,
+        )
+        devices.assert_called_once_with(
+            force=True,
+            refresh_ios=False,
+            refresh_harmony=True,
+        )
+
     def test_runtime_marker_is_appended_with_device_uptime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -603,6 +667,34 @@ class UiConfigurationTests(unittest.TestCase):
         self.assertEqual(record.device, "ios:00008150-TEST")
         self.assertEqual(record.ios_python, "C:/ios/python.exe")
         self.assertEqual(pair.command, "ios-pair")
+
+    def test_cli_parser_exposes_harmony_hdc_workflow(self) -> None:
+        record = build_parser().parse_args(
+            [
+                "--hdc",
+                "C:/DevEco/hdc.exe",
+                "record",
+                "--platform",
+                "harmony",
+                "--device",
+                "harmony:192.168.21.8:8710",
+            ]
+        )
+        probe = build_parser().parse_args(
+            [
+                "--hdc",
+                "custom-hdc",
+                "probe",
+                "--platform",
+                "harmony",
+                "--device",
+                "harmony:USB123",
+            ]
+        )
+        self.assertEqual(record.platform, "harmony")
+        self.assertEqual(record.hdc, "C:/DevEco/hdc.exe")
+        self.assertEqual(probe.device, "harmony:USB123")
+        self.assertEqual(requested_platform(record), "harmony")
 
     def test_cli_parser_exposes_portable_workflow_commands(self) -> None:
         record = build_parser().parse_args(

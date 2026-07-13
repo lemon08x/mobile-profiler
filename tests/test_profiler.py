@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mobile_power_profiler.analysis import (
+    analyze_performance_contexts,
     analyze_run,
     analyze_cpu,
     analyze_gpu,
@@ -24,6 +25,10 @@ from mobile_power_profiler.collector import (
     collect_streaming_session,
     gpu_load_from_text,
     is_gpu_core_devfreq,
+    parse_android_display_performance,
+    parse_android_gfxinfo,
+    parse_android_surfaceflinger_performance,
+    parse_android_touch_devices,
     parse_sampler_line,
     parse_normalized_samples,
 )
@@ -35,6 +40,24 @@ from mobile_power_profiler.ios import (
     collect_ios_session,
     list_ios_devices,
     select_ios_device,
+)
+from mobile_power_profiler.harmony import (
+    build_harmony_sample,
+    harmony_cpu_policies,
+    harmony_policy_frequencies_mhz,
+    parse_harmony_battery,
+    parse_harmony_cpufreq,
+    parse_harmony_compositor_fps,
+    parse_harmony_foreground,
+    parse_harmony_gles,
+    parse_harmony_hitches,
+    parse_harmony_input_devices,
+    parse_harmony_input_events,
+    parse_harmony_refresh_counts,
+    parse_harmony_render_screen,
+    parse_harmony_thermal,
+    parse_harmony_window_manager,
+    parse_hdc_targets,
 )
 from mobile_power_profiler.log_import import (
     host_epoch_to_device_uptime,
@@ -180,6 +203,63 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(parsed.foreground_package, "tv.danmaku.bili")
         self.assertEqual(parsed.foreground_activity, ".MainActivity")
         self.assertEqual(parsed.refresh_rate_hz, 60.0)
+
+    def test_android_display_surface_and_touch_performance_parsers(self) -> None:
+        display = parse_android_display_performance(
+            "mSfDisplayModes=\n"
+            "DisplayMode{id=0, width=1260, height=2800, peakRefreshRate=120.00001, vsyncRate=120.00001}\n"
+            "DisplayMode{id=1, width=1260, height=2800, peakRefreshRate=90.0, vsyncRate=90.0}\n"
+            "DisplayMode{id=2, width=1260, height=2800, peakRefreshRate=60.0, vsyncRate=60.0}\n"
+            "mActiveSfDisplayMode=DisplayMode{id=2, width=1260, height=2800, peakRefreshRate=60.0}\n"
+            "mActiveRenderFrameRate=60.0\n"
+        )
+        self.assertEqual(display["display_width_px"], 1260)
+        self.assertEqual(display["display_height_px"], 2800)
+        self.assertEqual(display["refresh_rate_hz"], 60.0)
+        self.assertEqual(display["supported_refresh_rates_hz"], [60.0, 90.0, 120.0])
+
+        surface = parse_android_surfaceflinger_performance(
+            "ScreenOff: 3d02:46:40.574\n"
+            "120.00 Hz: 0d00:00:27.839\n"
+            "60.00 Hz: 0d01:12:01.945\n"
+            "GLES: ARM, Mali-G925-Immortalis MC12, OpenGL ES 3.2\n"
+        )
+        self.assertAlmostEqual(surface["refresh_rate_durations_s"]["120"], 27.839)
+        self.assertAlmostEqual(surface["refresh_rate_durations_s"]["60"], 4321.945)
+        self.assertEqual(surface["gpu_vendor"], "ARM")
+        self.assertEqual(surface["gpu_renderer"], "Mali-G925-Immortalis MC12")
+
+        touch = parse_android_touch_devices(
+            "add device 1: /dev/input/event6\n"
+            '  name:     "vivo_ts"\n'
+            "    ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0\n"
+            "    ABS_MT_POSITION_X     : value 0, min 0, max 12599, fuzz 0\n"
+            "    ABS_MT_POSITION_Y     : value 0, min 0, max 27999, fuzz 0\n"
+            "  INPUT_PROP_DIRECT\n"
+        )
+        self.assertEqual(touch["devices"][0]["name"], "vivo_ts")
+        self.assertEqual(touch["devices"][0]["max_touch_points"], 10)
+        self.assertFalse(touch["sampling_rate_available"])
+
+    def test_android_gfxinfo_parser_selects_foreground_window(self) -> None:
+        parsed = parse_android_gfxinfo(
+            "Total frames rendered: 200\n"
+            "Window: com.example/com.example.MainActivity\n"
+            "Total frames rendered: 120\n"
+            "Janky frames: 4 (3.3%)\n"
+            "Number Missed Vsync: 2\n"
+            "Number Frame deadline missed: 3\n"
+            "HISTOGRAM: 10ms=100 20ms=20\n"
+            "Window: com.example/com.example.OldActivity\n"
+            "Total frames rendered: 900\n"
+            "HISTOGRAM: 10ms=800 20ms=100\n",
+            "com.example",
+            ".MainActivity",
+        )
+        self.assertEqual(parsed["foreground_window_name"], "com.example/com.example.MainActivity")
+        self.assertEqual(parsed["frame_counter_total"], 120)
+        self.assertEqual(parsed["frame_counter_deadline_missed"], 3)
+        self.assertEqual(parsed["frame_histogram_ms"], {"10": 100, "20": 20})
 
     def test_top_process_and_thread_parsers_prioritize_dex2oat(self) -> None:
         processes = parse_top_processes(
@@ -975,6 +1055,7 @@ class StreamingTests(unittest.TestCase):
                     None,
                     journal,
                     reconnect_timeout_s=1.0,
+                    performance_context_enabled=False,
                 )
             checkpoint = json.loads((root / "checkpoint.json").read_text(encoding="utf-8"))
             stream = (root / "raw" / "sampler-stream.txt").read_text(encoding="utf-8")
@@ -983,6 +1064,299 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(checkpoint["sample_count"], 2)
         self.assertIn("S|0|10", stream)
         self.assertIn("S|0|11", stream)
+
+
+class HarmonyAdapterTests(unittest.TestCase):
+    def test_hdc_targets_ignore_uart_and_prefix_device_ids(self) -> None:
+        devices = parse_hdc_targets(
+            "192.168.21.8:8710\t\tTCP\tConnected\tlocalhost\thdc\n"
+            "7DZ9K26524002289\t\tUSB\tOffline\tlocalhost\thdc\n"
+            "COM3\t\tUART\tReady\tunknown\thdc\n"
+        )
+        self.assertEqual(len(devices), 2)
+        self.assertEqual(devices[0]["serial"], "harmony:192.168.21.8:8710")
+        self.assertEqual(devices[0]["state"], "device")
+        self.assertEqual(devices[0]["connection_type"], "wireless")
+        self.assertEqual(devices[1]["state"], "offline")
+
+    def test_harmony_battery_frequency_thermal_and_foreground_parsers(self) -> None:
+        battery = parse_harmony_battery(
+            "capacity: 90\nchargingStatus: 0\npluggedType: 0\n"
+            "voltage: 4321032\nnowCurrent: -149\ncurrentAverage: -113\n"
+            "temperature: 280\npresent: 1\ntechnology: Li-poly\n"
+        )
+        self.assertEqual(battery["level_pct"], 90.0)
+        self.assertAlmostEqual(battery["voltage_mv"], 4321.032)
+        self.assertEqual(battery["current_now_ma"], -149.0)
+        self.assertEqual(battery["temperature_c"], 28.0)
+        self.assertEqual(battery["powered"], [])
+        self.assertEqual(battery["status"], "discharging")
+
+        cpufreq = parse_harmony_cpufreq(
+            "cmd is: cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq\n"
+            "1133000\n"
+            "cmd is: cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq\n"
+            "1500000\n"
+            "cmd is: cat /sys/devices/system/cpu/cpu1/cpufreq/cpuinfo_cur_freq\n"
+            "1306000\n"
+            "cmd is: cat /sys/devices/system/cpu/cpu1/cpufreq/cpuinfo_max_freq\n"
+            "1500000\n"
+            "cmd is: cat /sys/devices/system/cpu/cpu2/cpufreq/cpuinfo_cur_freq\n"
+            "2050000\n"
+            "cmd is: cat /sys/devices/system/cpu/cpu2/cpufreq/cpuinfo_max_freq\n"
+            "2050000\n"
+        )
+        policies = harmony_cpu_policies(cpufreq)
+        self.assertEqual([item.cores for item in policies], [[0, 1], [2]])
+        frequencies = harmony_policy_frequencies_mhz(cpufreq, policies)
+        self.assertAlmostEqual(frequencies["policy0"], 1219.5)
+        self.assertAlmostEqual(frequencies["policy1"], 2050.0)
+
+        temperatures = parse_harmony_thermal(
+            "Type: Battery\nTemperature: 28000\n"
+            "Type: modem\nTemperature: 30\n"
+        )
+        self.assertEqual(temperatures[0]["value_c"], 28.0)
+        self.assertEqual(temperatures[1]["value_c"], 30.0)
+
+        foreground = parse_harmony_foreground(
+            "AbilityRecord ID #247\n"
+            "  main name [EntryAbility]\n"
+            "  bundle name [yylx.danmaku.bili]\n"
+            "  state #FOREGROUND\n"
+        )
+        self.assertEqual(foreground["package"], "yylx.danmaku.bili")
+        self.assertEqual(foreground["activity"], "EntryAbility")
+
+    def test_harmony_display_frame_window_touch_and_gpu_parsers(self) -> None:
+        screen = parse_harmony_render_screen(
+            "screen[0]: id=0, powerStatus=POWER_STATUS_ON, backlight=23707, "
+            "screenType=EXTERNAL_TYPE, render resolution=1320x2856, physical resolution=1320x2856\n"
+            "supportedMode[0]: 1320x2856, refreshRate=120\n"
+            "supportedMode[1]: 1320x2856, refreshRate=60\n"
+            "activeMode: 1320x2856, refreshRate=60\n"
+        )
+        self.assertEqual(screen["display_width_px"], 1320)
+        self.assertEqual(screen["refresh_rate_hz"], 60.0)
+        self.assertEqual(screen["supported_refresh_rates_hz"], [60.0, 120.0])
+        self.assertEqual(
+            parse_harmony_refresh_counts(
+                "Refresh Rate:60, Count:320565;\nRefresh Rate:120, Count:6597;"
+            ),
+            {"60": 320565, "120": 6597},
+        )
+
+        frame = parse_harmony_compositor_fps(
+            "The fps of screen [Id:0] is:\n"
+            "12066666668\n12050000001\n12033333334\n12000000000\n",
+            60.0,
+        )
+        self.assertEqual(frame["frame_sample_count"], 3)
+        self.assertEqual(frame["missed_vsync_interval_count"], 1)
+        self.assertGreater(float(frame["frame_interval_p95_ms"]), 30.0)
+
+        window = parse_harmony_window_manager(
+            "WindowName DisplayId Pid WinId Type Mode Flag ZOrd Orientation [ x y w h ]\n"
+            "bili0 0 21799 108 1 1 0 101 0 [ 0 0 1320 2856 ]\n"
+            "Focus window: 108\n"
+        )
+        self.assertEqual(window["foreground_window_name"], "bili0")
+        self.assertEqual(window["foreground_window_pid"], 21799)
+        self.assertEqual(
+            parse_harmony_hitches(
+                "more than 66 ms 1\nmore than 33 ms 2\nmore than 16.67 ms 3\n"
+            )["hitch_over_16_67ms"],
+            3,
+        )
+
+        touch = parse_harmony_input_events(
+            "{eventType:pointer,actionTime:100,deviceId:1,sourceType:touch-screen,pointerAction:down}\n"
+            "{eventType:pointer,actionTime:101,deviceId:1,sourceType:touch-screen,pointerAction:up}\n"
+            "{eventType:pointer,actionTime:100,deviceId:1,sourceType:touch-screen,pointerId:20000,pointerAction:down}\n"
+        )
+        self.assertEqual(touch["touch_event_count"], 2)
+        self.assertEqual(touch["touch_interaction_count"], 1)
+        devices = parse_harmony_input_devices(
+            "deviceId:1 | deviceName:input_mt_wrapper | deviceType:19 | bus:0\n"
+            "axis: count=2\n"
+            " axisType:POSITION_X | minimum:0 | maximum:10559 | fuzz:0\n"
+            " axisType:POSITION_Y | minimum:0 | maximum:22847 | fuzz:0\n"
+        )
+        self.assertEqual(devices[0]["name"], "input_mt_wrapper")
+        self.assertEqual(len(devices[0]["axes"]), 2)
+        self.assertEqual(
+            parse_harmony_gles("GL_VENDOR: HUAWEI\nGL_RENDERER: Maleoon 920C\n")["renderer"],
+            "Maleoon 920C",
+        )
+
+    def test_harmony_performance_context_analysis_tracks_residency_frames_and_touches(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                refresh_rate_hz=60.0,
+                performance={
+                    "refresh_rate_counts": {"60": 100, "120": 50},
+                    "frame_sample_count": 100,
+                    "compositor_fps": 59.8,
+                    "frame_interval_average_ms": 16.72,
+                    "frame_interval_p95_ms": 17.0,
+                    "missed_vsync_interval_count": 1,
+                    "touch_down_times_us": [1, 2],
+                    "display_width_px": 1320,
+                    "display_height_px": 2856,
+                },
+            ),
+            ContextSample(
+                110.0,
+                refresh_rate_hz=120.0,
+                performance={
+                    "refresh_rate_counts": {"60": 700, "120": 650},
+                    "frame_sample_count": 100,
+                    "compositor_fps": 118.0,
+                    "frame_interval_average_ms": 8.47,
+                    "frame_interval_p95_ms": 16.8,
+                    "missed_vsync_interval_count": 2,
+                    "touch_down_times_us": [1, 2, 3, 4],
+                },
+            ),
+        ]
+        result = analyze_performance_contexts(
+            contexts,
+            {"performance_probe": {"supported_refresh_rates_hz": [60, 120], "gpu_renderer": "Maleoon 920C"}},
+        )
+        self.assertEqual(result["current_refresh_rate_hz"], 120.0)
+        self.assertEqual(result["touch_interaction_count"], 2)
+        self.assertEqual(result["frame_sample_count"], 200)
+        self.assertAlmostEqual(result["missed_vsync_interval_pct"], 1.5)
+        residency = {row["refresh_rate_hz"]: row for row in result["refresh_residency"]}
+        self.assertAlmostEqual(residency[60.0]["share_pct"], 66.666, places=2)
+        self.assertEqual(result["gpu_renderer"], "Maleoon 920C")
+
+    def test_android_performance_context_analysis_uses_counter_deltas(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example",
+                foreground_activity=".MainActivity",
+                refresh_rate_hz=60.0,
+                performance={
+                    "foreground_window_name": "com.example/com.example.MainActivity",
+                    "refresh_rate_durations_s": {"60": 100.0, "120": 50.0},
+                    "frame_counter_total": 100,
+                    "frame_counter_deadline_missed": 2,
+                    "frame_counter_missed_vsync": 1,
+                    "frame_counter_janky": 3,
+                    "frame_histogram_ms": {"10": 80, "20": 20},
+                },
+            ),
+            ContextSample(
+                110.0,
+                foreground_package="com.example",
+                foreground_activity=".MainActivity",
+                refresh_rate_hz=60.0,
+                performance={
+                    "foreground_window_name": "com.example/com.example.MainActivity",
+                    "refresh_rate_durations_s": {"60": 108.0, "120": 52.0},
+                    "frame_counter_total": 160,
+                    "frame_counter_deadline_missed": 5,
+                    "frame_counter_missed_vsync": 2,
+                    "frame_counter_janky": 5,
+                    "frame_histogram_ms": {"10": 120, "20": 40},
+                    "display_width_px": 1260,
+                    "display_height_px": 2800,
+                },
+            ),
+        ]
+        result = analyze_performance_contexts(
+            contexts,
+            {"performance_probe": {"supported_refresh_rates_hz": [60, 90, 120]}},
+        )
+        self.assertAlmostEqual(result["sampled_frame_rate_fps"], 6.0)
+        self.assertEqual(result["frame_sample_count"], 60)
+        self.assertEqual(result["frame_metric_p95_ms"], 20.0)
+        self.assertEqual(result["frame_deadline_missed_count"], 3)
+        self.assertAlmostEqual(result["frame_issue_pct"], 5.0)
+        self.assertEqual(result["touch_interaction_count"], None)
+        residency = {row["refresh_rate_hz"]: row for row in result["refresh_residency"]}
+        self.assertAlmostEqual(residency[60.0]["share_pct"], 80.0)
+        self.assertAlmostEqual(residency[120.0]["share_pct"], 20.0)
+        self.assertEqual(
+            result["refresh_residency_source"],
+            "Android SurfaceFlinger refresh-rate duration delta",
+        )
+
+    def test_android_asleep_context_does_not_fake_refresh_residency_or_zero_fps(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example",
+                screen_state="Asleep",
+                refresh_rate_hz=60.0,
+                performance={
+                    "platform": "android",
+                    "frame_data_available": False,
+                    "frame_unavailable_reason": "screen asleep",
+                },
+            ),
+            ContextSample(
+                110.0,
+                foreground_package="com.example",
+                screen_state="Asleep",
+                refresh_rate_hz=60.0,
+                performance={
+                    "platform": "android",
+                    "frame_data_available": False,
+                    "frame_unavailable_reason": "screen asleep",
+                },
+            ),
+        ]
+        result = analyze_performance_contexts(contexts, {"platform": "android"})
+        self.assertEqual(result["refresh_residency"], [])
+        self.assertIsNone(result["sampled_frame_rate_fps"])
+        self.assertEqual(result["frame_rate_label"], "应用 UI 帧提交速率")
+        self.assertEqual(result["frame_unavailable_reason"], "screen asleep")
+        self.assertIsNone(result["touch_interaction_count"])
+
+    def test_harmony_normalized_sample_preserves_signed_current_and_cpu_delta(self) -> None:
+        policies = [
+            CpuPolicy(
+                name="policy0",
+                path="hidumper --cpufreq",
+                cluster_index=0,
+                label="Performance",
+                cores=[0, 1],
+                max_khz=2_000_000,
+            )
+        ]
+        previous = {
+            "cpu": CpuTimes.from_values([100, 0, 50, 850, 0, 0, 0, 0]),
+            "cpu0": CpuTimes.from_values([50, 0, 25, 425, 0, 0, 0, 0]),
+            "cpu1": CpuTimes.from_values([50, 0, 25, 425, 0, 0, 0, 0]),
+        }
+        sample, counters = build_harmony_sample(
+            1,
+            1_783_934_231.0,
+            "pluggedType: 0\nchargingStatus: 0\nvoltage: 4318299\n"
+            "nowCurrent: -100\ntemperature: 280\n",
+            "cpu  120 0 60 920 0 0 0 0\n"
+            "cpu0 60 0 30 460 0 0 0 0\n"
+            "cpu1 60 0 30 460 0 0 0 0\n",
+            previous,
+            policies,
+            {"policy0": 1500.0},
+            previous_timestamp_s=1_783_934_230.0,
+            max_cpu_gap_s=3.0,
+        )
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertEqual(sample.current_ma, 100.0)
+        self.assertEqual(sample.signed_current_ma, -100.0)
+        self.assertEqual(sample.direction, "discharging")
+        self.assertAlmostEqual(sample.power_mw, 431.8299)
+        self.assertGreater(sample.cpu_pct or 0.0, 0.0)
+        self.assertIn("policy0", sample.cluster_cpu_pct)
+        self.assertEqual(sample.power_source, "harmony_battery_service")
+        self.assertIn("cpu", counters)
 
 
 class IosAdapterTests(unittest.TestCase):
@@ -1151,6 +1525,102 @@ class IosAdapterTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_harmony_analysis_and_report_use_hdc_sources_without_android_attribution(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index),
+                uptime_s=1_783_934_230.0 + index,
+                current_ma=100.0 + index * 10,
+                signed_current_ma=-100.0 - index * 10,
+                voltage_mv=4320.0 - index,
+                power_mw=(100.0 + index * 10) * (4320.0 - index) / 1000.0,
+                direction="discharging",
+                cpu_pct=20.0 + index,
+                core_cpu_pct={"0": 20.0 + index, "1": 25.0 + index},
+                cluster_cpu_pct={"policy0": 22.5 + index},
+                frequencies_mhz={"policy0": 1300.0 + index * 100},
+                battery_temperature_c=28.0,
+                power_source="harmony_battery_service",
+            )
+            for index in range(3)
+        ]
+        metadata = {
+            "platform": "harmony",
+            "title": "HarmonyOS smoke",
+            "sample_interval_s": 1.0,
+            "session_mode": False,
+            "foreground_package": "yylx.danmaku.bili",
+            "cpu_policies": [
+                {
+                    "name": "policy0",
+                    "path": "hidumper --cpufreq",
+                    "cluster_index": 0,
+                    "label": "Performance",
+                    "cores": [0, 1],
+                    "min_khz": None,
+                    "max_khz": 1_500_000,
+                    "available_frequencies_khz": [],
+                    "governor": None,
+                    "core_control": {},
+                }
+            ],
+            "gpu_source": None,
+            "gpu_probe": {
+                "provider": "HarmonyOS production shell",
+                "model": "Kirin9010S",
+                "reason": "GPU sysfs is restricted",
+            },
+            "device": {
+                "brand": "HUAWEI",
+                "model": "nova 16 Pro",
+                "hardware": "HL1CPLM",
+                "soc_model": "Kirin9010S",
+                "harmony": "6.1.0.130",
+            },
+            "battery_start": {"level_pct": 90, "temperature_c": 28.0},
+            "battery_end": {"level_pct": 90, "temperature_c": 28.0},
+            "system_monitor": {"enabled": True},
+        }
+        analysis = analyze_run(
+            samples,
+            metadata,
+            {},
+            [],
+            thermal_snapshots=[
+                ThermalSnapshot(
+                    uptime_s=samples[1].uptime_s,
+                    host_epoch_s=1_783_934_231.0,
+                    status=None,
+                    temperatures=[
+                        {
+                            "name": "Battery",
+                            "type": "Battery",
+                            "value_c": 28.0,
+                            "status": 0,
+                            "status_available": False,
+                        }
+                    ],
+                )
+            ],
+        )
+        fragment = build_report_fragment(
+            {
+                "metadata": metadata,
+                "analysis": analysis,
+                "samples": [item.__dict__ for item in samples],
+            }
+        )
+
+        sources = {item["source"] for item in analysis["data_sources"]}
+        self.assertIn("HarmonyOS BatteryService via hidumper", sources)
+        self.assertEqual(analysis["cpu"]["source"], "HarmonyOS /proc/stat + hidumper --cpufreq")
+        self.assertIsNone(analysis["thermal"]["maximum_status"])
+        self.assertIn("HarmonyOS 6.1.0.130", fragment)
+        self.assertIn("HDC 实测计数器", fragment)
+        self.assertIn("Android BatteryStats、ADPF", fragment)
+        self.assertIn("GPU sysfs is restricted", fragment)
+
     def test_ios_analysis_and_report_keep_physical_power_separate_from_dvt_scores(self) -> None:
         samples = [
             Sample(
@@ -1262,7 +1732,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(prepared["samples"][0]["elapsed_s"], 0.0)
         self.assertEqual(prepared["samples"][-1]["elapsed_s"], 3599.0)
 
-    def test_report_contains_system_and_thermal_views(self) -> None:
+    def test_report_prioritizes_performance_context_and_keeps_only_compact_interference(self) -> None:
         bundle = {
             "metadata": {"title": "test", "device": {}, "cpu_policies": []},
             "samples": [
@@ -1301,6 +1771,25 @@ class ReportTests(unittest.TestCase):
                     "top_processes": [],
                     "hot_threads": [],
                 },
+                "performance": {
+                    "available": True,
+                    "current_refresh_rate_hz": 120.0,
+                    "peak_refresh_rate_hz": 120.0,
+                    "sampled_compositor_fps": 118.4,
+                    "frame_interval_p95_ms": 16.7,
+                    "frame_sample_count": 240,
+                    "missed_vsync_interval_pct": 0.8,
+                    "touch_interaction_count": 8,
+                    "touch_interactions_per_minute": 4.0,
+                    "refresh_residency": [
+                        {"refresh_rate_hz": 120.0, "estimated_duration_s": 55.0, "share_pct": 91.7}
+                    ],
+                    "supported_refresh_rates_hz": [60.0, 120.0],
+                    "foreground_window_name": "bili0",
+                    "display_width_px": 1320,
+                    "display_height_px": 2856,
+                    "gpu_renderer": "Maleoon 920C",
+                },
                 "thermal": {"sensors": [], "cooling_devices": []},
                 "scheduler": {"cpusets": [], "cpu_policies": [], "hint_sessions": [], "process_states": []},
                 "applications": {},
@@ -1311,13 +1800,15 @@ class ReportTests(unittest.TestCase):
             },
         }
         fragment = build_report_fragment(bundle)
-        self.assertIn("全系统活动", fragment)
-        self.assertIn("热控与调度状态", fragment)
+        self.assertIn("性能与功耗上下文", fragment)
+        self.assertIn("刷新档位驻留", fragment)
+        self.assertIn("合成器抽样 FPS", fragment)
+        self.assertIn("硬件触控采样率未公开", fragment)
+        self.assertNotIn("热控与调度状态", fragment)
         self.assertIn("DEX AOT compilation", fragment)
         self.assertIn("数据质量", fragment)
         self.assertIn("测试项分析", fragment)
         self.assertIn("测试项矩阵", fragment)
-        self.assertIn("GC / kworker / 内核与显示活动聚合", fragment)
         self.assertIn("Adreno830v2", fragment)
         self.assertIn("GPU 进程内存快照", fragment)
         self.assertIn("surfaceflinger", fragment)

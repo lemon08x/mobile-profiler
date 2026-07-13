@@ -127,6 +127,7 @@ class ContextSample:
     brightness_raw: Optional[float] = None
     refresh_rate_hz: Optional[float] = None
     source: str = "sampler"
+    performance: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

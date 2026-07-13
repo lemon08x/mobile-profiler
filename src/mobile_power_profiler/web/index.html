@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Power Profiler</title>
-  <link rel="stylesheet" href="/app.css">
-  <script src="/app.js" defer></script>
+  <link rel="stylesheet" href="/app.css?v=performance-context-2">
+  <script src="/app.js?v=performance-context-2" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -23,11 +23,7 @@
         </button>
         <button class="nav-item" type="button" data-view="system">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16M7 3v4M12 10v4M17 17v4"/></svg>
-          <span>系统活动</span>
-        </button>
-        <button class="nav-item" type="button" data-view="thermal">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5a2 2 0 0 1 4 0v8.2a4 4 0 1 1-4 0V5zM12 8v7"/></svg>
-          <span>热控与调度</span>
+          <span>性能上下文</span>
         </button>
         <button class="nav-item" type="button" data-view="device">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M10 18.5h4"/></svg>
@@ -57,10 +53,11 @@
         </div>
         <div class="topbar-actions">
           <form class="adb-connect-form" id="adb-connect-form">
-            <label for="adb-address-input">ADB IP</label>
-            <input id="adb-address-input" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.20:5555">
+            <label for="adb-address-input">ADB IP / HDC IP</label>
+            <input id="adb-address-input" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.20:5555 或 harmony:192.168.1.20:8710">
             <button type="submit">连接</button>
             <button class="tcpip-button" id="enable-tcpip" type="button" title="对当前设备执行 adb tcpip 5555，并自动连接 Wi-Fi IP">无线 ADB</button>
+            <button class="tcpip-button" id="enable-harmony-tcpip" type="button" title="对当前 USB 鸿蒙设备执行 hdc tmode port 8710，并自动连接 Wi-Fi IP">鸿蒙无线</button>
             <button class="tcpip-button" id="pair-ios" type="button" title="通过已信任的 USB iPhone 创建 RemotePairing 并缓存无线端点">iOS 无线</button>
             <button class="disconnect-button" id="disconnect-wireless" type="button" title="断开当前选择的无线 ADB 设备">断开无线</button>
           </form>
@@ -152,7 +149,7 @@
                     <input id="unplugged-input" name="require_unplugged" type="checkbox" checked><i aria-hidden="true"></i>
                   </label>
                   <label class="switch-row">
-                    <span><strong>全系统活动监控</strong><small>低频采集进程、热点线程、热控、cpuset 与 ADPF</small></span>
+                    <span><strong>性能干扰监控</strong><small>低频采集进程与温度，仅在发现后台或热异常时提示</small></span>
                     <input id="system-monitor-input" name="system_monitor" type="checkbox" checked><i aria-hidden="true"></i>
                   </label>
                 </div>
@@ -178,7 +175,7 @@
                       <label for="gpu-path-input">GPU 频率节点 <span>可选</span></label>
                       <input id="gpu-path-input" type="text" placeholder="/sys/class/devfreq/.../cur_freq">
                     </div>
-                    <div class="form-row monitor-intervals">
+                     <div class="form-row monitor-intervals">
                       <div class="form-field">
                         <label for="process-interval-input">系统进程</label>
                         <div class="input-with-unit"><input id="process-interval-input" type="number" min="2" max="600" value="10"><span>秒</span></div>
@@ -189,12 +186,12 @@
                       </div>
                     </div>
                     <div class="form-row monitor-intervals">
-                      <div class="form-field">
-                        <label for="thermal-interval-input">热状态</label>
+                       <div class="form-field">
+                         <label for="thermal-interval-input">温度快照</label>
                         <div class="input-with-unit"><input id="thermal-interval-input" type="number" min="2" max="600" value="10"><span>秒</span></div>
                       </div>
-                      <div class="form-field">
-                        <label for="scheduler-interval-input">调度 / ADPF</label>
+                       <div class="form-field">
+                         <label for="scheduler-interval-input">CPU 频率上下文</label>
                         <div class="input-with-unit"><input id="scheduler-interval-input" type="number" min="5" max="1800" value="30"><span>秒</span></div>
                       </div>
                     </div>
@@ -247,9 +244,11 @@
                   <div class="panel-heading"><div><small>DEVICE CONTEXT</small><h2>当前场景</h2></div><span class="data-source" id="context-source">sampler</span></div>
                   <dl class="context-list">
                     <div><dt>前台应用</dt><dd id="context-package">--</dd></div>
-                    <div><dt>Activity</dt><dd id="context-activity">--</dd></div>
+                    <div><dt>Activity / 窗口</dt><dd id="context-activity">--</dd></div>
                     <div><dt>屏幕</dt><dd id="context-screen">--</dd></div>
-                    <div><dt>亮度 / 刷新率</dt><dd id="context-display">--</dd></div>
+                    <div><dt>刷新率 / 抽样 FPS</dt><dd id="context-display">--</dd></div>
+                    <div><dt>帧间隔 / 慢帧</dt><dd id="context-frame">--</dd></div>
+                    <div><dt>触控交互</dt><dd id="context-touch">--</dd></div>
                     <div><dt>电压 / 电量</dt><dd id="context-battery">--</dd></div>
                     <div><dt>设备重连</dt><dd id="context-reconnect">0</dd></div>
                   </dl>
@@ -266,82 +265,53 @@
 
         <section class="view" data-panel="system" hidden>
           <div class="view-header system-view-header">
-            <div><small>WHOLE-SYSTEM ACTIVITY</small><h2>系统进程与热点线程</h2><p>平台侧快照覆盖可观测的应用、系统进程和线程；重点活动会与同期电池侧功率关联。</p></div>
-            <span class="live-source-badge"><i></i><span id="system-snapshot-status">等待系统快照</span></span>
+            <div><small>PERFORMANCE & POWER CONTEXT</small><h2>显示、帧节奏与交互</h2><p>优先展示刷新率、合成器帧率、帧间隔、触控交互和影响功耗的关键上下文；热控与系统活动只保留异常提示。</p></div>
+            <span class="live-source-badge"><i></i><span id="performance-snapshot-status">等待性能上下文</span></span>
+          </div>
+
+          <div class="system-stat-grid">
+            <article class="panel system-stat"><small>REFRESH RATE</small><strong id="performance-refresh-value">--</strong><span id="performance-refresh-label">当前显示档位</span></article>
+            <article class="panel system-stat"><small>FRAME RATE</small><strong id="performance-fps-value">--</strong><span id="performance-fps-label">帧率抽样</span></article>
+            <article class="panel system-stat"><small>FRAME P95</small><strong id="performance-frame-value">--</strong><span id="performance-frame-label">帧间隔</span></article>
+            <article class="panel system-stat accent"><small>TOUCHES</small><strong id="performance-touch-value">--</strong><span id="performance-touch-label">硬件采样率未公开</span></article>
+          </div>
+
+          <div class="system-split-grid">
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>REFRESH RESIDENCY</small><h2>刷新档位驻留</h2></div><span class="data-source" id="performance-residency-source">平台累计计数</span></div>
+              <div class="performance-residency-list" id="performance-residency-list"><div class="empty-row">等待刷新档位计数</div></div>
+            </section>
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>RUNTIME CONTEXT</small><h2>关键上下文</h2></div><span class="data-source">window / display / thermal</span></div>
+              <dl class="context-list performance-context-list">
+                <div><dt>前台窗口</dt><dd id="performance-window-value">--</dd></div>
+                <div><dt>分辨率 / 亮度</dt><dd id="performance-display-value">--</dd></div>
+                <div><dt>GPU</dt><dd id="performance-gpu-value">--</dd></div>
+                <div><dt>最高温度</dt><dd id="performance-temperature-value">--</dd></div>
+                <div><dt>刷新切换</dt><dd id="performance-switch-value">0</dd></div>
+                <div><dt>采样帧数</dt><dd id="performance-frame-count">0</dd></div>
+              </dl>
+            </section>
           </div>
 
           <section class="panel priority-alert idle" id="system-priority-banner">
             <span class="priority-alert-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4L12 3zM12 9v5M12 17.5v.5"/></svg></span>
-            <div><small>PRIORITY BACKGROUND WATCH</small><h3 id="system-priority-title">未检测到 DEX / 系统更新高影响活动</h3><p id="system-priority-detail">持续监控 dex2oat、dexopt、artd、installd、profman、odrefresh、update_engine 与 apexd。</p></div>
-            <span class="priority-state" id="system-priority-badge">STANDBY</span>
-          </section>
-
-          <div class="system-stat-grid">
-            <article class="panel system-stat"><small>PROCESSES</small><strong id="system-process-count">--</strong><span>全系统进程 / 内核任务</span></article>
-            <article class="panel system-stat"><small>THREADS</small><strong id="system-thread-count">--</strong><span>全系统线程</span></article>
-            <article class="panel system-stat"><small>SNAPSHOTS</small><strong id="system-snapshot-count">0</strong><span>进程快照</span></article>
-            <article class="panel system-stat accent"><small>PRIORITY ACTIVE</small><strong id="system-priority-count">0</strong><span>当前重点活动</span></article>
-          </div>
-
-          <section class="panel system-table-panel">
-            <div class="panel-heading"><div><small>DEX / UPDATE / PACKAGE</small><h2>重点后台活动</h2></div><span class="data-source">ps + top</span></div>
-            <div class="system-table-wrap"><table class="system-table"><thead><tr><th>活动</th><th>PID</th><th>CPU</th><th>策略 / 状态</th><th>判定</th></tr></thead><tbody id="watched-process-body"><tr><td colspan="5" class="table-empty">等待系统快照...</td></tr></tbody></table></div>
+            <div><small>INTERFERENCE WATCH</small><h3 id="system-priority-title">未检测到明显性能干扰</h3><p id="system-priority-detail">仅在后台更新、安装、编译、明显进程 CPU 或热状态异常时提示。</p></div>
+            <span class="priority-state" id="system-priority-badge">CLEAR</span>
           </section>
 
           <div class="system-split-grid">
             <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>TOP PROCESSES</small><h2>整机 CPU 热点</h2></div><span class="data-source">10 s default</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>进程</th><th>CPU</th><th>内存</th><th>PCY</th></tr></thead><tbody id="system-process-body"><tr><td colspan="4" class="table-empty">暂无进程快照</td></tr></tbody></table></div>
+              <div class="panel-heading"><div><small>TOP PROCESSES</small><h2>当前 CPU 热点</h2></div><span class="data-source">最多 5 项</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>进程</th><th>CPU</th><th>内存</th><th>状态</th></tr></thead><tbody id="system-process-body"><tr><td colspan="4" class="table-empty">暂无进程快照</td></tr></tbody></table></div>
             </section>
             <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>HOT THREADS</small><h2>热点线程</h2></div><span class="data-source">30 s default</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>线程 / 进程</th><th>TID</th><th>CPU</th><th>PCY</th></tr></thead><tbody id="system-thread-body"><tr><td colspan="4" class="table-empty">暂无线程快照</td></tr></tbody></table></div>
-            </section>
-          </div>
-        </section>
-
-        <section class="view" data-panel="thermal" hidden>
-          <div class="view-header system-view-header">
-            <div><small>THERMAL & SCHEDULER</small><h2>热策略与调度证据</h2><p>展示当前平台实际暴露的温度、冷却、调度和性能提示状态；不可用能力会保持为空。</p></div>
-            <span class="live-source-badge"><i></i><span id="thermal-snapshot-status">等待热控快照</span></span>
-          </div>
-
-          <div class="system-stat-grid thermal-stat-grid">
-            <article class="panel system-stat"><small>THERMAL STATUS</small><strong id="thermal-status-value">--</strong><span id="thermal-status-label">ThermalService</span></article>
-            <article class="panel system-stat"><small>HOTTEST SENSOR</small><strong id="thermal-hottest-value">--</strong><span id="thermal-hottest-label">--</span></article>
-            <article class="panel system-stat"><small>SENSORS</small><strong id="thermal-sensor-count">0</strong><span>HAL / BCL 传感器</span></article>
-            <article class="panel system-stat"><small>ADPF SESSIONS</small><strong id="adpf-session-count">0</strong><span>活跃 Performance Hint</span></article>
-          </div>
-
-          <div class="system-split-grid">
-            <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>THERMAL HAL</small><h2>温度与阈值</h2></div><span class="data-source">dumpsys thermalservice</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>传感器</th><th>数值</th><th>级别</th><th>首个阈值</th></tr></thead><tbody id="thermal-sensor-body"><tr><td colspan="4" class="table-empty">暂无温度快照</td></tr></tbody></table></div>
-            </section>
-            <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>COOLING DEVICES</small><h2>冷却动作</h2></div><span class="data-source">HAL observable</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>设备</th><th>值</th><th>状态</th></tr></thead><tbody id="cooling-device-body"><tr><td colspan="3" class="table-empty">暂无冷却设备数据</td></tr></tbody></table></div>
+              <div class="panel-heading"><div><small>BACKGROUND ANOMALIES</small><h2>后台异常</h2></div><span class="data-source">仅显示命中项</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>活动</th><th>PID</th><th>CPU</th><th>判定</th></tr></thead><tbody id="watched-process-body"><tr><td colspan="4" class="table-empty">未检测到后台异常</td></tr></tbody></table></div>
             </section>
           </div>
 
-          <div class="system-split-grid">
-            <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>CPUSETS / CPUFREQ</small><h2>调度边界</h2></div><span class="data-source">cgroup + sysfs</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>组 / Policy</th><th>CPU / 范围</th><th>运行时控制</th></tr></thead><tbody id="scheduler-policy-body"><tr><td colspan="3" class="table-empty">暂无调度快照</td></tr></tbody></table></div>
-            </section>
-            <section class="panel system-table-panel">
-              <div class="panel-heading"><div><small>ADPF</small><h2>Performance Hint 会话</h2></div><span class="data-source">performance_hint</span></div>
-              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>PID / UID</th><th>TIDs</th><th>目标</th><th>标志</th></tr></thead><tbody id="adpf-session-body"><tr><td colspan="4" class="table-empty">暂无 ADPF 会话</td></tr></tbody></table></div>
-            </section>
-          </div>
-
-          <section class="panel system-table-panel">
-            <div class="panel-heading"><div><small>ACTIVITY MANAGER</small><h2>进程调度状态</h2></div><span class="data-source">proc state / sched group / frozen</span></div>
-            <div class="system-table-wrap"><table class="system-table"><thead><tr><th>进程</th><th>PID / UID</th><th>Proc state</th><th>Sched group</th><th>冻结</th></tr></thead><tbody id="scheduler-process-body"><tr><td colspan="5" class="table-empty">暂无进程状态</td></tr></tbody></table></div>
-            <div class="power-state-strip" id="scheduler-power-state"><span>PowerManager 状态尚不可用</span></div>
-          </section>
-
-          <p class="observability-note"><strong>可观测边界：</strong>这里能看到系统暴露的热状态、静态阈值和调度结果；量产机通常不允许读取完整 OEM 热控算法、sched_debug、governor 或 uclamp 内部配置。</p>
+          <p class="observability-note"><strong>边界：</strong>帧率与帧耗时来自平台公开的合成器或前台窗口统计，不等于应用内部渲染线程或最终可见 FPS；触摸次数来自已分发事件，不能代表面板硬件触控采样率。完整原始快照仍保留在 JSONL 中。</p>
         </section>
 
         <section class="view" data-panel="device" hidden>
@@ -358,7 +328,7 @@
               <article class="panel probe-identity"><small>DEVICE</small><h3 id="probe-device-name">--</h3><p id="probe-device-detail">--</p><code id="probe-serial">--</code></article>
               <article class="panel probe-status"><small>POWER STATE</small><h3 id="probe-power-state">--</h3><p id="probe-current-state">--</p><span id="probe-power-badge" class="probe-badge">UNKNOWN</span></article>
               <article class="panel probe-status"><small>GPU SOURCE</small><h3 id="probe-gpu-state">--</h3><p id="probe-gpu-detail">--</p><span id="probe-gpu-badge" class="probe-badge neutral">CHECKING</span></article>
-              <article class="panel probe-status"><small>FOREGROUND</small><h3 id="probe-foreground">--</h3><p>ActivityManager sampled package</p></article>
+              <article class="panel probe-status"><small>FOREGROUND</small><h3 id="probe-foreground">--</h3><p>platform context sampler</p></article>
             </div>
             <div class="probe-detail-grid">
               <section class="panel"><div class="panel-heading"><div><small>CPU POLICIES</small><h2>CPU 集群</h2></div></div><div class="capability-table" id="probe-cpu-table"></div></section>
