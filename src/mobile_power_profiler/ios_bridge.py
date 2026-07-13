@@ -1,0 +1,1079 @@
+from __future__ import annotations
+
+"""Optional pymobiledevice3 sidecar used by the platform-neutral collector.
+
+This file is intentionally executable by a Python interpreter that does not have
+the main project installed.  The parent process talks to it through JSON/JSONL,
+keeping the ADB standard-library runtime independent from the optional iOS
+dependency and providing the same boundary a native HarmonyOS sidecar can use.
+"""
+
+import argparse
+import asyncio
+import dataclasses
+import json
+import os
+import plistlib
+import socket
+import sys
+import time
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import Any, AsyncIterator, Optional
+
+
+IMPORT_ERROR: Optional[BaseException] = None
+try:
+    from pymobiledevice3 import usbmux
+    from pymobiledevice3.bonjour import browse_remotepairing
+    from pymobiledevice3.exceptions import RemotePairingCompletedError
+    from pymobiledevice3.lockdown import (
+        create_using_tcp,
+        create_using_usbmux,
+    )
+    try:
+        from pymobiledevice3.lockdown import get_mobdev2_devices
+    except ImportError:
+        get_mobdev2_devices = None
+    try:
+        from pymobiledevice3.lockdown import get_mobdev2_lockdowns
+    except ImportError:
+        get_mobdev2_lockdowns = None
+    from pymobiledevice3.pair_records import get_remote_pairing_record_filename
+    from pymobiledevice3.remote import userspace_tunnel
+    from pymobiledevice3.remote.tunnel_service import (
+        CoreDeviceTunnelProxy,
+        RemotePairingLockdownService,
+        create_core_device_tunnel_service_using_remotepairing,
+    )
+    from pymobiledevice3.services.diagnostics import DiagnosticsService
+    try:
+        from pymobiledevice3.services.dvt.instruments.application_listing import ApplicationListing
+    except ImportError:
+        ApplicationListing = None
+    from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
+    from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+    from pymobiledevice3.services.dvt.instruments.graphics import Graphics
+    from pymobiledevice3.services.dvt.instruments.notifications import Notifications
+    from pymobiledevice3.services.dvt.instruments.sysmontap import Sysmontap
+except BaseException as exc:  # pragma: no cover - exercised through the parent runtime check
+    IMPORT_ERROR = exc
+
+
+DEFAULT_REMOTE_PORT = 49152
+PAIR_CACHE = Path.home() / ".pymobiledevice3"
+COLLECTOR_PROCESSES = {"sysmond", "DTServiceHub", "remotepairingdeviced"}
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()  # type: ignore[union-attr]
+        except Exception:
+            pass
+    return str(value)
+
+
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, default=_json_default), flush=True)
+
+
+def _emit(event_type: str, **payload: object) -> None:
+    _print_json({"type": event_type, **payload})
+
+
+def _require_runtime() -> None:
+    if IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "pymobiledevice3 is unavailable in the selected iOS Python runtime: "
+            f"{IMPORT_ERROR}"
+        )
+
+
+def _pair_record_candidates(udid: str) -> list[Path]:
+    candidates = [PAIR_CACHE / f"{udid}.plist"]
+    if os.name == "nt":
+        program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+        lockdown = program_data / "Apple" / "Lockdown"
+        candidates.extend(
+            [
+                lockdown / f"{udid}.plist.tmp",
+                lockdown / f"{udid}.plist",
+            ]
+        )
+    return candidates
+
+
+def _load_pair_record(path: Path) -> Optional[dict[str, object]]:
+    try:
+        value = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _remote_pair_record_path(udid: str) -> Path:
+    return PAIR_CACHE / f"{get_remote_pairing_record_filename(udid)}.plist"
+
+
+async def _usb_devices() -> list[object]:
+    return [device for device in await usbmux.list_devices() if device.connection_type == "USB"]
+
+
+async def _open_usb_lockdown(udid: str, *, autopair: bool) -> object:
+    for path in _pair_record_candidates(udid):
+        record = _load_pair_record(path)
+        if record is None:
+            continue
+        client = await create_using_usbmux(
+            serial=udid,
+            pair_record=record,
+            autopair=False,
+        )
+        if client.paired:
+            return client
+        await client.close()
+
+    if not autopair:
+        raise RuntimeError(
+            "the iPhone is visible over USB but has no valid trust record; unlock it and trust this computer"
+        )
+
+    try:
+        return await create_using_usbmux(serial=udid, autopair=True)
+    except Exception:
+        # Apple Devices can accept the trust operation but reject overwriting its
+        # stale pair record with Win32 error 183. pymobiledevice3 has already saved
+        # the fresh record in its local cache, so retry it explicitly.
+        record = _load_pair_record(PAIR_CACHE / f"{udid}.plist")
+        if record is None:
+            raise
+        client = await create_using_usbmux(
+            serial=udid,
+            pair_record=record,
+            autopair=False,
+        )
+        if not client.paired:
+            await client.close()
+            raise
+        return client
+
+
+async def _open_tcp_lockdown(udid: str, host: str) -> object:
+    for path in _pair_record_candidates(udid):
+        record = _load_pair_record(path)
+        if record is None:
+            continue
+        client = await create_using_tcp(hostname=host, pair_record=record, autopair=False)
+        if client.paired:
+            return client
+        await client.close()
+    raise RuntimeError(f"no valid Wi-Fi lockdown pair record for {udid}")
+
+
+def _peer_host(client: object) -> Optional[str]:
+    hostname = getattr(client, "hostname", None)
+    if hostname:
+        return str(hostname).split("%", 1)[0]
+    service = getattr(client, "service", None)
+    writer = getattr(service, "writer", None)
+    if writer is not None:
+        peer = writer.get_extra_info("peername")
+        if isinstance(peer, tuple) and peer:
+            return str(peer[0]).split("%", 1)[0]
+    return None
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 0.8) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _private_ipv4(address: object) -> bool:
+    text = str(address)
+    return text.startswith("10.") or text.startswith("192.168.") or any(
+        text.startswith(f"172.{part}.") for part in range(16, 32)
+    )
+
+
+async def _network_devices() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    clients: list[tuple[Optional[str], object]] = []
+    try:
+        if get_mobdev2_devices is not None:
+            clients = [(None, client) for client in list(await get_mobdev2_devices())]
+        elif get_mobdev2_lockdowns is not None:
+            clients = [
+                (host, client)
+                async for host, client in get_mobdev2_lockdowns(
+                    only_paired=False,
+                    timeout=2.0,
+                )
+            ]
+    except Exception:
+        return rows
+    for discovered_host, client in clients:
+        try:
+            values = dict(getattr(client, "all_values", {}) or {})
+            udid = str(
+                values.get("UniqueDeviceID")
+                or getattr(client, "udid", "")
+                or getattr(client, "identifier", "")
+            )
+            host = str(discovered_host).split("%", 1)[0] if discovered_host else _peer_host(client)
+            if not udid or not host:
+                continue
+            remote_paired = _remote_pair_record_path(udid).is_file()
+            remote_port = DEFAULT_REMOTE_PORT if remote_paired and _tcp_reachable(host, DEFAULT_REMOTE_PORT) else None
+            rows.append(
+                {
+                    "udid": udid,
+                    "name": values.get("DeviceName") or "iPhone",
+                    "product_type": values.get("ProductType"),
+                    "product_version": values.get("ProductVersion"),
+                    "build_version": values.get("BuildVersion"),
+                    "connection_type": "wireless",
+                    "host": host,
+                    "port": remote_port,
+                    "remote_paired": remote_paired,
+                    "state": "device" if remote_port else "basic",
+                }
+            )
+        finally:
+            with suppress(Exception):
+                await client.close()
+    return rows
+
+
+async def list_devices() -> dict[str, object]:
+    _require_runtime()
+    rows: dict[str, dict[str, object]] = {}
+    for device in await _usb_devices():
+        udid = str(device.serial)
+        item: dict[str, object] = {
+            "udid": udid,
+            "name": "iPhone",
+            "product_type": None,
+            "product_version": None,
+            "build_version": None,
+            "connection_type": "usb",
+            "remote_paired": _remote_pair_record_path(udid).is_file(),
+            "state": "unauthorized",
+        }
+        try:
+            client = await _open_usb_lockdown(udid, autopair=False)
+        except Exception:
+            rows[udid] = item
+            continue
+        try:
+            values = dict(client.all_values or {})
+            item.update(
+                {
+                    "name": values.get("DeviceName") or "iPhone",
+                    "product_type": values.get("ProductType"),
+                    "product_version": values.get("ProductVersion"),
+                    "build_version": values.get("BuildVersion"),
+                    "state": "device",
+                }
+            )
+        finally:
+            await client.close()
+        rows[udid] = item
+
+    for item in await _network_devices():
+        udid = str(item["udid"])
+        existing = rows.get(udid)
+        if existing is None or existing.get("state") != "device":
+            rows[udid] = item
+        elif item.get("port"):
+            existing["wireless_host"] = item.get("host")
+            existing["wireless_port"] = item.get("port")
+            existing["remote_paired"] = item.get("remote_paired")
+
+    return {"devices": list(rows.values())}
+
+
+async def _find_remote_endpoint(udid: str, timeout: float) -> Optional[dict[str, object]]:
+    answers = await browse_remotepairing(timeout=timeout)
+    candidates: list[tuple[str, int]] = []
+    for answer in answers:
+        addresses = list(getattr(answer, "addresses", []) or [])
+        addresses.sort(key=lambda item: not _private_ipv4(getattr(item, "ip", item)))
+        for address in addresses:
+            host = str(getattr(address, "full_ip", None) or getattr(address, "ip", address))
+            candidates.append((host, int(answer.port)))
+
+    for host, port in candidates:
+        service = None
+        try:
+            service = await create_core_device_tunnel_service_using_remotepairing(
+                udid,
+                host,
+                port,
+                autopair=False,
+            )
+            return {"host": host.split("%", 1)[0], "port": port}
+        except Exception:
+            continue
+        finally:
+            if service is not None:
+                with suppress(Exception):
+                    await service.close()
+
+    for item in await _network_devices():
+        if item.get("udid") == udid and item.get("host") and item.get("port"):
+            return {"host": item["host"], "port": item["port"]}
+    return None
+
+
+async def pair_device(udid: Optional[str], timeout: float) -> dict[str, object]:
+    _require_runtime()
+    devices = await _usb_devices()
+    if udid:
+        devices = [device for device in devices if str(device.serial) == udid]
+    if len(devices) != 1:
+        raise RuntimeError(f"expected one matching USB iPhone, found {len(devices)}")
+    udid = str(devices[0].serial)
+    client = await _open_usb_lockdown(udid, autopair=True)
+    created = False
+    try:
+        service = await RemotePairingLockdownService.create(client)
+        try:
+            try:
+                await service.connect(autopair=True)
+            except RemotePairingCompletedError:
+                created = True
+        finally:
+            await service.close()
+    finally:
+        await client.close()
+
+    if created:
+        await asyncio.sleep(0.8)
+    client = await _open_usb_lockdown(udid, autopair=False)
+    try:
+        service = await RemotePairingLockdownService.create(client)
+        try:
+            await service.connect(autopair=False)
+            if service.encryption_key is None:
+                raise RuntimeError("RemotePairing verification failed")
+        finally:
+            await service.close()
+    finally:
+        await client.close()
+
+    endpoint = await _find_remote_endpoint(udid, timeout)
+    values = await _device_values(udid, None)
+    return {
+        "udid": udid,
+        "created": created,
+        "remote_pairing": True,
+        "endpoint": endpoint,
+        "device": values,
+    }
+
+
+async def _device_values(udid: str, host: Optional[str]) -> dict[str, object]:
+    client = await (_open_tcp_lockdown(udid, host) if host else _open_usb_lockdown(udid, autopair=False))
+    try:
+        values = dict(client.all_values or {})
+        try:
+            developer_mode = await client.get_developer_mode_status()
+        except Exception:
+            developer_mode = None
+        try:
+            wifi_connections = await client.get_enable_wifi_connections()
+        except Exception:
+            wifi_connections = None
+        return {
+            "serial": udid,
+            "brand": "Apple",
+            "model": values.get("DeviceName") or values.get("ProductType") or "iPhone",
+            "device": values.get("ProductType"),
+            "product_type": values.get("ProductType"),
+            "hardware": values.get("HardwareModel"),
+            "cpu_architecture": values.get("CPUArchitecture"),
+            "ios": values.get("ProductVersion"),
+            "build": values.get("BuildVersion"),
+            "device_class": values.get("DeviceClass"),
+            "developer_mode": developer_mode,
+            "wifi_connections": wifi_connections,
+        }
+    finally:
+        await client.close()
+
+
+@asynccontextmanager
+async def _open_rsd(
+    udid: str,
+    host: Optional[str],
+    port: Optional[int],
+) -> AsyncIterator[object]:
+    previous_provider = userspace_tunnel._create_no_root_tunnel_provider
+
+    if host and port:
+        async def provider(serial: Optional[str], autopair: bool) -> tuple[object, None]:
+            service = await create_core_device_tunnel_service_using_remotepairing(
+                udid,
+                host,
+                int(port),
+                autopair=False,
+            )
+            return service, None
+    else:
+        async def provider(serial: Optional[str], autopair: bool) -> tuple[object, object]:
+            lockdown = await _open_usb_lockdown(udid, autopair=autopair)
+            return await CoreDeviceTunnelProxy.create(lockdown), lockdown
+
+    userspace_tunnel._create_no_root_tunnel_provider = provider
+    tunnel = userspace_tunnel.UserspaceRsdTunnel(serial=udid, autopair=False)
+    try:
+        async with tunnel as rsd:
+            yield rsd
+    finally:
+        userspace_tunnel._create_no_root_tunnel_provider = previous_provider
+
+
+def _battery_payload(raw: dict[str, object]) -> dict[str, object]:
+    telemetry = raw.get("PowerTelemetryData")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    external = bool(raw.get("ExternalConnected"))
+    charging = bool(raw.get("IsCharging"))
+    raw_current = raw.get("InstantAmperage")
+    if not isinstance(raw_current, (int, float)):
+        raw_current = raw.get("Amperage")
+    current = float(raw_current) if isinstance(raw_current, (int, float)) else None
+    status = (
+        "charging"
+        if charging
+        else "discharging"
+        if current is not None and current < 0
+        else "full"
+        if raw.get("FullyCharged")
+        else "idle"
+    )
+    temperature = raw.get("Temperature")
+    return {
+        "level_pct": raw.get("CurrentCapacity"),
+        "voltage_mv": raw.get("Voltage"),
+        "temperature_c": float(temperature) / 100.0 if isinstance(temperature, (int, float)) else None,
+        "status": status,
+        "powered": ["External"] if external else [],
+        "external_connected": external,
+        "is_charging": charging,
+        "fully_charged": bool(raw.get("FullyCharged")),
+        "current_ma": current,
+        "cycle_count": raw.get("CycleCount"),
+        "design_capacity_mah": raw.get("DesignCapacity"),
+        "nominal_charge_capacity_mah": raw.get("NominalChargeCapacity"),
+        "full_charge_capacity_mah": raw.get("AppleRawMaxCapacity") or raw.get("FullChargeCapacity"),
+        "maximum_capacity_pct": raw.get("MaxCapacity"),
+        "update_time": raw.get("UpdateTime"),
+        "power_telemetry": {
+            key: telemetry[key]
+            for key in (
+                "BatteryPower",
+                "SystemLoad",
+                "SystemPowerIn",
+                "SystemCurrentIn",
+                "SystemVoltageIn",
+                "SystemEnergyConsumed",
+                "AccumulatedSystemEnergyConsumed",
+            )
+            if key in telemetry
+        },
+    }
+
+
+def _battery_revision(raw: dict[str, object]) -> tuple[object, ...]:
+    telemetry = raw.get("PowerTelemetryData")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    return (
+        raw.get("UpdateTime"),
+        raw.get("InstantAmperage"),
+        raw.get("Amperage"),
+        raw.get("Voltage"),
+        raw.get("Temperature"),
+        telemetry.get("SystemLoad"),
+        telemetry.get("BatteryPower"),
+    )
+
+
+def _battery_sample_age(raw: dict[str, object], changed_host_epoch_s: float) -> float:
+    update_time = raw.get("UpdateTime")
+    if isinstance(update_time, (int, float)):
+        epoch_age = time.time() - float(update_time)
+        if -5.0 <= epoch_age <= 86_400.0:
+            return max(0.0, epoch_age)
+    return max(0.0, time.time() - changed_host_epoch_s)
+
+
+async def probe_device(
+    udid: str,
+    host: Optional[str],
+    port: Optional[int],
+) -> dict[str, object]:
+    _require_runtime()
+    device = await _device_values(udid, host)
+    async with _open_rsd(udid, host, port) as rsd:
+        async with DiagnosticsService(rsd) as diagnostics:
+            raw_battery = await diagnostics.get_battery()
+        hardware: dict[str, object] = {}
+        process_attributes: list[str] = []
+        system_attributes: list[str] = []
+        process_count: Optional[int] = None
+        graphics: dict[str, object] = {}
+        async with DvtProvider(rsd) as dvt:
+            async with DeviceInfo(dvt) as info:
+                hardware = dict(await info.hardware_information() or {})
+                process_attributes = sorted(await info.sysmon_process_attributes())
+                system_attributes = sorted(await info.sysmon_system_attributes())
+                with suppress(Exception):
+                    process_count = len(await info.proclist())
+            try:
+                async with Graphics(dvt) as monitor:
+                    graphics = dict(await asyncio.wait_for(anext(monitor.__aiter__()), timeout=5))
+            except Exception:
+                graphics = {}
+
+    cpu_count = hardware.get("numberOfCpus") or hardware.get("numberOfPhysicalCpus")
+    device["cpu_count"] = cpu_count
+    battery = _battery_payload(dict(raw_battery or {}))
+    power_telemetry = battery.get("power_telemetry")
+    power_telemetry = power_telemetry if isinstance(power_telemetry, dict) else {}
+    return {
+        "platform": "ios",
+        "device": device,
+        "battery": battery,
+        "current_command": "IORegistry IOPMPowerSource / PowerTelemetryData",
+        "current_command_ok": isinstance(battery.get("current_ma"), (int, float)),
+        "cpu_policies": [],
+        "gpu_source": {
+            "name": "Apple GPU",
+            "load_path": "DVT graphics Device Utilization %",
+            "load_format": "percentage",
+            "source_type": "ios_dvt_graphics",
+        },
+        "gpu_probe": {
+            "provider": "ios_dvt_graphics",
+            "device_utilization_pct": graphics.get("Device Utilization %"),
+            "renderer_utilization_pct": graphics.get("Renderer Utilization %"),
+            "tiler_utilization_pct": graphics.get("Tiler Utilization %"),
+            "core_animation_fps": graphics.get("CoreAnimationFramesPerSecond"),
+        },
+        "foreground_package": None,
+        "power_telemetry_available": any(
+            isinstance(power_telemetry.get(key), (int, float))
+            for key in ("SystemLoad", "BatteryPower", "SystemPowerIn")
+        ),
+        "system_monitor": {
+            "process_top_available": bool(process_attributes),
+            "process_count": process_count,
+            "process_attributes": process_attributes,
+            "system_attributes": system_attributes,
+            "thermalservice_available": battery.get("temperature_c") is not None,
+            "thermal_sensor_count": 1 if battery.get("temperature_c") is not None else 0,
+            "thermal_threshold_count": 0,
+            "cpusets": {},
+            "cpu_policies": [],
+            "adpf_available": False,
+            "adpf_active_session_count": 0,
+            "scheduler_warnings": [],
+        },
+        "capabilities": {
+            "remote_xpc": True,
+            "wireless": bool(host and port),
+            "process_cpu": bool(process_attributes),
+            "gpu_utilization": bool(graphics),
+            "application_state_notifications": True,
+            "battery_power_update_hint_s": 20,
+        },
+        "connection": {"type": "wireless" if host and port else "usb", "host": host, "port": port},
+    }
+
+
+def _number(value: object, default: float = 0.0) -> float:
+    return float(value) if isinstance(value, (int, float)) else default
+
+
+def _mach_seconds(value: object, numer: float, denom: float) -> float:
+    return _number(value) * numer / max(1.0, denom) / 1_000_000_000.0
+
+
+def _process_snapshot(
+    processes: list[dict[str, object]],
+    uptime_s: float,
+    applications: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    watched: list[dict[str, object]] = []
+    for process in processes:
+        name = str(process.get("name") or process.get("comm") or "unknown")
+        cpu = _number(process.get("cpuUsage"))
+        uid = process.get("uid")
+        sandboxed = bool(process.get("__sandbox"))
+        application = applications.get(name)
+        is_application = application is not None
+        category = (
+            "kernel"
+            if name == "kernel_task"
+            else "application"
+            if is_application
+            else "native_system"
+        )
+        row = {
+            "pid": int(_number(process.get("pid"))),
+            "ppid": int(_number(process.get("ppid"))),
+            "user": "" if uid is None else str(uid),
+            "name": name,
+            "command": name,
+            "category": category,
+            "policy": process.get("policy"),
+            "state": process.get("procStatus"),
+            "app_sleep": process.get("appSleep"),
+            "sandboxed": sandboxed,
+            "bundle_id": application.get("bundle_id") if application else None,
+            "display_name": application.get("display_name") if application else None,
+            "cpu_pct": cpu,
+            "resident_bytes": int(_number(process.get("physFootprint"))),
+            "thread_count": int(_number(process.get("threadCount"))),
+            "disk_bytes_read": int(_number(process.get("diskBytesRead"))),
+            "disk_bytes_written": int(_number(process.get("diskBytesWritten"))),
+            "power_score": process.get("powerScore"),
+            "average_power_score": process.get("avgPowerScore"),
+            "total_energy_score": process.get("totalEnergyScore"),
+            "platform": "ios",
+        }
+        rows.append(row)
+        if name in COLLECTOR_PROCESSES:
+            watched.append(
+                {
+                    **row,
+                    "watch_name": "ios_profiler",
+                    "watch_label": "iOS Instruments collector overhead",
+                    "watch_kind": "profiler_overhead",
+                    "watch_impact": "iOS Instruments 采集器本身会占用设备 CPU，比较运行时应保持同一采集配置。",
+                    "activity_family": "profiler_overhead",
+                    "subsystem": "ios_instruments",
+                    "activity_active": cpu > 0.0,
+                }
+            )
+    rows.sort(key=lambda item: _number(item.get("cpu_pct")), reverse=True)
+    return {
+        "uptime_s": uptime_s,
+        "host_epoch_s": time.time(),
+        "processes": rows[:80],
+        "threads": [],
+        "watched_processes": watched,
+        "process_count": len(rows),
+        "thread_count": sum(int(_number(item.get("thread_count"))) for item in rows),
+    }
+
+
+async def record_device(args: argparse.Namespace) -> None:
+    _require_runtime()
+    udid = str(args.udid)
+    host = str(args.host) if args.host else None
+    port = int(args.port) if args.port else None
+    device = await _device_values(udid, host)
+    async with _open_rsd(udid, host, port) as rsd:
+        async with DiagnosticsService(rsd) as diagnostics:
+            initial_raw = dict(await diagnostics.get_battery() or {})
+        latest_battery = initial_raw
+        latest_battery_host = time.time()
+        latest_battery_revision = _battery_revision(initial_raw)
+        latest_graphics: dict[str, object] = {}
+        latest_uptime = 0.0
+        current_app: Optional[dict[str, object]] = None
+        applications: dict[str, dict[str, object]] = {}
+        stop = asyncio.Event()
+        collector_values: list[float] = []
+
+        async with DvtProvider(rsd) as dvt:
+            async with DeviceInfo(dvt) as info:
+                hardware = dict(await info.hardware_information() or {})
+                clock_before_epoch = time.time()
+                clock_before_monotonic = time.monotonic()
+                mach_info = list(await info.mach_time_info() or [])
+                clock_after_monotonic = time.monotonic()
+                clock_after_epoch = time.time()
+                process_attributes = list(await info.sysmon_process_attributes())
+                system_attributes = list(await info.sysmon_system_attributes())
+
+            if ApplicationListing is not None:
+                try:
+                    async with ApplicationListing(dvt) as listing:
+                        installed_apps = list(await listing.applist())
+                    for app in installed_apps:
+                        if not isinstance(app, dict):
+                            continue
+                        bundle_path = str(app.get("BundlePath") or "")
+                        if not bundle_path.startswith("/private/var/containers/Bundle/Application/"):
+                            continue
+                        executable = str(app.get("ExecutableName") or "").strip()
+                        display_name = str(app.get("DisplayName") or "").strip()
+                        bundle_id = str(app.get("CFBundleIdentifier") or "").strip()
+                        if not executable or not bundle_id:
+                            continue
+                        value = {
+                            "bundle_id": bundle_id,
+                            "display_name": display_name or executable,
+                            "executable": executable,
+                        }
+                        applications[executable] = value
+                        if display_name:
+                            applications.setdefault(display_name, value)
+                except Exception as exc:
+                    _emit("warning", message=f"iOS application listing unavailable: {exc}")
+
+            cpu_count = max(1.0, _number(hardware.get("numberOfCpus"), 1.0))
+            numer = _number(mach_info[1], 1.0) if len(mach_info) > 1 else 1.0
+            denom = _number(mach_info[2], 1.0) if len(mach_info) > 2 else 1.0
+            clock_uptime = _mach_seconds(mach_info[0], numer, denom) if mach_info else 0.0
+            clock_epoch = (clock_before_epoch + clock_after_epoch) / 2.0
+            clock_monotonic = (clock_before_monotonic + clock_after_monotonic) / 2.0
+            clock_round_trip_ms = max(
+                0.0,
+                (clock_after_monotonic - clock_before_monotonic) * 1000.0,
+            )
+            latest_uptime = clock_uptime
+            _emit(
+                "ready",
+                device={**device, "cpu_count": int(cpu_count)},
+                hardware=hardware,
+                battery=_battery_payload(initial_raw),
+                process_attributes=sorted(process_attributes),
+                system_attributes=sorted(system_attributes),
+                clock={
+                    "host_epoch_s": clock_epoch,
+                    "host_monotonic_s": clock_monotonic,
+                    "device_uptime_s": clock_uptime,
+                    "round_trip_ms": clock_round_trip_ms,
+                },
+            )
+
+            async def battery_loop() -> None:
+                nonlocal latest_battery, latest_battery_host, latest_battery_revision
+                warned = False
+                while not stop.is_set():
+                    try:
+                        async with DiagnosticsService(rsd) as service:
+                            value = dict(await service.get_battery() or {})
+                        latest_battery = value
+                        revision = _battery_revision(value)
+                        if revision != latest_battery_revision:
+                            latest_battery_revision = revision
+                            latest_battery_host = time.time()
+                            battery = _battery_payload(value)
+                            temperature = battery.get("temperature_c")
+                            if isinstance(temperature, (int, float)):
+                                _emit(
+                                    "thermal",
+                                    snapshot={
+                                        "uptime_s": latest_uptime,
+                                        "host_epoch_s": time.time(),
+                                        "status": None,
+                                        "hal_ready": True,
+                                        "temperatures": [
+                                            {
+                                                "name": "Battery",
+                                                "type": "BATTERY",
+                                                "value_c": temperature,
+                                                "status": None,
+                                            }
+                                        ],
+                                        "cooling_devices": [],
+                                        "thresholds": [],
+                                        "headroom_thresholds": [],
+                                    },
+                                )
+                    except Exception as exc:
+                        if not warned:
+                            _emit("warning", message=f"iOS battery polling failed: {exc}")
+                            warned = True
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+
+            async def graphics_loop() -> None:
+                nonlocal latest_graphics
+                try:
+                    async with Graphics(dvt) as graphics:
+                        async for event in graphics:
+                            if stop.is_set():
+                                return
+                            if isinstance(event, dict):
+                                latest_graphics = dict(event)
+                except Exception as exc:
+                    _emit("warning", message=f"iOS GPU graphics stream unavailable: {exc}")
+
+            async def notifications_loop() -> None:
+                nonlocal current_app
+                try:
+                    async with Notifications(dvt) as notifications:
+                        async for event in notifications:
+                            if stop.is_set():
+                                return
+                            if not isinstance(event, tuple) or len(event) != 2:
+                                continue
+                            selector, arguments = event
+                            if selector != "applicationStateNotification:" or not arguments:
+                                continue
+                            value = arguments[0]
+                            if not isinstance(value, dict):
+                                continue
+                            state = str(value.get("state_description") or "")
+                            app_name = str(value.get("appName") or "").strip() or None
+                            executable = str(value.get("execName") or "").strip() or None
+                            application = applications.get(executable or "") or applications.get(app_name or "")
+                            bundle_id = (
+                                str(application.get("bundle_id"))
+                                if isinstance(application, dict) and application.get("bundle_id")
+                                else app_name
+                            )
+                            event_uptime = _mach_seconds(value.get("mach_absolute_time"), numer, denom)
+                            if state == "Running" and app_name:
+                                current_app = {
+                                    "name": app_name,
+                                    "package": bundle_id,
+                                    "executable": executable,
+                                }
+                                _emit(
+                                    "context",
+                                    context={
+                                        "uptime_s": event_uptime or latest_uptime,
+                                        "foreground_package": bundle_id,
+                                        "foreground_activity": executable,
+                                        "screen_state": "Awake",
+                                        "brightness_raw": None,
+                                        "refresh_rate_hz": None,
+                                        "source": "ios_dvt_notifications",
+                                    },
+                                )
+                            elif (
+                                state == "Suspended"
+                                and current_app is not None
+                                and app_name == current_app.get("name")
+                            ):
+                                current_app = None
+                                _emit(
+                                    "context",
+                                    context={
+                                        "uptime_s": event_uptime or latest_uptime,
+                                        "foreground_package": None,
+                                        "foreground_activity": None,
+                                        "screen_state": "Awake",
+                                        "brightness_raw": None,
+                                        "refresh_rate_hz": None,
+                                        "source": "ios_dvt_notifications",
+                                    },
+                                )
+                except Exception as exc:
+                    _emit("warning", message=f"iOS application-state stream unavailable: {exc}")
+
+            tap = Sysmontap(
+                dvt,
+                process_attributes,
+                system_attributes,
+                interval_ms=max(200, int(float(args.interval) * 1000.0)),
+            )
+            fields = [field.name for field in dataclasses.fields(tap.process_attributes_cls)]
+            tasks = [
+                asyncio.create_task(battery_loop(), name="ios-battery"),
+                asyncio.create_task(graphics_loop(), name="ios-graphics"),
+                asyncio.create_task(notifications_loop(), name="ios-notifications"),
+            ]
+            deadline = time.monotonic() + float(args.duration)
+            sample_index = 0
+            next_process_snapshot = 0.0
+            next_clock_sync = clock_uptime + float(args.clock_interval)
+            try:
+                async with tap:
+                    async for row in tap:
+                        if time.monotonic() >= deadline:
+                            break
+                        if "Processes" not in row:
+                            continue
+                        processes = [
+                            dict(zip(fields, values))
+                            for values in dict(row.get("Processes") or {}).values()
+                        ]
+                        cpu_visible = [
+                            item for item in processes if isinstance(item.get("cpuUsage"), (int, float))
+                        ]
+                        if not cpu_visible:
+                            continue
+                        uptime = _mach_seconds(row.get("EndMachAbsTime"), numer, denom)
+                        if uptime <= 0:
+                            uptime = clock_uptime + (time.monotonic() - clock_monotonic)
+                        latest_uptime = uptime
+                        total_process_cpu = sum(_number(item.get("cpuUsage")) for item in cpu_visible)
+                        collector_cpu = sum(
+                            _number(item.get("cpuUsage"))
+                            for item in cpu_visible
+                            if str(item.get("name") or item.get("comm") or "") in COLLECTOR_PROCESSES
+                        )
+                        normalized_cpu = max(0.0, min(100.0, total_process_cpu / cpu_count))
+                        normalized_collector_cpu = max(0.0, collector_cpu / cpu_count)
+                        collector_values.append(normalized_collector_cpu)
+
+                        battery = latest_battery
+                        telemetry = battery.get("PowerTelemetryData")
+                        telemetry = telemetry if isinstance(telemetry, dict) else {}
+                        voltage = _number(battery.get("Voltage"))
+                        signed_current = battery.get("InstantAmperage")
+                        if not isinstance(signed_current, (int, float)):
+                            signed_current = battery.get("Amperage")
+                        signed_current = _number(signed_current)
+                        system_load = telemetry.get("SystemLoad")
+                        if isinstance(system_load, (int, float)):
+                            power_mw = max(0.0, float(system_load))
+                            power_source = "ios_power_telemetry_system_load"
+                        else:
+                            power_mw = abs(signed_current) * voltage / 1000.0
+                            power_source = "ios_battery_current_voltage"
+                        external = bool(battery.get("ExternalConnected"))
+                        charging = bool(battery.get("IsCharging"))
+                        direction = (
+                            "charging"
+                            if charging or signed_current > 0
+                            else "discharging"
+                            if signed_current < 0
+                            else "idle"
+                        )
+                        power_age = _battery_sample_age(battery, latest_battery_host)
+                        temperature = battery.get("Temperature")
+                        gpu_load = latest_graphics.get("Device Utilization %")
+                        _emit(
+                            "sample",
+                            sample={
+                                "index": sample_index,
+                                "elapsed_s": max(0.0, uptime - clock_uptime),
+                                "uptime_s": uptime,
+                                "current_ma": abs(signed_current),
+                                "signed_current_ma": signed_current,
+                                "voltage_mv": voltage,
+                                "power_mw": power_mw,
+                                "direction": direction,
+                                "cpu_pct": normalized_cpu,
+                                "core_cpu_pct": {},
+                                "cluster_cpu_pct": {},
+                                "frequencies_mhz": {},
+                                "gpu_frequency_mhz": None,
+                                "gpu_load_pct": (
+                                    float(gpu_load) if isinstance(gpu_load, (int, float)) else None
+                                ),
+                                "battery_temperature_c": (
+                                    float(temperature) / 100.0
+                                    if isinstance(temperature, (int, float))
+                                    else None
+                                ),
+                                "power_source": power_source,
+                                "power_sample_age_s": power_age,
+                                "collector_cpu_pct": normalized_collector_cpu,
+                                "external_power": external,
+                            },
+                        )
+                        sample_index += 1
+
+                        if uptime >= next_clock_sync:
+                            _emit(
+                                "clock",
+                                clock={
+                                    "host_epoch_s": time.time(),
+                                    "host_monotonic_s": time.monotonic(),
+                                    "device_uptime_s": uptime,
+                                    "round_trip_ms": 0.0,
+                                },
+                            )
+                            next_clock_sync = uptime + float(args.clock_interval)
+
+                        if not args.no_system_monitor and uptime >= next_process_snapshot:
+                            _emit(
+                                "system",
+                                snapshot=_process_snapshot(cpu_visible, uptime, applications),
+                            )
+                            next_process_snapshot = uptime + float(args.process_interval)
+            finally:
+                stop.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            async with DiagnosticsService(rsd) as diagnostics:
+                final_raw = dict(await diagnostics.get_battery() or {})
+        except Exception:
+            final_raw = latest_battery
+        _emit(
+            "end",
+            battery=_battery_payload(final_raw),
+            stats={
+                "sample_count": sample_index,
+                "average_collector_cpu_pct": (
+                    sum(collector_values) / len(collector_values) if collector_values else None
+                ),
+                "battery_update_hint_s": 20,
+            },
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="iOS sidecar for Mobile Power Profiler")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("list")
+
+    pair = subparsers.add_parser("pair")
+    pair.add_argument("--udid")
+    pair.add_argument("--timeout", type=float, default=8.0)
+
+    probe = subparsers.add_parser("probe")
+    probe.add_argument("--udid", required=True)
+    probe.add_argument("--host")
+    probe.add_argument("--port", type=int)
+
+    record = subparsers.add_parser("record")
+    record.add_argument("--udid", required=True)
+    record.add_argument("--host")
+    record.add_argument("--port", type=int)
+    record.add_argument("--duration", type=float, required=True)
+    record.add_argument("--interval", type=float, default=1.0)
+    record.add_argument("--process-interval", type=float, default=10.0)
+    record.add_argument("--clock-interval", type=float, default=30.0)
+    record.add_argument("--no-system-monitor", action="store_true")
+    return parser
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    if args.command == "list":
+        _print_json(await list_devices())
+    elif args.command == "pair":
+        _print_json(await pair_device(args.udid, args.timeout))
+    elif args.command == "probe":
+        _print_json(await probe_device(args.udid, args.host, args.port))
+    elif args.command == "record":
+        await record_device(args)
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        return 130
+    except BaseException as exc:
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

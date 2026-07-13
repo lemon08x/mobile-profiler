@@ -3,12 +3,22 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, TextIO, Tuple, Type, TypeVar
 
-from .models import ClockSyncPoint, ContextSample, ExternalEvent, SCHEMA_VERSION, Sample
+from .models import (
+    ClockSyncPoint,
+    ContextSample,
+    ExternalEvent,
+    SCHEMA_VERSION,
+    Sample,
+    SchedulerSnapshot,
+    SystemSnapshot,
+    ThermalSnapshot,
+)
 
 
 T = TypeVar("T")
@@ -65,6 +75,18 @@ def load_events(output_dir: Path) -> List[ExternalEvent]:
     return read_jsonl(output_dir / "events.jsonl", ExternalEvent)
 
 
+def load_system_snapshots(output_dir: Path) -> List[SystemSnapshot]:
+    return read_jsonl(output_dir / "system-snapshots.jsonl", SystemSnapshot)
+
+
+def load_thermal_snapshots(output_dir: Path) -> List[ThermalSnapshot]:
+    return read_jsonl(output_dir / "thermal-snapshots.jsonl", ThermalSnapshot)
+
+
+def load_scheduler_snapshots(output_dir: Path) -> List[SchedulerSnapshot]:
+    return read_jsonl(output_dir / "scheduler-snapshots.jsonl", SchedulerSnapshot)
+
+
 class RunJournal:
     """Append-only run journal used while a long ADB session is active."""
 
@@ -77,35 +99,58 @@ class RunJournal:
         self._stderr: Optional[TextIO] = None
         self._contexts: Optional[TextIO] = None
         self._clock_sync: Optional[TextIO] = None
+        self._system_snapshots: Optional[TextIO] = None
+        self._thermal_snapshots: Optional[TextIO] = None
+        self._scheduler_snapshots: Optional[TextIO] = None
+        self._lock = threading.RLock()
 
     def __enter__(self) -> "RunJournal":
-        self._sampler = (self.raw_dir / "sampler-stream.txt").open(
-            "a", encoding="utf-8", newline="\n"
-        )
-        self._stderr = (self.raw_dir / "sampler-stderr.txt").open(
-            "a", encoding="utf-8", newline="\n"
-        )
-        self._contexts = (self.output_dir / "contexts.jsonl").open(
-            "a", encoding="utf-8", newline="\n"
-        )
-        self._clock_sync = (self.output_dir / "clock-sync.jsonl").open(
-            "a", encoding="utf-8", newline="\n"
-        )
+        with self._lock:
+            self._sampler = (self.raw_dir / "sampler-stream.txt").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._stderr = (self.raw_dir / "sampler-stderr.txt").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._contexts = (self.output_dir / "contexts.jsonl").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._clock_sync = (self.output_dir / "clock-sync.jsonl").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._system_snapshots = (self.output_dir / "system-snapshots.jsonl").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._thermal_snapshots = (self.output_dir / "thermal-snapshots.jsonl").open(
+                "a", encoding="utf-8", newline="\n"
+            )
+            self._scheduler_snapshots = (
+                self.output_dir / "scheduler-snapshots.jsonl"
+            ).open("a", encoding="utf-8", newline="\n")
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        for handle in (self._sampler, self._stderr, self._contexts, self._clock_sync):
-            if handle is not None:
-                handle.flush()
-                handle.close()
+        with self._lock:
+            for handle in (
+                self._sampler,
+                self._stderr,
+                self._contexts,
+                self._clock_sync,
+                self._system_snapshots,
+                self._thermal_snapshots,
+                self._scheduler_snapshots,
+            ):
+                if handle is not None:
+                    handle.flush()
+                    handle.close()
 
-    @staticmethod
-    def _append_line(handle: Optional[TextIO], value: str) -> None:
-        if handle is None:
-            raise RuntimeError("run journal is not open")
-        handle.write(value.rstrip("\r\n"))
-        handle.write("\n")
-        handle.flush()
+    def _append_line(self, handle: Optional[TextIO], value: str) -> None:
+        with self._lock:
+            if handle is None:
+                raise RuntimeError("run journal is not open")
+            handle.write(value.rstrip("\r\n"))
+            handle.write("\n")
+            handle.flush()
 
     def append_sampler_line(self, line: str) -> None:
         self._append_line(self._sampler, line)
@@ -125,14 +170,34 @@ class RunJournal:
             json.dumps(asdict(point), ensure_ascii=False, separators=(",", ":")),
         )
 
+    def append_system_snapshot(self, snapshot: SystemSnapshot) -> None:
+        self._append_line(
+            self._system_snapshots,
+            json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def append_thermal_snapshot(self, snapshot: ThermalSnapshot) -> None:
+        self._append_line(
+            self._thermal_snapshots,
+            json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def append_scheduler_snapshot(self, snapshot: SchedulerSnapshot) -> None:
+        self._append_line(
+            self._scheduler_snapshots,
+            json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")),
+        )
+
     def write_metadata(self, metadata: Dict[str, object]) -> None:
-        _write_json_atomic(self.output_dir / "metadata.json", metadata)
+        with self._lock:
+            _write_json_atomic(self.output_dir / "metadata.json", metadata)
 
     def write_raw_output(self, name: str, value: str) -> None:
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-        (self.raw_dir / f"{safe_name}.txt").write_text(
-            value, encoding="utf-8", errors="replace"
-        )
+        with self._lock:
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+            (self.raw_dir / f"{safe_name}.txt").write_text(
+                value, encoding="utf-8", errors="replace"
+            )
 
     def checkpoint(self, state: Dict[str, object]) -> None:
         payload = {
@@ -140,7 +205,8 @@ class RunJournal:
             "updated_at": _utc_now(),
             **state,
         }
-        _write_json_atomic(self.output_dir / "checkpoint.json", payload)
+        with self._lock:
+            _write_json_atomic(self.output_dir / "checkpoint.json", payload)
 
 
 def load_checkpoint(output_dir: Path) -> Dict[str, object]:
@@ -177,6 +243,17 @@ def sample_to_dict(sample: Sample) -> Dict[str, object]:
             if sample.battery_temperature_c is not None
             else None
         ),
+        "power_source": sample.power_source,
+        "power_sample_age_s": (
+            round(sample.power_sample_age_s, 4)
+            if sample.power_sample_age_s is not None
+            else None
+        ),
+        "collector_cpu_pct": (
+            round(sample.collector_cpu_pct, 4)
+            if sample.collector_cpu_pct is not None
+            else None
+        ),
     }
 
 
@@ -203,6 +280,9 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
         "battery_temperature_c",
         "gpu_frequency_mhz",
         "gpu_load_pct",
+        "power_source",
+        "power_sample_age_s",
+        "collector_cpu_pct",
     ]
     fields.extend(f"core{core}_pct" for core in core_names)
     fields.extend(f"{name}_load_pct" for name in policy_names)
@@ -230,6 +310,13 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
                     "" if sample.gpu_frequency_mhz is None else f"{sample.gpu_frequency_mhz:.4f}"
                 ),
                 "gpu_load_pct": "" if sample.gpu_load_pct is None else f"{sample.gpu_load_pct:.4f}",
+                "power_source": sample.power_source,
+                "power_sample_age_s": (
+                    "" if sample.power_sample_age_s is None else f"{sample.power_sample_age_s:.4f}"
+                ),
+                "collector_cpu_pct": (
+                    "" if sample.collector_cpu_pct is None else f"{sample.collector_cpu_pct:.4f}"
+                ),
             }
             row.update(
                 {
@@ -315,6 +402,9 @@ def read_samples_csv(path: Path) -> List[Sample]:
                     gpu_frequency_mhz=_optional_float(row, "gpu_frequency_mhz"),
                     gpu_load_pct=_optional_float(row, "gpu_load_pct"),
                     battery_temperature_c=_optional_float(row, "battery_temperature_c"),
+                    power_source=row.get("power_source") or "battery_current_voltage",
+                    power_sample_age_s=_optional_float(row, "power_sample_age_s"),
+                    collector_cpu_pct=_optional_float(row, "collector_cpu_pct"),
                 )
             )
     return samples
@@ -336,6 +426,9 @@ def write_run_artifacts(
     contexts: Optional[Sequence[ContextSample]] = None,
     clock_sync: Optional[Sequence[ClockSyncPoint]] = None,
     events: Optional[Sequence[ExternalEvent]] = None,
+    system_snapshots: Optional[Sequence[SystemSnapshot]] = None,
+    thermal_snapshots: Optional[Sequence[ThermalSnapshot]] = None,
+    scheduler_snapshots: Optional[Sequence[SchedulerSnapshot]] = None,
 ) -> Tuple[Path, Path]:
     from .report import write_report_files
 
@@ -353,6 +446,12 @@ def write_run_artifacts(
         write_jsonl(output_dir / "clock-sync.jsonl", clock_sync)
     if events is not None:
         write_jsonl(output_dir / "events.jsonl", events)
+    if system_snapshots is not None:
+        write_jsonl(output_dir / "system-snapshots.jsonl", system_snapshots)
+    if thermal_snapshots is not None:
+        write_jsonl(output_dir / "thermal-snapshots.jsonl", thermal_snapshots)
+    if scheduler_snapshots is not None:
+        write_jsonl(output_dir / "scheduler-snapshots.jsonl", scheduler_snapshots)
     if raw_outputs:
         raw_dir = output_dir / "raw"
         raw_dir.mkdir(exist_ok=True)
@@ -369,6 +468,9 @@ def write_run_artifacts(
         "contexts": [asdict(item) for item in (contexts or [])],
         "clock_sync": [asdict(item) for item in (clock_sync or [])],
         "events": [asdict(item) for item in (events or [])],
+        "system_snapshots": [asdict(item) for item in (system_snapshots or [])],
+        "thermal_snapshots": [asdict(item) for item in (thermal_snapshots or [])],
+        "scheduler_snapshots": [asdict(item) for item in (scheduler_snapshots or [])],
     }
     return write_report_files(output_dir, bundle)
 

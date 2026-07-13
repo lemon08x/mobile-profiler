@@ -1,0 +1,3223 @@
+from __future__ import annotations
+
+import bisect
+import math
+import statistics
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from .collector import frequency_to_mhz
+from .models import (
+    ContextSample,
+    CpuPolicy,
+    ExternalEvent,
+    GpuSource,
+    RawSample,
+    Sample,
+    SchedulerSnapshot,
+    SystemSnapshot,
+    ThermalSnapshot,
+)
+from .parsers import (
+    classify_thread_activity,
+    extract_kernel_wakelocks,
+    extract_stats_window,
+    format_bytes,
+    parse_battery_usage,
+    parse_checkin_network,
+    parse_cpu_processes,
+    parse_display,
+    parse_gpu_dump,
+    parse_gpu_work,
+    parse_package_uids,
+    parse_power_profile,
+    parse_thermal,
+)
+
+
+def normalize_current_ma(raw_value: float, unit: str) -> float:
+    if unit == "ua":
+        return raw_value / 1000.0
+    if unit == "ma":
+        return raw_value
+    if abs(raw_value) >= 20_000:
+        return raw_value / 1000.0
+    return raw_value
+
+
+def _cpu_utilization(previous: object, current: object) -> Optional[float]:
+    previous_total, previous_idle = previous.total_and_idle()  # type: ignore[attr-defined]
+    current_total, current_idle = current.total_and_idle()  # type: ignore[attr-defined]
+    delta_total = current_total - previous_total
+    delta_idle = current_idle - previous_idle
+    if delta_total <= 0:
+        return None
+    return max(0.0, min(100.0, 100.0 * (delta_total - delta_idle) / delta_total))
+
+
+def _directed_current(raw_ma: float, battery_status: str) -> Tuple[float, bool]:
+    if battery_status == "discharging":
+        return -abs(raw_ma), raw_ma > 0
+    if battery_status == "charging":
+        return abs(raw_ma), raw_ma < 0
+    return raw_ma, False
+
+
+def convert_samples(
+    raw_samples: Sequence[RawSample],
+    policies: Sequence[CpuPolicy],
+    gpu_source: Optional[GpuSource],
+    start_voltage_mv: float,
+    end_voltage_mv: float,
+    current_unit: str,
+    battery_status: str,
+    max_cpu_gap_s: Optional[float] = None,
+) -> Tuple[List[Sample], List[str]]:
+    if len(raw_samples) < 2:
+        raise RuntimeError("sampler returned fewer than two valid rows")
+    warnings: List[str] = []
+    base_uptime = raw_samples[0].uptime_s
+    duration = max(0.001, raw_samples[-1].uptime_s - base_uptime)
+    sign_corrected = False
+    samples: List[Sample] = []
+    previous_raw: Optional[RawSample] = None
+
+    for raw in raw_samples:
+        elapsed = raw.uptime_s - base_uptime
+        fraction = max(0.0, min(1.0, elapsed / duration))
+        fallback_voltage = start_voltage_mv + (end_voltage_mv - start_voltage_mv) * fraction
+        voltage = raw.voltage_mv if raw.voltage_mv and raw.voltage_mv > 0 else fallback_voltage
+        sensor_ma = normalize_current_ma(raw.current_raw, current_unit)
+        signed_current_ma, corrected = _directed_current(sensor_ma, battery_status)
+        sign_corrected = sign_corrected or corrected
+        current_ma = abs(signed_current_ma)
+        if signed_current_ma < 0:
+            direction = "discharging"
+        elif signed_current_ma > 0:
+            direction = "charging"
+        else:
+            direction = battery_status if battery_status in {"charging", "discharging"} else "idle"
+
+        cpu_pct = None
+        core_cpu_pct: Dict[str, float] = {}
+        if previous_raw is not None and (
+            max_cpu_gap_s is None or raw.uptime_s - previous_raw.uptime_s <= max_cpu_gap_s
+        ):
+            cpu_pct = _cpu_utilization(previous_raw.cpu, raw.cpu)
+            for core, counters in raw.core_cpu.items():
+                previous_counters = previous_raw.core_cpu.get(core)
+                if previous_counters is None:
+                    continue
+                value = _cpu_utilization(previous_counters, counters)
+                if value is not None:
+                    core_cpu_pct[str(core)] = value
+
+        cluster_cpu_pct: Dict[str, float] = {}
+        for policy in policies:
+            values = [core_cpu_pct[str(core)] for core in policy.cores if str(core) in core_cpu_pct]
+            if values:
+                cluster_cpu_pct[policy.name] = statistics.fmean(values)
+
+        gpu_frequency_mhz = None
+        if gpu_source is not None and raw.gpu_frequency_raw is not None:
+            gpu_frequency_mhz = frequency_to_mhz(raw.gpu_frequency_raw)
+        gpu_load_pct = None
+        if raw.gpu_load_raw is not None:
+            gpu_load_pct = max(0.0, min(100.0, raw.gpu_load_raw))
+
+        samples.append(
+            Sample(
+                index=raw.index,
+                elapsed_s=elapsed,
+                uptime_s=raw.uptime_s,
+                current_ma=current_ma,
+                signed_current_ma=signed_current_ma,
+                voltage_mv=voltage,
+                power_mw=current_ma * voltage / 1000.0,
+                direction=direction,
+                cpu_pct=cpu_pct,
+                core_cpu_pct=core_cpu_pct,
+                cluster_cpu_pct=cluster_cpu_pct,
+                frequencies_mhz={
+                    name: value / 1000.0 for name, value in raw.frequencies_khz.items()
+                },
+                gpu_frequency_mhz=gpu_frequency_mhz,
+                gpu_load_pct=gpu_load_pct,
+                battery_temperature_c=(
+                    raw.temperature_tenths_c / 10.0
+                    if raw.temperature_tenths_c is not None
+                    else None
+                ),
+            )
+        )
+        previous_raw = raw
+
+    if sign_corrected:
+        warnings.append(
+            "厂商电流符号与 BatteryService 状态不一致，已自动标准化。"
+            "current_ma 始终为正幅值，signed_current_ma 保留充放电方向。"
+        )
+    return samples, warnings
+
+
+def percentile(values: Sequence[float], quantile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * quantile) - 1))
+    return ordered[index]
+
+
+def median_absolute_deviation(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    center = statistics.median(values)
+    return statistics.median(abs(value - center) for value in values)
+
+
+def detect_spikes(samples: Sequence[Sample]) -> List[Dict[str, float]]:
+    if len(samples) < 5:
+        return []
+    powers = [sample.power_mw for sample in samples]
+    median = statistics.median(powers)
+    mad = median_absolute_deviation(powers)
+    threshold = median + max(150.0, 3.0 * mad)
+    windows: List[Dict[str, float]] = []
+    current: List[Sample] = []
+    for sample in samples:
+        if sample.power_mw >= threshold:
+            current.append(sample)
+            continue
+        if current:
+            windows.append(_spike_window(current, threshold))
+            current = []
+    if current:
+        windows.append(_spike_window(current, threshold))
+    return sorted(windows, key=lambda item: item["peak_mw"], reverse=True)[:5]
+
+
+def _spike_window(samples: Sequence[Sample], threshold: float) -> Dict[str, float]:
+    return {
+        "start_s": samples[0].elapsed_s,
+        "end_s": samples[-1].elapsed_s,
+        "peak_mw": max(item.power_mw for item in samples),
+        "average_mw": statistics.fmean(item.power_mw for item in samples),
+        "threshold_mw": threshold,
+    }
+
+
+def sample_intervals(
+    samples: Sequence[Sample],
+    max_gap_s: Optional[float] = None,
+) -> List[Tuple[Sample, Sample, float]]:
+    intervals: List[Tuple[Sample, Sample, float]] = []
+    for previous, current in zip(samples, samples[1:]):
+        delta_s = current.uptime_s - previous.uptime_s
+        if delta_s <= 0:
+            continue
+        if max_gap_s is not None and delta_s > max_gap_s:
+            continue
+        intervals.append((previous, current, delta_s))
+    return intervals
+
+
+def integrate_values(
+    samples: Sequence[Sample],
+    getter: Callable[[Sample], float],
+    max_gap_s: Optional[float] = None,
+) -> float:
+    total = 0.0
+    for previous, current, delta_s in sample_intervals(samples, max_gap_s):
+        total += (getter(previous) + getter(current)) * 0.5 * delta_s / 3600.0
+    return total
+
+
+def build_buckets(samples: Sequence[Sample], width_s: float = 10.0) -> List[Dict[str, object]]:
+    bucket_map: Dict[int, List[Sample]] = {}
+    for sample in samples:
+        bucket_map.setdefault(int(sample.elapsed_s // width_s), []).append(sample)
+    buckets: List[Dict[str, object]] = []
+    for bucket in sorted(bucket_map):
+        rows = bucket_map[bucket]
+        powers = [item.power_mw for item in rows]
+        currents = [item.current_ma for item in rows]
+        cpus = [item.cpu_pct for item in rows if item.cpu_pct is not None]
+        buckets.append(
+            {
+                "start_s": bucket * width_s,
+                "end_s": (bucket + 1) * width_s,
+                "average_power_mw": statistics.fmean(powers),
+                "peak_power_mw": max(powers),
+                "average_current_ma": statistics.fmean(currents),
+                "average_cpu_pct": statistics.fmean(cpus) if cpus else None,
+            }
+        )
+    return buckets
+
+
+def _profile_array(profile: Dict[str, object], *keys: str) -> List[float]:
+    for key in keys:
+        value = profile.get(key)
+        if isinstance(value, list):
+            return [float(item) for item in value]
+    return []
+
+
+def _nearest_power_coefficient(
+    frequency_mhz: float,
+    speeds_mhz: Sequence[float],
+    currents_ma: Sequence[float],
+) -> Optional[float]:
+    count = min(len(speeds_mhz), len(currents_ma))
+    if count == 0:
+        return None
+    index = min(range(count), key=lambda item: abs(speeds_mhz[item] - frequency_mhz))
+    return float(currents_ma[index])
+
+
+def _pearson(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    mean_x = statistics.fmean(xs)
+    mean_y = statistics.fmean(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    denominator = math.sqrt(
+        sum((x - mean_x) ** 2 for x in xs) * sum((y - mean_y) ** 2 for y in ys)
+    )
+    return numerator / denominator if denominator > 0 else None
+
+
+def analyze_cpu(
+    samples: Sequence[Sample],
+    policies: Sequence[Dict[str, object]],
+    power_profile: Dict[str, object],
+    max_gap_s: Optional[float] = None,
+) -> Dict[str, object]:
+    cluster_rows: List[Dict[str, object]] = []
+    timeline: List[Dict[str, object]] = [
+        {"elapsed_s": sample.elapsed_s, "clusters": {}, "modeled_power_mw": 0.0}
+        for sample in samples
+    ]
+
+    for policy in policies:
+        name = str(policy.get("name"))
+        label = str(policy.get("label") or name)
+        cluster_index = int(policy.get("cluster_index") or 0)
+        cores = [int(value) for value in policy.get("cores", [])]
+        max_khz = policy.get("max_khz")
+        hardware_max_mhz = float(max_khz) / 1000.0 if isinstance(max_khz, (int, float)) else None
+        frequencies = [sample.frequencies_mhz.get(name, 0.0) for sample in samples]
+        loads = [sample.cluster_cpu_pct.get(name) for sample in samples]
+        speed_values = _profile_array(
+            power_profile,
+            f"cpu.core_speeds.cluster{cluster_index}",
+            f"cpu.speeds.cluster{cluster_index}",
+        )
+        speeds_mhz = [value / 1000.0 if value >= 10_000 else value for value in speed_values]
+        current_curve = _profile_array(
+            power_profile,
+            f"cpu.core_power.cluster{cluster_index}",
+            f"cpu.active.cluster{cluster_index}",
+        )
+        pair_count = min(len(speeds_mhz), len(current_curve))
+        speeds_mhz = speeds_mhz[:pair_count]
+        current_curve = current_curve[:pair_count]
+        cluster_overhead = power_profile.get(f"cpu.cluster_power.cluster{cluster_index}")
+        overhead_ma = float(cluster_overhead) if isinstance(cluster_overhead, (int, float)) else 0.0
+
+        modeled_values: List[float] = []
+        premium_values: List[float] = []
+        active_core_values: List[float] = []
+        valid_loads: List[float] = []
+        measured_for_model: List[float] = []
+        model_available = bool(pair_count)
+        minimum_coefficient = current_curve[0] if current_curve else None
+
+        for index, sample in enumerate(samples):
+            load = loads[index]
+            frequency = frequencies[index]
+            entry: Dict[str, object] = {
+                "frequency_mhz": frequency,
+                "load_pct": load,
+                "active_cores": None,
+                "modeled_power_mw": None,
+                "frequency_premium_mw": None,
+            }
+            if load is not None:
+                active_cores = float(load) / 100.0 * max(1, len(cores))
+                entry["active_cores"] = active_cores
+                active_core_values.append(active_cores)
+                valid_loads.append(float(load))
+                coefficient = _nearest_power_coefficient(frequency, speeds_mhz, current_curve)
+                if coefficient is not None and minimum_coefficient is not None:
+                    max_core_load = max(
+                        (sample.core_cpu_pct.get(str(core), 0.0) for core in cores),
+                        default=float(load),
+                    )
+                    cluster_active_fraction = max_core_load / 100.0
+                    modeled_current_ma = coefficient * active_cores + overhead_ma * cluster_active_fraction
+                    baseline_current_ma = (
+                        minimum_coefficient * active_cores + overhead_ma * cluster_active_fraction
+                    )
+                    modeled_power = modeled_current_ma * sample.voltage_mv / 1000.0
+                    premium_power = max(
+                        0.0,
+                        (modeled_current_ma - baseline_current_ma) * sample.voltage_mv / 1000.0,
+                    )
+                    entry["modeled_power_mw"] = modeled_power
+                    entry["frequency_premium_mw"] = premium_power
+                    modeled_values.append(modeled_power)
+                    premium_values.append(premium_power)
+                    measured_for_model.append(sample.power_mw)
+                    timeline[index]["modeled_power_mw"] = (
+                        float(timeline[index]["modeled_power_mw"]) + modeled_power
+                    )
+            timeline[index]["clusters"][name] = entry  # type: ignore[index]
+
+        band_seconds = {"low": 0.0, "balanced": 0.0, "high": 0.0}
+        band_load = {"low": 0.0, "balanced": 0.0, "high": 0.0}
+        total_seconds = 0.0
+        total_load_weight = 0.0
+        reference_max = hardware_max_mhz or (max(frequencies) if frequencies else 1.0) or 1.0
+        for index, (current, following) in enumerate(zip(samples, samples[1:])):
+            delta_s = max(0.0, following.uptime_s - current.uptime_s)
+            if max_gap_s is not None and delta_s > max_gap_s:
+                continue
+            ratio = frequencies[index] / reference_max if reference_max else 0.0
+            band = "low" if ratio < 0.5 else "balanced" if ratio < 0.8 else "high"
+            load = float(loads[index] or 0.0) / 100.0 * max(1, len(cores))
+            band_seconds[band] += delta_s
+            band_load[band] += delta_s * load
+            total_seconds += delta_s
+            total_load_weight += delta_s * load
+
+        load_weighted_frequency = None
+        load_frequency_pairs = [
+            (frequency, float(load))
+            for frequency, load in zip(frequencies, loads)
+            if load is not None and float(load) > 0
+        ]
+        if load_frequency_pairs:
+            denominator = sum(load for _, load in load_frequency_pairs)
+            load_weighted_frequency = sum(freq * load for freq, load in load_frequency_pairs) / denominator
+
+        cluster_rows.append(
+            {
+                "name": name,
+                "label": label,
+                "cluster_index": cluster_index,
+                "cores": cores,
+                "core_count": len(cores),
+                "average_mhz": statistics.fmean(frequencies) if frequencies else None,
+                "load_weighted_mhz": load_weighted_frequency,
+                "maximum_mhz": max(frequencies) if frequencies else None,
+                "hardware_max_mhz": hardware_max_mhz,
+                "average_load_pct": statistics.fmean(valid_loads) if valid_loads else None,
+                "average_active_cores": statistics.fmean(active_core_values) if active_core_values else None,
+                "modeled_power_mw": statistics.fmean(modeled_values) if modeled_values else None,
+                "maximum_modeled_power_mw": max(modeled_values) if modeled_values else None,
+                "frequency_premium_mw": statistics.fmean(premium_values) if premium_values else None,
+                "frequency_premium_pct": (
+                    statistics.fmean(premium_values) / statistics.fmean(modeled_values) * 100.0
+                    if modeled_values and statistics.fmean(modeled_values) > 0
+                    else None
+                ),
+                "measured_power_correlation": _pearson(modeled_values, measured_for_model),
+                "model_available": model_available,
+                "model_source": "Android Power Profile per-core frequency table" if model_available else None,
+                "residency": [
+                    {
+                        "band": band,
+                        "time_pct": band_seconds[band] / total_seconds * 100.0 if total_seconds else 0.0,
+                        "load_weighted_pct": (
+                            band_load[band] / total_load_weight * 100.0 if total_load_weight else 0.0
+                        ),
+                    }
+                    for band in ("low", "balanced", "high")
+                ],
+                "power_curve": [
+                    {"frequency_mhz": speed, "current_ma_per_core": current}
+                    for speed, current in zip(speeds_mhz, current_curve)
+                ],
+            }
+        )
+
+    total_modeled = [
+        float(item["modeled_power_mw"])
+        for item in timeline
+        if float(item["modeled_power_mw"]) > 0
+    ]
+    return {
+        "clusters": cluster_rows,
+        "timeline": timeline,
+        "modeled_power_mw": statistics.fmean(total_modeled) if total_modeled else None,
+        "source": "Power Profile estimate",
+        "limitations": (
+            "The estimate combines /proc/stat utilization with instantaneous cpufreq and Android's "
+            "per-core current table. It is useful for same-device comparisons, not a hardware rail measurement."
+        ),
+    }
+
+
+def analyze_gpu(
+    samples: Sequence[Sample],
+    metadata: Dict[str, object],
+    raw_outputs: Dict[str, str],
+    package_uids: Dict[int, List[str]],
+    target_uid: Optional[int],
+    duration_s: float,
+    system_snapshots: Sequence[SystemSnapshot] = (),
+) -> Dict[str, object]:
+    platform = str(metadata.get("platform") or "android").lower()
+    frequency_values = [
+        sample.gpu_frequency_mhz for sample in samples if sample.gpu_frequency_mhz is not None
+    ]
+    load_values = [sample.gpu_load_pct for sample in samples if sample.gpu_load_pct is not None]
+    start = parse_gpu_work(raw_outputs.get("gpu_start", ""))
+    end = parse_gpu_work(raw_outputs.get("gpu_end", ""))
+    start_dump = parse_gpu_dump(raw_outputs.get("gpu_start", ""))
+    end_dump = parse_gpu_dump(raw_outputs.get("gpu_end", ""))
+    work_rows: List[Dict[str, object]] = []
+    for uid, end_item in end.items():
+        start_item = start.get(uid, {})
+        active_delta = max(0, end_item["active_ns"] - int(start_item.get("active_ns", 0)))
+        inactive_delta = max(0, end_item["inactive_ns"] - int(start_item.get("inactive_ns", 0)))
+        if active_delta <= 0 and inactive_delta <= 0:
+            continue
+        work_rows.append(
+            {
+                "uid": uid,
+                "packages": package_uids.get(uid, []),
+                "active_ms": active_delta / 1_000_000.0,
+                "inactive_ms": inactive_delta / 1_000_000.0,
+                "active_ratio_pct": active_delta / (duration_s * 1_000_000_000.0) * 100.0
+                if duration_s > 0
+                else None,
+                "source": "dumpsys gpu work duration",
+            }
+        )
+    work_rows.sort(key=lambda item: float(item["active_ms"]), reverse=True)
+    target_work = next((item for item in work_rows if item.get("uid") == target_uid), None)
+    gpu_probe = metadata.get("gpu_probe", {})
+    source = metadata.get("gpu_source")
+    process_names: Dict[int, str] = {}
+    for snapshot in system_snapshots:
+        for item in [*snapshot.processes, *snapshot.watched_processes]:
+            pid = item.get("pid")
+            name = item.get("name") or item.get("command")
+            if isinstance(pid, int) and name:
+                process_names[pid] = str(name)
+    memory_rows: List[Dict[str, object]] = []
+    for item in end_dump.get("process_memory", []):
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pid")
+        memory_rows.append(
+            {
+                **item,
+                "name": process_names.get(pid) if isinstance(pid, int) else None,
+            }
+        )
+    reason = None
+    if not frequency_values and not load_values and isinstance(gpu_probe, dict):
+        reason = gpu_probe.get("reason")
+    if not reason and platform == "ios" and not load_values:
+        reason = "本次会话未恢复到 DVT Graphics 利用率事件。"
+    limitations = (
+        "iOS DVT Graphics reports relative GPU utilization counters. It does not expose an "
+        "electrical GPU rail or a public per-application GPU energy measurement."
+        if platform == "ios"
+        else (
+            "GPU frequency/load is reported only when a readable OEM sysfs/devfreq node exists. "
+            "Qualcomm KGSL is commonly permission-restricted on production builds. UID active "
+            "durations and GPU memory are driver evidence, not an electrical power rail."
+        )
+    )
+    return {
+        "frequency_available": bool(frequency_values),
+        "load_available": bool(load_values),
+        "source": source,
+        "provider": gpu_probe.get("provider") if isinstance(gpu_probe, dict) else None,
+        "model": gpu_probe.get("model") if isinstance(gpu_probe, dict) else None,
+        "unavailable_reason": reason,
+        "average_frequency_mhz": statistics.fmean(frequency_values) if frequency_values else None,
+        "minimum_frequency_mhz": min(frequency_values) if frequency_values else None,
+        "maximum_frequency_mhz": max(frequency_values) if frequency_values else None,
+        "average_load_pct": statistics.fmean(load_values) if load_values else None,
+        "minimum_load_pct": min(load_values) if load_values else None,
+        "maximum_load_pct": max(load_values) if load_values else None,
+        "work_by_uid": work_rows[:20],
+        "target_work": target_work,
+        "work_source_available": bool(start and end),
+        "memory": {
+            "available": bool(end_dump.get("memory_available")),
+            "start_total_bytes": start_dump.get("global_total_bytes"),
+            "end_total_bytes": end_dump.get("global_total_bytes"),
+            "change_bytes": (
+                int(end_dump["global_total_bytes"]) - int(start_dump["global_total_bytes"])
+                if isinstance(start_dump.get("global_total_bytes"), int)
+                and isinstance(end_dump.get("global_total_bytes"), int)
+                else None
+            ),
+            "processes": memory_rows[:20],
+        },
+        "driver": {
+            "stable_game_driver": end_dump.get("stable_game_driver"),
+            "prerelease_game_driver": end_dump.get("prerelease_game_driver"),
+        },
+        "limitations": limitations,
+    }
+
+
+def component_power_estimates(
+    usage: Dict[str, object],
+    stats_window: Dict[str, Optional[float]],
+    average_voltage_mv: float,
+    power_profile: Dict[str, object],
+    display: Dict[str, object],
+) -> List[Dict[str, object]]:
+    observation_s = stats_window.get("time_on_battery_s")
+    components: List[Dict[str, object]] = []
+    if observation_s and observation_s > 0:
+        for item in usage.get("components", []):
+            component = dict(item)
+            mah = float(component.get("mah", 0.0))
+            average_ma = mah / (observation_s / 3600.0)
+            component["modeled_power_mw"] = average_ma * average_voltage_mv / 1000.0
+            component["confidence"] = "medium"
+            components.append(component)
+
+    known_names = {str(item.get("name", "")).lower() for item in components}
+    if "screen" not in known_names:
+        screen_on = power_profile.get("screen.on.display0", power_profile.get("screen.on"))
+        screen_full = power_profile.get("screen.full.display0", power_profile.get("screen.full"))
+        brightness_raw = display.get("brightness_raw")
+        if isinstance(screen_on, (float, int)) and isinstance(screen_full, (float, int)):
+            brightness_fraction = 0.5
+            if isinstance(brightness_raw, (float, int)) and 0 <= float(brightness_raw) <= 255:
+                brightness_fraction = float(brightness_raw) / 255.0
+            screen_ma = float(screen_on) + float(screen_full) * brightness_fraction
+            components.append(
+                {
+                    "name": "screen",
+                    "mah": None,
+                    "modeled_power_mw": screen_ma * average_voltage_mv / 1000.0,
+                    "duration_s": stats_window.get("screen_on_s"),
+                    "source": "Power Profile brightness estimate",
+                    "confidence": "low",
+                }
+            )
+    components.sort(key=lambda item: float(item.get("modeled_power_mw") or 0.0), reverse=True)
+    return components
+
+
+def _context_at(
+    contexts: Sequence[ContextSample],
+    uptimes: Sequence[float],
+    uptime_s: float,
+) -> Optional[ContextSample]:
+    index = bisect.bisect_right(uptimes, uptime_s) - 1
+    return contexts[index] if index >= 0 else None
+
+
+def analyze_applications(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    max_gap_s: float,
+) -> Dict[str, object]:
+    ordered = sorted(contexts, key=lambda item: item.uptime_s)
+    uptimes = [item.uptime_s for item in ordered]
+    rows: Dict[str, Dict[str, object]] = {}
+    covered_s = 0.0
+    known_s = 0.0
+    for previous, current, delta_s in sample_intervals(samples, max_gap_s):
+        midpoint = (previous.uptime_s + current.uptime_s) * 0.5
+        context = _context_at(ordered, uptimes, midpoint)
+        package = context.foreground_package if context and context.foreground_package else "unknown"
+        row = rows.setdefault(
+            package,
+            {
+                "package": package,
+                "duration_s": 0.0,
+                "energy_mwh": 0.0,
+                "discharge_mah": 0.0,
+                "transition_count": 0,
+                "activities": set(),
+            },
+        )
+        row["duration_s"] = float(row["duration_s"]) + delta_s
+        row["energy_mwh"] = float(row["energy_mwh"]) + (
+            (previous.power_mw + current.power_mw) * 0.5 * delta_s / 3600.0
+        )
+        average_current = (previous.current_ma + current.current_ma) * 0.5
+        if previous.direction == "discharging" or current.direction == "discharging":
+            row["discharge_mah"] = float(row["discharge_mah"]) + average_current * delta_s / 3600.0
+        if context and context.foreground_activity:
+            activities = row["activities"]
+            if isinstance(activities, set):
+                activities.add(context.foreground_activity)
+        covered_s += delta_s
+        if package != "unknown":
+            known_s += delta_s
+
+    transitions: List[Dict[str, object]] = []
+    previous_package: Optional[str] = None
+    for context in ordered:
+        if context.uptime_s < samples[0].uptime_s or context.uptime_s >= samples[-1].uptime_s:
+            continue
+        package = context.foreground_package or "unknown"
+        if package == previous_package:
+            continue
+        transitions.append(
+            {
+                "elapsed_s": context.uptime_s - samples[0].uptime_s,
+                "uptime_s": context.uptime_s,
+                "package": package,
+                "activity": context.foreground_activity,
+            }
+        )
+        row = rows.get(package)
+        if row is not None:
+            row["transition_count"] = int(row["transition_count"]) + 1
+        previous_package = package
+
+    result_rows: List[Dict[str, object]] = []
+    for row in rows.values():
+        duration_s = float(row["duration_s"])
+        energy_mwh = float(row["energy_mwh"])
+        activities = row.pop("activities")
+        row["average_power_mw"] = energy_mwh * 3600.0 / duration_s if duration_s > 0 else None
+        row["time_pct"] = duration_s / covered_s * 100.0 if covered_s > 0 else None
+        row["activities"] = sorted(activities)[:8] if isinstance(activities, set) else []
+        row["confidence"] = "medium" if row["package"] != "unknown" else "low"
+        result_rows.append(row)
+    result_rows.sort(key=lambda item: float(item.get("energy_mwh") or 0.0), reverse=True)
+
+    context_deltas = [
+        following.uptime_s - current.uptime_s
+        for current, following in zip(ordered, ordered[1:])
+        if following.uptime_s > current.uptime_s
+    ]
+    return {
+        "available": bool(ordered),
+        "context_sample_count": len(ordered),
+        "coverage_pct": known_s / covered_s * 100.0 if covered_s > 0 else 0.0,
+        "transition_count": max(0, len(transitions) - 1),
+        "boundary_uncertainty_s": statistics.median(context_deltas) if context_deltas else None,
+        "rows": result_rows,
+        "transitions": transitions,
+    }
+
+
+def analyze_external_events(
+    samples: Sequence[Sample],
+    events: Sequence[ExternalEvent],
+    max_gap_s: float,
+    sample_interval_s: float,
+) -> Dict[str, object]:
+    minimum_reliable_duration_s = max(3.0 * sample_interval_s, sample_interval_s + 2.0)
+    intervals = sample_intervals(samples, max_gap_s)
+    span_rows: List[Dict[str, object]] = []
+    for event in sorted(events, key=lambda item: item.device_uptime_s):
+        if event.duration_s is None or event.duration_s <= 0:
+            continue
+        start = event.device_uptime_s
+        end = start + event.duration_s
+        covered_s = 0.0
+        energy_mwh = 0.0
+        discharge_mah = 0.0
+        for previous, current, _ in intervals:
+            overlap_s = max(
+                0.0,
+                min(end, current.uptime_s) - max(start, previous.uptime_s),
+            )
+            if overlap_s <= 0:
+                continue
+            covered_s += overlap_s
+            energy_mwh += (previous.power_mw + current.power_mw) * 0.5 * overlap_s / 3600.0
+            if previous.direction == "discharging" or current.direction == "discharging":
+                discharge_mah += (
+                    (previous.current_ma + current.current_ma) * 0.5 * overlap_s / 3600.0
+                )
+        confidence = "medium"
+        if event.duration_s < minimum_reliable_duration_s or covered_s < event.duration_s * 0.75:
+            confidence = "low"
+        span_rows.append(
+            {
+                "name": event.name,
+                "phase": event.phase,
+                "kind": event.kind,
+                "start_elapsed_s": start - samples[0].uptime_s,
+                "duration_s": event.duration_s,
+                "covered_duration_s": covered_s,
+                "energy_mwh": energy_mwh,
+                "discharge_mah": discharge_mah,
+                "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else None,
+                "confidence": confidence,
+                "source": event.source,
+                "metadata": event.metadata,
+            }
+        )
+
+    grouped: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for row in span_rows:
+        key = (str(row["phase"]), str(row["name"]))
+        aggregate = grouped.setdefault(
+            key,
+            {
+                "phase": key[0],
+                "name": key[1],
+                "count": 0,
+                "duration_s": 0.0,
+                "covered_duration_s": 0.0,
+                "energy_mwh": 0.0,
+                "discharge_mah": 0.0,
+                "confidence": "medium",
+            },
+        )
+        aggregate["count"] = int(aggregate["count"]) + 1
+        for field in ("duration_s", "covered_duration_s", "energy_mwh", "discharge_mah"):
+            aggregate[field] = float(aggregate[field]) + float(row[field] or 0.0)
+        if row["confidence"] == "low":
+            aggregate["confidence"] = "low"
+    aggregate_rows = list(grouped.values())
+    for row in aggregate_rows:
+        covered_s = float(row["covered_duration_s"])
+        row["average_power_mw"] = (
+            float(row["energy_mwh"]) * 3600.0 / covered_s if covered_s > 0 else None
+        )
+    aggregate_rows.sort(key=lambda item: float(item.get("energy_mwh") or 0.0), reverse=True)
+    return {
+        "available": bool(events),
+        "event_count": len(events),
+        "instant_count": sum(1 for event in events if not event.duration_s),
+        "minimum_reliable_duration_s": minimum_reliable_duration_s,
+        "spans": span_rows,
+        "rows": aggregate_rows,
+    }
+
+
+def build_long_windows(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    max_gap_s: float,
+    width_s: float = 300.0,
+) -> List[Dict[str, object]]:
+    ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+    context_uptimes = [item.uptime_s for item in ordered_contexts]
+    windows: Dict[int, Dict[str, object]] = {}
+    base_uptime = samples[0].uptime_s
+    for previous, current, _ in sample_intervals(samples, max_gap_s):
+        cursor = previous.uptime_s
+        while cursor < current.uptime_s:
+            window_index = int(max(0.0, cursor - base_uptime) // width_s)
+            window_end_uptime = base_uptime + (window_index + 1) * width_s
+            segment_end = min(current.uptime_s, window_end_uptime)
+            segment_s = segment_end - cursor
+            if segment_s <= 0:
+                break
+            midpoint = (cursor + segment_end) * 0.5
+            context = _context_at(ordered_contexts, context_uptimes, midpoint)
+            package = context.foreground_package if context and context.foreground_package else "unknown"
+            row = windows.setdefault(
+                window_index,
+                {
+                    "start_s": window_index * width_s,
+                    "end_s": (window_index + 1) * width_s,
+                    "covered_duration_s": 0.0,
+                    "energy_mwh": 0.0,
+                    "app_duration_s": {},
+                },
+            )
+            row["covered_duration_s"] = float(row["covered_duration_s"]) + segment_s
+            row["energy_mwh"] = float(row["energy_mwh"]) + (
+                (previous.power_mw + current.power_mw) * 0.5 * segment_s / 3600.0
+            )
+            app_duration = row["app_duration_s"]
+            if isinstance(app_duration, dict):
+                app_duration[package] = float(app_duration.get(package, 0.0)) + segment_s
+            cursor = segment_end
+
+    result: List[Dict[str, object]] = []
+    for index in sorted(windows):
+        row = windows[index]
+        duration_s = float(row["covered_duration_s"])
+        energy_mwh = float(row["energy_mwh"])
+        app_duration = row.pop("app_duration_s")
+        dominant_app = None
+        if isinstance(app_duration, dict) and app_duration:
+            dominant_app = max(app_duration, key=lambda key: float(app_duration[key]))
+        row["average_power_mw"] = energy_mwh * 3600.0 / duration_s if duration_s else None
+        row["dominant_app"] = dominant_app
+        result.append(row)
+    return result
+
+
+def _nearest_sample(
+    samples: Sequence[Sample],
+    uptimes: Sequence[float],
+    uptime_s: float,
+) -> Optional[Sample]:
+    if not samples:
+        return None
+    index = bisect.bisect_left(uptimes, uptime_s)
+    candidates = []
+    if index < len(samples):
+        candidates.append(samples[index])
+    if index > 0:
+        candidates.append(samples[index - 1])
+    return min(candidates, key=lambda item: abs(item.uptime_s - uptime_s)) if candidates else None
+
+
+def _window_power_metrics(
+    samples: Sequence[Sample],
+    intervals: Sequence[Tuple[Sample, Sample, float]],
+    start_uptime_s: float,
+    end_uptime_s: float,
+) -> Dict[str, float]:
+    covered_s = 0.0
+    energy_mwh = 0.0
+    for previous, current, _ in intervals:
+        overlap_s = max(
+            0.0,
+            min(end_uptime_s, current.uptime_s) - max(start_uptime_s, previous.uptime_s),
+        )
+        if overlap_s <= 0:
+            continue
+        covered_s += overlap_s
+        energy_mwh += (previous.power_mw + current.power_mw) * 0.5 * overlap_s / 3600.0
+    return {
+        "covered_duration_s": covered_s,
+        "energy_mwh": energy_mwh,
+        "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else 0.0,
+    }
+
+
+def _snapshot_cadence(uptimes: Sequence[float], fallback: float) -> float:
+    deltas = [
+        current - previous
+        for previous, current in zip(uptimes, uptimes[1:])
+        if current > previous
+    ]
+    return statistics.median(deltas) if deltas else fallback
+
+
+def analyze_system_activity(
+    samples: Sequence[Sample],
+    snapshots: Sequence[SystemSnapshot],
+    max_gap_s: float,
+    thermal_snapshots: Sequence[ThermalSnapshot] = (),
+) -> Dict[str, object]:
+    ordered = sorted(
+        (
+            item
+            for item in snapshots
+            if samples[0].uptime_s - max_gap_s <= item.uptime_s <= samples[-1].uptime_s + max_gap_s
+        ),
+        key=lambda item: item.uptime_s,
+    )
+    if not ordered:
+        return {
+            "available": False,
+            "snapshot_count": 0,
+            "top_processes": [],
+            "hot_threads": [],
+            "timeline": [],
+            "activity_groups": {
+                "available": False,
+                "rows": [],
+                "timeline": [],
+                "runtime": [],
+                "kernel": [],
+            },
+            "runtime_activity": [],
+            "kernel_activity": [],
+            "priority_activities": {
+                "available": False,
+                "active": False,
+                "rows": [],
+                "timeline": [],
+                "monitored": [],
+            },
+        }
+
+    sample_uptimes = [item.uptime_s for item in samples]
+    powers_by_snapshot: List[Optional[float]] = []
+    process_values: Dict[Tuple[str, str, str], Dict[int, float]] = {}
+    process_meta: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    process_powers: Dict[Tuple[str, str, str], List[float]] = {}
+    process_relative_power_scores: Dict[Tuple[str, str, str], List[float]] = {}
+    thread_values: Dict[Tuple[str, str, str], List[float]] = {}
+    thread_meta: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    timeline: List[Dict[str, object]] = []
+    active_detections: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    monitored: Dict[Tuple[str, str], Dict[str, object]] = {}
+    classified_values: Dict[Tuple[str, str, str], Dict[int, float]] = {}
+    classified_meta: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    classified_detections: Dict[Tuple[str, str, str], List[Dict[str, object]]] = {}
+    classified_sources: Dict[Tuple[str, str, str], set[str]] = {}
+    classified_entities: Dict[Tuple[str, str, str], Dict[str, set[object]]] = {}
+    thread_snapshot_indices: List[int] = []
+
+    ordered_thermal = sorted(
+        (
+            item
+            for item in thermal_snapshots
+            if samples[0].uptime_s - 60.0 <= item.uptime_s <= samples[-1].uptime_s + 60.0
+        ),
+        key=lambda item: item.uptime_s,
+    )
+    thermal_uptimes = [item.uptime_s for item in ordered_thermal]
+
+    def thermal_context(uptime_s: float) -> Tuple[Optional[float], Optional[str]]:
+        if not ordered_thermal:
+            return None, None
+        index = bisect.bisect_left(thermal_uptimes, uptime_s)
+        candidates: List[ThermalSnapshot] = []
+        if index < len(ordered_thermal):
+            candidates.append(ordered_thermal[index])
+        if index > 0:
+            candidates.append(ordered_thermal[index - 1])
+        nearest = min(candidates, key=lambda item: abs(item.uptime_s - uptime_s))
+        if abs(nearest.uptime_s - uptime_s) > max(60.0, max_gap_s * 2.0):
+            return None, None
+        values = [
+            (float(item["value_c"]), str(item.get("name") or "unknown"))
+            for item in nearest.temperatures
+            if isinstance(item.get("value_c"), (int, float))
+        ]
+        return max(values) if values else (None, None)
+
+    for snapshot_index, snapshot in enumerate(ordered):
+        sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        power = sample.power_mw if sample is not None else None
+        temperature_c, temperature_sensor = thermal_context(snapshot.uptime_s)
+        powers_by_snapshot.append(power)
+        category_cpu: Dict[str, float] = {}
+        active_names: List[str] = []
+        active_classified: List[str] = []
+        snapshot_classified: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+
+        def add_classified(item: Dict[str, object], source: str) -> None:
+            descriptor = None
+            if not item.get("activity_kind"):
+                descriptor = classify_thread_activity(
+                    str(item.get("name") or item.get("command") or ""),
+                    str(item.get("process") or item.get("command") or ""),
+                )
+            classified_item = {**item, **descriptor} if descriptor else item
+            kind = classified_item.get("activity_kind")
+            if not kind:
+                return
+            key = (
+                str(kind),
+                str(classified_item.get("subsystem") or "other"),
+                str(classified_item.get("activity_label") or kind),
+            )
+            state = snapshot_classified.setdefault(
+                key,
+                {
+                    "process_cpu_pct": 0.0,
+                    "thread_cpu_pct": 0.0,
+                    "active": False,
+                    "pids": set(),
+                    "tids": set(),
+                    "processes": set(),
+                    "threads": set(),
+                    "sources": set(),
+                },
+            )
+            cpu = float(classified_item.get("cpu_pct") or 0.0)
+            state[f"{source}_cpu_pct"] = float(state[f"{source}_cpu_pct"]) + cpu
+            state["active"] = bool(state["active"]) or bool(
+                classified_item.get("classified_activity_active")
+                or cpu >= 0.5
+                or str(classified_item.get("state") or "").upper() in {"R", "D"}
+            )
+            state["sources"].add(source)  # type: ignore[union-attr]
+            if isinstance(classified_item.get("pid"), int):
+                state["pids"].add(int(classified_item["pid"]))  # type: ignore[union-attr]
+            if isinstance(classified_item.get("tid"), int):
+                state["tids"].add(int(classified_item["tid"]))  # type: ignore[union-attr]
+            process_name = (
+                classified_item.get("process")
+                or classified_item.get("command")
+                or classified_item.get("name")
+            )
+            if process_name:
+                state["processes"].add(str(process_name))  # type: ignore[union-attr]
+            if source == "thread" and classified_item.get("name"):
+                state["threads"].add(str(classified_item["name"]))  # type: ignore[union-attr]
+            classified_meta.setdefault(
+                key,
+                {
+                    "kind": str(kind),
+                    "family": str(classified_item.get("activity_family") or kind),
+                    "label": str(classified_item.get("activity_label") or kind),
+                    "domain": str(classified_item.get("activity_domain") or "system"),
+                    "subsystem": str(classified_item.get("subsystem") or "other"),
+                    "impact": classified_item.get("impact_hint"),
+                },
+            )
+
+        for process in snapshot.processes:
+            name = str(process.get("name") or process.get("command") or "unknown")
+            user = str(process.get("user") or "unknown")
+            category = str(process.get("category") or "other")
+            key = (name, user, category)
+            cpu = float(process.get("cpu_pct") or 0.0)
+            process_values.setdefault(key, {})[snapshot_index] = cpu
+            process_meta.setdefault(key, dict(process))
+            relative_power_score = process.get("power_score")
+            if isinstance(relative_power_score, (int, float)):
+                process_relative_power_scores.setdefault(key, []).append(
+                    float(relative_power_score)
+                )
+            if power is not None:
+                process_powers.setdefault(key, []).append(power)
+            category_cpu[category] = category_cpu.get(category, 0.0) + cpu
+            add_classified(process, "process")
+
+        if snapshot.threads:
+            thread_snapshot_indices.append(snapshot_index)
+        for thread in snapshot.threads:
+            key = (
+                str(thread.get("name") or "unknown"),
+                str(thread.get("process") or "unknown"),
+                str(thread.get("user") or "unknown"),
+            )
+            thread_values.setdefault(key, []).append(float(thread.get("cpu_pct") or 0.0))
+            thread_meta.setdefault(key, dict(thread))
+            add_classified(thread, "thread")
+
+        classified_cpu = 0.0
+        for key, state in snapshot_classified.items():
+            cpu = max(
+                float(state.get("process_cpu_pct") or 0.0),
+                float(state.get("thread_cpu_pct") or 0.0),
+            )
+            classified_values.setdefault(key, {})[snapshot_index] = cpu
+            classified_sources.setdefault(key, set()).update(state["sources"])  # type: ignore[arg-type]
+            entities = classified_entities.setdefault(
+                key,
+                {"pids": set(), "tids": set(), "processes": set(), "threads": set()},
+            )
+            for field in ("pids", "tids", "processes", "threads"):
+                entities[field].update(state[field])  # type: ignore[arg-type]
+            if not state.get("active"):
+                continue
+            classified_cpu += cpu
+            meta = classified_meta[key]
+            active_classified.append(str(meta.get("label") or key[0]))
+            classified_detections.setdefault(key, []).append(
+                {
+                    "uptime_s": snapshot.uptime_s,
+                    "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                    "cpu_pct": cpu,
+                    "device_cpu_pct": sample.cpu_pct if sample else None,
+                    "power_mw": power,
+                    "temperature_c": temperature_c,
+                    "temperature_sensor": temperature_sensor,
+                    "pids": sorted(state["pids"]),
+                    "tids": sorted(state["tids"]),
+                    "processes": sorted(str(value) for value in state["processes"]),
+                    "threads": sorted(str(value) for value in state["threads"]),
+                    "sources": sorted(str(value) for value in state["sources"]),
+                }
+            )
+
+        for watched in snapshot.watched_processes:
+            watch_kind = str(watched.get("watch_kind") or "system_activity")
+            watch_name = str(watched.get("watch_name") or watched.get("name") or "unknown")
+            key = (watch_kind, watch_name)
+            state = monitored.setdefault(
+                key,
+                {
+                    "kind": watch_kind,
+                    "name": watch_name,
+                    "label": watched.get("watch_label"),
+                    "impact": watched.get("watch_impact"),
+                    "trigger": watched.get("watch_trigger"),
+                    "seen_snapshots": 0,
+                    "active_snapshots": 0,
+                    "maximum_cpu_pct": 0.0,
+                    "latest_active": False,
+                    "pids": set(),
+                },
+            )
+            state["seen_snapshots"] = int(state["seen_snapshots"]) + 1
+            if isinstance(watched.get("pid"), int):
+                state["pids"].add(int(watched["pid"]))  # type: ignore[union-attr]
+            cpu = float(watched.get("cpu_pct") or 0.0)
+            state["maximum_cpu_pct"] = max(float(state["maximum_cpu_pct"]), cpu)
+            is_active = bool(watched.get("activity_active"))
+            state["latest_active"] = is_active
+            if not is_active:
+                continue
+            state["active_snapshots"] = int(state["active_snapshots"]) + 1
+            active_names.append(str(watched.get("watch_label") or watch_name))
+            active_detections.setdefault(key, []).append(
+                {
+                    "uptime_s": snapshot.uptime_s,
+                    "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                    "pid": watched.get("pid"),
+                    "cpu_pct": watched.get("cpu_pct"),
+                    "power_mw": power,
+                    "state": watched.get("state"),
+                    "policy": watched.get("policy"),
+                    "command": watched.get("command"),
+                }
+            )
+
+        timeline.append(
+            {
+                "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                "uptime_s": snapshot.uptime_s,
+                "power_mw": power,
+                "visible_cpu_pct": sum(category_cpu.values()),
+                "background_cpu_pct": sum(
+                    float(item.get("cpu_pct") or 0.0)
+                    for item in snapshot.processes
+                    if str(item.get("policy") or "").lower() in {"bg", "background"}
+                ),
+                "kernel_cpu_pct": category_cpu.get("kernel", 0.0),
+                "android_system_cpu_pct": category_cpu.get("android_system", 0.0)
+                + category_cpu.get("native_system", 0.0)
+                + category_cpu.get("vendor_service", 0.0),
+                "application_cpu_pct": category_cpu.get("application", 0.0),
+                "priority_cpu_pct": sum(
+                    float(item.get("cpu_pct") or 0.0)
+                    for item in snapshot.watched_processes
+                    if item.get("activity_active")
+                ),
+                "active_priority": active_names,
+                "classified_activity_cpu_pct": classified_cpu,
+                "active_classified": active_classified,
+                "temperature_c": temperature_c,
+                "process_count": snapshot.process_count,
+                "thread_count": snapshot.thread_count,
+                "collection_ms": snapshot.collection_ms,
+            }
+        )
+
+    valid_power_indices = [index for index, value in enumerate(powers_by_snapshot) if value is not None]
+    top_processes: List[Dict[str, object]] = []
+    for key, values in process_values.items():
+        meta = dict(process_meta[key])
+        vector = [values.get(index, 0.0) for index in range(len(ordered))]
+        visible = list(values.values())
+        paired_cpu = [vector[index] for index in valid_power_indices]
+        paired_power = [float(powers_by_snapshot[index]) for index in valid_power_indices]
+        meta.update(
+            {
+                "seen_snapshots": len(visible),
+                "average_cpu_pct": statistics.fmean(vector),
+                "average_when_visible_cpu_pct": statistics.fmean(visible),
+                "maximum_cpu_pct": max(visible),
+                "power_correlation": _pearson(paired_cpu, paired_power),
+                "average_power_when_visible_mw": (
+                    statistics.fmean(process_powers.get(key, []))
+                    if process_powers.get(key)
+                    else None
+                ),
+                "average_relative_power_score": (
+                    statistics.fmean(process_relative_power_scores[key])
+                    if process_relative_power_scores.get(key)
+                    else None
+                ),
+                "maximum_relative_power_score": (
+                    max(process_relative_power_scores[key])
+                    if process_relative_power_scores.get(key)
+                    else None
+                ),
+            }
+        )
+        top_processes.append(meta)
+    top_processes.sort(
+        key=lambda item: (
+            float(item.get("average_cpu_pct") or 0.0),
+            float(item.get("maximum_cpu_pct") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    hot_threads: List[Dict[str, object]] = []
+    for key, values in thread_values.items():
+        meta = dict(thread_meta[key])
+        meta.update(
+            {
+                "seen_snapshots": len(values),
+                "average_when_visible_cpu_pct": statistics.fmean(values),
+                "maximum_cpu_pct": max(values),
+            }
+        )
+        hot_threads.append(meta)
+    hot_threads.sort(key=lambda item: float(item.get("maximum_cpu_pct") or 0.0), reverse=True)
+
+    cadence = _snapshot_cadence([item.uptime_s for item in ordered], 10.0)
+    intervals = sample_intervals(samples, max_gap_s)
+    total_metrics = _window_power_metrics(
+        samples,
+        intervals,
+        samples[0].uptime_s,
+        samples[-1].uptime_s,
+    )
+    baseline_power = total_metrics["average_power_mw"]
+    for process in top_processes:
+        visible_power = process.get("average_power_when_visible_mw")
+        process["power_delta_when_visible_mw"] = (
+            float(visible_power) - baseline_power
+            if isinstance(visible_power, (int, float))
+            else None
+        )
+    activity_rows: List[Dict[str, object]] = []
+    activity_timeline: List[Dict[str, object]] = []
+    for key, detections in active_detections.items():
+        detections.sort(key=lambda item: float(item["uptime_s"]))
+        windows: List[List[Dict[str, object]]] = []
+        for detection in detections:
+            if not windows or float(detection["uptime_s"]) - float(windows[-1][-1]["uptime_s"]) > max(
+                15.0,
+                cadence * 2.5,
+            ):
+                windows.append([detection])
+            else:
+                windows[-1].append(detection)
+        covered_s = 0.0
+        energy_mwh = 0.0
+        estimated_s = 0.0
+        activity_windows: List[Dict[str, object]] = []
+        for window in windows:
+            start = max(samples[0].uptime_s, float(window[0]["uptime_s"]) - cadence * 0.5)
+            end = min(samples[-1].uptime_s, float(window[-1]["uptime_s"]) + cadence * 0.5)
+            metrics = _window_power_metrics(samples, intervals, start, end)
+            covered_s += metrics["covered_duration_s"]
+            energy_mwh += metrics["energy_mwh"]
+            estimated_s += max(0.0, end - start)
+            activity_windows.append(
+                {
+                    "start_uptime_s": start,
+                    "end_uptime_s": end,
+                    "start_elapsed_s": start - samples[0].uptime_s,
+                    "end_elapsed_s": end - samples[0].uptime_s,
+                    "duration_s": max(0.0, end - start),
+                    **metrics,
+                }
+            )
+        average_power = energy_mwh * 3600.0 / covered_s if covered_s > 0 else None
+        cpu_values = [
+            float(item["cpu_pct"])
+            for item in detections
+            if isinstance(item.get("cpu_pct"), (int, float))
+        ]
+        monitored_state = monitored[key]
+        row = {
+            "kind": key[0],
+            "name": key[1],
+            "label": monitored_state.get("label"),
+            "impact": monitored_state.get("impact"),
+            "detection_count": len(detections),
+            "window_count": len(windows),
+            "first_elapsed_s": float(detections[0]["elapsed_s"]),
+            "last_elapsed_s": float(detections[-1]["elapsed_s"]),
+            "estimated_duration_s": estimated_s,
+            "covered_duration_s": covered_s,
+            "energy_mwh": energy_mwh,
+            "average_power_mw": average_power,
+            "baseline_power_mw": baseline_power,
+            "power_delta_mw": average_power - baseline_power if average_power is not None else None,
+            "excess_energy_mwh": (
+                max(0.0, average_power - baseline_power) * covered_s / 3600.0
+                if average_power is not None
+                else None
+            ),
+            "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
+            "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
+            "windows": activity_windows,
+            "confidence": "medium" if len(detections) >= 2 and covered_s >= cadence else "low",
+            "source": "periodic whole-system top/ps snapshots; power association is temporal, not causal",
+        }
+        activity_rows.append(row)
+        for detection in detections:
+            activity_timeline.append(
+                {
+                    **detection,
+                    "kind": key[0],
+                    "name": key[1],
+                    "label": monitored_state.get("label"),
+                }
+            )
+    activity_rows.sort(
+        key=lambda item: (
+            float(item.get("excess_energy_mwh") or 0.0),
+            float(item.get("maximum_cpu_pct") or 0.0),
+        ),
+        reverse=True,
+    )
+    activity_timeline.sort(key=lambda item: float(item.get("elapsed_s") or 0.0))
+
+    thread_cadence = _snapshot_cadence(
+        [ordered[index].uptime_s for index in thread_snapshot_indices],
+        max(cadence, 30.0),
+    )
+    classified_rows: List[Dict[str, object]] = []
+    classified_timeline: List[Dict[str, object]] = []
+    for key, detections in classified_detections.items():
+        detections.sort(key=lambda item: float(item["uptime_s"]))
+        sources = classified_sources.get(key, set())
+        observation_cadence = thread_cadence if sources == {"thread"} else cadence
+        observation_indices = (
+            thread_snapshot_indices if sources == {"thread"} else list(range(len(ordered)))
+        )
+        values = classified_values.get(key, {})
+        cpu_vector = [float(values.get(index, 0.0)) for index in observation_indices]
+        paired = [
+            (float(values.get(index, 0.0)), float(powers_by_snapshot[index]))
+            for index in observation_indices
+            if powers_by_snapshot[index] is not None
+        ]
+        windows: List[List[Dict[str, object]]] = []
+        for detection in detections:
+            if not windows or float(detection["uptime_s"]) - float(windows[-1][-1]["uptime_s"]) > max(
+                15.0,
+                observation_cadence * 2.5,
+            ):
+                windows.append([detection])
+            else:
+                windows[-1].append(detection)
+
+        covered_s = 0.0
+        energy_mwh = 0.0
+        estimated_s = 0.0
+        window_rows: List[Dict[str, object]] = []
+        for window in windows:
+            start = max(
+                samples[0].uptime_s,
+                float(window[0]["uptime_s"]) - observation_cadence * 0.5,
+            )
+            end = min(
+                samples[-1].uptime_s,
+                float(window[-1]["uptime_s"]) + observation_cadence * 0.5,
+            )
+            metrics = _window_power_metrics(samples, intervals, start, end)
+            covered_s += metrics["covered_duration_s"]
+            energy_mwh += metrics["energy_mwh"]
+            estimated_s += max(0.0, end - start)
+            window_rows.append(
+                {
+                    "start_uptime_s": start,
+                    "end_uptime_s": end,
+                    "start_elapsed_s": start - samples[0].uptime_s,
+                    "end_elapsed_s": end - samples[0].uptime_s,
+                    "duration_s": max(0.0, end - start),
+                    **metrics,
+                }
+            )
+
+        cpu_values = [float(item.get("cpu_pct") or 0.0) for item in detections]
+        device_cpu_values = [
+            float(item["device_cpu_pct"])
+            for item in detections
+            if isinstance(item.get("device_cpu_pct"), (int, float))
+        ]
+        temperature_values = [
+            float(item["temperature_c"])
+            for item in detections
+            if isinstance(item.get("temperature_c"), (int, float))
+        ]
+        average_power = energy_mwh * 3600.0 / covered_s if covered_s > 0 else None
+        meta = classified_meta[key]
+        entities = classified_entities.get(
+            key,
+            {"pids": set(), "tids": set(), "processes": set(), "threads": set()},
+        )
+        row = {
+            **meta,
+            "detection_count": len(detections),
+            "window_count": len(windows),
+            "observed_snapshot_count": len(observation_indices),
+            "first_elapsed_s": float(detections[0]["elapsed_s"]),
+            "last_elapsed_s": float(detections[-1]["elapsed_s"]),
+            "estimated_duration_s": estimated_s,
+            "covered_duration_s": covered_s,
+            "energy_mwh": energy_mwh,
+            "average_power_mw": average_power,
+            "baseline_power_mw": baseline_power,
+            "power_delta_mw": average_power - baseline_power if average_power is not None else None,
+            "excess_energy_mwh": (
+                max(0.0, average_power - baseline_power) * covered_s / 3600.0
+                if average_power is not None
+                else None
+            ),
+            "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
+            "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
+            "session_average_cpu_pct": statistics.fmean(cpu_vector) if cpu_vector else None,
+            "average_device_cpu_pct": statistics.fmean(device_cpu_values) if device_cpu_values else None,
+            "power_correlation": _pearson(
+                [item[0] for item in paired],
+                [item[1] for item in paired],
+            ),
+            "average_temperature_c": (
+                statistics.fmean(temperature_values) if temperature_values else None
+            ),
+            "maximum_temperature_c": max(temperature_values) if temperature_values else None,
+            "pids": sorted(int(value) for value in entities["pids"] if isinstance(value, int)),
+            "tids": sorted(int(value) for value in entities["tids"] if isinstance(value, int)),
+            "processes": sorted(str(value) for value in entities["processes"])[:12],
+            "threads": sorted(str(value) for value in entities["threads"])[:12],
+            "sources": sorted(sources),
+            "observation_cadence_s": observation_cadence,
+            "windows": window_rows,
+            "confidence": (
+                "medium"
+                if len(detections) >= 2 and covered_s >= observation_cadence
+                else "low"
+            ),
+            "source": (
+                "periodic top process/thread snapshots; power and temperature associations are temporal, not causal"
+            ),
+        }
+        classified_rows.append(row)
+        for detection in detections:
+            classified_timeline.append(
+                {
+                    **detection,
+                    "kind": meta.get("kind"),
+                    "family": meta.get("family"),
+                    "label": meta.get("label"),
+                    "domain": meta.get("domain"),
+                    "subsystem": meta.get("subsystem"),
+                }
+            )
+    classified_rows.sort(
+        key=lambda item: (
+            float(item.get("excess_energy_mwh") or 0.0),
+            float(item.get("maximum_cpu_pct") or 0.0),
+            int(item.get("detection_count") or 0),
+        ),
+        reverse=True,
+    )
+    classified_timeline.sort(key=lambda item: float(item.get("elapsed_s") or 0.0))
+    runtime_activity = [item for item in classified_rows if item.get("domain") == "runtime"]
+    kernel_activity = [item for item in classified_rows if item.get("domain") == "kernel"]
+
+    latest_active_keys = {
+        (
+            str(item.get("watch_kind") or "system_activity"),
+            str(item.get("watch_name") or item.get("name") or "unknown"),
+        )
+        for item in ordered[-1].watched_processes
+        if item.get("activity_active")
+    }
+    monitored_rows = []
+    for key, value in monitored.items():
+        row = dict(value)
+        row["latest_active"] = key in latest_active_keys
+        pids = row.pop("pids")
+        row["pids"] = sorted(pids) if isinstance(pids, set) else []
+        monitored_rows.append(row)
+    monitored_rows.sort(
+        key=lambda item: (
+            not bool(item.get("latest_active")),
+            -int(item.get("active_snapshots") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+    process_counts = [item.process_count for item in ordered if item.process_count is not None]
+    thread_counts = [item.thread_count for item in ordered if item.thread_count is not None]
+    collection_times = [
+        float(item.collection_ms)
+        for item in ordered
+        if isinstance(item.collection_ms, (int, float))
+    ]
+    return {
+        "available": True,
+        "snapshot_count": len(ordered),
+        "thread_snapshot_count": sum(1 for item in ordered if item.threads),
+        "average_process_count": statistics.fmean(process_counts) if process_counts else None,
+        "maximum_process_count": max(process_counts) if process_counts else None,
+        "average_thread_count": statistics.fmean(thread_counts) if thread_counts else None,
+        "maximum_thread_count": max(thread_counts) if thread_counts else None,
+        "average_collection_ms": statistics.fmean(collection_times) if collection_times else None,
+        "maximum_collection_ms": max(collection_times) if collection_times else None,
+        "top_processes": top_processes[:40],
+        "hot_threads": hot_threads[:40],
+        "timeline": timeline,
+        "activity_groups": {
+            "available": bool(classified_rows),
+            "rows": classified_rows,
+            "timeline": classified_timeline,
+            "runtime": runtime_activity,
+            "kernel": kernel_activity,
+            "cadence_s": cadence,
+            "thread_cadence_s": thread_cadence,
+            "limitations": (
+                "Activity groups are inferred from process/thread names in periodic top snapshots. "
+                "They are sampling evidence rather than continuous scheduler traces or rail-level energy attribution."
+            ),
+        },
+        "runtime_activity": runtime_activity,
+        "kernel_activity": kernel_activity,
+        "priority_activities": {
+            "available": bool(monitored_rows),
+            "active": bool(activity_rows),
+            "rows": activity_rows,
+            "timeline": activity_timeline,
+            "monitored": monitored_rows,
+            "latest_active": [
+                item.get("label") or item.get("name")
+                for item in monitored_rows
+                if item.get("latest_active")
+            ],
+            "cadence_s": cadence,
+        },
+        "limitations": (
+            "Process and thread CPU values are periodic top snapshots, not continuous scheduler traces. "
+            "Power deltas show time association with whole-device battery output and must not be read as causal attribution."
+        ),
+    }
+
+
+THERMAL_STATUS_LABELS = {
+    0: "none",
+    1: "light",
+    2: "moderate",
+    3: "severe",
+    4: "critical",
+    5: "emergency",
+    6: "shutdown",
+}
+
+# Android TemperatureType values 6-8 are battery-current-limit (BCL)
+# telemetry rather than temperature sensors. Their status values describe BCL
+# conditions (for example low voltage), so folding them into ThermalService
+# severity can incorrectly turn a vbat status of 6 into a "thermal shutdown".
+BCL_SENSOR_UNITS = {
+    6: "V",  # BCL_VOLTAGE
+    7: "A",  # BCL_CURRENT
+    8: "%",  # BCL_PERCENTAGE
+}
+
+
+def _thermal_sensor_type(value: object) -> Optional[int]:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _contributes_to_thermal_status(sensor_type: object) -> bool:
+    parsed = _thermal_sensor_type(sensor_type)
+    return parsed not in BCL_SENSOR_UNITS
+
+
+def _thermal_sensor_unit(sensor_type: object) -> str:
+    parsed = _thermal_sensor_type(sensor_type)
+    return BCL_SENSOR_UNITS.get(parsed, "°C")
+
+
+def analyze_thermal_history(
+    samples: Sequence[Sample],
+    snapshots: Sequence[ThermalSnapshot],
+) -> Dict[str, object]:
+    ordered = sorted(snapshots, key=lambda item: item.uptime_s)
+    if not ordered:
+        return {
+            "available": False,
+            "snapshot_count": 0,
+            "timeline": [],
+            "sensors": [],
+            "cooling_devices": [],
+        }
+    sample_uptimes = [item.uptime_s for item in samples]
+    sensor_values: Dict[str, List[float]] = {}
+    sensor_statuses: Dict[str, List[int]] = {}
+    sensor_types: Dict[str, object] = {}
+    sensor_powers: Dict[str, List[float]] = {}
+    threshold_map: Dict[str, Dict[str, object]] = {}
+    cooling: Dict[str, Dict[str, object]] = {}
+    timeline: List[Dict[str, object]] = []
+    statuses: List[int] = []
+    for snapshot in ordered:
+        sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        power = sample.power_mw if sample else None
+        sensors: Dict[str, float] = {}
+        sensor_severity: Dict[str, int] = {}
+        if snapshot.status is not None:
+            statuses.append(snapshot.status)
+        for threshold in snapshot.thresholds:
+            name = str(threshold.get("name") or "unknown")
+            threshold_map[name] = threshold
+        for item in snapshot.temperatures:
+            name = str(item.get("name") or "unknown")
+            if not isinstance(item.get("value_c"), (int, float)):
+                continue
+            value = float(item["value_c"])
+            severity = int(item.get("status") or 0)
+            sensor_type = item.get("type")
+            sensors[name] = value
+            sensor_severity[name] = severity
+            sensor_values.setdefault(name, []).append(value)
+            sensor_statuses.setdefault(name, []).append(severity)
+            if sensor_type is not None:
+                sensor_types[name] = sensor_type
+            if power is not None:
+                sensor_powers.setdefault(name, []).append(power)
+        active_cooling = []
+        for item in snapshot.cooling_devices:
+            name = str(item.get("name") or "unknown")
+            value = float(item.get("value") or 0.0)
+            row = cooling.setdefault(
+                name,
+                {
+                    "name": name,
+                    "type": item.get("type"),
+                    "maximum_value": 0.0,
+                    "active_snapshots": 0,
+                },
+            )
+            row["maximum_value"] = max(float(row["maximum_value"]), value)
+            if value > 0:
+                row["active_snapshots"] = int(row["active_snapshots"]) + 1
+                active_cooling.append(name)
+        timeline.append(
+            {
+                "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                "uptime_s": snapshot.uptime_s,
+                "status": snapshot.status,
+                "status_label": THERMAL_STATUS_LABELS.get(snapshot.status, "unknown"),
+                "sensors": sensors,
+                "sensor_status": sensor_severity,
+                "active_cooling": active_cooling,
+                "power_mw": power,
+            }
+        )
+
+    sensors_rows: List[Dict[str, object]] = []
+    for name, values in sensor_values.items():
+        threshold = threshold_map.get(name, {})
+        sensor_type = sensor_types.get(name)
+        if sensor_type is None and isinstance(threshold, dict):
+            sensor_type = threshold.get("type")
+        contributes_to_thermal_status = _contributes_to_thermal_status(sensor_type)
+        maximum_sensor_status = max(sensor_statuses.get(name, [0]))
+        hot = threshold.get("hot_c", []) if isinstance(threshold, dict) else []
+        first_hot = next(
+            (float(value) for value in hot if isinstance(value, (int, float))),
+            None,
+        )
+        powers = sensor_powers.get(name, [])
+        sensors_rows.append(
+            {
+                "name": name,
+                "type": sensor_type,
+                "unit": _thermal_sensor_unit(sensor_type),
+                "contributes_to_thermal_status": contributes_to_thermal_status,
+                "minimum_value": min(values),
+                "average_value": statistics.fmean(values),
+                "maximum_value": max(values),
+                "minimum_c": min(values),
+                "average_c": statistics.fmean(values),
+                "maximum_c": max(values),
+                "maximum_status": maximum_sensor_status,
+                "maximum_status_label": (
+                    THERMAL_STATUS_LABELS.get(maximum_sensor_status, "unknown")
+                    if contributes_to_thermal_status
+                    else "not_applicable"
+                ),
+                "first_hot_threshold_c": first_hot,
+                "margin_to_first_threshold_c": first_hot - max(values) if first_hot is not None else None,
+                "power_correlation": _pearson(values, powers) if len(values) == len(powers) else None,
+                "thresholds": threshold,
+            }
+        )
+    sensors_rows.sort(
+        key=lambda item: (
+            bool(item.get("contributes_to_thermal_status")),
+            float(item.get("maximum_value") or 0.0),
+        ),
+        reverse=True,
+    )
+    thermal_sensor_rows = [
+        item for item in sensors_rows if bool(item.get("contributes_to_thermal_status"))
+    ]
+    maximum_status = max(
+        statuses
+        + [int(item.get("maximum_status") or 0) for item in thermal_sensor_rows],
+        default=0,
+    )
+    latest_status = ordered[-1].status
+    collection_times = [
+        float(item.collection_ms)
+        for item in ordered
+        if isinstance(item.collection_ms, (int, float))
+    ]
+    cooling_rows = sorted(
+        cooling.values(),
+        key=lambda item: (int(item.get("active_snapshots") or 0), float(item.get("maximum_value") or 0.0)),
+        reverse=True,
+    )
+    return {
+        "available": True,
+        "snapshot_count": len(ordered),
+        "hal_ready": ordered[-1].hal_ready,
+        "latest_status": latest_status,
+        "latest_status_label": THERMAL_STATUS_LABELS.get(latest_status, "unknown"),
+        "maximum_status": maximum_status,
+        "maximum_status_label": THERMAL_STATUS_LABELS.get(maximum_status, "unknown"),
+        "throttling_observed": maximum_status > 0,
+        "hottest_sensor": thermal_sensor_rows[0] if thermal_sensor_rows else None,
+        "sensors": sensors_rows,
+        "cooling_devices": cooling_rows,
+        "timeline": timeline,
+        "headroom_thresholds": ordered[-1].headroom_thresholds,
+        "average_collection_ms": statistics.fmean(collection_times) if collection_times else None,
+        "maximum_collection_ms": max(collection_times) if collection_times else None,
+        "limitations": (
+            "ThermalService exposes observed temperatures, severity, cooling states and static thresholds. "
+            "BCL voltage/current/percentage sensors are retained as auxiliary telemetry but excluded from "
+            "thermal severity aggregation. "
+            "The OEM's internal thermal decision algorithm and all vendor configuration semantics remain opaque."
+        ),
+    }
+
+
+def analyze_scheduler_history(
+    samples: Sequence[Sample],
+    snapshots: Sequence[SchedulerSnapshot],
+) -> Dict[str, object]:
+    ordered = sorted(snapshots, key=lambda item: item.uptime_s)
+    if not ordered:
+        return {
+            "available": False,
+            "snapshot_count": 0,
+            "cpusets": [],
+            "cpu_policies": [],
+            "hint_sessions": [],
+            "process_states": [],
+            "timeline": [],
+        }
+    cpuset_values: Dict[str, List[str]] = {}
+    policy_values: Dict[str, Dict[str, object]] = {}
+    session_values: Dict[Tuple[object, object, Tuple[int, ...]], Dict[str, object]] = {}
+    process_values: Dict[Tuple[object, object], Dict[str, object]] = {}
+    timeline: List[Dict[str, object]] = []
+    sample_uptimes = [item.uptime_s for item in samples]
+    for snapshot in ordered:
+        for name, value in snapshot.cpusets.items():
+            cpuset_values.setdefault(name, []).append(value)
+        for policy in snapshot.cpu_policies:
+            name = str(policy.get("name") or "unknown")
+            row = policy_values.setdefault(
+                name,
+                {
+                    "name": name,
+                    "governors": set(),
+                    "scaling_min_khz": set(),
+                    "scaling_max_khz": set(),
+                    "cpuinfo_min_khz": set(),
+                    "cpuinfo_max_khz": set(),
+                    "related_cpus": set(),
+                    "core_ctl_enabled": set(),
+                    "core_ctl_min_cpus": set(),
+                    "core_ctl_max_cpus": set(),
+                    "statuses": set(),
+                },
+            )
+            if policy.get("governor"):
+                row["governors"].add(str(policy["governor"]))  # type: ignore[union-attr]
+            for key in ("scaling_min_khz", "scaling_max_khz", "cpuinfo_min_khz", "cpuinfo_max_khz"):
+                if isinstance(policy.get(key), (int, float)):
+                    row[key].add(float(policy[key]))  # type: ignore[union-attr]
+            if policy.get("related_cpus"):
+                row["related_cpus"].add(str(policy["related_cpus"]))  # type: ignore[union-attr]
+            if isinstance(policy.get("core_ctl_enabled"), bool):
+                row["core_ctl_enabled"].add(bool(policy["core_ctl_enabled"]))  # type: ignore[union-attr]
+            for key in ("core_ctl_min_cpus", "core_ctl_max_cpus"):
+                if isinstance(policy.get(key), (int, float)):
+                    row[key].add(int(policy[key]))  # type: ignore[union-attr]
+            row["statuses"].add(str(policy.get("status") or "unknown"))  # type: ignore[union-attr]
+        for session in snapshot.hint_sessions:
+            tids = tuple(int(value) for value in session.get("tids", []) if isinstance(value, int))
+            key = (session.get("uid"), session.get("pid"), tids)
+            row = session_values.setdefault(
+                key,
+                {**session, "snapshot_count": 0},
+            )
+            row["snapshot_count"] = int(row["snapshot_count"]) + 1
+            row.update(session)
+        for process in snapshot.watched_processes:
+            key = (process.get("pid"), process.get("name"))
+            row = process_values.setdefault(
+                key,
+                {**process, "snapshot_count": 0},
+            )
+            row["snapshot_count"] = int(row["snapshot_count"]) + 1
+            row.update(process)
+        sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        timeline.append(
+            {
+                "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                "hint_session_count": len(snapshot.hint_sessions),
+                "graphics_session_count": sum(
+                    1 for item in snapshot.hint_sessions if item.get("graphics_pipeline")
+                ),
+                "power_efficient_session_count": sum(
+                    1 for item in snapshot.hint_sessions if item.get("power_efficient")
+                ),
+                "power_mw": sample.power_mw if sample else None,
+                "collection_ms": snapshot.collection_ms,
+            }
+        )
+
+    cpuset_rows = [
+        {
+            "name": name,
+            "latest_cpus": values[-1],
+            "observed_cpus": list(dict.fromkeys(values)),
+            "changed": len(set(values)) > 1,
+        }
+        for name, values in sorted(cpuset_values.items())
+    ]
+    policy_rows: List[Dict[str, object]] = []
+    for row in policy_values.values():
+        policy_rows.append(
+            {
+                "name": row["name"],
+                "governors": sorted(row["governors"]),
+                "scaling_min_khz": sorted(row["scaling_min_khz"]),
+                "scaling_max_khz": sorted(row["scaling_max_khz"]),
+                "cpuinfo_min_khz": sorted(row["cpuinfo_min_khz"]),
+                "cpuinfo_max_khz": sorted(row["cpuinfo_max_khz"]),
+                "related_cpus": sorted(row["related_cpus"]),
+                "core_ctl_enabled": sorted(row["core_ctl_enabled"]),
+                "core_ctl_min_cpus": sorted(row["core_ctl_min_cpus"]),
+                "core_ctl_max_cpus": sorted(row["core_ctl_max_cpus"]),
+                "statuses": sorted(row["statuses"]),
+                "runtime_controls_visible": bool(
+                    row["governors"]
+                    or row["scaling_min_khz"]
+                    or row["scaling_max_khz"]
+                    or row["core_ctl_min_cpus"]
+                    or row["core_ctl_max_cpus"]
+                ),
+            }
+        )
+    policy_rows.sort(key=lambda item: str(item["name"]))
+    hint_rows = sorted(
+        session_values.values(),
+        key=lambda item: (int(item.get("snapshot_count") or 0), bool(item.get("graphics_pipeline"))),
+        reverse=True,
+    )
+    process_rows = sorted(
+        process_values.values(),
+        key=lambda item: (
+            int(item.get("current_proc_state") or 99) * -1,
+            int(item.get("snapshot_count") or 0),
+        ),
+        reverse=True,
+    )
+    availability: Dict[str, object] = {}
+    for snapshot in ordered:
+        availability.update(snapshot.availability)
+    collection_times = [
+        float(item.collection_ms)
+        for item in ordered
+        if isinstance(item.collection_ms, (int, float))
+    ]
+    return {
+        "available": True,
+        "snapshot_count": len(ordered),
+        "cpusets": cpuset_rows,
+        "cpu_policies": policy_rows,
+        "hint_sessions": hint_rows,
+        "maximum_hint_session_count": max((item["hint_session_count"] for item in timeline), default=0),
+        "process_states": process_rows[:60],
+        "timeline": timeline,
+        "availability": availability,
+        "latest_power_state": ordered[-1].power_hal,
+        "average_collection_ms": statistics.fmean(collection_times) if collection_times else None,
+        "maximum_collection_ms": max(collection_times) if collection_times else None,
+        "limitations": (
+            "cpuset membership, ActivityManager proc state and ADPF sessions are observable. "
+            "Kernel sched_debug and OEM governor/uclamp controls may remain permission-restricted on production builds."
+        ),
+    }
+
+
+def _merge_time_windows(windows: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    ordered = sorted((start, end) for start, end in windows if end > start)
+    merged: List[Tuple[float, float]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _overlap_segments(
+    left: Sequence[Tuple[float, float]],
+    right: Sequence[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    overlaps: List[Tuple[float, float]] = []
+    for left_start, left_end in left:
+        for right_start, right_end in right:
+            start = max(left_start, right_start)
+            end = min(left_end, right_end)
+            if end > start:
+                overlaps.append((start, end))
+    return _merge_time_windows(overlaps)
+
+
+def _time_in_windows(value: float, windows: Sequence[Tuple[float, float]]) -> bool:
+    return any(start <= value <= end for start, end in windows)
+
+
+def _analysis_windows(rows: Sequence[Dict[str, object]]) -> List[Tuple[float, float]]:
+    windows: List[Tuple[float, float]] = []
+    for row in rows:
+        for item in row.get("windows", []):
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start_uptime_s")
+            end = item.get("end_uptime_s")
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                windows.append((float(start), float(end)))
+    return windows
+
+
+def analyze_test_items(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    events: Sequence[ExternalEvent],
+    system_snapshots: Sequence[SystemSnapshot],
+    system_analysis: Dict[str, object],
+    thermal_analysis: Dict[str, object],
+    scheduler_analysis: Dict[str, object],
+    max_gap_s: float,
+    sample_interval_s: float,
+) -> Dict[str, object]:
+    """Aggregate long sessions by explicit test spans, falling back to foreground activity."""
+    session_start = samples[0].uptime_s
+    session_end = samples[-1].uptime_s
+    intervals = sample_intervals(samples, max_gap_s)
+    sample_uptimes = [item.uptime_s for item in samples]
+    minimum_reliable_duration_s = max(3.0 * sample_interval_s, sample_interval_s + 2.0)
+    definitions: Dict[Tuple[str, str], Dict[str, object]] = {}
+    occurrences: List[Dict[str, object]] = []
+
+    duration_events = [
+        item
+        for item in events
+        if isinstance(item.duration_s, (int, float))
+        and float(item.duration_s or 0.0) > 0
+        and item.device_uptime_s < session_end
+        and item.device_uptime_s + float(item.duration_s or 0.0) > session_start
+    ]
+    source_mode = "external_events" if duration_events else "foreground_activity"
+    if duration_events:
+        for event in sorted(duration_events, key=lambda item: item.device_uptime_s):
+            start = max(session_start, event.device_uptime_s)
+            end = min(session_end, event.device_uptime_s + float(event.duration_s or 0.0))
+            if end <= start:
+                continue
+            key = (event.phase or "测试", event.name or "未命名测试项")
+            occurrence = {
+                "phase": key[0],
+                "name": key[1],
+                "start_uptime_s": start,
+                "end_uptime_s": end,
+                "source": event.source,
+                "metadata": event.metadata,
+            }
+            occurrences.append(occurrence)
+            row = definitions.setdefault(
+                key,
+                {
+                    "phase": key[0],
+                    "name": key[1],
+                    "comparison_key": str(event.metadata.get("test") or key[1]),
+                    "source": event.source,
+                    "windows": [],
+                },
+            )
+            row["windows"].append((start, end))  # type: ignore[union-attr]
+    else:
+        ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+        context_uptimes = [item.uptime_s for item in ordered_contexts]
+        current = _context_at(ordered_contexts, context_uptimes, session_start)
+        cursor = session_start
+        changes = [
+            item for item in ordered_contexts if session_start < item.uptime_s < session_end
+        ]
+
+        def context_key(context: Optional[ContextSample]) -> Tuple[str, str]:
+            package = context.foreground_package if context else None
+            activity = context.foreground_activity if context else None
+            return package or "前台活动", activity or package or "未知前台活动"
+
+        def append_context_window(key: Tuple[str, str], start: float, end: float) -> None:
+            if end <= start:
+                return
+            occurrence = {
+                "phase": key[0],
+                "name": key[1],
+                "start_uptime_s": start,
+                "end_uptime_s": end,
+                "source": "ActivityManager context sampler",
+                "metadata": {},
+            }
+            occurrences.append(occurrence)
+            row = definitions.setdefault(
+                key,
+                {
+                    "phase": key[0],
+                    "name": key[1],
+                    "comparison_key": key[1],
+                    "source": "ActivityManager context sampler",
+                    "windows": [],
+                },
+            )
+            row["windows"].append((start, end))  # type: ignore[union-attr]
+
+        current_key = context_key(current)
+        for following in changes:
+            next_key = context_key(following)
+            if next_key == current_key:
+                current = following
+                continue
+            append_context_window(current_key, cursor, following.uptime_s)
+            current = following
+            current_key = next_key
+            cursor = following.uptime_s
+        append_context_window(current_key, cursor, session_end)
+
+    activity_groups = system_analysis.get("activity_groups", {})
+    classified_rows = (
+        activity_groups.get("rows", []) if isinstance(activity_groups, dict) else []
+    )
+    classified_timeline = (
+        activity_groups.get("timeline", []) if isinstance(activity_groups, dict) else []
+    )
+    priority = system_analysis.get("priority_activities", {})
+    priority_rows = priority.get("rows", []) if isinstance(priority, dict) else []
+    priority_timeline = priority.get("timeline", []) if isinstance(priority, dict) else []
+    system_timeline = system_analysis.get("timeline", [])
+    thermal_timeline = thermal_analysis.get("timeline", [])
+    scheduler_timeline = scheduler_analysis.get("timeline", [])
+
+    thermal_points = sorted(
+        (
+            item
+            for item in thermal_timeline
+            if isinstance(item.get("uptime_s"), (int, float))
+        ),
+        key=lambda item: float(item["uptime_s"]),
+    )
+    thermal_cadence = _snapshot_cadence(
+        [float(item["uptime_s"]) for item in thermal_points],
+        30.0,
+    )
+    throttled_windows: List[Tuple[float, float]] = []
+    for index, item in enumerate(thermal_points):
+        status = int(item.get("status") or 0)
+        if status <= 0:
+            continue
+        previous_uptime = (
+            float(thermal_points[index - 1]["uptime_s"])
+            if index > 0
+            else float(item["uptime_s"]) - thermal_cadence
+        )
+        next_uptime = (
+            float(thermal_points[index + 1]["uptime_s"])
+            if index + 1 < len(thermal_points)
+            else float(item["uptime_s"]) + thermal_cadence
+        )
+        throttled_windows.append(
+            (
+                max(session_start, (previous_uptime + float(item["uptime_s"])) * 0.5),
+                min(session_end, (float(item["uptime_s"]) + next_uptime) * 0.5),
+            )
+        )
+
+    ordered_system_snapshots = sorted(
+        (
+            item
+            for item in system_snapshots
+            if session_start - max_gap_s <= item.uptime_s <= session_end + max_gap_s
+        ),
+        key=lambda item: item.uptime_s,
+    )
+    ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+    context_uptimes = [item.uptime_s for item in ordered_contexts]
+
+    def analyze_windows(windows: Sequence[Tuple[float, float]]) -> Dict[str, object]:
+        valid_windows = [(float(start), float(end)) for start, end in windows if end > start]
+        duration_s = sum(end - start for start, end in valid_windows)
+        covered_s = 0.0
+        energy_mwh = 0.0
+        discharge_mah = 0.0
+        power_values: List[float] = []
+        cpu_values: List[float] = []
+        battery_temperatures: List[float] = []
+        gpu_load_values: List[float] = []
+        gpu_frequency_values: List[float] = []
+        foreground_duration: Dict[str, float] = {}
+        for start, end in valid_windows:
+            metrics = _window_power_metrics(samples, intervals, start, end)
+            covered_s += metrics["covered_duration_s"]
+            energy_mwh += metrics["energy_mwh"]
+            for previous, current, _ in intervals:
+                overlap_s = max(0.0, min(end, current.uptime_s) - max(start, previous.uptime_s))
+                if overlap_s <= 0:
+                    continue
+                if previous.direction == "discharging" or current.direction == "discharging":
+                    discharge_mah += (
+                        (previous.current_ma + current.current_ma) * 0.5 * overlap_s / 3600.0
+                    )
+                midpoint = max(start, previous.uptime_s) + overlap_s * 0.5
+                context = _context_at(ordered_contexts, context_uptimes, midpoint)
+                package = context.foreground_package if context and context.foreground_package else "unknown"
+                foreground_duration[package] = foreground_duration.get(package, 0.0) + overlap_s
+            for sample in samples:
+                if start <= sample.uptime_s <= end:
+                    power_values.append(sample.power_mw)
+                    if sample.cpu_pct is not None:
+                        cpu_values.append(float(sample.cpu_pct))
+                    if sample.battery_temperature_c is not None:
+                        battery_temperatures.append(float(sample.battery_temperature_c))
+                    if sample.gpu_load_pct is not None:
+                        gpu_load_values.append(float(sample.gpu_load_pct))
+                    if sample.gpu_frequency_mhz is not None:
+                        gpu_frequency_values.append(float(sample.gpu_frequency_mhz))
+
+        first_start = min((item[0] for item in valid_windows), default=session_start)
+        last_end = max((item[1] for item in valid_windows), default=session_start)
+        start_sample = _nearest_sample(samples, sample_uptimes, first_start)
+        end_sample = _nearest_sample(samples, sample_uptimes, last_end)
+
+        relevant_system = [
+            item for item in ordered_system_snapshots if _time_in_windows(item.uptime_s, valid_windows)
+        ]
+        process_aggregate: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+        for snapshot in relevant_system:
+            for process in snapshot.processes:
+                key = (
+                    str(process.get("name") or process.get("command") or "unknown"),
+                    str(process.get("user") or "unknown"),
+                    str(process.get("category") or "other"),
+                )
+                row = process_aggregate.setdefault(
+                    key,
+                    {
+                        "name": key[0],
+                        "user": key[1],
+                        "category": key[2],
+                        "cpu_sum": 0.0,
+                        "visible_snapshots": 0,
+                        "maximum_cpu_pct": 0.0,
+                        "pids": set(),
+                    },
+                )
+                cpu = float(process.get("cpu_pct") or 0.0)
+                row["cpu_sum"] = float(row["cpu_sum"]) + cpu
+                row["visible_snapshots"] = int(row["visible_snapshots"]) + 1
+                row["maximum_cpu_pct"] = max(float(row["maximum_cpu_pct"]), cpu)
+                if isinstance(process.get("pid"), int):
+                    row["pids"].add(int(process["pid"]))  # type: ignore[union-attr]
+        top_processes: List[Dict[str, object]] = []
+        for row in process_aggregate.values():
+            cpu_sum = float(row.pop("cpu_sum"))
+            visible = int(row["visible_snapshots"])
+            pids = row.pop("pids")
+            row["average_cpu_pct"] = (
+                cpu_sum / len(relevant_system) if relevant_system else None
+            )
+            row["average_when_visible_cpu_pct"] = cpu_sum / visible if visible else None
+            row["pids"] = sorted(pids) if isinstance(pids, set) else []
+            top_processes.append(row)
+        top_processes.sort(
+            key=lambda item: (
+                float(item.get("average_cpu_pct") or 0.0),
+                float(item.get("maximum_cpu_pct") or 0.0),
+            ),
+            reverse=True,
+        )
+
+        classified_summaries: List[Dict[str, object]] = []
+        for activity in classified_rows:
+            activity_windows = _analysis_windows([activity])
+            overlap = _overlap_segments(valid_windows, activity_windows)
+            detections = [
+                item
+                for item in classified_timeline
+                if item.get("kind") == activity.get("kind")
+                and item.get("subsystem") == activity.get("subsystem")
+                and _time_in_windows(float(item.get("uptime_s") or -1.0), valid_windows)
+            ]
+            if not overlap and not detections:
+                continue
+            cpu = [float(item.get("cpu_pct") or 0.0) for item in detections]
+            classified_summaries.append(
+                {
+                    "kind": activity.get("kind"),
+                    "family": activity.get("family"),
+                    "label": activity.get("label"),
+                    "subsystem": activity.get("subsystem"),
+                    "overlap_s": sum(end - start for start, end in overlap),
+                    "snapshot_count": len({float(item.get("uptime_s") or 0.0) for item in detections}),
+                    "average_cpu_pct": statistics.fmean(cpu) if cpu else None,
+                    "maximum_cpu_pct": max(cpu) if cpu else None,
+                }
+            )
+
+        priority_summaries: List[Dict[str, object]] = []
+        for activity in priority_rows:
+            activity_windows = _analysis_windows([activity])
+            overlap = _overlap_segments(valid_windows, activity_windows)
+            detections = [
+                item
+                for item in priority_timeline
+                if item.get("kind") == activity.get("kind")
+                and item.get("name") == activity.get("name")
+                and _time_in_windows(float(item.get("uptime_s") or -1.0), valid_windows)
+            ]
+            if not overlap and not detections:
+                continue
+            cpu = [
+                float(item["cpu_pct"])
+                for item in detections
+                if isinstance(item.get("cpu_pct"), (int, float))
+            ]
+            priority_summaries.append(
+                {
+                    "kind": activity.get("kind"),
+                    "family": activity.get("kind"),
+                    "label": activity.get("label") or activity.get("name"),
+                    "subsystem": activity.get("kind"),
+                    "overlap_s": sum(end - start for start, end in overlap),
+                    "snapshot_count": len({float(item.get("uptime_s") or 0.0) for item in detections}),
+                    "average_cpu_pct": statistics.fmean(cpu) if cpu else None,
+                    "maximum_cpu_pct": max(cpu) if cpu else None,
+                }
+            )
+
+        def family_metrics(family: str) -> Dict[str, object]:
+            matching = [item for item in classified_summaries if item.get("family") == family]
+            detections = [
+                item
+                for item in classified_timeline
+                if item.get("family") == family
+                and _time_in_windows(float(item.get("uptime_s") or -1.0), valid_windows)
+            ]
+            cpu = [float(item.get("cpu_pct") or 0.0) for item in detections]
+            matching_rows = [item for item in classified_rows if item.get("family") == family]
+            overlap = _overlap_segments(valid_windows, _analysis_windows(matching_rows))
+            return {
+                "overlap_s": sum(end - start for start, end in overlap),
+                "snapshot_count": len({float(item.get("uptime_s") or 0.0) for item in detections}),
+                "average_cpu_pct": statistics.fmean(cpu) if cpu else None,
+                "maximum_cpu_pct": max(cpu) if cpu else None,
+                "labels": [str(item.get("label")) for item in matching],
+            }
+
+        gc = family_metrics("gc")
+        kworker = family_metrics("kworker")
+        dex_update_rows = [
+            item
+            for item in priority_rows
+            if item.get("kind") in {"dex_optimization", "system_update"}
+        ]
+        dex_update_overlap = _overlap_segments(
+            valid_windows,
+            _analysis_windows(dex_update_rows),
+        )
+        package_rows = [item for item in priority_rows if item.get("kind") == "package_management"]
+        package_overlap = _overlap_segments(valid_windows, _analysis_windows(package_rows))
+        interference_activity_rows = [
+            item for item in classified_rows if item.get("family") != "display"
+        ]
+        all_activity_overlap = _overlap_segments(
+            valid_windows,
+            _analysis_windows(interference_activity_rows) + _analysis_windows(priority_rows),
+        )
+        system_activity_overlap_s = sum(end - start for start, end in all_activity_overlap)
+        system_activity_overlap_pct = (
+            system_activity_overlap_s / duration_s * 100.0 if duration_s > 0 else 0.0
+        )
+
+        system_points = [
+            item
+            for item in system_timeline
+            if _time_in_windows(
+                session_start + float(item.get("elapsed_s") or 0.0),
+                valid_windows,
+            )
+        ]
+        visible_cpu = sum(float(item.get("visible_cpu_pct") or 0.0) for item in system_points)
+        system_cpu = sum(
+            float(item.get("kernel_cpu_pct") or 0.0)
+            + float(item.get("android_system_cpu_pct") or 0.0)
+            + float(item.get("priority_cpu_pct") or 0.0)
+            for item in system_points
+        )
+        system_cpu_share_pct = (
+            min(100.0, system_cpu / visible_cpu * 100.0) if visible_cpu > 0 else None
+        )
+
+        relevant_thermal = [
+            item
+            for item in thermal_points
+            if _time_in_windows(float(item["uptime_s"]), valid_windows)
+        ]
+        thermal_values = [
+            float(value)
+            for item in relevant_thermal
+            for value in (item.get("sensors") or {}).values()
+            if isinstance(value, (int, float))
+        ]
+        thermal_max_status = max((int(item.get("status") or 0) for item in relevant_thermal), default=0)
+        throttled_overlap = _overlap_segments(valid_windows, throttled_windows)
+        throttled_overlap_s = sum(end - start for start, end in throttled_overlap)
+        relevant_scheduler = [
+            item
+            for item in scheduler_timeline
+            if _time_in_windows(
+                session_start + float(item.get("elapsed_s") or 0.0),
+                valid_windows,
+            )
+        ]
+        maximum_hint_sessions = max(
+            (int(item.get("hint_session_count") or 0) for item in relevant_scheduler),
+            default=0,
+        )
+
+        dex_update_overlap_s = sum(end - start for start, end in dex_update_overlap)
+        package_overlap_s = sum(end - start for start, end in package_overlap)
+        if not system_analysis.get("available"):
+            interference_level = "unknown"
+        elif (
+            system_activity_overlap_pct >= 40.0
+            or (system_cpu_share_pct is not None and system_cpu_share_pct >= 50.0)
+            or dex_update_overlap_s >= max(10.0, duration_s * 0.15)
+        ):
+            interference_level = "high"
+        elif (
+            system_activity_overlap_pct >= 10.0
+            or (system_cpu_share_pct is not None and system_cpu_share_pct >= 25.0)
+            or int(gc["snapshot_count"]) > 0
+            or int(kworker["snapshot_count"]) > 0
+            or dex_update_overlap_s > 0
+            or package_overlap_s > 0
+        ):
+            interference_level = "medium"
+        else:
+            interference_level = "low"
+
+        coverage_pct = covered_s / duration_s * 100.0 if duration_s > 0 else 0.0
+        power_confidence = (
+            "medium"
+            if duration_s >= minimum_reliable_duration_s and coverage_pct >= 75.0
+            else "low"
+        )
+        interference_confidence = (
+            "medium" if len(relevant_system) >= 2 else "low"
+        )
+        confidence = (
+            "medium"
+            if power_confidence == "medium" and interference_confidence == "medium"
+            else "low"
+        )
+        activity_summaries = classified_summaries + priority_summaries
+        activity_summaries.sort(
+            key=lambda item: (
+                float(item.get("overlap_s") or 0.0),
+                float(item.get("average_cpu_pct") or 0.0),
+            ),
+            reverse=True,
+        )
+        foreground_rows = sorted(
+            foreground_duration.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        all_temperatures = battery_temperatures + thermal_values
+        return {
+            "duration_s": duration_s,
+            "covered_duration_s": covered_s,
+            "coverage_pct": coverage_pct,
+            "energy_mwh": energy_mwh,
+            "discharge_mah": discharge_mah,
+            "mwh_per_minute": energy_mwh * 60.0 / covered_s if covered_s > 0 else None,
+            "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else None,
+            "p95_power_mw": percentile(power_values, 0.95),
+            "maximum_power_mw": max(power_values) if power_values else None,
+            "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
+            "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
+            "average_gpu_load_pct": statistics.fmean(gpu_load_values) if gpu_load_values else None,
+            "maximum_gpu_load_pct": max(gpu_load_values) if gpu_load_values else None,
+            "average_gpu_frequency_mhz": (
+                statistics.fmean(gpu_frequency_values) if gpu_frequency_values else None
+            ),
+            "maximum_gpu_frequency_mhz": max(gpu_frequency_values) if gpu_frequency_values else None,
+            "start_temperature_c": (
+                start_sample.battery_temperature_c if start_sample else None
+            ),
+            "end_temperature_c": end_sample.battery_temperature_c if end_sample else None,
+            "maximum_temperature_c": max(all_temperatures) if all_temperatures else None,
+            "maximum_thermal_status": thermal_max_status,
+            "thermal_throttling_overlap_s": throttled_overlap_s,
+            "maximum_hint_session_count": maximum_hint_sessions,
+            "foreground_packages": [item[0] for item in foreground_rows[:5]],
+            "top_processes": top_processes[:8],
+            "top_activities": activity_summaries[:8],
+            "gc": gc,
+            "kworker": kworker,
+            "dex_update_overlap_s": dex_update_overlap_s,
+            "package_management_overlap_s": package_overlap_s,
+            "system_activity_overlap_s": system_activity_overlap_s,
+            "system_activity_overlap_pct": system_activity_overlap_pct,
+            "visible_system_cpu_share_pct": system_cpu_share_pct,
+            "system_snapshot_count": len(relevant_system),
+            "interference_level": interference_level,
+            "power_confidence": power_confidence,
+            "interference_confidence": interference_confidence,
+            "confidence": confidence,
+        }
+
+    rows: List[Dict[str, object]] = []
+    for definition in definitions.values():
+        windows = definition.get("windows", [])
+        metrics = analyze_windows(windows if isinstance(windows, list) else [])
+        rows.append(
+            {
+                "phase": definition.get("phase"),
+                "name": definition.get("name"),
+                "comparison_key": definition.get("comparison_key") or definition.get("name"),
+                "source": definition.get("source"),
+                "count": len(windows) if isinstance(windows, list) else 0,
+                "first_start_elapsed_s": (
+                    min((item[0] for item in windows), default=session_start) - session_start
+                    if isinstance(windows, list)
+                    else 0.0
+                ),
+                "last_end_elapsed_s": (
+                    max((item[1] for item in windows), default=session_start) - session_start
+                    if isinstance(windows, list)
+                    else 0.0
+                ),
+                **metrics,
+            }
+        )
+    rows.sort(key=lambda item: float(item.get("first_start_elapsed_s") or 0.0))
+
+    span_rows: List[Dict[str, object]] = []
+    for occurrence in occurrences:
+        start = float(occurrence["start_uptime_s"])
+        end = float(occurrence["end_uptime_s"])
+        metrics = analyze_windows([(start, end)])
+        span_rows.append(
+            {
+                "phase": occurrence.get("phase"),
+                "name": occurrence.get("name"),
+                "source": occurrence.get("source"),
+                "metadata": occurrence.get("metadata"),
+                "start_uptime_s": start,
+                "end_uptime_s": end,
+                "start_elapsed_s": start - session_start,
+                "end_elapsed_s": end - session_start,
+                **metrics,
+            }
+        )
+    span_rows.sort(key=lambda item: float(item.get("start_uptime_s") or 0.0))
+
+    overlap_count = 0
+    for index, current in enumerate(occurrences):
+        for following in occurrences[index + 1 :]:
+            if (
+                float(current["start_uptime_s"]) < float(following["end_uptime_s"])
+                and float(following["start_uptime_s"]) < float(current["end_uptime_s"])
+                and (current.get("phase"), current.get("name"))
+                != (following.get("phase"), following.get("name"))
+            ):
+                overlap_count += 1
+
+    return {
+        "available": bool(rows),
+        "source_mode": source_mode,
+        "source_label": (
+            "导入的持续测试事件" if source_mode == "external_events" else "前台 Activity 区间"
+        ),
+        "minimum_reliable_duration_s": minimum_reliable_duration_s,
+        "row_count": len(rows),
+        "span_count": len(span_rows),
+        "overlap_count": overlap_count,
+        "rows": rows,
+        "spans": span_rows,
+        "instant_events": [
+            {
+                "name": item.name,
+                "phase": item.phase,
+                "elapsed_s": item.device_uptime_s - session_start,
+                "source": item.source,
+            }
+            for item in events
+            if not item.duration_s and session_start <= item.device_uptime_s <= session_end
+        ],
+        "limitations": (
+            "Energy and power are whole-device measurements integrated inside each test window. "
+            "GC, kworker, DEX/update and thermal columns report sampled temporal overlap and relative influence, "
+            "not exclusive per-process rail power. Overlapping test rows are not additive."
+        ),
+    }
+
+
+def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
+    platform = str(analysis.get("platform") or "android").lower()
+    summary = analysis["summary"]
+    cpu = analysis.get("cpu", {})
+    gpu = analysis.get("gpu", {})
+    display = analysis.get("display", {})
+    thermal = analysis.get("thermal", {})
+    system = analysis.get("system", {})
+    scheduler = analysis.get("scheduler", {})
+    target = analysis.get("target_app")
+    findings: List[Dict[str, str]] = [
+        {
+            "level": "measured",
+            "title": "电池侧实测输出",
+            "detail": (
+                f"平均功率 {float(summary.get('average_power_mw') or 0.0) / 1000.0:.3f} W，"
+                f"平均放电电流幅值 {float(summary.get('average_current_ma') or 0.0):.1f} mA；"
+                f"P95 功率 {float(summary.get('p95_power_mw') or 0.0) / 1000.0:.3f} W。"
+            ),
+        }
+    ]
+
+    clusters = cpu.get("clusters", []) if isinstance(cpu, dict) else []
+    modeled_clusters = [
+        item for item in clusters if isinstance(item.get("frequency_premium_mw"), (int, float))
+    ]
+    if modeled_clusters:
+        leading = max(modeled_clusters, key=lambda item: float(item.get("frequency_premium_mw") or 0.0))
+        cluster_label = {
+            "Little": "小核",
+            "Big": "大核",
+            "Performance": "性能核",
+            "Prime": "超大核",
+        }.get(str(leading.get("label") or ""), str(leading.get("label") or "CPU"))
+        findings.append(
+            {
+                "level": "model",
+                "title": f"{cluster_label}频率影响",
+                "detail": (
+                    f"Android CPU Power Profile 估算：在相同负载下，相对最低频率基线，"
+                    f"平均增加 {float(leading.get('frequency_premium_mw') or 0.0):.1f} mW。"
+                ),
+            }
+        )
+
+    if isinstance(gpu, dict):
+        target_work = gpu.get("target_work")
+        if isinstance(target_work, dict):
+            findings.append(
+                {
+                    "level": "driver",
+                    "title": "目标 UID 的 GPU 活动",
+                    "detail": (
+                        f"GPU 驱动在本次测试中向目标 UID 记录了 "
+                        f"{float(target_work.get('active_ms') or 0.0):.1f} ms 活跃工作时长。"
+                    ),
+                }
+            )
+        elif not gpu.get("frequency_available") and not gpu.get("load_available"):
+            findings.append(
+                {
+                    "level": "context",
+                    "title": "GPU 实时计数器不可用",
+                    "detail": (
+                        "本次会话未恢复到 iOS DVT Graphics 利用率事件；报告不会据此推断 GPU 电源轨功耗。"
+                        if platform == "ios"
+                        else "OEM 系统未向 ADB shell 暴露可读的 GPU 频率节点，报告使用可获得的 UID 工作时长证据。"
+                    ),
+                }
+            )
+
+    if isinstance(target, dict):
+        uid_usage = target.get("usage")
+        network = target.get("network")
+        details = []
+        if isinstance(uid_usage, dict):
+            details.append(f"BatteryStats 模型归因 {float(uid_usage.get('mah') or 0.0):.3f} mAh")
+        if isinstance(network, dict):
+            details.append(
+                f"Wi-Fi 接收 {format_bytes(network.get('wifi_rx_bytes'))} / "
+                f"发送 {format_bytes(network.get('wifi_tx_bytes'))}"
+            )
+        if details:
+            findings.append(
+                {
+                    "level": "model",
+                    "title": f"目标应用：{target.get('package')}",
+                    "detail": "；".join(details) + "。",
+                }
+            )
+
+    applications = analysis.get("applications", {})
+    if isinstance(applications, dict):
+        known_apps = [
+            item
+            for item in applications.get("rows", [])
+            if item.get("package") != "unknown"
+        ]
+        if known_apps:
+            leading_app = max(known_apps, key=lambda item: float(item.get("energy_mwh") or 0.0))
+            findings.append(
+                {
+                    "level": "measured",
+                    "title": f"前台能耗最高：{leading_app.get('package')}",
+                    "detail": (
+                        f"观测到的前台时间为 {float(leading_app.get('duration_s') or 0.0):.1f} s，"
+                        f"期间分配的整机实测能量为 {float(leading_app.get('energy_mwh') or 0.0):.2f} mWh。"
+                    ),
+                }
+            )
+
+    if isinstance(system, dict):
+        priority = system.get("priority_activities", {})
+        rows = priority.get("rows", []) if isinstance(priority, dict) else []
+        if rows:
+            leading = max(
+                rows,
+                key=lambda item: float(item.get("excess_energy_mwh") or 0.0),
+            )
+            delta = leading.get("power_delta_mw")
+            delta_text = (
+                f"，相对会话基线 {float(delta):+.0f} mW"
+                if isinstance(delta, (int, float))
+                else ""
+            )
+            findings.append(
+                {
+                    "level": "measured",
+                    "title": f"重点后台活动：{leading.get('label') or leading.get('name')}",
+                    "detail": (
+                        f"在 {int(leading.get('detection_count') or 0)} 个系统快照中被检测到，"
+                        f"估算持续 {float(leading.get('estimated_duration_s') or 0.0):.1f} s{delta_text}。"
+                        "该结果仅表示与整机功率的时间相关性，不代表因果归因。"
+                    ),
+                }
+            )
+        groups = system.get("activity_groups", {})
+        group_rows = groups.get("rows", []) if isinstance(groups, dict) else []
+        if group_rows:
+            leading_group = max(
+                group_rows,
+                key=lambda item: (
+                    float(item.get("excess_energy_mwh") or 0.0),
+                    float(item.get("maximum_cpu_pct") or 0.0),
+                ),
+            )
+            findings.append(
+                {
+                    "level": "measured",
+                    "title": f"系统活动关联：{leading_group.get('label')}",
+                    "detail": (
+                        f"在 {int(leading_group.get('detection_count') or 0)} 个热点快照中可见，"
+                        f"CPU 平均 / 峰值为 {float(leading_group.get('average_cpu_pct') or 0.0):.1f}% / "
+                        f"{float(leading_group.get('maximum_cpu_pct') or 0.0):.1f}%，"
+                        f"同期整机功率相对会话基线 {float(leading_group.get('power_delta_mw') or 0.0):+.0f} mW。"
+                        "该结果是采样时间关联，不是独占功耗归因。"
+                    ),
+                }
+            )
+
+    external = analysis.get("external_events", {})
+    if isinstance(external, dict) and external.get("rows"):
+        leading_phase = max(
+            external["rows"],
+            key=lambda item: float(item.get("energy_mwh") or 0.0),
+        )
+        findings.append(
+            {
+                "level": "measured",
+                "title": f"导入阶段能耗最高：{leading_phase.get('name')}",
+                "detail": (
+                    f"根据 {leading_phase.get('phase')} 日志事件对齐得到 "
+                    f"{float(leading_phase.get('energy_mwh') or 0.0):.2f} mWh。"
+                ),
+            }
+        )
+
+    test_items = analysis.get("test_items", {})
+    if isinstance(test_items, dict) and test_items.get("rows"):
+        rank = {"unknown": -1, "low": 0, "medium": 1, "high": 2}
+        leading_test = max(
+            test_items["rows"],
+            key=lambda item: (
+                rank.get(str(item.get("interference_level") or "unknown"), -1),
+                float(item.get("system_activity_overlap_pct") or 0.0),
+                float(item.get("energy_mwh") or 0.0),
+            ),
+        )
+        findings.append(
+            {
+                "level": "context",
+                "title": f"系统干扰最高的测试项：{leading_test.get('name')}",
+                "detail": (
+                    f"系统活动窗口重叠 {float(leading_test.get('system_activity_overlap_pct') or 0.0):.1f}%，"
+                    f"GC {int((leading_test.get('gc') or {}).get('snapshot_count') or 0)} 个采样点，"
+                    f"kworker {int((leading_test.get('kworker') or {}).get('snapshot_count') or 0)} 个采样点，"
+                    f"DEX/更新重叠 {float(leading_test.get('dex_update_overlap_s') or 0.0):.1f} s。"
+                ),
+            }
+        )
+
+    active_refresh = display.get("active_refresh_hz") if isinstance(display, dict) else None
+    if isinstance(active_refresh, (int, float)):
+        findings.append(
+            {
+                "level": "context",
+                "title": "显示模式",
+                "detail": f"采集期间显示渲染刷新率为 {active_refresh:.0f} Hz。",
+            }
+        )
+    thermal_status = None
+    if isinstance(thermal, dict):
+        thermal_status = thermal.get("maximum_status")
+        if thermal_status is None:
+            thermal_status = thermal.get("status")
+    if isinstance(thermal_status, (int, float)) and thermal_status > 0:
+        thermal_label = {
+            "light": "轻度",
+            "moderate": "中度",
+            "severe": "严重",
+            "critical": "危急",
+            "emergency": "紧急",
+            "shutdown": "关机",
+        }.get(str(thermal.get("maximum_status_label") or ""), "级别升高")
+        findings.append(
+            {
+                "level": "measured",
+                "title": "检测到热限制",
+                "detail": (
+                    f"ThermalService 最高达到状态 {int(thermal_status)} "
+                    f"（{thermal_label}）。"
+                ),
+            }
+        )
+    elif thermal_status == 0:
+        findings.append(
+            {
+                "level": "low",
+                "title": "未检测到热限制",
+                "detail": "所有已采集的 ThermalService 状态均保持为 0。",
+            }
+        )
+    if isinstance(scheduler, dict) and scheduler.get("maximum_hint_session_count"):
+        findings.append(
+            {
+                "level": "context",
+                "title": "存在活跃的 ADPF Performance Hint 会话",
+                "detail": (
+                    f"最多观察到 {int(scheduler.get('maximum_hint_session_count') or 0)} 个活跃 ADPF 会话，"
+                    "报告保留了对应 PID/TID 与目标时长状态。"
+                ),
+            }
+        )
+    return findings
+
+
+def _analysis_data_sources(platform: str) -> List[Dict[str, str]]:
+    if platform == "ios":
+        return [
+            {
+                "metric": "Whole-device battery power",
+                "source": "iOS DiagnosticsService PowerTelemetryData.SystemLoad",
+                "kind": "measured",
+            },
+            {
+                "metric": "Battery current and voltage",
+                "source": "iOS DiagnosticsService battery properties",
+                "kind": "measured",
+            },
+            {
+                "metric": "CPU and process activity",
+                "source": "iOS DVT sysmontap",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Relative process power score",
+                "source": "iOS DVT sysmontap powerScore",
+                "kind": "diagnostic score",
+            },
+            {
+                "metric": "GPU activity",
+                "source": "iOS DVT Graphics utilization",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Foreground application",
+                "source": "iOS DVT application-state notifications",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Test phases and actions",
+                "source": "Imported timestamped logs aligned to device uptime",
+                "kind": "context",
+            },
+            {
+                "metric": "System processes and collector overhead",
+                "source": "iOS DVT sysmontap process snapshots",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Battery temperature",
+                "source": "iOS DiagnosticsService battery temperature",
+                "kind": "measured counters",
+            },
+        ]
+    return [
+        {
+            "metric": "Battery current",
+            "source": "BatteryService / fuel gauge",
+            "kind": "measured",
+        },
+        {
+            "metric": "Battery voltage",
+            "source": "BatteryService state",
+            "kind": "measured",
+        },
+        {
+            "metric": "CPU utilization/frequency",
+            "source": "/proc/stat + cpufreq",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "CPU frequency impact",
+            "source": "Android Power Profile",
+            "kind": "model",
+        },
+        {
+            "metric": "GPU activity",
+            "source": "OEM devfreq/KGSL when readable; dumpsys gpu UID work and memory otherwise",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "Component/app attribution",
+            "source": "BatteryStats",
+            "kind": "model",
+        },
+        {
+            "metric": "Foreground application",
+            "source": "ActivityManager context sampler",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "Test phases and actions",
+            "source": "Imported timestamped logs aligned by /proc/uptime",
+            "kind": "context",
+        },
+        {
+            "metric": "Per-test power and system interference",
+            "source": "Whole-device telemetry + aligned process/thread/thermal snapshots",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "System processes and hot threads",
+            "source": "Periodic toybox top/ps snapshots",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "Thermal severity, sensors and cooling devices",
+            "source": "Android ThermalService / thermal HAL",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "cpuset, process state and ADPF hints",
+            "source": "cgroup files + ActivityManager + performance_hint",
+            "kind": "measured counters",
+        },
+    ]
+
+
+def analyze_run(
+    samples: Sequence[Sample],
+    metadata: Dict[str, object],
+    raw_outputs: Dict[str, str],
+    warnings: Sequence[str],
+    contexts: Sequence[ContextSample] = (),
+    events: Sequence[ExternalEvent] = (),
+    system_snapshots: Sequence[SystemSnapshot] = (),
+    thermal_snapshots: Sequence[ThermalSnapshot] = (),
+    scheduler_snapshots: Sequence[SchedulerSnapshot] = (),
+) -> Dict[str, object]:
+    if len(samples) < 2:
+        raise RuntimeError("at least two samples are required")
+    powers = [sample.power_mw for sample in samples]
+    currents = [sample.current_ma for sample in samples]
+    signed_currents = [sample.signed_current_ma for sample in samples]
+    cpus = [sample.cpu_pct for sample in samples if sample.cpu_pct is not None]
+    power_sample_ages = [
+        sample.power_sample_age_s
+        for sample in samples
+        if sample.power_sample_age_s is not None
+    ]
+    collector_cpu_values = [
+        sample.collector_cpu_pct
+        for sample in samples
+        if sample.collector_cpu_pct is not None
+    ]
+    power_sources = sorted({sample.power_source for sample in samples if sample.power_source})
+    platform = str(metadata.get("platform") or "android").lower()
+    duration_s = samples[-1].uptime_s - samples[0].uptime_s
+    configured_interval = metadata.get("sample_interval_s")
+    observed_intervals = [
+        current.uptime_s - previous.uptime_s
+        for previous, current in zip(samples, samples[1:])
+        if current.uptime_s > previous.uptime_s
+    ]
+    sample_interval_s = (
+        float(configured_interval)
+        if isinstance(configured_interval, (int, float)) and float(configured_interval) > 0
+        else statistics.median(observed_intervals) if observed_intervals else 1.0
+    )
+    max_gap_s = max(sample_interval_s * 3.0, sample_interval_s + 2.0)
+    valid_intervals = sample_intervals(samples, max_gap_s)
+    covered_duration_s = sum(item[2] for item in valid_intervals)
+    missing_duration_s = max(0.0, duration_s - covered_duration_s)
+    average_voltage_mv = statistics.fmean(sample.voltage_mv for sample in samples)
+    energy_mwh = integrate_values(samples, lambda sample: sample.power_mw, max_gap_s)
+    discharge_mah = integrate_values(
+        samples,
+        lambda sample: sample.current_ma if sample.direction == "discharging" else 0.0,
+        max_gap_s,
+    )
+    time_weighted_power_mw = (
+        energy_mwh * 3600.0 / covered_duration_s if covered_duration_s > 0 else statistics.fmean(powers)
+    )
+    time_weighted_current_ma = (
+        integrate_values(samples, lambda sample: sample.current_ma, max_gap_s)
+        * 3600.0
+        / covered_duration_s
+        if covered_duration_s > 0
+        else statistics.fmean(currents)
+    )
+    analysis_warnings = list(warnings)
+    if duration_s > 0 and missing_duration_s > max_gap_s:
+        analysis_warnings.append(
+            f"遥测覆盖率为 {covered_duration_s / duration_s * 100.0:.1f}%；"
+            "能量积分会排除连接或采集缺口，不会跨缺口插值。"
+        )
+    if metadata.get("session_mode") and not contexts:
+        analysis_warnings.append(
+            "会话模式没有采集到前台应用上下文，因此无法按应用拆分整机实测能量。"
+        )
+    monitor_config = metadata.get("system_monitor", {})
+    if isinstance(monitor_config, dict) and monitor_config.get("enabled") and not system_snapshots:
+        analysis_warnings.append(
+            "已启用全系统监控，但未恢复到任何进程快照。"
+        )
+
+    package_uids, package_to_uid = parse_package_uids(raw_outputs.get("packages", ""))
+    usage = parse_battery_usage(raw_outputs.get("batterystats_usage", ""), package_uids)
+    stats_window = extract_stats_window(raw_outputs.get("batterystats", ""))
+    power_profile = parse_power_profile(raw_outputs.get("power_profile", ""))
+    display = parse_display(
+        raw_outputs.get("display", ""),
+        raw_outputs.get("screen_brightness", ""),
+        raw_outputs.get("peak_refresh_rate", ""),
+    )
+    thermal_post_run = parse_thermal(raw_outputs.get("thermalservice", ""))
+    processes = parse_cpu_processes(raw_outputs.get("cpuinfo", ""))
+    wakelocks = extract_kernel_wakelocks(raw_outputs.get("batterystats", ""))
+
+    policies = metadata.get("cpu_policies", [])
+    cpu_analysis = analyze_cpu(
+        samples,
+        policies if isinstance(policies, list) else [],
+        power_profile,
+        max_gap_s,
+    )
+
+    target_package = metadata.get("target_package")
+    if not target_package and not metadata.get("session_mode"):
+        target_package = metadata.get("foreground_package")
+    target_uid = package_to_uid.get(str(target_package)) if target_package else None
+    target_usage = next(
+        (item for item in usage.get("uids", []) if item.get("uid") == target_uid),
+        None,
+    )
+    target_network = parse_checkin_network(raw_outputs.get("batterystats_checkin", ""), target_uid)
+    gpu_analysis = analyze_gpu(
+        samples,
+        metadata,
+        raw_outputs,
+        package_uids,
+        target_uid,
+        duration_s,
+        system_snapshots,
+    )
+
+    start_battery = metadata.get("battery_start", {})
+    end_battery = metadata.get("battery_end", {})
+    capacity_mah = usage.get("capacity_mah")
+    if not isinstance(capacity_mah, (int, float)):
+        profile_capacity = power_profile.get("battery.capacity")
+        capacity_mah = profile_capacity if isinstance(profile_capacity, (int, float)) else None
+    if not isinstance(capacity_mah, (int, float)) and isinstance(start_battery, dict):
+        capacity_mah = next(
+            (
+                float(start_battery[key])
+                for key in (
+                    "full_charge_capacity_mah",
+                    "nominal_charge_capacity_mah",
+                    "design_capacity_mah",
+                )
+                if isinstance(start_battery.get(key), (int, float))
+                and float(start_battery[key]) > 0
+            ),
+            None,
+        )
+    average_discharge_ma = (
+        discharge_mah * 3600.0 / covered_duration_s if covered_duration_s > 0 else 0.0
+    )
+    drain_pct_per_hour = (
+        average_discharge_ma / float(capacity_mah) * 100.0
+        if isinstance(capacity_mah, (int, float)) and capacity_mah > 0
+        else None
+    )
+    full_runtime_h = (
+        float(capacity_mah) / average_discharge_ma
+        if average_discharge_ma > 0 and isinstance(capacity_mah, (int, float))
+        else None
+    )
+    end_level = end_battery.get("level_pct") if isinstance(end_battery, dict) else None
+    remaining_runtime_h = (
+        full_runtime_h * float(end_level) / 100.0
+        if full_runtime_h is not None and isinstance(end_level, (int, float))
+        else None
+    )
+
+    components = component_power_estimates(
+        usage,
+        stats_window,
+        average_voltage_mv,
+        power_profile,
+        display,
+    )
+    application_analysis = analyze_applications(samples, contexts, max_gap_s)
+    event_analysis = analyze_external_events(
+        samples,
+        events,
+        max_gap_s,
+        sample_interval_s,
+    )
+    system_analysis = analyze_system_activity(
+        samples,
+        system_snapshots,
+        max_gap_s,
+        thermal_snapshots,
+    )
+    thermal_history = analyze_thermal_history(samples, thermal_snapshots)
+    if thermal_history.get("available"):
+        thermal: Dict[str, object] = {
+            **thermal_post_run,
+            **thermal_history,
+            "status": thermal_history.get("latest_status"),
+            "post_run": thermal_post_run,
+        }
+    else:
+        thermal = {**thermal_post_run, **thermal_history, "post_run": thermal_post_run}
+    scheduler_analysis = analyze_scheduler_history(samples, scheduler_snapshots)
+    test_item_analysis = analyze_test_items(
+        samples,
+        contexts,
+        events,
+        system_snapshots,
+        system_analysis,
+        thermal,
+        scheduler_analysis,
+        max_gap_s,
+        sample_interval_s,
+    )
+    analysis: Dict[str, object] = {
+        "platform": platform,
+        "summary": {
+            "duration_s": duration_s,
+            "covered_duration_s": covered_duration_s,
+            "missing_duration_s": missing_duration_s,
+            "coverage_pct": covered_duration_s / duration_s * 100.0 if duration_s > 0 else 0.0,
+            "sample_count": len(samples),
+            "current_semantics": "positive magnitude",
+            "average_current_ma": time_weighted_current_ma,
+            "minimum_current_ma": min(currents),
+            "maximum_current_ma": max(currents),
+            "average_signed_current_ma": statistics.fmean(signed_currents),
+            "average_voltage_mv": average_voltage_mv,
+            "average_power_mw": time_weighted_power_mw,
+            "median_power_mw": statistics.median(powers),
+            "p95_power_mw": percentile(powers, 0.95),
+            "minimum_power_mw": min(powers),
+            "maximum_power_mw": max(powers),
+            "energy_mwh": energy_mwh,
+            "discharge_mah": discharge_mah,
+            "energy_per_minute_mwh": energy_mwh / duration_s * 60.0 if duration_s > 0 else None,
+            "mah_per_minute": discharge_mah / duration_s * 60.0 if duration_s > 0 else None,
+            "average_cpu_pct": statistics.fmean(cpus) if cpus else None,
+            "maximum_cpu_pct": max(cpus) if cpus else None,
+            "power_sources": power_sources,
+            "average_power_sample_age_s": (
+                statistics.fmean(power_sample_ages) if power_sample_ages else None
+            ),
+            "maximum_power_sample_age_s": max(power_sample_ages) if power_sample_ages else None,
+            "average_collector_cpu_pct": (
+                statistics.fmean(collector_cpu_values) if collector_cpu_values else None
+            ),
+            "maximum_collector_cpu_pct": (
+                max(collector_cpu_values) if collector_cpu_values else None
+            ),
+            "capacity_mah": capacity_mah,
+            "drain_pct_per_hour": drain_pct_per_hour,
+            "full_runtime_h": full_runtime_h,
+            "remaining_runtime_h": remaining_runtime_h,
+            "temperature_delta_c": (
+                float(end_battery.get("temperature_c")) - float(start_battery.get("temperature_c"))
+                if isinstance(start_battery, dict)
+                and isinstance(end_battery, dict)
+                and isinstance(start_battery.get("temperature_c"), (int, float))
+                and isinstance(end_battery.get("temperature_c"), (int, float))
+                else None
+            ),
+        },
+        "buckets": build_buckets(samples),
+        "long_windows": build_long_windows(samples, contexts, max_gap_s),
+        "spikes": detect_spikes(samples),
+        "cpu": cpu_analysis,
+        "frequency_summary": cpu_analysis.get("clusters", []),
+        "gpu": gpu_analysis,
+        "battery_usage": usage,
+        "components": components,
+        "target_app": {
+            "package": target_package,
+            "uid": target_uid,
+            "usage": target_usage,
+            "network": target_network,
+        }
+        if target_package
+        else None,
+        "processes": processes,
+        "system": system_analysis,
+        "wakelocks": wakelocks,
+        "display": display,
+        "thermal": thermal,
+        "scheduler": scheduler_analysis,
+        "applications": application_analysis,
+        "external_events": event_analysis,
+        "test_items": test_item_analysis,
+        "stats_window": stats_window,
+        "data_sources": _analysis_data_sources(platform),
+        "warnings": analysis_warnings,
+    }
+    analysis["findings"] = build_findings(analysis)
+    return analysis

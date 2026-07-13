@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-SCHEMA_VERSION = 3
-APP_NAME = "Android Power Profiler"
+SCHEMA_VERSION = 5
+APP_NAME = "Mobile Power Profiler"
 DEFAULT_ADB = os.environ.get("ADB", "adb")
 DEFAULT_DURATION_S = 60
 DEFAULT_INTERVAL_S = 1.0
@@ -35,13 +35,16 @@ class CpuPolicy:
     min_khz: Optional[float] = None
     max_khz: Optional[float] = None
     available_frequencies_khz: List[float] = field(default_factory=list)
+    governor: Optional[str] = None
+    core_control: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
 class GpuSource:
     name: str
-    frequency_path: str
+    frequency_path: Optional[str] = None
     load_path: Optional[str] = None
+    load_format: str = "percentage"
     minimum_mhz: Optional[float] = None
     maximum_mhz: Optional[float] = None
     available_frequencies_mhz: List[float] = field(default_factory=list)
@@ -110,6 +113,9 @@ class Sample:
     gpu_frequency_mhz: Optional[float] = None
     gpu_load_pct: Optional[float] = None
     battery_temperature_c: Optional[float] = None
+    power_source: str = "battery_current_voltage"
+    power_sample_age_s: Optional[float] = None
+    collector_cpu_pct: Optional[float] = None
 
 
 @dataclass
@@ -141,3 +147,41 @@ class ExternalEvent:
     duration_s: Optional[float] = None
     source: str = "external_log"
     metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class SystemSnapshot:
+    uptime_s: float
+    host_epoch_s: float
+    processes: List[Dict[str, object]] = field(default_factory=list)
+    threads: List[Dict[str, object]] = field(default_factory=list)
+    watched_processes: List[Dict[str, object]] = field(default_factory=list)
+    process_count: Optional[int] = None
+    thread_count: Optional[int] = None
+    collection_ms: Optional[float] = None
+
+
+@dataclass
+class ThermalSnapshot:
+    uptime_s: float
+    host_epoch_s: float
+    status: Optional[int] = None
+    hal_ready: Optional[bool] = None
+    temperatures: List[Dict[str, object]] = field(default_factory=list)
+    cooling_devices: List[Dict[str, object]] = field(default_factory=list)
+    thresholds: List[Dict[str, object]] = field(default_factory=list)
+    headroom_thresholds: List[Optional[float]] = field(default_factory=list)
+    collection_ms: Optional[float] = None
+
+
+@dataclass
+class SchedulerSnapshot:
+    uptime_s: float
+    host_epoch_s: float
+    cpusets: Dict[str, str] = field(default_factory=dict)
+    cpu_policies: List[Dict[str, object]] = field(default_factory=list)
+    hint_sessions: List[Dict[str, object]] = field(default_factory=list)
+    watched_processes: List[Dict[str, object]] = field(default_factory=list)
+    power_hal: List[str] = field(default_factory=list)
+    availability: Dict[str, object] = field(default_factory=dict)
+    collection_ms: Optional[float] = None

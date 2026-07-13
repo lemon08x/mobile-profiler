@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0f15">
+  <title>Mobile Power Profiler</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand" aria-label="Mobile Power Profiler">
+        <span class="brand-mark" aria-hidden="true">MP</span>
+        <span class="brand-copy"><strong>Power Profiler</strong><small>Mobile runtime lab</small></span>
+      </div>
+
+      <nav class="primary-nav" aria-label="主导航">
+        <button class="nav-item active" type="button" data-view="live" aria-current="page">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h3l2.2-5.4 4.1 11 2.5-6.1H21"/></svg>
+          <span>实时监控</span>
+        </button>
+        <button class="nav-item" type="button" data-view="system">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16M7 3v4M12 10v4M17 17v4"/></svg>
+          <span>系统活动</span>
+        </button>
+        <button class="nav-item" type="button" data-view="thermal">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5a2 2 0 0 1 4 0v8.2a4 4 0 1 1-4 0V5zM12 8v7"/></svg>
+          <span>热控与调度</span>
+        </button>
+        <button class="nav-item" type="button" data-view="device">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M10 18.5h4"/></svg>
+          <span>设备能力</span>
+        </button>
+        <button class="nav-item" type="button" data-view="history">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v14H4zM4 9h16M8 3v5M16 3v5"/></svg>
+          <span>历史报告</span>
+        </button>
+        <button class="nav-item" type="button" data-view="tools">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h16v12H4zM8 7.5V5h8v2.5M4 12h16M10 12v2h4v-2"/></svg>
+          <span>工具与交付</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="connection-dot" id="server-dot"></span>
+        <span><strong id="server-label">连接中</strong><small id="server-detail">Local dashboard</small></span>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div class="page-title">
+          <p>MOBILE POWER LAB</p>
+          <h1 id="page-heading">实时监控</h1>
+        </div>
+        <div class="topbar-actions">
+          <form class="adb-connect-form" id="adb-connect-form">
+            <label for="adb-address-input">ADB IP</label>
+            <input id="adb-address-input" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.20:5555">
+            <button type="submit">连接</button>
+            <button class="tcpip-button" id="enable-tcpip" type="button" title="对当前设备执行 adb tcpip 5555，并自动连接 Wi-Fi IP">无线 ADB</button>
+            <button class="tcpip-button" id="pair-ios" type="button" title="通过已信任的 USB iPhone 创建 RemotePairing 并缓存无线端点">iOS 无线</button>
+            <button class="disconnect-button" id="disconnect-wireless" type="button" title="断开当前选择的无线 ADB 设备">断开无线</button>
+          </form>
+          <label class="device-picker" for="device-select">
+            <span class="device-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M10 18.5h4"/></svg>
+            </span>
+            <span class="device-picker-copy"><small>MOBILE DEVICE</small><select id="device-select" aria-label="移动设备"><option value="">正在扫描...</option></select></span>
+          </label>
+          <button class="icon-button" id="refresh-devices" type="button" title="刷新设备" aria-label="刷新设备">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.4 9A7 7 0 0 0 6.3 6.4L4 11M5.6 15A7 7 0 0 0 17.7 17.6L20 13"/></svg>
+          </button>
+          <span class="device-state" id="device-state"><i></i><span>等待设备</span></span>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="view active" data-panel="live">
+          <div class="session-strip" id="session-strip">
+            <div class="session-status">
+              <span class="record-orbit" id="record-orbit"><i></i></span>
+              <div><small id="session-kicker">SESSION READY</small><strong id="session-title">等待开始新的采集</strong></div>
+            </div>
+            <div class="session-progress-block">
+              <div class="session-progress-copy"><span id="session-time">00:00 / 00:00</span><span id="session-samples">0 samples</span></div>
+              <div class="progress-track"><span id="session-progress"></span></div>
+            </div>
+            <div class="session-actions">
+              <a class="button ghost hidden" id="open-report" href="#" target="_blank" rel="noreferrer">查看报告</a>
+              <button class="button ghost hidden" id="add-marker" type="button">添加时间标记</button>
+              <button class="button danger hidden" id="stop-record" type="button">停止并收尾</button>
+            </div>
+          </div>
+
+          <div class="runtime-layout">
+            <aside class="control-panel panel">
+              <div class="panel-heading">
+                <div><small>CAPTURE SETUP</small><h2>采集配置</h2></div>
+                <span class="safe-badge"><i></i>本地运行</span>
+              </div>
+              <form id="record-form">
+                <div class="form-field">
+                  <label for="title-input">会话标题</label>
+                  <input id="title-input" name="title" type="text" maxlength="200" placeholder="例如：BTR2 一小时续航流程">
+                </div>
+                <div class="form-field">
+                  <label for="run-name-input">采集目录名称</label>
+                  <input id="run-name-input" name="run_name" type="text" maxlength="96" placeholder="自动使用时间戳">
+                  <small class="field-hint" id="output-root-hint">保存在 power-runs</small>
+                </div>
+                <div class="form-row">
+                  <div class="form-field">
+                    <label for="duration-input">时长</label>
+                    <div class="input-with-unit"><input id="duration-input" name="duration" type="number" min="2" max="604800" step="1" value="3720"><span>秒</span></div>
+                  </div>
+                  <div class="form-field">
+                    <label for="interval-input">采样周期</label>
+                    <div class="input-with-unit"><input id="interval-input" name="interval" type="number" min="0.2" max="60" step="0.1" value="1"><span>秒</span></div>
+                  </div>
+                </div>
+                <div class="duration-presets" aria-label="时长快捷选项">
+                  <button type="button" data-duration="60">1 分钟</button>
+                  <button type="button" data-duration="900">15 分钟</button>
+                  <button type="button" data-duration="3600">1 小时</button>
+                  <button type="button" data-duration="3720" class="active">1 小时 + 2 分钟</button>
+                </div>
+                <div class="form-field">
+                  <label for="package-input">重点应用包名 <span>可选</span></label>
+                  <input id="package-input" name="package" type="text" maxlength="200" placeholder="com.example.app">
+                </div>
+                <div class="form-row">
+                  <div class="form-field">
+                    <label for="start-context-input">采集起点</label>
+                    <select id="start-context-input"><option value="desktop" selected>桌面 / Launcher</option><option value="app">应用内</option><option value="other">其他场景</option><option value="unknown">不确定</option></select>
+                  </div>
+                  <div class="form-field">
+                    <label for="start-note-input">起点备注 <span>可选</span></label>
+                    <input id="start-note-input" type="text" maxlength="500" placeholder="例如：先启动采集，30 秒后启动 BTR2">
+                  </div>
+                </div>
+
+                <div class="switch-stack">
+                  <label class="switch-row">
+                    <span><strong>多应用会话模式</strong><small>跟踪前台应用切换，适合 BTR2</small></span>
+                    <input id="session-mode-input" name="session_mode" type="checkbox" checked><i aria-hidden="true"></i>
+                  </label>
+                  <label class="switch-row emphasis">
+                    <span><strong>要求断开外部供电</strong><small>检测到 AC / USB / 无线充电时拒绝采集</small></span>
+                    <input id="unplugged-input" name="require_unplugged" type="checkbox" checked><i aria-hidden="true"></i>
+                  </label>
+                  <label class="switch-row">
+                    <span><strong>全系统活动监控</strong><small>低频采集进程、热点线程、热控、cpuset 与 ADPF</small></span>
+                    <input id="system-monitor-input" name="system_monitor" type="checkbox" checked><i aria-hidden="true"></i>
+                  </label>
+                </div>
+
+                <details class="advanced-settings">
+                  <summary>高级设置 <span>10 项</span></summary>
+                  <div class="advanced-body">
+                    <div class="form-row">
+                      <div class="form-field">
+                        <label for="checkpoint-input">检查点</label>
+                        <div class="input-with-unit"><input id="checkpoint-input" type="number" min="5" max="3600" value="30"><span>秒</span></div>
+                      </div>
+                      <div class="form-field">
+                        <label for="reconnect-input">重连等待</label>
+                        <div class="input-with-unit"><input id="reconnect-input" type="number" min="5" max="3600" value="120"><span>秒</span></div>
+                      </div>
+                    </div>
+                    <div class="form-field">
+                      <label for="current-unit-input">电流单位</label>
+                      <select id="current-unit-input"><option value="auto">自动识别</option><option value="ma">mA</option><option value="ua">µA</option></select>
+                    </div>
+                    <div class="form-field">
+                      <label for="gpu-path-input">GPU 频率节点 <span>可选</span></label>
+                      <input id="gpu-path-input" type="text" placeholder="/sys/class/devfreq/.../cur_freq">
+                    </div>
+                    <div class="form-row monitor-intervals">
+                      <div class="form-field">
+                        <label for="process-interval-input">系统进程</label>
+                        <div class="input-with-unit"><input id="process-interval-input" type="number" min="2" max="600" value="10"><span>秒</span></div>
+                      </div>
+                      <div class="form-field">
+                        <label for="thread-interval-input">热点线程</label>
+                        <div class="input-with-unit"><input id="thread-interval-input" type="number" min="5" max="1800" value="30"><span>秒</span></div>
+                      </div>
+                    </div>
+                    <div class="form-row monitor-intervals">
+                      <div class="form-field">
+                        <label for="thermal-interval-input">热状态</label>
+                        <div class="input-with-unit"><input id="thermal-interval-input" type="number" min="2" max="600" value="10"><span>秒</span></div>
+                      </div>
+                      <div class="form-field">
+                        <label for="scheduler-interval-input">调度 / ADPF</label>
+                        <div class="input-with-unit"><input id="scheduler-interval-input" type="number" min="5" max="1800" value="30"><span>秒</span></div>
+                      </div>
+                    </div>
+                    <label class="compact-check"><input id="no-reset-input" type="checkbox"><span>保留现有 BatteryStats（--no-reset）</span></label>
+                    <label class="compact-check"><input id="full-history-input" type="checkbox"><span>启用 BatteryStats full-history</span></label>
+                  </div>
+                </details>
+
+                <button class="button primary start-button" id="start-record" type="submit">
+                  <span class="button-led"></span><span>开始采集</span>
+                </button>
+                <p class="control-note">启动前建议先在“设备能力”页执行 Probe，确认 powered 为空且电流命令可用。</p>
+              </form>
+            </aside>
+
+            <div class="monitoring-stack">
+              <div class="metric-grid">
+                <article class="metric-card power-card"><div class="metric-top"><span>实时功率</span><i>BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">整机电池侧</small></article>
+                <article class="metric-card"><div class="metric-top"><span>放电电流</span><i>CURRENT</i></div><strong id="metric-current">--</strong><small id="metric-current-sub">正幅值</small></article>
+                <article class="metric-card"><div class="metric-top"><span>CPU 总负载</span><i>CPU</i></div><strong id="metric-cpu">--</strong><small id="metric-cpu-sub">全核心</small></article>
+                <article class="metric-card"><div class="metric-top"><span>电池温度</span><i>THERMAL</i></div><strong id="metric-temp">--</strong><small id="metric-temp-sub">BatteryService</small></article>
+                <article class="metric-card"><div class="metric-top"><span>累计能量</span><i>ENERGY</i></div><strong id="metric-energy">--</strong><small id="metric-energy-sub">有效区间积分</small></article>
+              </div>
+
+              <section class="panel chart-panel">
+                <div class="panel-heading chart-heading">
+                  <div><small>LIVE TELEMETRY</small><h2 id="chart-title">实时功率</h2></div>
+                  <div class="metric-tabs" role="tablist" aria-label="曲线指标">
+                    <button type="button" class="active" data-metric="power_mw">功率</button>
+                    <button type="button" data-metric="current_ma">电流</button>
+                    <button type="button" data-metric="cpu_pct">CPU</button>
+                    <button type="button" data-metric="temperature_c">温度</button>
+                    <button type="button" data-metric="voltage_mv">电压</button>
+                  </div>
+                </div>
+                <div class="chart-meta"><span><i class="legend-line"></i><b id="chart-legend">Power</b></span><span>AVG <b id="chart-average">--</b></span><span>P95 <b id="chart-p95">--</b></span></div>
+                <div class="chart-wrap" id="chart-wrap">
+                  <svg id="live-chart" viewBox="0 0 1000 320" preserveAspectRatio="none" role="img" aria-label="实时遥测曲线"></svg>
+                  <div class="chart-empty" id="chart-empty"><span class="empty-wave" aria-hidden="true"></span><strong>等待遥测数据</strong><small>开始采集后，曲线将在这里实时更新</small></div>
+                  <div class="chart-tooltip hidden" id="chart-tooltip"></div>
+                </div>
+              </section>
+
+              <div class="details-grid">
+                <section class="panel cpu-panel">
+                  <div class="panel-heading"><div><small>CPU CLUSTERS</small><h2>集群状态</h2></div><span class="data-source">kernel counters</span></div>
+                  <div class="cluster-list" id="cluster-list"><div class="empty-row">等待 CPU 数据</div></div>
+                </section>
+                <section class="panel context-panel">
+                  <div class="panel-heading"><div><small>DEVICE CONTEXT</small><h2>当前场景</h2></div><span class="data-source" id="context-source">sampler</span></div>
+                  <dl class="context-list">
+                    <div><dt>前台应用</dt><dd id="context-package">--</dd></div>
+                    <div><dt>Activity</dt><dd id="context-activity">--</dd></div>
+                    <div><dt>屏幕</dt><dd id="context-screen">--</dd></div>
+                    <div><dt>亮度 / 刷新率</dt><dd id="context-display">--</dd></div>
+                    <div><dt>电压 / 电量</dt><dd id="context-battery">--</dd></div>
+                    <div><dt>设备重连</dt><dd id="context-reconnect">0</dd></div>
+                  </dl>
+                </section>
+              </div>
+
+              <section class="panel console-panel">
+                <div class="panel-heading"><div><small>COLLECTOR JOURNAL</small><h2>运行日志</h2></div><button class="text-button" id="clear-console" type="button">清空视图</button></div>
+                <div class="console" id="console-output" aria-live="polite"><div class="console-line ui"><time>--:--:--</time><span>UI</span><p>Dashboard ready. Select a device and configure a session.</p></div></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" data-panel="system" hidden>
+          <div class="view-header system-view-header">
+            <div><small>WHOLE-SYSTEM ACTIVITY</small><h2>系统进程与热点线程</h2><p>平台侧快照覆盖可观测的应用、系统进程和线程；重点活动会与同期电池侧功率关联。</p></div>
+            <span class="live-source-badge"><i></i><span id="system-snapshot-status">等待系统快照</span></span>
+          </div>
+
+          <section class="panel priority-alert idle" id="system-priority-banner">
+            <span class="priority-alert-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4L12 3zM12 9v5M12 17.5v.5"/></svg></span>
+            <div><small>PRIORITY BACKGROUND WATCH</small><h3 id="system-priority-title">未检测到 DEX / 系统更新高影响活动</h3><p id="system-priority-detail">持续监控 dex2oat、dexopt、artd、installd、profman、odrefresh、update_engine 与 apexd。</p></div>
+            <span class="priority-state" id="system-priority-badge">STANDBY</span>
+          </section>
+
+          <div class="system-stat-grid">
+            <article class="panel system-stat"><small>PROCESSES</small><strong id="system-process-count">--</strong><span>全系统进程 / 内核任务</span></article>
+            <article class="panel system-stat"><small>THREADS</small><strong id="system-thread-count">--</strong><span>全系统线程</span></article>
+            <article class="panel system-stat"><small>SNAPSHOTS</small><strong id="system-snapshot-count">0</strong><span>进程快照</span></article>
+            <article class="panel system-stat accent"><small>PRIORITY ACTIVE</small><strong id="system-priority-count">0</strong><span>当前重点活动</span></article>
+          </div>
+
+          <section class="panel system-table-panel">
+            <div class="panel-heading"><div><small>DEX / UPDATE / PACKAGE</small><h2>重点后台活动</h2></div><span class="data-source">ps + top</span></div>
+            <div class="system-table-wrap"><table class="system-table"><thead><tr><th>活动</th><th>PID</th><th>CPU</th><th>策略 / 状态</th><th>判定</th></tr></thead><tbody id="watched-process-body"><tr><td colspan="5" class="table-empty">等待系统快照...</td></tr></tbody></table></div>
+          </section>
+
+          <div class="system-split-grid">
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>TOP PROCESSES</small><h2>整机 CPU 热点</h2></div><span class="data-source">10 s default</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>进程</th><th>CPU</th><th>内存</th><th>PCY</th></tr></thead><tbody id="system-process-body"><tr><td colspan="4" class="table-empty">暂无进程快照</td></tr></tbody></table></div>
+            </section>
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>HOT THREADS</small><h2>热点线程</h2></div><span class="data-source">30 s default</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>线程 / 进程</th><th>TID</th><th>CPU</th><th>PCY</th></tr></thead><tbody id="system-thread-body"><tr><td colspan="4" class="table-empty">暂无线程快照</td></tr></tbody></table></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" data-panel="thermal" hidden>
+          <div class="view-header system-view-header">
+            <div><small>THERMAL & SCHEDULER</small><h2>热策略与调度证据</h2><p>展示当前平台实际暴露的温度、冷却、调度和性能提示状态；不可用能力会保持为空。</p></div>
+            <span class="live-source-badge"><i></i><span id="thermal-snapshot-status">等待热控快照</span></span>
+          </div>
+
+          <div class="system-stat-grid thermal-stat-grid">
+            <article class="panel system-stat"><small>THERMAL STATUS</small><strong id="thermal-status-value">--</strong><span id="thermal-status-label">ThermalService</span></article>
+            <article class="panel system-stat"><small>HOTTEST SENSOR</small><strong id="thermal-hottest-value">--</strong><span id="thermal-hottest-label">--</span></article>
+            <article class="panel system-stat"><small>SENSORS</small><strong id="thermal-sensor-count">0</strong><span>HAL / BCL 传感器</span></article>
+            <article class="panel system-stat"><small>ADPF SESSIONS</small><strong id="adpf-session-count">0</strong><span>活跃 Performance Hint</span></article>
+          </div>
+
+          <div class="system-split-grid">
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>THERMAL HAL</small><h2>温度与阈值</h2></div><span class="data-source">dumpsys thermalservice</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>传感器</th><th>数值</th><th>级别</th><th>首个阈值</th></tr></thead><tbody id="thermal-sensor-body"><tr><td colspan="4" class="table-empty">暂无温度快照</td></tr></tbody></table></div>
+            </section>
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>COOLING DEVICES</small><h2>冷却动作</h2></div><span class="data-source">HAL observable</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>设备</th><th>值</th><th>状态</th></tr></thead><tbody id="cooling-device-body"><tr><td colspan="3" class="table-empty">暂无冷却设备数据</td></tr></tbody></table></div>
+            </section>
+          </div>
+
+          <div class="system-split-grid">
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>CPUSETS / CPUFREQ</small><h2>调度边界</h2></div><span class="data-source">cgroup + sysfs</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>组 / Policy</th><th>CPU / 范围</th><th>运行时控制</th></tr></thead><tbody id="scheduler-policy-body"><tr><td colspan="3" class="table-empty">暂无调度快照</td></tr></tbody></table></div>
+            </section>
+            <section class="panel system-table-panel">
+              <div class="panel-heading"><div><small>ADPF</small><h2>Performance Hint 会话</h2></div><span class="data-source">performance_hint</span></div>
+              <div class="system-table-wrap"><table class="system-table"><thead><tr><th>PID / UID</th><th>TIDs</th><th>目标</th><th>标志</th></tr></thead><tbody id="adpf-session-body"><tr><td colspan="4" class="table-empty">暂无 ADPF 会话</td></tr></tbody></table></div>
+            </section>
+          </div>
+
+          <section class="panel system-table-panel">
+            <div class="panel-heading"><div><small>ACTIVITY MANAGER</small><h2>进程调度状态</h2></div><span class="data-source">proc state / sched group / frozen</span></div>
+            <div class="system-table-wrap"><table class="system-table"><thead><tr><th>进程</th><th>PID / UID</th><th>Proc state</th><th>Sched group</th><th>冻结</th></tr></thead><tbody id="scheduler-process-body"><tr><td colspan="5" class="table-empty">暂无进程状态</td></tr></tbody></table></div>
+            <div class="power-state-strip" id="scheduler-power-state"><span>PowerManager 状态尚不可用</span></div>
+          </section>
+
+          <p class="observability-note"><strong>可观测边界：</strong>这里能看到系统暴露的热状态、静态阈值和调度结果；量产机通常不允许读取完整 OEM 热控算法、sched_debug、governor 或 uclamp 内部配置。</p>
+        </section>
+
+        <section class="view" data-panel="device" hidden>
+          <div class="view-header">
+            <div><small>DEVICE CAPABILITY</small><h2>设备能力检查</h2><p>在正式采集前确认电池供电状态、电流传感器、CPU 集群和 GPU 数据源。</p></div>
+            <button class="button primary" id="run-probe" type="button">运行 Probe</button>
+          </div>
+          <div class="probe-placeholder panel" id="probe-placeholder">
+            <span class="probe-illustration" aria-hidden="true"><svg viewBox="0 0 100 100"><rect x="30" y="8" width="40" height="84" rx="8"/><path d="M43 82h14M35 22h30M50 38v18M41 47h18"/></svg></span>
+            <strong>尚未检查设备</strong><p>选择在线设备后运行 Probe。该操作只读取设备能力，不会开始采集或重置 BatteryStats。</p>
+          </div>
+          <div class="probe-results hidden" id="probe-results">
+            <div class="probe-summary-grid">
+              <article class="panel probe-identity"><small>DEVICE</small><h3 id="probe-device-name">--</h3><p id="probe-device-detail">--</p><code id="probe-serial">--</code></article>
+              <article class="panel probe-status"><small>POWER STATE</small><h3 id="probe-power-state">--</h3><p id="probe-current-state">--</p><span id="probe-power-badge" class="probe-badge">UNKNOWN</span></article>
+              <article class="panel probe-status"><small>GPU SOURCE</small><h3 id="probe-gpu-state">--</h3><p id="probe-gpu-detail">--</p><span id="probe-gpu-badge" class="probe-badge neutral">CHECKING</span></article>
+              <article class="panel probe-status"><small>FOREGROUND</small><h3 id="probe-foreground">--</h3><p>ActivityManager sampled package</p></article>
+            </div>
+            <div class="probe-detail-grid">
+              <section class="panel"><div class="panel-heading"><div><small>CPU POLICIES</small><h2>CPU 集群</h2></div></div><div class="capability-table" id="probe-cpu-table"></div></section>
+              <section class="panel"><div class="panel-heading"><div><small>FEATURE MATRIX</small><h2>数据源可用性</h2></div></div><div class="feature-list" id="probe-feature-list"></div></section>
+            </div>
+            <section class="panel raw-probe-panel"><details><summary>查看原始 Probe JSON</summary><pre id="probe-json"></pre></details></section>
+          </div>
+        </section>
+
+        <section class="view" data-panel="history" hidden>
+          <div class="view-header">
+            <div><small>RUN ARCHIVE</small><h2>历史报告</h2><p id="history-root">采集目录中的最近运行记录。</p></div>
+            <button class="button ghost" id="refresh-history" type="button">刷新列表</button>
+          </div>
+          <section class="panel history-panel">
+            <div class="history-table-wrap">
+              <table class="history-table">
+                <thead><tr><th>会话</th><th>设备</th><th>状态</th><th>时长</th><th>平均功率</th><th>能量</th><th>覆盖率</th><th></th></tr></thead>
+                <tbody id="history-body"><tr><td colspan="8" class="table-empty">正在读取历史记录...</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" data-panel="tools" hidden>
+          <div class="view-header tools-view-header">
+            <div><small>WORKFLOW & DELIVERY</small><h2>工具与交付</h2><p>采集结束后的日志对齐、报告维护、证据归档、双机比较和软件打包都可以在这里完成。</p></div>
+            <span class="tooling-mode" id="tooling-mode"><i></i><span><strong>正在检查运行环境</strong><small>Source / Portable capability</small></span></span>
+          </div>
+
+          <div class="tool-grid">
+            <section class="panel tool-card">
+              <div class="tool-card-heading"><span class="tool-index">01</span><div><small>RUN MAINTENANCE</small><h2>报告重建与中断恢复</h2></div></div>
+              <p class="tool-description">报告样式或分析逻辑升级后可重新分析旧数据；意外退出时可从落盘的原始采样恢复。</p>
+              <div class="form-field tool-field">
+                <label for="maintenance-run-select"><span>运行记录</span></label>
+                <select id="maintenance-run-select" data-run-select><option value="">暂无运行记录</option></select>
+              </div>
+              <div class="tool-actions">
+                <button class="button primary tool-submit" id="regenerate-report-button" type="button">重建报告</button>
+                <button class="button ghost tool-submit" id="recover-run-button" type="button">恢复中断运行</button>
+              </div>
+              <p class="tool-hint">恢复操作会把状态标记为 recovered；正常完成的记录通常只需“重建报告”。</p>
+            </section>
+
+            <section class="panel tool-card">
+              <div class="tool-card-heading"><span class="tool-index">02</span><div><small>BTR2 ALIGNMENT</small><h2>导入 BTR2 日志</h2></div></div>
+              <p class="tool-description">使用主机绝对时间和设备 uptime 同步点，把测试阶段、动作和状态对齐到功耗时间线。</p>
+              <form class="tool-form" id="import-log-form">
+                <div class="form-field tool-field">
+                  <label for="import-run-select"><span>运行记录</span></label>
+                  <select id="import-run-select" data-run-select><option value="">暂无运行记录</option></select>
+                </div>
+                <div class="form-field tool-field">
+                  <label for="import-log-path"><span>BTR2 日志绝对路径</span></label>
+                  <input id="import-log-path" type="text" autocomplete="off" placeholder="D:\BTR2\logs\round-001.log">
+                </div>
+                <div class="form-field tool-field">
+                  <label for="import-rules-path"><span>规则 JSON 路径</span></label>
+                  <input id="import-rules-path" type="text" autocomplete="off" placeholder="examples\btr2-log-rules.json">
+                </div>
+                <div class="form-field tool-field">
+                  <label for="import-match-input"><span>多手机过滤（可选，每行一个 FIELD=VALUE）</span></label>
+                  <textarea id="import-match-input" rows="2" placeholder="phone_key=phone1"></textarea>
+                </div>
+                <label class="compact-check tool-check"><input id="import-replace-input" type="checkbox" checked><span>替换以前导入的外部事件，保留 UI 手工标记</span></label>
+                <button class="button primary tool-submit" type="submit">导入并重建报告</button>
+              </form>
+            </section>
+
+            <section class="panel tool-card">
+              <div class="tool-card-heading"><span class="tool-index">03</span><div><small>EVIDENCE ARCHIVE</small><h2>生成证据 ZIP</h2></div></div>
+              <p class="tool-description">归档完整运行目录、原始采样、分析结果、HTML 报告和可选附件，并生成 SHA-256 清单。</p>
+              <form class="tool-form" id="archive-form">
+                <div class="form-field tool-field">
+                  <label for="archive-run-select"><span>运行记录</span></label>
+                  <select id="archive-run-select" data-run-select><option value="">暂无运行记录</option></select>
+                </div>
+                <div class="form-field tool-field">
+                  <label for="archive-attachments-input"><span>额外附件（可选，每行一个文件或目录）</span></label>
+                  <textarea id="archive-attachments-input" rows="3" placeholder="D:\BTR2\logs\round-001.log&#10;D:\BTR2\camera-evidence"></textarea>
+                </div>
+                <div class="form-field tool-field">
+                  <label for="archive-output-path"><span>输出 ZIP（可选，留空自动命名）</span></label>
+                  <input id="archive-output-path" type="text" autocomplete="off" placeholder="D:\power-archives\round-001-evidence.zip">
+                </div>
+                <button class="button primary tool-submit" type="submit">生成证据包</button>
+              </form>
+            </section>
+
+            <section class="panel tool-card tool-card-wide">
+              <div class="tool-card-heading"><span class="tool-index">04</span><div><small>TWO-PHONE COMPARISON</small><h2>双机 / 两次运行对比</h2></div></div>
+              <p class="tool-description">按 comparison_key 配对相同测试项，对比平均功率、单位时间能量、CPU、温度、GC、kworker 和 DEX/更新干扰。</p>
+              <form class="tool-form compare-form" id="compare-form">
+                <div class="form-field tool-field">
+                  <label for="compare-run-a"><span>Run A（基准）</span></label>
+                  <select id="compare-run-a" data-run-select><option value="">暂无运行记录</option></select>
+                </div>
+                <div class="form-field tool-field">
+                  <label for="compare-run-b"><span>Run B（对比）</span></label>
+                  <select id="compare-run-b" data-run-select><option value="">暂无运行记录</option></select>
+                </div>
+                <div class="form-field tool-field">
+                  <label for="compare-label-a"><span>标签 A</span></label>
+                  <input id="compare-label-a" type="text" placeholder="手机 A / 旧版本">
+                </div>
+                <div class="form-field tool-field">
+                  <label for="compare-label-b"><span>标签 B</span></label>
+                  <input id="compare-label-b" type="text" placeholder="手机 B / 新版本">
+                </div>
+                <div class="form-field tool-field compare-title-field">
+                  <label for="compare-title"><span>报告标题</span></label>
+                  <input id="compare-title" type="text" value="双机续航与系统活动对比">
+                </div>
+                <div class="form-field tool-field">
+                  <label for="compare-output-name"><span>输出名称（可选）</span></label>
+                  <input id="compare-output-name" type="text" placeholder="phone-a-vs-phone-b">
+                </div>
+                <button class="button primary tool-submit compare-submit" type="submit">生成对比报告</button>
+              </form>
+              <div class="recent-comparisons" id="recent-comparisons"><span>尚未生成对比报告</span></div>
+            </section>
+
+            <section class="panel tool-card tool-card-wide portable-card">
+              <div class="tool-card-heading"><span class="tool-index">05</span><div><small>SOFTWARE DELIVERY</small><h2>重新构建 Windows 便携包</h2></div></div>
+              <p class="tool-description">修改源码并通过测试后，调用项目统一构建脚本，重新生成内置 Embedded Python、项目代码和可选 ADB 的 ZIP。</p>
+              <form class="tool-form portable-form" id="portable-build-form">
+                <div class="form-field tool-field portable-output-field">
+                  <label for="portable-output-directory"><span>输出目录（必须位于源码工程 dist 下）</span></label>
+                  <input id="portable-output-directory" type="text" autocomplete="off" placeholder="dist\mobile-power-profiler-portable">
+                </div>
+                <label class="compact-check tool-check"><input id="portable-include-adb" type="checkbox" checked><span>把本机可用的 ADB Platform Tools 一并打包</span></label>
+                <button class="button primary tool-submit" id="portable-build-button" type="submit">生成新版便携包</button>
+              </form>
+              <p class="tool-hint" id="portable-build-hint">正在检查是否从源码工程运行。</p>
+            </section>
+          </div>
+
+          <section class="panel tool-output-panel">
+            <div class="panel-heading"><div><small>OPERATION RESULT</small><h2>最近一次操作</h2></div><span class="tool-output-actions"><a class="button ghost hidden" id="tool-output-link" href="#" target="_blank" rel="noreferrer">打开生成结果</a><button class="text-button" id="clear-tool-output" type="button">清空</button></span></div>
+            <pre id="tool-output">等待操作。所有路径都指向运行 UI 的这台电脑。</pre>
+          </section>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+  <div class="busy-overlay hidden" id="busy-overlay" aria-hidden="true"><span class="spinner"></span><strong id="busy-label">正在处理...</strong></div>
+</body>
+</html>
