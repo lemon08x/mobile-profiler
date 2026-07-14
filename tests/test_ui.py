@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import tempfile
@@ -19,8 +20,11 @@ from mobile_power_profiler.ui import (
     DashboardHTTPServer,
     DashboardManager,
     LiveTelemetryReader,
+    android_icon_data_uri,
+    parse_android_apk_icon_candidates,
     parse_android_launcher_activities,
     parse_android_package_list,
+    parse_android_package_paths,
     parse_device_ipv4_addresses,
     sanitize_run_name,
 )
@@ -198,6 +202,25 @@ class UiServerTests(unittest.TestCase):
         self.assertEqual([item["package"] for item in apps], ["com.example.game", "com.android.settings"])
         self.assertTrue(apps[0]["user_app"])
         self.assertEqual(len(apps[0]["activities"]), 2)
+
+    def test_android_package_paths_and_icon_candidates_support_thumbnails(self) -> None:
+        paths = parse_android_package_paths(
+            "package:/data/app/example/base.apk=com.example.game\n"
+            "Error: ignored\n"
+        )
+        self.assertEqual(paths["com.example.game"], "/data/app/example/base.apk")
+        candidates = parse_android_apk_icon_candidates(
+            "  1200  2026-01-01 12:00 res/drawable-xhdpi/notification_icon.png\n"
+            " 24084  2026-01-01 12:00 res/drawable-xhdpi/icon.png\n"
+            " 77137  2026-01-01 12:00 res/drawable-xxxhdpi/icon.png\n"
+        )
+        self.assertEqual(candidates[0]["name"], "res/drawable-xxxhdpi/icon.png")
+        encoded = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 600).decode("ascii")
+        self.assertTrue(
+            android_icon_data_uri(encoded, "res/drawable/icon.png").startswith(
+                "data:image/png;base64,"
+            )
+        )
 
     def test_android_app_scan_uses_launcher_activities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

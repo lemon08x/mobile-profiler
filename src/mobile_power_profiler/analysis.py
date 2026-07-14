@@ -2892,7 +2892,26 @@ def analyze_performance_test_items(
             for item in detailed
             if isinstance(item.get("total_ms"), (int, float))
         ]
-        if detailed_totals:
+        presented_intervals = [
+            float(value)
+            for item in period_rows
+            for value in (
+                item.get("frame_intervals_ms", [])
+                if isinstance(item.get("frame_intervals_ms"), list)
+                else []
+            )
+            if isinstance(value, (int, float)) and float(value) > 0
+        ]
+        if presented_intervals:
+            slow_count = max(1, math.ceil(len(presented_intervals) * 0.01))
+            slow_average_ms = statistics.fmean(
+                sorted(presented_intervals, reverse=True)[:slow_count]
+            )
+            one_percent_low = 1000.0 / slow_average_ms if slow_average_ms > 0 else None
+            frame_p95 = percentile(presented_intervals, 0.95)
+            frame_p99 = percentile(presented_intervals, 0.99)
+            frame_metric_source = "Android SurfaceFlinger presented-frame intervals"
+        elif detailed_totals:
             slow_count = max(1, math.ceil(len(detailed_totals) * 0.01))
             slow_average_ms = statistics.fmean(
                 sorted(detailed_totals, reverse=True)[:slow_count]
@@ -3470,13 +3489,30 @@ def analyze_performance_contexts(
         if refresh_residency:
             residency_source = "context sample intervals"
 
-    frame_rows = [
+    all_frame_rows = [
         item.performance
         for item in performance_contexts
         if isinstance(item.performance.get("frame_sample_count"), (int, float))
         and float(item.performance.get("frame_sample_count") or 0) > 0
     ]
+    surface_frame_rows = [
+        item for item in all_frame_rows if bool(item.get("surface_frame_source"))
+    ]
+    using_surface_frames = is_android and bool(surface_frame_rows)
+    frame_rows = surface_frame_rows if using_surface_frames else all_frame_rows
     frame_sample_count = sum(int(item.get("frame_sample_count") or 0) for item in frame_rows)
+    presented_intervals = [
+        float(value)
+        for item in frame_rows
+        for value in (
+            item.get("frame_intervals_ms", [])
+            if isinstance(item.get("frame_intervals_ms"), list)
+            else []
+        )
+        if isinstance(value, (int, float)) and float(value) > 0
+    ]
+    if presented_intervals:
+        frame_sample_count = len(presented_intervals)
 
     counter_frame_contexts = [
         item
@@ -3494,6 +3530,13 @@ def analyze_performance_contexts(
     counter_timeline: List[Dict[str, object]] = []
 
     for previous, current in zip(counter_frame_contexts, counter_frame_contexts[1:]):
+        previous_screen = str(previous.screen_state or "").strip().lower()
+        current_screen = str(current.screen_state or "").strip().lower()
+        if (
+            (previous_screen and previous_screen not in {"awake", "on"})
+            or (current_screen and current_screen not in {"awake", "on"})
+        ):
+            continue
         previous_package = str(previous.foreground_package or "")
         current_package = str(current.foreground_package or "")
         previous_window = str(previous.performance.get("foreground_window_name") or "")
@@ -3632,17 +3675,43 @@ def analyze_performance_contexts(
     frozen_intervals = sum(
         int(item.get("frozen_frame_interval_count") or 0) for item in frame_rows
     )
-    compositor_fps = weighted_frame_value("compositor_fps")
+    compositor_fps = (
+        1000.0 / statistics.fmean(presented_intervals)
+        if presented_intervals
+        else weighted_frame_value("compositor_fps")
+    )
     compositor_minimum_fps = min(fps_values) if fps_values else None
-    compositor_frame_average_ms = weighted_frame_value("frame_interval_average_ms")
-    compositor_frame_p95_ms = max(p95_values) if p95_values else None
-    compositor_frame_p99_ms = weighted_frame_value("frame_interval_p99_ms")
-    compositor_one_percent_low_fps = weighted_frame_value("one_percent_low_fps")
+    compositor_frame_average_ms = (
+        statistics.fmean(presented_intervals)
+        if presented_intervals
+        else weighted_frame_value("frame_interval_average_ms")
+    )
+    compositor_frame_p95_ms = (
+        percentile(presented_intervals, 0.95)
+        if presented_intervals
+        else max(p95_values) if p95_values else None
+    )
+    compositor_frame_p99_ms = (
+        percentile(presented_intervals, 0.99)
+        if presented_intervals
+        else weighted_frame_value("frame_interval_p99_ms")
+    )
+    if presented_intervals:
+        slow_count = max(1, math.ceil(len(presented_intervals) * 0.01))
+        slow_average_ms = statistics.fmean(
+            sorted(presented_intervals, reverse=True)[:slow_count]
+        )
+        compositor_one_percent_low_fps = (
+            1000.0 / slow_average_ms if slow_average_ms > 0 else None
+        )
+    else:
+        compositor_one_percent_low_fps = weighted_frame_value("one_percent_low_fps")
     compositor_missed_pct = (
         missed_intervals / frame_sample_count * 100.0 if frame_sample_count > 0 else None
     )
 
-    if counter_pair_count > 0:
+    using_gfxinfo_counters = counter_pair_count > 0 and not using_surface_frames
+    if using_gfxinfo_counters:
         sampled_frame_rate = (
             counter_frame_count / counter_frame_duration_s
             if counter_frame_duration_s > 0
@@ -3687,25 +3756,47 @@ def analyze_performance_contexts(
             if compositor_one_percent_low_fps is not None
             else percentile(fps_values, 0.01) if fps_values else None
         )
-        one_percent_low_source = (
-            "HarmonyOS SmartPerf frame-jitter slowest 1%"
-            if compositor_one_percent_low_fps is not None
-            else "RenderService sampled-window 1st percentile" if fps_values else None
-        )
-        one_percent_low_confidence = (
-            "high" if compositor_one_percent_low_fps is not None
-            else "medium" if fps_values else None
-        )
         frame_issue_count = missed_intervals
         frame_issue_pct = compositor_missed_pct
         if is_android:
-            frame_rate_source = None
-            frame_rate_label = "应用 UI 帧提交速率"
-            frame_rate_unit = "帧/s"
-            frame_metric_label = "应用帧耗时 P95"
-            frame_issue_label = "超出帧截止时间"
+            if using_surface_frames:
+                one_percent_low_source = (
+                    "Android SurfaceFlinger presented-frame slowest 1%"
+                    if compositor_one_percent_low_fps is not None
+                    else "Android SurfaceFlinger sampled-window 1st percentile"
+                    if fps_values
+                    else None
+                )
+                one_percent_low_confidence = (
+                    "high" if compositor_one_percent_low_fps is not None
+                    else "medium" if fps_values else None
+                )
+                frame_rate_source = (
+                    "Android SurfaceFlinger BLAST layer present timestamps"
+                )
+                frame_rate_label = "应用呈现帧率"
+                frame_rate_unit = "FPS"
+                frame_metric_label = "呈现帧间隔 P95"
+                frame_issue_label = "跨越帧预算"
+            else:
+                one_percent_low_source = None
+                one_percent_low_confidence = None
+                frame_rate_source = None
+                frame_rate_label = "应用 UI 帧提交速率"
+                frame_rate_unit = "帧/s"
+                frame_metric_label = "应用帧耗时 P95"
+                frame_issue_label = "超出帧截止时间"
         else:
             smartperf_rows = any(item.get("smartperf_source") for item in frame_rows)
+            one_percent_low_source = (
+                "HarmonyOS SmartPerf frame-jitter slowest 1%"
+                if compositor_one_percent_low_fps is not None
+                else "RenderService sampled-window 1st percentile" if fps_values else None
+            )
+            one_percent_low_confidence = (
+                "high" if compositor_one_percent_low_fps is not None
+                else "medium" if fps_values else None
+            )
             frame_rate_source = (
                 "HarmonyOS SmartPerf SP_daemon app FPS and frame jitter"
                 if smartperf_rows
@@ -3770,7 +3861,7 @@ def analyze_performance_contexts(
         if isinstance(sampled_frame_rate, (int, float))
         and isinstance(current_refresh, (int, float))
         and current_refresh > 0
-        and counter_pair_count > 0
+        and using_gfxinfo_counters
         else None
     )
     display_to_frame_ratio = (
@@ -3794,6 +3885,9 @@ def analyze_performance_contexts(
     interpolation_confidence = str(
         latest_value("frame_interpolation_confidence") or "low"
     )
+    interpolation_scope = str(
+        latest_value("frame_interpolation_scope") or "none"
+    )
     interpolation_evidence = latest_value("frame_interpolation_evidence")
     interpolation_evidence = (
         list(interpolation_evidence)
@@ -3803,33 +3897,64 @@ def analyze_performance_contexts(
     if interpolation_status == "unavailable" and cadence_multiplier is not None:
         interpolation_status = "indeterminate"
         interpolation_label = (
-            f"显示刷新率约为应用提交率 {cadence_multiplier} 倍；"
+            f"显示刷新率约为应用帧率 {cadence_multiplier} 倍；"
             "仅凭系统计数无法区分重复帧与插帧"
         )
 
     display_width = latest_value("display_width_px")
     display_height = latest_value("display_height_px")
-    render_width = latest_value("render_width_px")
-    render_height = latest_value("render_height_px")
+    render_width = render_height = render_resolution_source = None
+    render_resolution_evidence = None
     render_resolution_estimated = False
-    render_resolution_source = latest_value("render_resolution_source")
-    if not isinstance(render_width, (int, float)) or not isinstance(
-        render_height, (int, float)
-    ):
-        render_width = display_width
-        render_height = display_height
-        render_resolution_source = (
-            "active display mode fallback"
-            if isinstance(render_width, (int, float))
-            and isinstance(render_height, (int, float))
-            else None
+    render_resolution_available = False
+    render_sources = [
+        item.performance
+        for item in reversed(performance_contexts)
+        if isinstance(item.performance, dict)
+    ] + [probe]
+    for source in render_sources:
+        candidate_width = source.get("render_width_px")
+        candidate_height = source.get("render_height_px")
+        candidate_source = str(source.get("render_resolution_source") or "")
+        candidate_estimated = bool(source.get("render_resolution_estimated"))
+        unreliable_source = (
+            not candidate_source
+            or candidate_source == "active display mode fallback"
+            or candidate_source.lower().startswith("windowmanager")
         )
-        render_resolution_estimated = bool(render_resolution_source)
+        if (
+            isinstance(candidate_width, (int, float))
+            and float(candidate_width) > 0
+            and isinstance(candidate_height, (int, float))
+            and float(candidate_height) > 0
+            and not candidate_estimated
+            and not unreliable_source
+        ):
+            render_width = candidate_width
+            render_height = candidate_height
+            render_resolution_source = candidate_source
+            render_resolution_evidence = source.get("render_resolution_evidence")
+            render_resolution_available = True
+            break
+    if not render_resolution_available:
+        render_width = None
+        render_height = None
+        render_resolution_source = None
+        render_resolution_evidence = None
+        render_resolution_estimated = False
     render_scale_pct = (
-        min(float(render_width) / float(display_width), float(render_height) / float(display_height))
+        max(
+            min(
+                float(render_width) / float(display_width),
+                float(render_height) / float(display_height),
+            ),
+            min(
+                float(render_width) / float(display_height),
+                float(render_height) / float(display_width),
+            ),
+        )
         * 100.0
-        if isinstance(render_width, (int, float))
-        and isinstance(render_height, (int, float))
+        if render_resolution_available
         and isinstance(display_width, (int, float))
         and isinstance(display_height, (int, float))
         and display_width > 0
@@ -3837,14 +3962,24 @@ def analyze_performance_contexts(
         else None
     )
 
-    frame_rate_timeline = list(counter_timeline)
+    frame_rate_timeline = list(counter_timeline) if using_gfxinfo_counters else []
     if not frame_rate_timeline:
         frame_rate_timeline = [
             {
                 "uptime_s": item.uptime_s,
-                "duration_s": None,
+                "duration_s": (
+                    float(item.performance.get("frame_sample_count") or 0)
+                    * float(item.performance.get("frame_interval_average_ms") or 0)
+                    / 1000.0
+                    if isinstance(
+                        item.performance.get("frame_interval_average_ms"),
+                        (int, float),
+                    )
+                    else None
+                ),
                 "frame_count": item.performance.get("frame_sample_count"),
                 "frame_rate_fps": item.performance.get("compositor_fps"),
+                "frame_intervals_ms": item.performance.get("frame_intervals_ms", []),
                 "frame_time_average_ms": item.performance.get("frame_interval_average_ms"),
                 "frame_time_p95_ms": item.performance.get("frame_interval_p95_ms"),
                 "frame_time_p99_ms": item.performance.get("frame_interval_p99_ms"),
@@ -3858,6 +3993,10 @@ def analyze_performance_contexts(
             }
             for item in performance_contexts
             if isinstance(item.performance.get("compositor_fps"), (int, float))
+            and (
+                not using_surface_frames
+                or bool(item.performance.get("surface_frame_source"))
+            )
         ]
 
     gpu_probe = metadata.get("gpu_probe", {})
@@ -3913,9 +4052,13 @@ def analyze_performance_contexts(
         "frame_sample_count": reported_frame_sample_count,
         "missed_vsync_interval_count": missed_intervals,
         "missed_vsync_interval_pct": compositor_missed_pct,
-        "frame_deadline_missed_count": counter_deadline_missed if counter_pair_count else None,
-        "gfxinfo_janky_frame_count": counter_janky if counter_pair_count else None,
-        "gfxinfo_missed_vsync_count": counter_missed_vsync if counter_pair_count else None,
+        "frame_deadline_missed_count": (
+            counter_deadline_missed if using_gfxinfo_counters else None
+        ),
+        "gfxinfo_janky_frame_count": counter_janky if using_gfxinfo_counters else None,
+        "gfxinfo_missed_vsync_count": (
+            counter_missed_vsync if using_gfxinfo_counters else None
+        ),
         "severe_frame_interval_count": severe_intervals,
         "frozen_frame_interval_count": frozen_intervals,
         "missed_vsync_slot_count": sum(
@@ -3944,7 +4087,9 @@ def analyze_performance_contexts(
         "render_width_px": render_width,
         "render_height_px": render_height,
         "render_resolution_source": render_resolution_source,
+        "render_resolution_evidence": render_resolution_evidence,
         "render_resolution_estimated": render_resolution_estimated,
+        "render_resolution_available": render_resolution_available,
         "render_scale_pct": render_scale_pct,
         "brightness_raw": latest_value("brightness_raw"),
         "gpu_renderer": latest_value("gpu_renderer") or gpu_probe.get("model"),
@@ -3952,19 +4097,37 @@ def analyze_performance_contexts(
         "frame_interpolation_status": interpolation_status,
         "frame_interpolation_label": interpolation_label,
         "frame_interpolation_confidence": interpolation_confidence,
+        "frame_interpolation_scope": interpolation_scope,
         "frame_interpolation_evidence": interpolation_evidence,
+        "frame_interpolation_available": (
+            interpolation_status in {"detected", "disabled"}
+            and (
+                not is_android
+                or interpolation_scope in {"current_app", "current_session"}
+            )
+        ),
         "frame_source": frame_rate_source,
-        "frame_unavailable_reason": latest_value("frame_unavailable_reason"),
+        "frame_unavailable_reason": (
+            None
+            if isinstance(sampled_frame_rate, (int, float))
+            else latest_value("frame_unavailable_reason")
+        ),
         "limitations": (
             (
-                "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
-                "for the sampled foreground window. The rate is UI frame submissions per second, not visible "
-                "display FPS, and can exceed the panel refresh rate when an app submits redundant frames. "
-                if counter_pair_count > 0
+                "Android game frame rate and frame intervals are derived from present timestamps on the "
+                "foreground SurfaceView/BLAST layer. They represent frames presented by SurfaceFlinger; "
+                "the public interface does not expose every internal engine or hardware-composer stage. "
+                if using_surface_frames
                 else (
-                    "Android gfxinfo did not expose usable foreground-window frame counter deltas in this session. "
-                    if is_android
-                    else "Compositor FPS and frame intervals are periodic samples of recent RenderService submissions. "
+                    "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
+                    "for the sampled foreground window. The rate is UI frame submissions per second, not visible "
+                    "display FPS, and can exceed the panel refresh rate when an app submits redundant frames. "
+                    if using_gfxinfo_counters
+                    else (
+                        "Android gfxinfo and SurfaceFlinger did not expose usable foreground frame deltas in this session. "
+                        if is_android
+                        else "Compositor FPS and frame intervals are periodic samples of recent RenderService submissions. "
+                    )
                 )
             )
             + "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed "
@@ -4695,7 +4858,7 @@ def _analysis_data_sources(
             if platform == "harmony" and backend == "harmony_smartperf"
             else "HarmonyOS RenderService screen/fpsCount/composer fps"
             if platform == "harmony"
-            else "Android gfxinfo frame counters and detailed framestats"
+            else "Android SurfaceFlinger BLAST present timestamps with gfxinfo fallback and detailed framestats"
         )
         platform_system_source = (
             "iOS DVT sysmontap"

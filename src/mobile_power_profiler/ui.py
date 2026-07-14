@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import statistics
@@ -173,9 +176,112 @@ def parse_android_package_list(text: str) -> List[str]:
         value = line.strip()
         if value.startswith("package:"):
             value = value[len("package:") :].strip()
+        if "=" in value:
+            _, package = value.rsplit("=", 1)
+            if ANDROID_PACKAGE_RE.fullmatch(package.strip()):
+                value = package.strip()
         if ANDROID_PACKAGE_RE.fullmatch(value):
             packages.add(value)
     return sorted(packages, key=str.casefold)
+
+
+def parse_android_package_paths(text: str) -> Dict[str, str]:
+    paths: Dict[str, str] = {}
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("package:") or "=" not in line:
+            continue
+        path, package = line[len("package:") :].rsplit("=", 1)
+        package = package.strip()
+        path = path.strip()
+        if ANDROID_PACKAGE_RE.fullmatch(package) and path.endswith(".apk"):
+            paths[package] = path
+    return paths
+
+
+def parse_android_apk_icon_candidates(text: str) -> List[Dict[str, object]]:
+    candidates: List[Dict[str, object]] = []
+    excluded = (
+        ".9.png",
+        "notification",
+        "google_signin",
+        "btn_",
+        "button",
+        "close",
+        "delete",
+        "retry",
+        "loading",
+        "rotate",
+        "camera",
+        "album",
+        "qr_",
+    )
+    for raw_line in (text or "").splitlines():
+        match = re.match(
+            r"^\s*(?P<size>\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(?P<name>res/\S+)$",
+            raw_line,
+        )
+        if match is None:
+            continue
+        size = int(match.group("size"))
+        name = match.group("name")
+        lowered = name.lower()
+        if not lowered.endswith((".png", ".webp", ".jpg", ".jpeg")):
+            continue
+        if size < 512 or size > 750_000 or any(token in lowered for token in excluded):
+            continue
+        basename = lowered.rsplit("/", 1)[-1]
+        score = 0
+        if basename in {"ic_launcher.png", "ic_launcher.webp", "app_icon.png", "app_icon.webp"}:
+            score += 220
+        elif basename in {"icon.png", "icon.webp"}:
+            score += 200
+        elif "launcher" in basename:
+            score += 150
+        elif "app_icon" in basename or basename.startswith("icon"):
+            score += 120
+        elif "icon" in basename or "logo" in basename:
+            score += 45
+        else:
+            continue
+        density_scores = {
+            "xxxhdpi": 50,
+            "xxhdpi": 42,
+            "xhdpi": 34,
+            "hdpi": 26,
+            "mdpi": 18,
+        }
+        score += next(
+            (value for density, value in density_scores.items() if density in lowered),
+            0,
+        )
+        score += min(35, int(math.log2(max(1, size))))
+        candidates.append({"name": name, "size": size, "score": score})
+    candidates.sort(
+        key=lambda item: (int(item["score"]), int(item["size"])),
+        reverse=True,
+    )
+    return candidates
+
+
+def android_icon_data_uri(encoded: str, resource_name: str) -> Optional[str]:
+    compact = re.sub(r"\s+", "", encoded or "")
+    if not compact or len(compact) > 1_100_000:
+        return None
+    try:
+        payload = base64.b64decode(compact, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    mime = None
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        mime = "image/webp"
+    elif payload.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    if mime is None or len(payload) < 512:
+        return None
+    return f"data:{mime};base64,{compact}"
 
 
 def parse_android_launcher_activities(
@@ -945,6 +1051,7 @@ class DashboardManager:
         self.demo_mode = demo_mode
         self.active: Optional[ActiveRun] = None
         self.probe_cache: Dict[str, Dict[str, object]] = {}
+        self._android_icon_cache: Dict[str, Optional[str]] = {}
         self._starting = False
         self._device_cache: List[Dict[str, str]] = []
         self._android_device_cache: List[Dict[str, str]] = []
@@ -1519,10 +1626,13 @@ class DashboardManager:
         third_party_result = adb_shell(
             self.adb,
             device,
-            ["pm", "list", "packages", "-3"],
+            ["pm", "list", "packages", "-3", "-f"],
             timeout_s=20,
         )
         third_party_packages = parse_android_package_list(
+            third_party_result.stdout if third_party_result.ok else ""
+        )
+        package_paths = parse_android_package_paths(
             third_party_result.stdout if third_party_result.ok else ""
         )
 
@@ -1592,11 +1702,61 @@ class DashboardManager:
                 "The device did not expose launcher activities; showing third-party packages instead"
             )
 
+        icon_count = 0
+        icon_attempt_count = 0
+        for item in apps:
+            if icon_attempt_count >= 48 or not bool(item.get("user_app")):
+                continue
+            package = str(item.get("package") or "")
+            apk_path = package_paths.get(package)
+            if not apk_path:
+                continue
+            icon_attempt_count += 1
+            cache_key = f"{device}|{package}|{apk_path}"
+            with self._lock:
+                cached = self._android_icon_cache.get(cache_key)
+                cached_known = cache_key in self._android_icon_cache
+            if cached_known:
+                if cached:
+                    item["icon_data_uri"] = cached
+                    icon_count += 1
+                continue
+            listing = adb_shell(
+                self.adb,
+                device,
+                ["unzip", "-l", apk_path],
+                timeout_s=12,
+            )
+            icon_uri: Optional[str] = None
+            if listing.ok:
+                candidates = parse_android_apk_icon_candidates(listing.stdout)
+                if candidates:
+                    resource_name = str(candidates[0]["name"])
+                    encoded = adb_shell(
+                        self.adb,
+                        device,
+                        "unzip -p "
+                        f"{shlex.quote(apk_path)} {shlex.quote(resource_name)} "
+                        "2>/dev/null | base64",
+                        timeout_s=12,
+                    )
+                    if encoded.ok:
+                        icon_uri = android_icon_data_uri(
+                            encoded.stdout,
+                            resource_name,
+                        )
+            with self._lock:
+                self._android_icon_cache[cache_key] = icon_uri
+            if icon_uri:
+                item["icon_data_uri"] = icon_uri
+                icon_count += 1
+
         return {
             "device": device,
             "platform": "android",
             "source": source,
             "count": len(apps),
+            "icon_count": icon_count,
             "apps": apps,
             "warnings": warnings,
             "scanned_at": time.time(),
@@ -2459,13 +2619,15 @@ class DashboardManager:
                 "display_height_px": 2856,
                 "render_width_px": 1260,
                 "render_height_px": 2736,
-                "render_resolution_source": "WindowManager mFrame",
+                "render_resolution_source": "SurfaceFlinger GraphicBuffer",
                 "render_resolution_estimated": False,
+                "render_resolution_available": True,
                 "render_scale_pct": 95.5,
                 "frame_interpolation_status": "indeterminate",
                 "frame_interpolation_label": "发现显示倍率，但无显式 MEMC 开关证据",
                 "frame_interpolation_confidence": "low",
                 "frame_interpolation_evidence": [],
+                "frame_interpolation_available": False,
                 "brightness_raw": 23707,
                 "gpu_renderer": "Maleoon 920C",
             },

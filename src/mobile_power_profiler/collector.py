@@ -4,6 +4,8 @@ import json
 import math
 import queue
 import re
+import shlex
+import statistics
 import subprocess
 import threading
 import time
@@ -424,6 +426,7 @@ def is_memory_devfreq(identity: str) -> bool:
             "memory-controller",
             "mem_ctrl",
             "mif",
+            "dvfsrc",
         )
     )
 
@@ -772,7 +775,7 @@ def parse_android_window_performance(
     foreground_package: Optional[str] = None,
     foreground_activity: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Extract the foreground app window bounds as the best public render-target proxy."""
+    """Extract foreground window bounds without treating them as engine render size."""
 
     sections: List[Dict[str, object]] = []
     current: Optional[Dict[str, object]] = None
@@ -829,6 +832,7 @@ def parse_android_window_performance(
                         "render_width_px": width,
                         "render_height_px": height,
                         "render_resolution_source": f"WindowManager {source}",
+                        "render_resolution_estimated": True,
                         "score": score(section) + source_priority,
                     }
                 )
@@ -848,6 +852,7 @@ def parse_android_window_performance(
                         "render_width_px": width,
                         "render_height_px": height,
                         "render_resolution_source": "WindowManager requested size",
+                        "render_resolution_estimated": True,
                         "score": score(section) + 1,
                     }
                 )
@@ -864,50 +869,189 @@ def parse_android_window_performance(
     return {key: value for key, value in selected.items() if key != "score"}
 
 
-def parse_android_frame_interpolation(text: str) -> Dict[str, object]:
+def parse_android_surface_render_resolution(
+    text: str,
+    foreground_package: Optional[str] = None,
+    surface_layer_name: Optional[str] = None,
+) -> Dict[str, object]:
+    """Read the active game SurfaceView GraphicBuffer size from SurfaceFlinger."""
+
+    package = str(foreground_package or "").strip().lower()
+    layer_token = str(surface_layer_name or "").strip().split(" ", 1)[0].lower()
+    if not package and not layer_token:
+        return {}
+
+    pattern = re.compile(
+        r"^\+\s+name:(?P<name>[^\r\n]+?),\s*"
+        r"id:[^,\r\n]+,\s*size:[^,\r\n]+,\s*"
+        r"w/h:(?P<width>\d+)x(?P<height>\d+),",
+        re.M,
+    )
+    grouped: Dict[Tuple[int, int], Dict[str, object]] = {}
+    for match in pattern.finditer(text or ""):
+        name = match.group("name").strip()
+        lowered = name.lower()
+        if "surfaceview" not in lowered or "blast consumer" not in lowered:
+            continue
+        if package and package not in lowered and (not layer_token or layer_token not in lowered):
+            continue
+        width = int(match.group("width"))
+        height = int(match.group("height"))
+        if width < 64 or height < 64:
+            continue
+        score = 0
+        if layer_token and layer_token in lowered:
+            score += 8
+        if package and package in lowered:
+            score += 4
+        if "(blast consumer)" in lowered:
+            score += 2
+        key = (width, height)
+        entry = grouped.setdefault(
+            key,
+            {"count": 0, "score": 0, "name": name},
+        )
+        entry["count"] = int(entry["count"]) + 1
+        if score >= int(entry["score"]):
+            entry["score"] = score
+            entry["name"] = name
+
+    if not grouped:
+        return {}
+    (width, height), selected = max(
+        grouped.items(),
+        key=lambda item: (
+            int(item[1]["score"]),
+            int(item[1]["count"]),
+            item[0][0] * item[0][1],
+        ),
+    )
+    return {
+        "render_width_px": width,
+        "render_height_px": height,
+        "render_resolution_source": "SurfaceFlinger GraphicBuffer",
+        "render_resolution_estimated": False,
+        "render_resolution_evidence": str(selected["name"]),
+    }
+
+
+def parse_android_frame_interpolation(
+    text: str,
+    foreground_package: Optional[str] = None,
+    foreground_pid: Optional[int] = None,
+) -> Dict[str, object]:
     """Classify explicit vendor MEMC/frame-interpolation switches without cadence guessing."""
 
     evidence: List[str] = []
-    enabled = disabled = False
+    states: List[Tuple[int, bool, str, str]] = []
     key_pattern = re.compile(
-        r"(?:memc|motion[_ .-]*(?:compensation|smoothing)|"
+        r"(?:memc(?!g)|motion[_ .-]*(?:compensation|smoothing)|"
         r"frame[_ .-]*interpolat|video[_ .-]*(?:motion|enhance)|iris.*memc)",
         re.I,
     )
+
+    def key_value(line: str) -> Tuple[str, str]:
+        bracketed = re.match(r"^\[([^\]]+)\]:\s*\[(.*)\]\s*$", line)
+        if bracketed:
+            return bracketed.group(1).strip().lower(), bracketed.group(2).strip()
+        if "=" in line:
+            key, value = line.split("=", 1)
+            return key.strip().lower(), value.strip()
+        if ":" in line:
+            key, value = line.split(":", 1)
+            return key.strip().lower(), value.strip()
+        return line.strip().lower(), ""
+
+    def bool_value(value: str) -> Optional[bool]:
+        token = value.strip("[],'\" ").split(":", 1)[0].lower()
+        if token in {"1", "true", "on", "enabled", "enable", "open"}:
+            return True
+        if token in {"0", "false", "off", "disabled", "disable", "closed", "close"}:
+            return False
+        return None
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or not key_pattern.search(line):
             continue
         if line not in evidence:
             evidence.append(line[:300])
-        value_match = re.search(r"(?:=|:\s*|\]:\s*\[)([^\]\s]+)", line)
-        value = value_match.group(1).strip("[],'\"").lower() if value_match else ""
-        if value in {"1", "true", "on", "enabled", "enable", "open"}:
-            enabled = True
-        elif value in {"0", "false", "off", "disabled", "disable", "closed", "close"}:
-            disabled = True
+        key, value = key_value(line)
+        state = bool_value(value)
+        if state is None:
+            continue
 
-    if enabled:
-        status = "detected"
-        label = "检测到已开启的插帧 / MEMC 开关"
-        confidence = "high"
-    elif disabled and evidence:
-        status = "disabled"
-        label = "检测到插帧 / MEMC 开关处于关闭状态"
-        confidence = "high"
+        lowered_line = line.lower()
+        package = str(foreground_package or "").strip().lower()
+        if package and package in lowered_line:
+            states.append((5, state, "current_app", line))
+            continue
+        if key == "gamecube_frame_interpolation":
+            parts = [part.strip() for part in value.split(":")]
+            pid_matches = (
+                foreground_pid is not None
+                and len(parts) >= 3
+                and parts[2].isdigit()
+                and int(parts[2]) == int(foreground_pid)
+            )
+            states.append((5 if pid_matches else 3, state, "current_session", line))
+            continue
+        if key in {
+            "memc_main",
+            "gpu_memc_switch_to_ic_memc",
+            "gpu_memc_frame_rate",
+            "cached_memc_sdk_game_target_fps",
+        }:
+            states.append((4, state, "current_session", line))
+            continue
+        if any(token in key for token in ("whitelist", "_apps", "mutex", "support", "capability")):
+            continue
+        if key.startswith("ro."):
+            continue
+        states.append((2, state, "device", line))
+
+    status = "unavailable"
+    label = "系统未公开可验证的插帧开关"
+    confidence = "low"
+    scope = "none"
+    selected_evidence: List[str] = []
+    if states:
+        strongest = max(item[0] for item in states)
+        selected = [item for item in states if item[0] == strongest]
+        selected_evidence = [item[3] for item in selected]
+        selected_values = {item[1] for item in selected}
+        scope = selected[-1][2]
+        if len(selected_values) > 1:
+            status = "indeterminate"
+            label = "插帧状态证据互相冲突，无法确认当前游戏是否启用"
+            confidence = "medium"
+        elif True in selected_values:
+            status = "detected"
+            label = "检测到当前插帧 / MEMC 开关已开启"
+            confidence = "high" if strongest >= 4 else "medium"
+        else:
+            status = "disabled"
+            label = "检测到当前插帧 / MEMC 开关已关闭"
+            confidence = "high" if strongest >= 4 else "medium"
     elif evidence:
         status = "indeterminate"
-        label = "发现插帧相关能力，但无法读取启用状态"
+        label = "发现插帧相关能力，但无法读取当前游戏的有效开关状态"
         confidence = "medium"
-    else:
-        status = "unavailable"
-        label = "系统未公开可验证的插帧开关"
-        confidence = "low"
+
+    if status == "detected" and scope == "device":
+        label = "检测到设备级插帧 / MEMC 开关已开启，无法确认当前游戏是否生效"
+    elif status == "disabled" and scope == "device":
+        label = "检测到设备级插帧 / MEMC 开关已关闭"
+
+    ordered_evidence = selected_evidence + [
+        item for item in evidence if item not in selected_evidence
+    ]
     return {
         "frame_interpolation_status": status,
         "frame_interpolation_label": label,
         "frame_interpolation_confidence": confidence,
-        "frame_interpolation_evidence": evidence[:20],
+        "frame_interpolation_scope": scope,
+        "frame_interpolation_evidence": ordered_evidence[:20],
     }
 
 
@@ -1045,6 +1189,185 @@ def parse_android_gfxinfo(
     result["frame_counter_source"] = "Android gfxinfo cumulative frame histogram"
     result.pop("window", None)
     return result
+
+
+def parse_android_surface_layers(
+    text: str,
+    foreground_package: Optional[str] = None,
+    foreground_activity: Optional[str] = None,
+) -> Dict[str, object]:
+    """Select the active app SurfaceView/BLAST layer from SurfaceFlinger --list."""
+
+    package = str(foreground_package or "").strip().lower()
+    if not package:
+        return {}
+    activity_token = str(foreground_activity or "").rsplit(".", 1)[-1].lower()
+    candidates: List[Tuple[int, int, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        name = line
+        if line.startswith("RequestedLayerState{"):
+            name = line[len("RequestedLayerState{") :]
+            if name.endswith("}"):
+                name = name[:-1]
+            name = re.split(
+                r"\s+(?:parentId|relativeParentId|z)=-?\d+",
+                name,
+                maxsplit=1,
+            )[0].strip()
+        lowered = name.lower()
+        if package and package not in lowered:
+            continue
+        if "surfaceview" not in lowered and "(blast)" not in lowered:
+            continue
+        score = 0
+        if package and package in lowered:
+            score += 20
+        if "surfaceview" in lowered:
+            score += 40
+        if "(blast)" in lowered:
+            score += 50
+        if activity_token and activity_token in lowered:
+            score += 5
+        if any(token in lowered for token in ("background for", "bounds for", "input sink")):
+            score -= 100
+        layer_id_match = re.search(r"#(\d+)\b", name)
+        layer_id = int(layer_id_match.group(1)) if layer_id_match else -1
+        candidates.append((score, layer_id, name))
+    if not candidates:
+        return {}
+    score, _, selected = max(candidates, key=lambda item: (item[0], item[1]))
+    if score < 20:
+        return {}
+    return {
+        "surface_layer_name": selected,
+        "surface_layer_type": (
+            "blast_surfaceview"
+            if "surfaceview" in selected.lower() and "(blast)" in selected.lower()
+            else "surfaceview"
+            if "surfaceview" in selected.lower()
+            else "app_layer"
+        ),
+        "surface_layer_source": "SurfaceFlinger --list",
+    }
+
+
+def parse_android_surface_latency(text: str) -> Dict[str, object]:
+    """Parse SurfaceFlinger --latency timestamps without clearing its ring buffer."""
+
+    refresh_period_ns: Optional[int] = None
+    records: List[Tuple[int, int, int]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if refresh_period_ns is None and re.fullmatch(r"\d{6,10}", line):
+            refresh_period_ns = int(line)
+            continue
+        parts = line.split()
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            continue
+        desired, actual, ready = (int(part) for part in parts)
+        if not desired or not actual or not ready:
+            continue
+        if max(desired, actual, ready) >= 9_000_000_000_000_000_000:
+            continue
+        records.append((desired, actual, ready))
+    timestamps = sorted({actual for _, actual, _ in records})
+    result: Dict[str, object] = {
+        "surface_frame_timestamps_ns": timestamps,
+        "surface_latency_frame_count": len(timestamps),
+    }
+    if refresh_period_ns is not None and refresh_period_ns > 0:
+        result["surface_refresh_period_ns"] = refresh_period_ns
+    return result
+
+
+def _percentile_float(values: Sequence[float], quantile: float) -> Optional[float]:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return None
+    position = max(0.0, min(1.0, quantile)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def android_surface_frame_metrics(
+    intervals_ms: Sequence[float],
+    refresh_rate_hz: Optional[float] = None,
+) -> Dict[str, object]:
+    """Summarize newly presented SurfaceFlinger frames for one context window."""
+
+    intervals = [float(value) for value in intervals_ms if 0.1 <= float(value) <= 2000.0]
+    if not intervals:
+        return {}
+    average_ms = statistics.fmean(intervals)
+    median_ms = statistics.median(intervals)
+    display_budget_ms = (
+        1000.0 / float(refresh_rate_hz)
+        if isinstance(refresh_rate_hz, (int, float)) and float(refresh_rate_hz) > 0
+        else None
+    )
+    cadence_divisor = 1
+    if display_budget_ms is not None:
+        candidate = max(1, min(4, int(round(median_ms / display_budget_ms))))
+        if abs(median_ms - display_budget_ms * candidate) <= display_budget_ms * 0.18:
+            cadence_divisor = candidate
+    frame_budget_ms = (
+        display_budget_ms * cadence_divisor
+        if display_budget_ms is not None
+        else median_ms
+    )
+    missed = [value for value in intervals if value > frame_budget_ms * 1.5]
+    severe = [value for value in intervals if value > frame_budget_ms * 2.5]
+    frozen = [value for value in intervals if value > max(700.0, frame_budget_ms * 4.5)]
+    missed_slots = sum(
+        max(0, int(round(value / frame_budget_ms)) - 1)
+        for value in intervals
+    )
+    slowest_count = max(1, math.ceil(len(intervals) * 0.01))
+    slowest_average = statistics.fmean(sorted(intervals, reverse=True)[:slowest_count])
+    return {
+        "compositor_fps": 1000.0 / average_ms if average_ms > 0 else None,
+        "frame_intervals_ms": intervals,
+        "frame_interval_average_ms": average_ms,
+        "frame_interval_p95_ms": _percentile_float(intervals, 0.95),
+        "frame_interval_p99_ms": _percentile_float(intervals, 0.99),
+        "frame_interval_maximum_ms": max(intervals),
+        "one_percent_low_fps": (
+            1000.0 / slowest_average if slowest_average > 0 else None
+        ),
+        "frame_sample_count": len(intervals),
+        "missed_vsync_interval_count": len(missed),
+        "severe_frame_interval_count": len(severe),
+        "frozen_frame_interval_count": len(frozen),
+        "missed_vsync_slot_count": missed_slots,
+        "frame_budget_ms": frame_budget_ms,
+        "frame_cadence_divisor": cadence_divisor,
+        "surface_frame_source": True,
+        "frame_counter_source": "Android SurfaceFlinger BLAST layer present timestamps",
+    }
+
+
+def collect_android_surface_latency(
+    adb: str,
+    device: str,
+    layer_name: str,
+) -> Tuple[Dict[str, object], Optional[str]]:
+    result = adb_shell(
+        adb,
+        device,
+        f"dumpsys SurfaceFlinger --latency {shlex.quote(layer_name)}",
+        timeout_s=12.0,
+    )
+    if not result.ok:
+        return {}, (result.stderr or result.stdout).strip() or "SurfaceFlinger latency failed"
+    return parse_android_surface_latency(result.stdout), None
 
 
 def parse_android_touch_devices(text: str) -> Dict[str, object]:
@@ -1536,6 +1859,7 @@ _POWER_STATE_MARKER = "__APP_POWER_STATE__"
 _ANDROID_CONTEXT_MARKER = "__APP_ANDROID_CONTEXT__|"
 _ANDROID_DISPLAY_MARKER = "__APP_ANDROID_DISPLAY__"
 _ANDROID_SURFACE_MARKER = "__APP_ANDROID_SURFACE__"
+_ANDROID_LAYER_MARKER = "__APP_ANDROID_LAYER__"
 _ANDROID_WINDOW_MARKER = "__APP_ANDROID_WINDOW__"
 _ANDROID_GFXINFO_MARKER = "__APP_ANDROID_GFXINFO__"
 
@@ -1620,6 +1944,13 @@ def _android_performance_context_script(
             "dumpsys SurfaceFlinger 2>/dev/null | grep -E "
             "'^[[:space:]]*(ScreenOff:|[0-9]+([.][0-9]+)? Hz:|GLES:)'"
         )
+    lines.append(f"printf '{_ANDROID_LAYER_MARKER}\\n'")
+    if include_frame_rate:
+        lines.append(
+            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "dumpsys SurfaceFlinger --list 2>/dev/null | "
+            "grep -F \"$app_ctx_package\" | head -n 160; fi"
+        )
     lines.append(f"printf '{_ANDROID_WINDOW_MARKER}\\n'")
     if include_window:
         lines.append(
@@ -1676,6 +2007,7 @@ def collect_android_performance_context(
     sections: Dict[str, List[str]] = {
         _ANDROID_DISPLAY_MARKER: [],
         _ANDROID_SURFACE_MARKER: [],
+        _ANDROID_LAYER_MARKER: [],
         _ANDROID_WINDOW_MARKER: [],
         _ANDROID_GFXINFO_MARKER: [],
     }
@@ -1723,6 +2055,12 @@ def collect_android_performance_context(
     performance: Dict[str, object] = dict(cached_surface or {})
     performance.update(surface_update)
     performance.update(display)
+    surface_layer = parse_android_surface_layers(
+        "\n".join(sections[_ANDROID_LAYER_MARKER]),
+        foreground_package,
+        foreground_activity,
+    )
+    performance.update(surface_layer)
     performance.update(
         parse_android_window_performance(
             "\n".join(sections[_ANDROID_WINDOW_MARKER]),
@@ -1736,12 +2074,17 @@ def collect_android_performance_context(
         foreground_activity,
     )
     performance.update(gfxinfo)
-    performance["frame_data_available"] = bool(gfxinfo) if include_frame_rate else False
-    if include_frame_rate and not gfxinfo:
+    screen_awake = screen.lower() in {"awake", "on"}
+    performance["frame_data_available"] = (
+        bool(gfxinfo or surface_layer) and screen_awake
+        if include_frame_rate
+        else False
+    )
+    if include_frame_rate and (not screen_awake or not (gfxinfo or surface_layer)):
         performance["frame_unavailable_reason"] = (
-            "屏幕未处于亮屏交互状态，Android gfxinfo 未提供前台窗口帧计数。"
-            if screen.lower() not in {"awake", "on"}
-            else "前台应用未向 Android gfxinfo 暴露可用的窗口帧计数。"
+            "屏幕未处于亮屏交互状态，未采集前台应用帧数据。"
+            if not screen_awake
+            else "前台应用未向 Android gfxinfo 或 SurfaceFlinger 暴露可用帧数据。"
         )
     performance["brightness_raw"] = brightness if brightness >= 0 else None
     performance.setdefault("foreground_window_name", component if component != "unknown" else None)
@@ -1767,6 +2110,12 @@ def collect_android_performance_context(
 def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     display_result = adb_shell(adb, device, ["dumpsys", "display"], timeout_s=30)
     surface_result = adb_shell(adb, device, ["dumpsys", "SurfaceFlinger"], timeout_s=30)
+    layer_result = adb_shell(
+        adb,
+        device,
+        ["dumpsys", "SurfaceFlinger", "--list"],
+        timeout_s=30,
+    )
     window_result = adb_shell(adb, device, ["dumpsys", "window", "windows"], timeout_s=30)
     touch_result = adb_shell(adb, device, ["getevent", "-lp"], timeout_s=20)
     interpolation_result = adb_shell(
@@ -1787,14 +2136,77 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     display = parse_android_display_performance(display_result.stdout)
     surface = parse_android_surfaceflinger_performance(surface_result.stdout)
     foreground = collect_foreground_package(adb, device)
+    foreground_pid_result = (
+        adb_shell(adb, device, ["pidof", foreground], timeout_s=10)
+        if foreground
+        else None
+    )
+    foreground_pid_value = (
+        first_number(foreground_pid_result.stdout)
+        if foreground_pid_result is not None and foreground_pid_result.ok
+        else None
+    )
+    foreground_pid = int(foreground_pid_value) if foreground_pid_value is not None else None
+    gfxinfo_result = (
+        adb_shell(
+            adb,
+            device,
+            ["dumpsys", "gfxinfo", foreground, "framestats"],
+            timeout_s=30,
+        )
+        if foreground
+        else None
+    )
+    gfxinfo = (
+        parse_android_gfxinfo(gfxinfo_result.stdout, foreground)
+        if gfxinfo_result is not None
+        else {}
+    )
+    layer = (
+        parse_android_surface_layers(layer_result.stdout, foreground)
+        if foreground
+        else {}
+    )
+    latency: Dict[str, object] = {}
+    latency_error: Optional[str] = None
+    layer_name = layer.get("surface_layer_name")
+    if isinstance(layer_name, str) and layer_name:
+        latency, latency_error = collect_android_surface_latency(
+            adb,
+            device,
+            layer_name,
+        )
     window = parse_android_window_performance(window_result.stdout, foreground)
+    render_resolution = parse_android_surface_render_resolution(
+        surface_result.stdout,
+        foreground,
+        str(layer.get("surface_layer_name") or "") or None,
+    )
     interpolation = parse_android_frame_interpolation(
-        interpolation_result.stdout + "\n" + surface_result.stdout
+        interpolation_result.stdout + "\n" + surface_result.stdout,
+        foreground,
+        foreground_pid,
     )
     touch = parse_android_touch_devices(touch_result.stdout)
-    performance: Dict[str, object] = {**display, **surface, **window, **interpolation}
+    performance: Dict[str, object] = {
+        **display,
+        **surface,
+        **window,
+        **render_resolution,
+        **interpolation,
+        **gfxinfo,
+        **layer,
+    }
     performance["brightness_raw"] = first_number(brightness_result.stdout)
-    performance["foreground_window_name"] = foreground
+    performance.setdefault("foreground_window_name", foreground)
+    performance["platform"] = "android"
+    performance["frame_data_available"] = bool(
+        gfxinfo or latency.get("surface_latency_frame_count")
+    )
+    performance["surface_latency_available"] = bool(
+        latency.get("surface_latency_frame_count")
+        or latency.get("surface_refresh_period_ns")
+    )
     performance["touch_device_count"] = len(touch.get("devices", []))
     performance["touch_sampling_rate_available"] = False
     performance["touch_sampling_rate_reason"] = touch.get("sampling_rate_reason")
@@ -1802,6 +2214,7 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     for label, result in (
         ("display", display_result),
         ("SurfaceFlinger", surface_result),
+        ("SurfaceFlinger layer list", layer_result),
         ("window", window_result),
         ("input", touch_result),
     ):
@@ -1810,14 +2223,27 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
                 f"Android {label} probe failed: "
                 f"{(result.stderr or result.stdout).strip() or result.returncode}"
             )
+    if gfxinfo_result is not None and not gfxinfo_result.ok:
+        warnings.append(
+            "Android gfxinfo probe failed: "
+            f"{(gfxinfo_result.stderr or gfxinfo_result.stdout).strip() or gfxinfo_result.returncode}"
+        )
+    if latency_error:
+        warnings.append(f"Android SurfaceFlinger latency probe failed: {latency_error}")
     return {
         "performance": performance,
         "touch": touch,
         "capabilities": {
             "display_modes": bool(display.get("supported_refresh_rates_hz")),
             "refresh_residency": bool(surface.get("refresh_rate_durations_s")),
-            "gfxinfo_frame_counters": True,
-            "render_resolution": bool(window.get("render_width_px")),
+            "gfxinfo_frame_counters": bool(gfxinfo),
+            "surfaceflinger_frame_timestamps": bool(
+                performance.get("surface_latency_available")
+            ),
+            "frame_rate": bool(
+                gfxinfo or performance.get("surface_latency_available")
+            ),
+            "render_resolution": bool(render_resolution.get("render_width_px")),
             "frame_interpolation_switch": bool(
                 interpolation.get("frame_interpolation_evidence")
             ),
@@ -2033,6 +2459,8 @@ def collect_scheduler_snapshot(
 class AndroidPerformanceContextWorker:
     """Collect Android display and frame counters outside the high-rate power sampler."""
 
+    _SURFACE_LATENCY_INTERVAL_S = 0.5
+
     def __init__(
         self,
         adb: str,
@@ -2060,6 +2488,12 @@ class AndroidPerformanceContextWorker:
         self._warning_keys: set[str] = set()
         self._surface_state: Dict[str, object] = {}
         self._last_surface_monotonic: Optional[float] = None
+        self._last_context_monotonic: Optional[float] = None
+        self._surface_layer_name: Optional[str] = None
+        self._surface_layer_package: Optional[str] = None
+        self._surface_last_timestamp_ns: Optional[int] = None
+        self._surface_refresh_period_ns: Optional[int] = None
+        self._surface_intervals_ms: List[float] = []
         self._stop_event = threading.Event()
         self._stopped = False
         self._thread = threading.Thread(
@@ -2077,6 +2511,82 @@ class AndroidPerformanceContextWorker:
         self._warning_keys.add(key)
         self.warnings.append(message)
 
+    def _reset_surface_latency(
+        self,
+        layer_name: Optional[str],
+        foreground_package: Optional[str],
+    ) -> None:
+        self._surface_layer_name = layer_name
+        self._surface_layer_package = foreground_package
+        self._surface_last_timestamp_ns = None
+        self._surface_refresh_period_ns = None
+        self._surface_intervals_ms.clear()
+
+    def _sample_surface_latency(self) -> None:
+        layer_name = self._surface_layer_name
+        if not self.include_frame_rate or not layer_name:
+            return
+        parsed, error = collect_android_surface_latency(
+            self.adb,
+            self.device,
+            layer_name,
+        )
+        if error:
+            self._warn_once(
+                f"surface-latency:{layer_name}",
+                f"Android SurfaceFlinger frame timestamps: {error}",
+            )
+            return
+        refresh_period = parsed.get("surface_refresh_period_ns")
+        if isinstance(refresh_period, (int, float)) and int(refresh_period) > 0:
+            self._surface_refresh_period_ns = int(refresh_period)
+        raw_timestamps = parsed.get("surface_frame_timestamps_ns")
+        if not isinstance(raw_timestamps, list):
+            return
+        timestamps = sorted(
+            {
+                int(value)
+                for value in raw_timestamps
+                if isinstance(value, (int, float)) and int(value) > 0
+            }
+        )
+        if not timestamps:
+            return
+        previous = self._surface_last_timestamp_ns
+        latest = timestamps[-1]
+        if previous is None or latest < previous:
+            self._surface_last_timestamp_ns = latest
+            return
+        new_timestamps = [value for value in timestamps if value > previous]
+        if not new_timestamps:
+            return
+
+        # A full SurfaceFlinger ring means the previous endpoint may already have
+        # fallen out. In that case retain intervals inside the current ring but do
+        # not invent one large gap across potentially dropped records.
+        cursor: Optional[int] = previous if previous >= timestamps[0] else None
+        for timestamp in new_timestamps:
+            if cursor is not None:
+                interval_ms = (timestamp - cursor) / 1_000_000.0
+                if 0.1 <= interval_ms <= 2000.0:
+                    self._surface_intervals_ms.append(interval_ms)
+            cursor = timestamp
+        self._surface_last_timestamp_ns = latest
+
+    def _drain_surface_metrics(
+        self,
+        refresh_rate_hz: Optional[float],
+    ) -> Dict[str, object]:
+        intervals = list(self._surface_intervals_ms)
+        self._surface_intervals_ms.clear()
+        effective_refresh = refresh_rate_hz
+        if (
+            not isinstance(effective_refresh, (int, float))
+            or float(effective_refresh) <= 0
+        ) and isinstance(self._surface_refresh_period_ns, int):
+            effective_refresh = 1_000_000_000.0 / self._surface_refresh_period_ns
+        return android_surface_frame_metrics(intervals, effective_refresh)
+
     def _collect(self, include_surface_flinger: bool) -> None:
         context, surface_update, error = collect_android_performance_context(
             self.adb,
@@ -2093,6 +2603,27 @@ class AndroidPerformanceContextWorker:
         if include_surface_flinger:
             self._last_surface_monotonic = time.monotonic()
         if context is not None:
+            screen_state = str(context.screen_state or "").strip().lower()
+            screen_awake = not screen_state or screen_state in {"awake", "on"}
+            layer_name = context.performance.get("surface_layer_name")
+            layer_name = layer_name if isinstance(layer_name, str) and layer_name else None
+            layer_changed = (
+                layer_name != self._surface_layer_name
+                or context.foreground_package != self._surface_layer_package
+            )
+            if not screen_awake or layer_name is None:
+                if self._surface_layer_name is not None:
+                    self._reset_surface_latency(None, None)
+            elif layer_changed:
+                self._reset_surface_latency(layer_name, context.foreground_package)
+                self._sample_surface_latency()
+            else:
+                frame_metrics = self._drain_surface_metrics(context.refresh_rate_hz)
+                if frame_metrics:
+                    context.performance.update(frame_metrics)
+                    context.performance["frame_data_available"] = True
+                    context.performance.pop("frame_unavailable_reason", None)
+            self._last_context_monotonic = time.monotonic()
             self.contexts.append(context)
             self.journal.append_context(context)
         if error:
@@ -2101,8 +2632,21 @@ class AndroidPerformanceContextWorker:
     def _run(self) -> None:
         next_context = time.monotonic()
         next_surface = next_context
+        next_surface_latency = next_context if self.include_frame_rate else math.inf
         while not self._stop_event.is_set():
             now = time.monotonic()
+            if self.include_frame_rate and now >= next_surface_latency:
+                try:
+                    self._sample_surface_latency()
+                except Exception as exc:
+                    self._warn_once(
+                        f"surface-worker:{type(exc).__name__}",
+                        "Android SurfaceFlinger timestamp sampler recovered from "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                completed = time.monotonic()
+                while next_surface_latency <= completed:
+                    next_surface_latency += self._SURFACE_LATENCY_INTERVAL_S
             if now >= next_context:
                 include_surface = now >= next_surface
                 try:
@@ -2118,7 +2662,10 @@ class AndroidPerformanceContextWorker:
                 if include_surface:
                     while next_surface <= completed:
                         next_surface += self.surface_interval_s
-            self._stop_event.wait(max(0.05, min(1.0, next_context - time.monotonic())))
+            next_deadline = min(next_context, next_surface_latency)
+            self._stop_event.wait(
+                max(0.05, min(0.5, next_deadline - time.monotonic()))
+            )
 
     def stop(self) -> None:
         if self._stopped:
@@ -2133,14 +2680,23 @@ class AndroidPerformanceContextWorker:
             )
             self._stopped = True
             return
+        now = time.monotonic()
         surface_age = (
-            time.monotonic() - self._last_surface_monotonic
+            now - self._last_surface_monotonic
             if self._last_surface_monotonic is not None
             else math.inf
         )
-        if surface_age >= 1.0 and _device_ready(self.adb, self.device):
+        context_age = (
+            now - self._last_context_monotonic
+            if self._last_context_monotonic is not None
+            else math.inf
+        )
+        if _device_ready(self.adb, self.device) and (
+            context_age >= 0.25 or self._surface_intervals_ms
+        ):
             try:
-                self._collect(True)
+                self._sample_surface_latency()
+                self._collect(surface_age >= 1.0)
             except Exception as exc:
                 self._warn_once(
                     f"final:{type(exc).__name__}",

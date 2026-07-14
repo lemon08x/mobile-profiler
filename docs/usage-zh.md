@@ -388,7 +388,8 @@ KGSL 实时频率/负载由 SELinux 限制并正确降级。
   HarmonyOS 不显示 Android settings、BatteryStats 归因和当前不可用的热点线程扫描。
 
 - 页面顶部默认选择 **功耗测试**。切换到 **性能测试** 后，主指标改为 FPS、1% Low、
-  P99 帧耗时、异常帧、渲染分辨率和插帧状态，同时提高前台窗口、进程和调度快照频率。
+  P99 帧耗时和异常帧；渲染分辨率与插帧状态仅在存在可靠证据时显示，同时提高前台窗口、
+  进程和调度快照频率。
   正在采集时不能改变测试档位。性能测试必须绑定具体游戏或应用；Android 可点击
   **扫描手机应用**，搜索包名或 Activity 后选择，选择结果会自动写入目标包名。
 
@@ -429,11 +430,13 @@ KGSL 实时频率/负载由 SELinux 限制并正确降级。
 | 低干扰 | 只保留必要观测 | 基础 CPU/前台；性能模式另保留帧率、目标进程和温度 |
 | Harmony SmartPerf 采集 | HarmonyOS 游戏性能 | 使用 `SP_daemon` 的应用 FPS/抖动、CPU/GPU/DDR、目标进程和温度 |
 
-展开 **高级设置 → 采集项与干扰控制** 后，可以逐项关闭 CPU/GPU/内存频率、
+展开 **高级设置 → 选择需要抓取的数据** 后，可以逐项关闭 CPU/GPU/内存频率、
 前台窗口、帧率、详细帧、触控、目标进程、全系统进程、热点线程、温度、调度、设置
 快照和功耗归因。关闭项目后，程序会尽量跳过对应命令、快照和分析；基础电流、电压和
 设备时间戳始终保留。详细帧依赖帧率、热点线程依赖进程上下文，界面会自动处理这些
-依赖。性能模式会强制关闭功耗来源归因；HarmonyOS 不支持的 Android 设置快照、
+依赖。内存频率在所有标准预设中默认关闭；只有手工开启且设备向 ADB/HDC shell 公开
+可读的 DMC/DRAM/MIF 节点时，才会出现在实时数据和报告中。性能模式会强制关闭功耗
+来源归因；HarmonyOS 不支持的 Android 设置快照、
 BatteryStats/UID/Wakelock 归因和当前不可用的全系统热点线程会显示为禁用。最终报告的
 **采集项与干扰控制** 表格会记录实际启用状态、关闭原因和预计干扰等级。
 
@@ -479,9 +482,11 @@ HDC、拔掉 USB，并确认 BatteryService 为放电状态。
 | ThermalService | 10 秒 |
 | cpuset、进程调度状态和 ADPF | 30 秒 |
 
-性能模式默认把电流/资源采样调到 0.5 秒、前台 gfxinfo 调到 2 秒，并把进程、
-热点线程、ThermalService 和调度快照分别调到 2 / 5 / 5 / 5 秒。较高频率会带来
-额外 ADB 和 dumpsys 开销，因此性能模式页面会明确展示数据来源和置信度。
+性能模式默认把电流/资源采样调到 0.5 秒、前台窗口与 gfxinfo 上下文调到 2 秒；检测到
+原生游戏的前台 SurfaceView/BLAST 图层后，会额外每 0.5 秒读取一次 SurfaceFlinger
+呈现时间戳环，避免 120 FPS 下短环形缓冲区覆盖未读取帧。进程、热点线程、
+ThermalService 和调度快照分别为 2 / 5 / 5 / 5 秒。较高频率会带来额外 ADB 和
+dumpsys 开销，因此性能模式页面会明确展示数据来源和置信度。
 
 ### 7.4 开始和结束
 
@@ -490,17 +495,20 @@ HDC、拔掉 USB，并确认 BatteryService 为放电状态。
 - 电流、电压、实测电池功率和累计能量。
 - CPU 总负载、各集群频率和可用的 GPU 信息。
 - 前台包名、Activity/窗口、屏幕、当前刷新率，以及平台可提供的帧率/帧耗时指标。
-  Android 显示 `gfxinfo` UI 帧提交速率、帧耗时 P95 和 deadline miss；HarmonyOS
-  显示抽样合成器 FPS、P95 帧间隔和跨刷新槽位比例。
+  Android 原生游戏优先显示 SurfaceFlinger BLAST 图层的呈现 FPS、1% Low、P95/P99
+  帧间隔和跨帧预算比例，普通 View 应用回退 `gfxinfo` UI 帧提交速率、帧耗时与
+  deadline miss；HarmonyOS 显示抽样合成器 FPS、P95 帧间隔和跨刷新槽位比例。
 - 会话内刷新档位驻留、触摸交互次数、分辨率/亮度、GPU renderer 和最高温度。
 - 当前前 5 个 CPU 热点；后台更新/安装/编译或热状态异常时才显示干扰告警。
 - 采集器日志、检查点、ADB/HDC 断线和恢复状态。
 
-性能模式中的 **1% Low** 优先使用 gfxinfo 会话内帧耗时直方图最慢 1% 的平均耗时
-换算；直方图不可用时才退化为采样窗口的 1 分位帧率。**渲染分辨率**优先读取前台
-WindowManager 窗口边界，并与活动显示模式分开标注。**插帧 / MEMC** 只有读取到厂商
-显式开关时才判为开启或关闭；仅看到“120 Hz 显示 + 60 FPS 应用”时会标为待确认，
-因为系统计数无法区分硬件插帧和普通重复帧。
+性能模式中的 **1% Low** 对原生游戏使用 SurfaceFlinger 呈现帧间隔最慢 1% 的平均
+耗时换算；普通 View 应用使用 gfxinfo 会话内帧耗时直方图，直方图不可用时才退化为
+采样窗口的 1 分位帧率。**渲染分辨率**只接受前台 BLAST SurfaceView 对应的
+SurfaceFlinger GraphicBuffer 尺寸；WindowManager 窗口边界只代表显示窗口，不再冒充
+游戏内部渲染尺寸。**插帧 / MEMC** 只有读取到与当前应用或当前游戏进程匹配的厂商
+显式状态时才显示；设备能力属性、白名单或“120 Hz 显示 + 60 FPS 应用”不会单独形成
+开启结论，因为这些证据无法证明插帧已在当前游戏生效。
 
 性能模式还会保留新观察到的 `gfxinfo framestats` 详细帧时间戳，用于计算渲染阶段
 平均/P95/P99 和慢帧明细。性能测试项按导入的持续事件或前台 Activity 区间汇总 FPS、
@@ -745,8 +753,9 @@ D:\MobileProfilerData\profiler-runs
 - CPU 总负载、各核心/集群频率和频率驻留影响。
 - 可用的整机 GPU 频率/负载，或 `dumpsys gpu` UID work duration 旁证。
 - 前台应用、Activity/窗口、屏幕、亮度和刷新率上下文。
-- Android SurfaceFlinger 刷新档位累计时长差值、前台窗口 `gfxinfo` UI 帧提交速率、
-  帧耗时分布、deadline miss、Mali/Adreno renderer 和触摸轴/触点能力。
+- Android SurfaceFlinger 刷新档位累计时长差值、前台 SurfaceView/BLAST 呈现 FPS、
+  1% Low 与帧间隔；普通 View 应用的 `gfxinfo` UI 帧提交速率、帧耗时分布和
+  deadline miss；以及 Mali/Adreno renderer 和触摸轴/触点能力。
 - HarmonyOS 刷新档位驻留、抽样合成器 FPS、平均/P95 帧间隔、跨刷新槽位慢帧、
   触摸交互次数和 GPU renderer。
 - 整机前后台进程与线程快照，包括应用、Android 系统服务、原生 Linux 服务和可见
@@ -965,7 +974,10 @@ mobile-profiler --hdc $hdc record `
 - Android GPU 能力依赖 OEM 是否公开频率、busy/load 节点；不可读时只报告可获得的
   `dumpsys gpu` UID 活跃时长和进程内存旁证，不凭空推断整机 GPU 百分比。高通
   `gpubw` 是 GPU 相关总线而不是 GPU 核心频率，程序会主动排除。
-- Android `gfxinfo` 速率是前台窗口 UI 帧提交数的会话差值，不是最终可见 FPS；同一
+- Android 原生游戏在存在前台 SurfaceView/BLAST 图层时，FPS 来自 SurfaceFlinger
+  `--latency` 的实际呈现时间戳；该公开接口仍不等同于游戏引擎内部全部阶段或 HWC
+  最终扫描输出。普通 View 应用的 `gfxinfo` 速率是前台窗口 UI 帧提交数的会话差值，
+  不是最终可见 FPS；同一
   刷新周期内多次提交或多个渲染目标会让它高于屏幕刷新率，这本身可作为潜在冗余渲染
   和额外 CPU/GPU/合成开销的线索。熄屏时会明确标记帧统计不可用。
 - Android 与 HarmonyOS 量产接口通常都不公开面板控制器硬件触控扫描频率；工具只

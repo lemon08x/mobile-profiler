@@ -55,7 +55,7 @@
   const platformProfiles = {
     android: {
       title: "Android 平台",
-      description: "ADB、BatteryStats、gfxinfo、SurfaceFlinger 与 Android 调度接口",
+      description: "ADB、BatteryStats、SurfaceFlinger、gfxinfo 与 Android 调度接口",
       deviceKicker: "ANDROID DEVICE",
       addressLabel: "ADB IP",
       addressPlaceholder: "192.168.1.20:5555",
@@ -64,14 +64,14 @@
       packagePlaceholder: "com.example.app",
       desktopLabel: "桌面 / Launcher",
       schedulerLabel: "调度上下文",
-      performanceIntervalHint: "读取前台窗口 gfxinfo；更低周期会增加测试工具开销。",
+      performanceIntervalHint: "读取前台窗口上下文；检测到游戏 BLAST 层后以 0.5 秒节奏采集呈现时间戳。",
       probeTitle: "Android 设备能力检查",
       probeDescription: "确认电池供电、电流传感器、CPU policy、GPU 节点、gfxinfo 与 SurfaceFlinger 能力。",
       probePlaceholder: "选择在线 Android 设备后运行 Probe。该操作只读，不会开始采集或重置 BatteryStats。",
       powerDescription: "以电流功率为主，解释任务负载、调度、频率与 Android 设置为何影响续航。",
-      performanceDescription: "以 FPS、1% Low、gfxinfo 帧时间戳、SurfaceFlinger、调度与热限制为主。",
+      performanceDescription: "以 SurfaceFlinger 呈现 FPS、1% Low、帧间隔、gfxinfo 渲染阶段、调度与热限制为主。",
       powerNote: "建议先运行 Probe，确认 powered 为空、BatteryStats 和电流命令可用。",
-      performanceNote: "性能模式会提高 gfxinfo、进程和调度快照频率；建议关闭录屏、悬浮窗与其他调试工具。",
+      performanceNote: "性能模式会读取 BLAST 呈现时间戳并提高窗口、进程和调度快照频率；建议关闭录屏、悬浮窗与其他调试工具。",
     },
     ios: {
       title: "iOS 平台",
@@ -395,7 +395,7 @@
       ? "<strong>边界：</strong>iOS 当前页面展示 DVT 诊断遥测和 PowerTelemetry 整机物理功耗，不提供通用应用 FPS、Core Animation 详细帧时间戳或 Android 调度接口。"
       : harmony
         ? "<strong>边界：</strong>HarmonyOS 使用 SmartPerf/RenderService 的应用帧抖动与合成节奏；量产 HDC 不提供 Android gfxinfo 的逐阶段 framestats，整机功耗只记录趋势和汇总。"
-        : "<strong>边界：</strong>帧率与帧耗时来自平台公开的合成器或前台窗口统计；详细 framestats 用于分析 UI / RenderThread 到 BufferQueue 的延迟。整机功耗只记录趋势和汇总，不拆分第三方任务、UID 或组件来源。";
+        : "<strong>边界：</strong>原生游戏优先使用前台 SurfaceView/BLAST 的 SurfaceFlinger 呈现时间戳，普通 View 应用回退 gfxinfo；详细 framestats 用于分析 UI / RenderThread 到 BufferQueue 的延迟。整机功耗只记录趋势和汇总，不拆分第三方任务、UID 或组件来源。";
     $("#power-pressure-kicker").textContent = ios ? "IOS POWER OBSERVABILITY" : harmony ? "HARMONY POWER PRESSURE" : "POWER PRESSURE";
     $("#power-pressure-title").textContent = ios ? "iOS 功耗与观察者开销" : harmony ? "HarmonyOS 功耗压力解释" : "功耗压力解释";
     $("#power-pressure-source").textContent = ios ? "PowerTelemetry / DVT / observer" : harmony ? "CPU / GPU / DDR / 进程 / 系统状态" : "负载 / 频率 / 设置与整机功率";
@@ -522,18 +522,18 @@
 
   const capturePresetFeatures = {
     "power-standard": new Set([
-      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "cpu_usage", "cpu_frequency", "gpu_metrics",
       "foreground_window", "target_process", "process_snapshots", "hot_threads",
       "thermal", "scheduler", "runtime_settings", "power_attribution",
     ]),
     "performance-standard": new Set([
-      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "cpu_usage", "cpu_frequency", "gpu_metrics",
       "foreground_window", "frame_rate", "frame_details", "harmony_hitches",
       "touch_events", "target_process", "process_snapshots", "hot_threads",
       "thermal", "scheduler",
     ]),
     "harmony-smartperf": new Set([
-      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "cpu_usage", "cpu_frequency", "gpu_metrics",
       "foreground_window", "frame_rate", "frame_details", "target_process", "thermal",
     ]),
   };
@@ -583,6 +583,10 @@
 
     const forcedOff = new Set(platformUnavailableFeatures[platform] || []);
     if (performance) forcedOff.add("power_attribution");
+    const probeData = currentProbe()?.data || {};
+    const memoryUnavailable = platform === "android"
+      && probeData.capabilities?.memory_frequency === false;
+    if (memoryUnavailable) forcedOff.add("memory_frequency");
     $$('[data-capture-feature]').forEach(input => {
       const name = input.dataset.captureFeature;
       const disabled = forcedOff.has(name) || Boolean(app.state?.active?.running);
@@ -590,7 +594,13 @@
       input.disabled = disabled;
       const row = input.closest("label");
       row?.classList.toggle("feature-unavailable", forcedOff.has(name));
-      if (row) row.title = forcedOff.has(name) ? `${platformLabel(platform)} 当前采集后端不提供此项目` : "";
+      if (row) {
+        row.title = forcedOff.has(name)
+          ? name === "memory_frequency" && memoryUnavailable
+            ? probeData.memory_probe?.limitations || "设备未向 ADB shell 公开可读的 DMC/DRAM 实时频率"
+            : `${platformLabel(platform)} 当前采集后端不提供此项目`
+          : "";
+      }
     });
 
     const values = Object.fromEntries($$('[data-capture-feature]').map(input => [
@@ -719,6 +729,67 @@
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower);
   }
 
+  function captureFeatureEnabled(active, name) {
+    const liveFeatures = active?.config?.capture_features;
+    if (liveFeatures && Object.prototype.hasOwnProperty.call(liveFeatures, name)) {
+      return Boolean(liveFeatures[name]);
+    }
+    const metadataFeatures = active?.metadata?.capture_configuration?.features;
+    if (metadataFeatures && Object.prototype.hasOwnProperty.call(metadataFeatures, name)) {
+      return Boolean(metadataFeatures[name]);
+    }
+    const input = $(`[data-capture-feature="${name}"]`);
+    return input ? Boolean(input.checked) : true;
+  }
+
+  function sparklineMarkup(values) {
+    const selected = values.slice(-60).filter(finite).map(Number);
+    if (selected.length < 2) return '<svg class="live-sparkline" viewBox="0 0 86 42" aria-hidden="true"><line x1="2" y1="21" x2="84" y2="21"></line></svg>';
+    let minimum = Math.min(...selected);
+    let maximum = Math.max(...selected);
+    if (minimum === maximum) {
+      minimum -= 1;
+      maximum += 1;
+    }
+    const points = selected.map((value, index) => {
+      const x = 2 + index / (selected.length - 1) * 82;
+      const y = 38 - (value - minimum) / Math.max(.0001, maximum - minimum) * 34;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    return `<svg class="live-sparkline" viewBox="0 0 86 42" aria-hidden="true"><line x1="2" y1="38" x2="84" y2="38"></line><path d="M${points.replaceAll(" ", " L")}"></path></svg>`;
+  }
+
+  function renderLiveDetails(active) {
+    const container = $("#live-detail-grid");
+    if (!container) return;
+    const platform = activePlatform(active);
+    const performanceMode = (active?.test_mode || app.testMode) === "performance";
+    const keys = performanceMode
+      ? platform === "ios"
+        ? ["cpu_pct", "gpu_load_pct", "power_mw", "temperature_c"]
+        : ["frame_rate_fps", "frame_time_ms", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c", "power_mw"]
+      : ["power_mw", "current_ma", "voltage_mv", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c"];
+    const cards = [];
+    keys.forEach(key => {
+      if (key === "memory_frequency_mhz" && !captureFeatureEnabled(active, "memory_frequency")) return;
+      const definition = metricDefinitions[key];
+      const source = definition.series === "performance" ? active?.performance_series : active?.series;
+      const values = (Array.isArray(source) ? source : []).map(definition.value).filter(finite).map(Number);
+      if (!values.length) return;
+      const current = values.at(-1);
+      const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const secondary = percentile(values, definition.secondaryQuantile ?? .95);
+      cards.push(`<button type="button" class="live-detail-card" data-live-metric="${escapeHtml(key)}" style="--detail-color:${escapeHtml(definition.color)}">
+        <span class="live-detail-copy"><small>${escapeHtml(definition.title)}</small><strong>${current.toFixed(definition.digits)} ${escapeHtml(definition.unit)}</strong><span>AVG ${average.toFixed(definition.digits)} · ${escapeHtml(definition.secondaryLabel || "P95")} ${secondary === null ? "--" : secondary.toFixed(definition.digits)}</span></span>
+        ${sparklineMarkup(values)}
+      </button>`);
+    });
+    container.innerHTML = cards.length
+      ? cards.join("")
+      : '<div class="empty-row">当前尚无可展开的实时数据；未启用或不可读的项目不会显示。</div>';
+    $("#live-detail-count").textContent = cards.length ? `${cards.length} 项有效数据` : "等待数据";
+  }
+
   function svgNode(name, attributes = {}, text = "") {
     const node = document.createElementNS(svgNs, name);
     Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)));
@@ -812,6 +883,7 @@
     app.selectedScannedPackage = "";
     const search = $("#app-search-input");
     const select = $("#app-select");
+    const resultList = $("#app-result-list");
     if (search) {
       search.value = "";
       search.disabled = true;
@@ -819,6 +891,10 @@
     if (select) {
       select.innerHTML = '<option value="">请先扫描手机应用</option>';
       select.disabled = true;
+    }
+    if (resultList) {
+      resultList.innerHTML = "";
+      resultList.classList.add("hidden");
     }
     if ($("#app-picker-status")) $("#app-picker-status").textContent = "尚未扫描";
     if ($("#app-picker-selection")) {
@@ -831,12 +907,14 @@
   function renderAppOptions() {
     const select = $("#app-select");
     const search = $("#app-search-input");
-    if (!select || !search) return;
+    const resultList = $("#app-result-list");
+    if (!select || !search || !resultList) return;
     const query = search.value.trim().toLowerCase();
     const apps = Array.isArray(app.scannedApps) ? app.scannedApps : [];
     const filtered = apps.filter(item => {
       const searchable = [
         item.package,
+        item.label,
         item.activity,
         item.component,
         ...(Array.isArray(item.activities) ? item.activities : []),
@@ -867,6 +945,21 @@
     });
     const packageValue = $("#package-input").value.trim();
     if (filtered.some(item => item.package === packageValue)) select.value = packageValue;
+    const shown = filtered.slice(0, 80);
+    resultList.classList.toggle("hidden", !app.scannedAppsDevice);
+    resultList.innerHTML = shown.length ? shown.map(item => {
+      const packageName = String(item.package || "");
+      const activity = String(item.activity || item.component || "").split(".").at(-1) || "应用";
+      const initials = packageName.split(".").filter(Boolean).at(-1)?.slice(0, 2).toUpperCase() || "APP";
+      const icon = typeof item.icon_data_uri === "string" && item.icon_data_uri.startsWith("data:image/")
+        ? `<img src="${escapeHtml(item.icon_data_uri)}" alt="" loading="lazy">`
+        : escapeHtml(initials);
+      return `<button type="button" class="app-option ${packageName === packageValue ? "selected" : ""}" data-app-package="${escapeHtml(packageName)}" role="option" aria-selected="${packageName === packageValue ? "true" : "false"}">
+        <span class="app-thumb">${icon}</span>
+        <span class="app-option-copy"><strong>${escapeHtml(activity)}</strong><small>${escapeHtml(packageName)}</small></span>
+        <span class="app-option-badge">${item.user_app ? "USER" : "SYSTEM"}</span>
+      </button>`;
+    }).join("") : '<div class="empty-row">没有匹配的应用</div>';
     const noun = app.scannedAppsSource === "third-party-packages-fallback" ? "第三方包" : "可启动应用";
     $("#app-picker-status").textContent = query
       ? `匹配 ${filtered.length} / ${apps.length} 个${noun}`
@@ -879,6 +972,7 @@
     const currentScan = Boolean(app.scannedAppsDevice && app.scannedAppsDevice === selectedDevice());
     search.disabled = !currentScan || running;
     select.disabled = !currentScan || running || !filtered.length;
+    resultList.querySelectorAll("button").forEach(button => { button.disabled = running; });
   }
 
   function updateAppScannerAvailability(device = selectedDeviceInfo()) {
@@ -905,6 +999,9 @@
       const hasOptions = Boolean(select.querySelector('option[value]:not([value=""])'));
       select.disabled = !currentScan || running || !hasOptions;
     }
+    $("#app-result-list")?.querySelectorAll("button").forEach(button => {
+      button.disabled = !currentScan || running;
+    });
   }
 
   function devicePlatform(device) {
@@ -1015,6 +1112,19 @@
     const latest = active?.latest || {};
     const summary = active?.summary || {};
     const isIos = activePlatform(active) === "ios";
+    const memoryEnabled = captureFeatureEnabled(active, "memory_frequency");
+    const memoryAvailable = isIos || (
+      memoryEnabled
+      && (finite(latest.memory_frequency_mhz) || Boolean(active?.memory?.available))
+    );
+    $("#metric-memory-card")?.classList.toggle("hidden", !memoryAvailable);
+    $("#resource-memory-row")?.classList.toggle("hidden", !memoryAvailable || isIos);
+    const memoryTab = $('[data-metric="memory_frequency_mhz"]');
+    memoryTab?.classList.toggle("hidden", !memoryAvailable || isIos);
+    if (!memoryAvailable && app.metric === "memory_frequency_mhz") {
+      app.metric = app.testMode === "performance" ? "frame_rate_fps" : "power_mw";
+      $$('[data-metric]').forEach(item => item.classList.toggle("active", item.dataset.metric === app.metric));
+    }
     $("#metric-power").textContent = finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--";
     $("#metric-current").textContent = formatMetric(latest.current_ma, "mA", 0);
     $("#metric-cpu").textContent = formatMetric(latest.cpu_pct, "%", 1);
@@ -1069,7 +1179,12 @@
         || "--";
       $("#metric-render-resolution-sub").textContent = context.foreground_activity
         || "事件驱动的 application state";
-      const interpolationCard = $(".interpolation-card");
+      $("#metric-render-resolution-card")?.classList.remove("hidden");
+      $("#metric-interpolation-card")?.classList.remove("hidden");
+      $("#performance-render-evidence")?.classList.remove("hidden");
+      $("#performance-interpolation-evidence-card")?.classList.remove("hidden");
+      $(".performance-evidence-grid")?.style.setProperty("grid-template-columns", "repeat(3, minmax(0, 1fr))");
+      const interpolationCard = $("#metric-interpolation-card");
       interpolationCard.classList.remove("detected", "disabled", "indeterminate", "unavailable");
       $("#metric-interpolation").textContent = formatMetric(latest.temperature_c, "°C", 1);
       $("#metric-interpolation-sub").textContent = "iOS battery diagnostics";
@@ -1108,6 +1223,11 @@
 
     const renderWidth = performance.render_width_px;
     const renderHeight = performance.render_height_px;
+    const renderAvailable = Boolean(performance.render_resolution_available)
+      && finite(renderWidth)
+      && finite(renderHeight);
+    $("#metric-render-resolution-card")?.classList.toggle("hidden", !renderAvailable);
+    $("#performance-render-evidence")?.classList.toggle("hidden", !renderAvailable);
     $("#metric-render-resolution").textContent = finite(renderWidth) && finite(renderHeight)
       ? Number(renderWidth).toFixed(0) + " × " + Number(renderHeight).toFixed(0)
       : "--";
@@ -1122,7 +1242,15 @@
       unavailable: "不可读",
     };
     const interpolationStatus = String(performance.frame_interpolation_status || "unavailable");
-    const interpolationCard = $(".interpolation-card");
+    const interpolationAvailable = Boolean(performance.frame_interpolation_available);
+    $("#metric-interpolation-card")?.classList.toggle("hidden", !interpolationAvailable);
+    $("#performance-interpolation-evidence-card")?.classList.toggle("hidden", !interpolationAvailable);
+    const evidenceCount = 1 + (renderAvailable ? 1 : 0) + (interpolationAvailable ? 1 : 0);
+    $(".performance-evidence-grid")?.style.setProperty(
+      "grid-template-columns",
+      `repeat(${evidenceCount}, minmax(0, 1fr))`,
+    );
+    const interpolationCard = $("#metric-interpolation-card");
     interpolationCard.classList.remove("detected", "disabled", "indeterminate", "unavailable");
     interpolationCard.classList.add(interpolationStatus);
     $("#metric-interpolation").textContent = interpolationLabels[interpolationStatus] || "待确认";
@@ -1821,6 +1949,7 @@
     renderRenderPipeline(active);
     renderSystem(active);
     renderConsole(active);
+    renderLiveDetails(active);
     renderChart();
     const warnings = Array.isArray(active?.warnings) ? active.warnings : [];
     warnings.forEach(warning => {
@@ -1911,11 +2040,13 @@
       ["Fuel-gauge current", "cmd battery current_now", Boolean(data.current_command_ok)],
       ["GPU frequency", `${gpuModel} · ${data.gpu_probe?.provider || "OEM sysfs"}`, gpuFrequencyAvailable],
       ["GPU load", data.gpu_source?.load_format || "OEM load node", gpuLoadAvailable],
+      ["Memory / DMC frequency", data.memory_source?.frequency_path || data.memory_probe?.limitations || "DRAM/DMC node not exposed", Boolean(data.capabilities?.memory_frequency)],
       ["GPU UID work", "dumpsys gpu active duration", Boolean(data.gpu_work_duration_available)],
       ["GPU memory", `${finite(data.gpu_memory_total_bytes) ? `${(Number(data.gpu_memory_total_bytes) / 1048576).toFixed(1)} MiB` : "dumpsys gpu snapshot"}`, Boolean(data.gpu_memory_snapshot_available)],
       ["Perfetto android.power", "registered data source", Boolean(data.perfetto_android_power)],
       ["Perfetto sysfs power", "linux.sysfs_power", Boolean(data.perfetto_sysfs_power)],
       ["PowerStats dump", "dumpsys powerstats", Boolean(data.powerstats_dump_available)],
+      ["Foreground frame rate", data.performance?.surface_layer_name ? "SurfaceFlinger BLAST present timestamps" : "gfxinfo foreground-window counters", Boolean(data.capabilities?.frame_rate)],
       ["System process monitor", "top + ps for apps/services/kernel", Boolean(data.system_monitor?.process_top_available)],
       ["ThermalService history", `${data.system_monitor?.thermal_sensor_count || 0} sensors / ${data.system_monitor?.thermal_threshold_count || 0} thresholds`, Boolean(data.system_monitor?.thermalservice_available)],
       ["cpuset / ADPF", `${Object.keys(data.system_monitor?.cpusets || {}).length} cpusets / ${data.system_monitor?.adpf_active_session_count || 0} active sessions`, Boolean(data.system_monitor?.adpf_available)],
@@ -2419,7 +2550,7 @@
         const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
         notify(
           "手机应用扫描完成",
-          `${app.scannedApps.length} 个${result.source === "third-party-packages-fallback" ? "第三方包" : "可启动应用"}${warnings.length ? ` · ${warnings.join("；")}` : ""}`,
+          `${app.scannedApps.length} 个${result.source === "third-party-packages-fallback" ? "第三方包" : "可启动应用"} · ${Number(result.icon_count || 0)} 个图标${warnings.length ? ` · ${warnings.join("；")}` : ""}`,
           warnings.length ? "error" : "success",
           8000,
         );
@@ -2435,6 +2566,15 @@
     $("#app-search-input").addEventListener("input", renderAppOptions);
     $("#app-select").addEventListener("change", event => {
       const packageName = event.target.value;
+      if (!packageName) return;
+      $("#package-input").value = packageName;
+      app.selectedScannedPackage = packageName;
+      renderAppOptions();
+    });
+    $("#app-result-list").addEventListener("click", event => {
+      const option = event.target.closest("[data-app-package]");
+      if (!option || option.disabled) return;
+      const packageName = option.dataset.appPackage || "";
       if (!packageName) return;
       $("#package-input").value = packageName;
       app.selectedScannedPackage = packageName;
@@ -2460,6 +2600,13 @@
       $$("[data-metric]").forEach(item => item.classList.toggle("active", item === button));
       renderChart();
     }));
+    $("#live-detail-grid").addEventListener("click", event => {
+      const card = event.target.closest("[data-live-metric]");
+      if (!card) return;
+      app.metric = card.dataset.liveMetric;
+      $$("[data-metric]").forEach(item => item.classList.toggle("active", item.dataset.metric === app.metric));
+      renderChart();
+    });
 
     $("#record-form").addEventListener("submit", async event => {
       event.preventDefault();
@@ -2535,6 +2682,7 @@
         });
         app.state.probes = { ...(app.state.probes || {}), [device]: entry };
         renderProbe(app.state);
+        updateCaptureFeatureControls();
         const powered = entry.data?.battery?.powered;
         const unplugged = !powered || (Array.isArray(powered) && powered.length === 0);
         notify(unplugged ? "Probe 完成，设备可测试" : "Probe 完成，检测到外部供电", unplugged ? "电流与 CPU 数据源已检查。" : `powered: ${Array.isArray(powered) ? powered.join(", ") : powered}`, unplugged ? "success" : "error", 7000);

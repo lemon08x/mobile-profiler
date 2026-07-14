@@ -24,6 +24,7 @@ from mobile_power_profiler.analysis import (
 )
 from mobile_power_profiler.collector import (
     adb_connection_type,
+    android_surface_frame_metrics,
     build_sampler_script,
     collect_streaming_session,
     gpu_load_from_text,
@@ -33,6 +34,9 @@ from mobile_power_profiler.collector import (
     parse_android_frame_interpolation,
     parse_android_gfxinfo,
     parse_android_runtime_settings,
+    parse_android_surface_render_resolution,
+    parse_android_surface_latency,
+    parse_android_surface_layers,
     parse_android_surfaceflinger_performance,
     parse_android_touch_devices,
     parse_android_window_performance,
@@ -290,6 +294,49 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(touch["devices"][0]["max_touch_points"], 10)
         self.assertFalse(touch["sampling_rate_available"])
 
+    def test_android_surface_layer_and_latency_parser_support_vivo_android_16(self) -> None:
+        layers = parse_android_surface_layers(
+            "RequestedLayerState{Bounds for - com.hottagames.yh.laohu/"
+            "com.epicgames.unreal.GameActivity#1738 parentId=1735}\n"
+            "RequestedLayerState{5a0d38c SurfaceView[com.hottagames.yh.laohu/"
+            "com.epicgames.unreal.GameActivity](BLAST) 07-14 19:19:43.866#1740 "
+            "parentId=1739}\n"
+            "RequestedLayerState{Background for 5a0d38c SurfaceView["
+            "com.hottagames.yh.laohu/com.epicgames.unreal.GameActivity]#1741 "
+            "parentId=1739 z=-2147483648}\n",
+            "com.hottagames.yh.laohu",
+            "com.epicgames.unreal.GameActivity",
+        )
+        self.assertEqual(layers["surface_layer_type"], "blast_surfaceview")
+        self.assertIn("(BLAST)", layers["surface_layer_name"])
+
+        latency = parse_android_surface_latency(
+            "8333333\n"
+            "900000000 1000000000 1000100000\n"
+            "916666667 1016666667 1016766667\n"
+            "933333334 9223372036854775807 1016866667\n"
+            "0 1033333334 1033433334\n"
+        )
+        self.assertEqual(latency["surface_refresh_period_ns"], 8_333_333)
+        self.assertEqual(
+            latency["surface_frame_timestamps_ns"],
+            [1_000_000_000, 1_016_666_667],
+        )
+
+    def test_android_surface_frame_metrics_report_fps_p99_and_one_percent_low(self) -> None:
+        metrics = android_surface_frame_metrics(
+            [16.666] * 99 + [33.269],
+            refresh_rate_hz=120.0,
+        )
+        self.assertEqual(metrics["frame_sample_count"], 100)
+        self.assertAlmostEqual(metrics["compositor_fps"], 59.41, places=1)
+        self.assertAlmostEqual(metrics["one_percent_low_fps"], 30.06, places=1)
+        self.assertGreater(metrics["frame_interval_p99_ms"], 16.66)
+        self.assertEqual(metrics["missed_vsync_interval_count"], 1)
+        self.assertEqual(metrics["frame_cadence_divisor"], 2)
+        self.assertTrue(metrics["surface_frame_source"])
+        self.assertEqual(len(metrics["frame_intervals_ms"]), 100)
+
     def test_android_gfxinfo_parser_selects_foreground_window(self) -> None:
         parsed = parse_android_gfxinfo(
             "Total frames rendered: 200\n"
@@ -384,13 +431,50 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(window["render_width_px"], 1260)
         self.assertEqual(window["render_height_px"], 2664)
         self.assertEqual(window["render_resolution_source"], "WindowManager mFrame")
+        self.assertTrue(window["render_resolution_estimated"])
+
+        render = parse_android_surface_render_resolution(
+            "+ name:abc123 SurfaceView[com.example/.MainActivity]#1(BLAST Consumer)1, "
+            "id:42, size:4500.00KiB, w/h:720x1600, usage: 0xb00, req fmt:1,\n"
+            "+ name:VRI[MainActivity,type=1]#0(BLAST Consumer)0, "
+            "id:43, size:12000.00KiB, w/h:1260x2800, usage: 0xb00, req fmt:1,\n",
+            "com.example",
+            "abc123 SurfaceView[com.example/.MainActivity](BLAST)",
+        )
+        self.assertEqual(render["render_width_px"], 720)
+        self.assertEqual(render["render_height_px"], 1600)
+        self.assertEqual(render["render_resolution_source"], "SurfaceFlinger GraphicBuffer")
+        self.assertFalse(render["render_resolution_estimated"])
 
         interpolation = parse_android_frame_interpolation(
             "[persist.vendor.display.memc.enable]: [1]\n"
         )
         self.assertEqual(interpolation["frame_interpolation_status"], "detected")
-        self.assertEqual(interpolation["frame_interpolation_confidence"], "high")
+        self.assertEqual(interpolation["frame_interpolation_confidence"], "medium")
+        self.assertEqual(interpolation["frame_interpolation_scope"], "device")
         self.assertTrue(interpolation["frame_interpolation_evidence"])
+
+        current_game = parse_android_frame_interpolation(
+            "[ro.config.per_app_memcg]: [false]\n"
+            "[ro.vendor.mtk.gpu.game_memc]: [1]\n"
+            "[sys.game.memc.postprocessing.enable]: [1]\n"
+            "gamecube_frame_interpolation=0:-1:22590:0:0\n"
+            "[sys.vivo.memcg.delayinit]: [1]\n"
+            "memc_main=0\n",
+            "com.example",
+            22590,
+        )
+        self.assertEqual(current_game["frame_interpolation_status"], "disabled")
+        self.assertEqual(current_game["frame_interpolation_scope"], "current_session")
+        self.assertEqual(current_game["frame_interpolation_confidence"], "high")
+        self.assertTrue(
+            current_game["frame_interpolation_evidence"][0].startswith(
+                "gamecube_frame_interpolation="
+            )
+        )
+        self.assertFalse(
+            any("memcg" in item for item in current_game["frame_interpolation_evidence"])
+        )
 
         unavailable = parse_android_frame_interpolation("ro.surface_flinger.use_color_management=true")
         self.assertEqual(unavailable["frame_interpolation_status"], "unavailable")
@@ -1425,9 +1509,58 @@ class HarmonyAdapterTests(unittest.TestCase):
             result["refresh_residency_source"],
             "Android SurfaceFlinger refresh-rate duration delta",
         )
-        self.assertEqual(result["render_width_px"], 1260)
-        self.assertEqual(result["render_height_px"], 2800)
-        self.assertTrue(result["render_resolution_estimated"])
+        self.assertIsNone(result["render_width_px"])
+        self.assertIsNone(result["render_height_px"])
+        self.assertFalse(result["render_resolution_available"])
+        self.assertFalse(result["render_resolution_estimated"])
+
+    def test_android_surface_frames_override_static_gfxinfo_counter(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.hottagames.yh.laohu",
+                foreground_activity="com.epicgames.unreal.GameActivity",
+                screen_state="Awake",
+                refresh_rate_hz=120.0,
+                performance={
+                    "platform": "android",
+                    "foreground_window_name": "com.hottagames.yh.laohu/"
+                    "com.epicgames.unreal.GameActivity",
+                    "frame_counter_total": 35,
+                },
+            ),
+            ContextSample(
+                110.0,
+                foreground_package="com.hottagames.yh.laohu",
+                foreground_activity="com.epicgames.unreal.GameActivity",
+                screen_state="Awake",
+                refresh_rate_hz=120.0,
+                performance={
+                    "platform": "android",
+                    "foreground_window_name": "com.hottagames.yh.laohu/"
+                    "com.epicgames.unreal.GameActivity",
+                    "frame_counter_total": 35,
+                    "surface_frame_source": True,
+                    "frame_sample_count": 600,
+                    "compositor_fps": 60.07,
+                    "frame_interval_average_ms": 16.647,
+                    "frame_interval_p95_ms": 16.674,
+                    "frame_interval_p99_ms": 16.744,
+                    "one_percent_low_fps": 52.61,
+                    "missed_vsync_interval_count": 2,
+                },
+            ),
+        ]
+        result = analyze_performance_contexts(contexts, {"platform": "android"})
+        self.assertAlmostEqual(result["sampled_frame_rate_fps"], 60.07)
+        self.assertAlmostEqual(result["one_percent_low_fps"], 52.61)
+        self.assertEqual(result["frame_sample_count"], 600)
+        self.assertEqual(result["frame_rate_label"], "应用呈现帧率")
+        self.assertEqual(
+            result["frame_source"],
+            "Android SurfaceFlinger BLAST layer present timestamps",
+        )
+        self.assertEqual(len(result["frame_rate_timeline"]), 1)
 
     def test_android_frame_pipeline_and_performance_test_items_follow_slow_frame_path(self) -> None:
         def frame_record(frame_id: int, base: int, completed_ms: int) -> dict[str, int]:
@@ -1531,6 +1664,72 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertTrue(row["throttling_observed"])
         self.assertIsNotNone(row["average_whole_device_power_mw"])
 
+    def test_performance_test_item_aggregates_presented_intervals_for_one_percent_low(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index),
+                uptime_s=100.0 + index,
+                current_ma=300.0,
+                signed_current_ma=-300.0,
+                voltage_mv=3800.0,
+                power_mw=1140.0,
+                direction="discharging",
+                cpu_pct=30.0,
+            )
+            for index in range(11)
+        ]
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example",
+                foreground_activity=".GameActivity",
+            ),
+            ContextSample(
+                110.0,
+                foreground_package="com.example",
+                foreground_activity=".GameActivity",
+            ),
+        ]
+        performance = {
+            "frame_rate_timeline": [
+                {
+                    "uptime_s": 105.0,
+                    "duration_s": 5.0,
+                    "frame_count": 300,
+                    "frame_rate_fps": 60.0,
+                    "one_percent_low_fps": 10.0,
+                    "frame_intervals_ms": [16.667] * 99 + [100.0],
+                },
+                {
+                    "uptime_s": 110.0,
+                    "duration_s": 5.0,
+                    "frame_count": 300,
+                    "frame_rate_fps": 60.0,
+                    "one_percent_low_fps": 40.0,
+                    "frame_intervals_ms": [16.667] * 100,
+                },
+            ],
+            "render_pipeline": {"timeline": [], "stages": []},
+        }
+        result = analyze_performance_test_items(
+            samples,
+            contexts,
+            [],
+            performance,
+            {"timeline": []},
+            {"timeline": []},
+            3.0,
+            1.0,
+        )
+        row = result["rows"][0]
+        self.assertAlmostEqual(row["average_fps"], 60.0)
+        self.assertAlmostEqual(row["one_percent_low_fps"], 17.14, places=2)
+        self.assertEqual(
+            row["frame_metric_source"],
+            "Android SurfaceFlinger presented-frame intervals",
+        )
+
     def test_android_asleep_context_does_not_fake_refresh_residency_or_zero_fps(self) -> None:
         contexts = [
             ContextSample(
@@ -1540,6 +1739,7 @@ class HarmonyAdapterTests(unittest.TestCase):
                 refresh_rate_hz=60.0,
                 performance={
                     "platform": "android",
+                    "frame_counter_total": 35,
                     "frame_data_available": False,
                     "frame_unavailable_reason": "screen asleep",
                 },
@@ -1551,6 +1751,7 @@ class HarmonyAdapterTests(unittest.TestCase):
                 refresh_rate_hz=60.0,
                 performance={
                     "platform": "android",
+                    "frame_counter_total": 35,
                     "frame_data_available": False,
                     "frame_unavailable_reason": "screen asleep",
                 },
@@ -1629,6 +1830,9 @@ class HarmonyAdapterTests(unittest.TestCase):
             "performance", "android", "performance-standard"
         )
         self.assertFalse(android["features"]["harmony_hitches"])
+        self.assertFalse(android["features"]["memory_frequency"])
+        power = resolve_capture_configuration("power", "android", "power-standard")
+        self.assertFalse(power["features"]["memory_frequency"])
         ios = resolve_capture_configuration(
             "performance", "ios", "performance-standard"
         )
@@ -2135,7 +2339,15 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(power["runtime_settings"]["available"])
         self.assertTrue(power["render_performance"]["analysis_disabled"])
 
-        performance_metadata = {**base_metadata, "test_mode": "performance"}
+        performance_metadata = {
+            **base_metadata,
+            "test_mode": "performance",
+            "capture_configuration": resolve_capture_configuration(
+                "performance",
+                "android",
+                "performance-standard",
+            ),
+        }
         performance = analyze_run(
             samples,
             performance_metadata,
@@ -2179,11 +2391,15 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('id="mobile-power-profiler"', power_fragment)
         self.assertIn('data-test-mode="power"', power_fragment)
         self.assertIn("功耗压力分析", power_fragment)
-        self.assertIn("系统设置快照", power_fragment)
+        self.assertIn("系统设置变化", power_fragment)
         self.assertIn('data-test-mode="performance"', performance_fragment)
         self.assertIn("渲染链路与帧延迟", performance_fragment)
         self.assertIn("性能测试项矩阵", performance_fragment)
         self.assertIn("性能模式不继续拆分组件、UID、Wakelock", performance_fragment)
+        self.assertNotIn("<td><strong>渲染分辨率</strong></td>", performance_fragment)
+        self.assertNotIn("<td><strong>插帧 / MEMC</strong></td>", performance_fragment)
+        self.assertNotIn("内存频率 平均 / P95", performance_fragment)
+        self.assertNotIn("@@", power_fragment)
         self.assertNotIn("@@", performance_fragment)
 
     def test_report_records_capture_controls_and_harmony_performance_restore(self) -> None:
@@ -2436,7 +2652,7 @@ class ReportTests(unittest.TestCase):
             analysis["system"]["top_processes"][0]["average_relative_power_score"],
             7.5,
         )
-        self.assertIn("PowerScope Mobile", fragment)
+        self.assertIn("Mobile Profiler", fragment)
         self.assertIn("iOS 26.5.2", fragment)
         self.assertIn("相对分数 ≠ mW", fragment)
         self.assertIn('data-overview-metric="gpu_load_pct"', fragment)
@@ -2536,7 +2752,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("功耗压力分析", fragment)
         self.assertIn("刷新档位驻留", fragment)
         self.assertIn("合成器抽样 FPS", fragment)
-        self.assertIn("硬件触控采样率未公开", fragment)
+        self.assertNotIn("硬件触控采样率未公开", fragment)
         self.assertNotIn("热控与调度状态", fragment)
         self.assertIn("DEX AOT compilation", fragment)
         self.assertIn("数据质量", fragment)

@@ -368,27 +368,50 @@ def _performance_context_rows(analysis: Dict[str, object]) -> str:
         and isinstance(render_height, (int, float))
         else "—"
     )
+    render_available = bool(performance.get("render_resolution_available")) and render_resolution != "—"
+    interpolation_status = str(performance.get("frame_interpolation_status") or "unavailable")
+    interpolation_available = bool(performance.get("frame_interpolation_available"))
     interpolation_label = str(
         performance.get("frame_interpolation_label") or "系统未公开可验证的插帧开关"
     )
     rows = [
         ("前台窗口", performance.get("foreground_window_name") or "—", f"Window #{performance.get('foreground_window_id') or '—'}"),
         ("显示", resolution, f"亮度原始值 {_number(performance.get('brightness_raw'), 0)}"),
-        (
+    ]
+    if render_available:
+        rows.append((
             "渲染分辨率",
             render_resolution,
-            str(performance.get("render_resolution_source") or "窗口边界不可用"),
-        ),
-        (
+            str(performance.get("render_resolution_source")),
+        ))
+    if interpolation_available:
+        rows.append((
             "插帧 / MEMC",
             interpolation_label,
             f"置信度 {performance.get('frame_interpolation_confidence') or 'low'}；不凭刷新倍率单独推断",
-        ),
-        ("支持刷新率", supported_text, f"切换 {int(performance.get('refresh_switch_count') or 0)} 次"),
-        ("GPU", performance.get("gpu_renderer") or "—", performance.get("gpu_vendor") or "RenderService renderer"),
-        ("最高温度", hottest_text, "仅在严重度或温升异常时形成结论"),
-        ("触控边界", "硬件触控采样率未公开", "仅展示系统公开的触摸设备能力与已分发交互"),
-    ]
+        ))
+    if supported_text != "—":
+        rows.append((
+            "支持刷新率",
+            supported_text,
+            f"切换 {int(performance.get('refresh_switch_count') or 0)} 次",
+        ))
+    if performance.get("gpu_renderer"):
+        rows.append((
+            "GPU",
+            performance.get("gpu_renderer"),
+            performance.get("gpu_vendor") or "RenderService renderer",
+        ))
+    if hottest:
+        rows.append(("最高温度", hottest_text, "仅在严重度或温升异常时形成结论"))
+    if performance.get("touch_devices") or isinstance(
+        performance.get("touch_interaction_count"), (int, float)
+    ):
+        rows.append((
+            "触控交互",
+            f"{int(performance.get('touch_interaction_count') or 0)} 次",
+            "硬件触控扫描率未通过系统接口公开",
+        ))
     return "".join(
         "<tr>"
         f"<td><strong>{_escape(label)}</strong></td>"
@@ -491,6 +514,52 @@ def _memory_pressure_summary(analysis: Dict[str, object]) -> str:
         f'<div class="metric-value">{_number(memory.get("power_correlation"), 2)}</div>'
         '<div class="metric-context">只表示同一时间轴变化，不是内存电源轨测量</div></article>'
         '</div>'
+    )
+
+
+def _power_pressure_sections(analysis: Dict[str, object]) -> str:
+    pressure = analysis.get("power_pressure", {})
+    pressure = pressure if isinstance(pressure, dict) else {}
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    settings = analysis.get("runtime_settings", {})
+    settings = settings if isinstance(settings, dict) else {}
+    sections = []
+    if memory.get("available"):
+        sections.append(
+            '<section class="analysis-section"><h2>内存频率压力</h2>'
+            + _memory_pressure_summary(analysis)
+            + "</section>"
+        )
+    if pressure.get("drivers"):
+        sections.append(
+            '<section class="analysis-section"><h2>资源压力驱动</h2>'
+            '<div class="data-table-wrap"><table><thead><tr><th>资源</th><th>功率相关系数</th>'
+            '<th>方向</th><th>样本数</th><th>解释</th></tr></thead><tbody>'
+            + _power_pressure_driver_rows(analysis)
+            + "</tbody></table></div></section>"
+        )
+    if pressure.get("tasks"):
+        sections.append(
+            '<section class="analysis-section"><h2>任务负载压力</h2>'
+            '<div class="data-table-wrap"><table><thead><tr><th>任务</th><th>平均 CPU</th>'
+            '<th>峰值 CPU</th><th>可见时相对功率</th><th>功率相关性</th><th>快照数</th>'
+            '</tr></thead><tbody>'
+            + _power_pressure_task_rows(analysis)
+            + "</tbody></table></div></section>"
+        )
+    if settings.get("rows"):
+        sections.append(
+            '<section class="analysis-section"><h2>系统设置变化</h2>'
+            '<div class="data-table-wrap"><table><thead><tr><th>设置</th><th>开始</th>'
+            '<th>结束</th><th>变化</th><th>续航影响</th></tr></thead><tbody>'
+            + _runtime_setting_rows(analysis)
+            + "</tbody></table></div></section>"
+        )
+    return "".join(sections) or (
+        '<section class="analysis-section"><div class="availability-note">'
+        '<strong>没有额外功耗压力明细</strong><span>本次关闭了相关采集项，或样本不足；'
+        '报告仅保留电池侧实测趋势与摘要。</span></div></section>'
     )
 
 
@@ -619,9 +688,48 @@ def _performance_power_recording(analysis: Dict[str, object]) -> str:
     )
 
 
+def _performance_memory_frequency_available(analysis: Dict[str, object]) -> bool:
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    if bool(memory.get("analysis_disabled")):
+        return False
+    if bool(memory.get("available")) and not bool(memory.get("analysis_disabled")):
+        return True
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    rows = test_items.get("rows", [])
+    return any(
+        isinstance(item, dict)
+        and (
+            isinstance(item.get("average_memory_frequency_mhz"), (int, float))
+            or isinstance(item.get("p95_memory_frequency_mhz"), (int, float))
+        )
+        for item in rows if isinstance(rows, list)
+    )
+
+
+def _performance_test_item_headers(analysis: Dict[str, object]) -> str:
+    labels = [
+        "测试项",
+        "时长",
+        "平均 FPS",
+        "1% Low",
+        "P95 / P99",
+        "异常帧",
+        "主要延迟阶段",
+        "CPU 平均 / 峰值",
+        "GPU 平均 / 峰值",
+    ]
+    if _performance_memory_frequency_available(analysis):
+        labels.append("内存频率 平均 / P95")
+    labels.extend(["热限制", "整机功耗记录", "置信度"])
+    return "".join(f"<th>{_escape(label)}</th>" for label in labels)
+
+
 def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
     test_items = analysis.get("test_items", {})
     test_items = test_items if isinstance(test_items, dict) else {}
+    show_memory_frequency = _performance_memory_frequency_available(analysis)
     rows = []
     for item in test_items.get("rows", []) if isinstance(test_items.get("rows"), list) else []:
         if not isinstance(item, dict):
@@ -632,6 +740,12 @@ def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
         last_end = windows[-1].get("end_elapsed_s") if windows and isinstance(windows[-1], dict) else first_start
         dominant = item.get("dominant_stage", {})
         dominant = dominant if isinstance(dominant, dict) else {}
+        memory_cell = (
+            f'<td>{_number(item.get("average_memory_frequency_mhz"), 0)} / '
+            f'{_number(item.get("p95_memory_frequency_mhz"), 0)} MHz</td>'
+            if show_memory_frequency
+            else ""
+        )
         rows.append(
             f'<tr class="test-item-row" data-test-start="{_number(first_start, 3, "0")}" data-test-end="{_number(last_end, 3, "0")}">'
             f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(item.get("phase"))} · {int(item.get("occurrence_count") or 0)} 次</span></td>'
@@ -643,13 +757,14 @@ def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
             f'<td>{_escape(dominant.get("label") or "—")}<span class="cell-sub">P95 {_number(dominant.get("p95_ms"), 2)} ms</span></td>'
             f'<td>{_number(item.get("average_cpu_pct"))}% / {_number(item.get("maximum_cpu_pct"))}%</td>'
             f'<td>{_number(item.get("average_gpu_load_pct"))}% / {_number(item.get("maximum_gpu_load_pct"))}%</td>'
-            f'<td>{_number(item.get("average_memory_frequency_mhz"), 0)} / {_number(item.get("p95_memory_frequency_mhz"), 0)} MHz</td>'
+            f'{memory_cell}'
             f'<td>{"是" if item.get("throttling_observed") else "否"}<span class="cell-sub">{_number(item.get("maximum_temperature_c"))} °C</span></td>'
             f'<td>{_number(item.get("average_whole_device_power_mw"), 0)} mW<span class="cell-sub">只记录整机</span></td>'
             f'<td>{_escape(_display_label(item.get("confidence"), CONFIDENCE_LABELS))}</td>'
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="13" class="empty-cell">没有可用的性能测试项区间。</td></tr>'
+    column_count = 13 if show_memory_frequency else 12
+    return "".join(rows) or f'<tr><td colspan="{column_count}" class="empty-cell">没有可用的性能测试项区间。</td></tr>'
 
 
 def _performance_test_item_span_rows(analysis: Dict[str, object]) -> str:
@@ -1735,8 +1850,8 @@ REPORT_FRAGMENT = r"""
 <div id="mobile-profiler" data-test-mode="@@TEST_MODE@@">
   <header class="app-topbar">
     <div class="brand-block">
-      <span class="brand-mark">P</span>
-      <div><strong>PowerScope Mobile</strong><span>@@REPORT_SUBTITLE@@</span></div>
+      <span class="brand-mark">M</span>
+      <div><strong>Mobile Profiler</strong><span>@@REPORT_SUBTITLE@@</span></div>
     </div>
     <div class="session-block">
       <span class="status-dot good"></span>
@@ -1789,10 +1904,7 @@ REPORT_FRAGMENT = r"""
             </div>
           </div>
         </section>
-        <div class="split-layout" data-report-only="power">
-          <section class="analysis-section"><h2>资源汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
-          <section class="analysis-section"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
-        </div>
+        <section class="analysis-section" data-report-only="power"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         <div class="split-layout" data-report-only="performance">
           <section class="analysis-section"><h2>性能上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
           <section class="analysis-section"><h2>帧表现结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
@@ -1817,7 +1929,7 @@ REPORT_FRAGMENT = r"""
       </section>
 
       <section class="app-view" data-panel="test-items" hidden>
-        <div class="view-heading"><div><h1>一小时测试项分析</h1><p>@@TEST_ITEM_COPY@@</p></div><span class="source-tag counter">点击表格行可聚焦时间窗口</span></div>
+        <div class="view-heading"><div><h1>测试项分析</h1><p>@@TEST_ITEM_COPY@@</p></div><span class="source-tag counter">点击表格行可聚焦时间窗口</span></div>
         @@CAPTURE_START_NOTE@@
         <section class="analysis-section">@@TEST_ITEM_STATUS@@</section>
         <section class="analysis-section">
@@ -1828,7 +1940,7 @@ REPORT_FRAGMENT = r"""
           <div class="chart-surface"><svg id="test-item-chart" role="img" aria-label="Per-test power, foreground activity, system activity, thermal and scheduler lanes"></svg></div>
         </section>
         <section class="analysis-section" data-report-only="power"><h2>功耗测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="performance"><h2>性能测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th><th>异常帧</th><th>主要延迟阶段</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>内存频率 平均 / P95</th><th>热限制</th><th>整机功耗记录</th><th>置信度</th></tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="performance"><h2>性能测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr>@@PERFORMANCE_TEST_ITEM_HEADERS@@</tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_ROWS@@</tbody></table></div></section>
         <section class="analysis-section" data-report-only="power"><h2>单次执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th><th>系统干扰</th><th>前台应用</th></tr></thead><tbody>@@TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
         <section class="analysis-section" data-report-only="performance"><h2>单次性能执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th><th>异常帧</th><th>整机功耗</th><th>置信度</th></tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
         <div class="availability-note"><strong>解读边界</strong><span>@@TEST_ITEM_BOUNDARY@@</span></div>
@@ -1836,10 +1948,7 @@ REPORT_FRAGMENT = r"""
 
       <section class="app-view" data-panel="pressure" data-report-only="power" hidden>
         <div class="view-heading"><div><h1>功耗压力分析</h1><p>解释电流和功率为什么随任务负载、调度、频率与系统设置变化。</p></div><span class="source-tag counter">时间相关性，不是独立电源轨</span></div>
-        <section class="analysis-section"><h2>内存频率压力</h2>@@MEMORY_PRESSURE_SUMMARY@@</section>
-        <section class="analysis-section"><h2>资源压力驱动</h2><div class="data-table-wrap"><table><thead><tr><th>资源</th><th>功率相关系数</th><th>方向</th><th>样本数</th><th>解释</th></tr></thead><tbody>@@POWER_PRESSURE_DRIVER_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>任务负载压力</h2><div class="data-table-wrap"><table><thead><tr><th>任务</th><th>平均 CPU</th><th>峰值 CPU</th><th>可见时相对功率</th><th>功率相关性</th><th>快照数</th></tr></thead><tbody>@@POWER_PRESSURE_TASK_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>系统设置快照</h2><div class="data-table-wrap"><table><thead><tr><th>设置</th><th>开始</th><th>结束</th><th>变化</th><th>续航影响</th></tr></thead><tbody>@@RUNTIME_SETTING_ROWS@@</tbody></table></div></section>
+        @@POWER_PRESSURE_SECTIONS@@
       </section>
 
       <section class="app-view" data-panel="pipeline" data-report-only="performance" hidden>
@@ -1869,7 +1978,7 @@ REPORT_FRAGMENT = r"""
       </section>
 
       <section class="app-view" data-panel="system" data-report-only="performance" hidden>
-        <div class="view-heading"><div><h1>性能资源与调度上下文</h1><p>帧表现结合 CPU/GPU、内存频率、cpuset、ADPF、热点进程和热限制解释；不进行进程功耗归因。</p></div><span class="source-tag counter">平台实测计数器</span></div>
+        <div class="view-heading"><div><h1>性能资源与调度上下文</h1><p>帧表现结合 CPU/GPU、可用频率、cpuset、ADPF、热点进程和热限制解释；不进行进程功耗归因。</p></div><span class="source-tag counter">平台实测计数器</span></div>
         <div class="metric-grid">@@PERFORMANCE_CARDS@@</div>
         <div class="split-layout">
           <section class="analysis-section"><h2>刷新档位驻留</h2><div class="residency-list">@@REFRESH_RESIDENCY_ROWS@@</div></section>
@@ -1904,7 +2013,7 @@ REPORT_FRAGMENT = r"""
         <section class="analysis-section"><h2>采集项与干扰控制</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>数据来源</h2><div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div></section>
         @@WARNING_SECTION@@
-        <section class="analysis-section"><h2>会话元数据</h2><pre class="metadata-block">@@METADATA@@</pre></section>
+        <section class="analysis-section"><details><summary>查看完整会话元数据</summary><pre class="metadata-block">@@METADATA@@</pre></details></section>
       </section>
     </main>
   </div>
@@ -2612,10 +2721,10 @@ def _report_mode_profile(
                 "overview_title": "性能测试概览",
                 "overview_tag": "帧计数器 + 整机功耗记录",
                 "overview_copy": (
-                    "帧表现使用前台窗口 / 合成器计数器；CPU、GPU、内存频率与整机功耗统一使用设备 uptime 对齐。"
+                    "帧表现使用前台窗口 / 合成器计数器；CPU、GPU、调度与整机功耗统一使用设备 uptime 对齐。"
                 ),
                 "timeline_copy": (
-                    "帧率窗口、CPU/GPU/内存资源、调度与整机功耗记录位于同一设备时间轴。"
+                    "帧率窗口、CPU/GPU、可用资源、调度与整机功耗记录位于同一设备时间轴。"
                 ),
                 "cpu_title": "CPU 调度与频率上下文",
                 "cpu_copy": (
@@ -2646,10 +2755,10 @@ def _report_mode_profile(
                 "overview_title": "功耗测试概览",
                 "overview_tag": "电池侧整机实测",
                 "overview_copy": (
-                    "电流、电压、任务负载、CPU/GPU/内存频率和设置上下文统一使用设备 uptime 时间轴。"
+                    "电流、电压、任务负载、CPU/GPU、可用频率和设置上下文统一使用设备 uptime 时间轴。"
                 ),
                 "timeline_copy": (
-                    "整机电流功率、任务负载、CPU/GPU/内存频率与系统活动位于同一时间轴。"
+                    "整机电流功率、任务负载、CPU/GPU、可用频率与系统活动位于同一时间轴。"
                 ),
             }
         )
@@ -2746,6 +2855,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@REFRESH_RESIDENCY_ROWS@@": _refresh_residency_rows(analysis),
         "@@PERFORMANCE_CONTEXT_ROWS@@": _performance_context_rows(analysis),
         "@@PERFORMANCE_POWER_RECORDING@@": _performance_power_recording(analysis),
+        "@@POWER_PRESSURE_SECTIONS@@": _power_pressure_sections(analysis),
         "@@POWER_PRESSURE_DRIVER_ROWS@@": _power_pressure_driver_rows(analysis),
         "@@POWER_PRESSURE_TASK_ROWS@@": _power_pressure_task_rows(analysis),
         "@@RUNTIME_SETTING_ROWS@@": _runtime_setting_rows(analysis),
@@ -2808,6 +2918,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@CAPTURE_START_NOTE@@": capture_start_note,
         "@@TEST_ITEM_ROWS@@": _test_item_rows(analysis),
         "@@TEST_ITEM_SPAN_ROWS@@": _test_item_span_rows(analysis),
+        "@@PERFORMANCE_TEST_ITEM_HEADERS@@": _performance_test_item_headers(analysis),
         "@@PERFORMANCE_TEST_ITEM_ROWS@@": _performance_test_item_rows(analysis),
         "@@PERFORMANCE_TEST_ITEM_SPAN_ROWS@@": _performance_test_item_span_rows(analysis),
         "@@APP_COVERAGE@@": _number(

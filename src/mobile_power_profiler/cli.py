@@ -504,6 +504,7 @@ def run_probe(args: argparse.Namespace) -> int:
     gpu_source, gpu_probe = detect_gpu_source(
         args.adb, device, getattr(args, "gpu_frequency_path", None)
     )
+    memory_source, memory_probe = detect_memory_source(args.adb, device)
     perfetto = adb_shell(args.adb, device, ["perfetto", "--query"], timeout_s=20)
     powerstats = adb_shell(args.adb, device, ["dumpsys", "powerstats"], timeout_s=20)
     gpu_dump = adb_shell(args.adb, device, ["dumpsys", "gpu"], timeout_s=30)
@@ -512,6 +513,8 @@ def run_probe(args: argparse.Namespace) -> int:
     thermal_snapshot, thermal_error = collect_thermal_snapshot(args.adb, device)
     scheduler_snapshot, scheduler_warnings = collect_scheduler_snapshot(args.adb, device, set())
     android_performance = probe_android_performance(args.adb, device)
+    capabilities = dict(android_performance.get("capabilities", {}))
+    capabilities["memory_frequency"] = memory_source is not None
     info = {
         "device": collect_device_info(args.adb, device),
         "battery": parse_battery(battery_text),
@@ -520,6 +523,8 @@ def run_probe(args: argparse.Namespace) -> int:
         "cpu_policies": [asdict(item) for item in collect_cpu_policies(args.adb, device)],
         "gpu_source": asdict(gpu_source) if gpu_source else None,
         "gpu_probe": gpu_probe,
+        "memory_source": asdict(memory_source) if memory_source else None,
+        "memory_probe": memory_probe,
         "gpu_work_duration_available": "GPU work information" in gpu_dump.stdout,
         "gpu_memory_snapshot_available": bool(gpu_dump_details.get("memory_available")),
         "gpu_memory_total_bytes": gpu_dump_details.get("global_total_bytes"),
@@ -529,7 +534,7 @@ def run_probe(args: argparse.Namespace) -> int:
         "foreground_package": collect_foreground_package(args.adb, device),
         "performance": android_performance.get("performance", {}),
         "touch": android_performance.get("touch", {}),
-        "capabilities": android_performance.get("capabilities", {}),
+        "capabilities": capabilities,
         "performance_warnings": android_performance.get("warnings", []),
         "system_monitor": {
             "process_top_available": system_snapshot is not None and bool(system_snapshot.processes),
@@ -588,6 +593,13 @@ def run_probe(args: argparse.Namespace) -> int:
         print(f"GPU load: readable from {info['gpu_source']['load_path']}")
     else:
         print(f"GPU frequency: unavailable ({gpu_probe.get('reason')})")
+    if memory_source is not None:
+        print(f"Memory frequency: readable from {memory_source.frequency_path}")
+    else:
+        print(
+            "Memory frequency: unavailable ("
+            f"{memory_probe.get('limitations') or 'no readable DRAM/DMC/MIF node'})"
+        )
     if gpu_probe.get("model"):
         print(
             f"GPU platform: {gpu_probe.get('model')} "
@@ -615,7 +627,9 @@ def run_probe(args: argparse.Namespace) -> int:
         f"supported={supported_refresh or 'n/a'}"
     )
     print(
-        "Frame telemetry: Android gfxinfo cumulative counters; "
+        "Frame telemetry: "
+        f"SurfaceFlinger BLAST timestamps={bool(info.get('capabilities', {}).get('surfaceflinger_frame_timestamps'))}, "
+        f"gfxinfo counters={bool(info.get('capabilities', {}).get('gfxinfo_frame_counters'))}; "
         f"refresh residency={bool(performance.get('refresh_rate_durations_s'))}"
     )
     touch = info.get("touch", {})
@@ -1503,6 +1517,7 @@ def run_record(args: argparse.Namespace) -> int:
                 if feature("foreground_window") or feature("frame_rate")
                 else None
             ),
+            "surfaceflinger_blast_latency": 0.5 if feature("frame_rate") else None,
             "surfaceflinger_refresh_residency": (
                 max(10.0, args.performance_interval * 5.0)
                 if feature("frame_rate")
@@ -2464,7 +2479,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--performance-interval",
         type=positive_float,
         default=2.0,
-        help="foreground display/gfxinfo sampling interval used by performance mode",
+        help=(
+            "foreground display/gfxinfo context interval used by performance mode; "
+            "detected BLAST layers use a separate 0.5s timestamp sampler"
+        ),
     )
     record.add_argument(
         "--capture-preset",

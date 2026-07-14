@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-5">
-  <script src="/app.js?v=platform-ui-5" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-6">
+  <script src="/app.js?v=platform-ui-6" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -169,8 +169,9 @@
                   </div>
                   <div class="app-picker-controls">
                     <input id="app-search-input" type="search" autocomplete="off" placeholder="搜索包名或 Activity" aria-label="搜索手机应用" disabled>
-                    <select id="app-select" aria-label="选择测试应用" disabled><option value="">请先扫描手机应用</option></select>
+                    <select id="app-select" class="app-select-fallback" aria-label="选择测试应用" disabled><option value="">请先扫描手机应用</option></select>
                   </div>
+                  <div class="app-result-list hidden" id="app-result-list" role="listbox" aria-label="已扫描的游戏和应用"></div>
                   <div class="app-picker-meta"><span id="app-picker-status">尚未扫描</span><span id="app-picker-selection">未选择目标应用</span></div>
                 </section>
                 <div class="form-field">
@@ -264,30 +265,45 @@
                     <div class="form-field" data-mode-only="performance" data-platforms="android harmony">
                       <label for="performance-interval-input">帧 / 窗口采样周期</label>
                       <div class="input-with-unit"><input id="performance-interval-input" type="number" min="1" max="60" step="0.5" value="2"><span>秒</span></div>
-                      <small class="field-hint" id="performance-interval-hint">读取前台窗口 gfxinfo；更低周期会增加测试工具开销。</small>
+                      <small class="field-hint" id="performance-interval-hint">读取前台窗口上下文；检测到游戏 BLAST 层后以 0.5 秒节奏采集呈现时间戳。</small>
                     </div>
                     <div class="capture-feature-section">
                       <div class="capture-feature-heading">
-                        <div><strong>采集项与干扰控制</strong><small>关闭不需要的项目可减少命令、快照和日志开销</small></div>
+                        <div><strong>选择需要抓取的数据</strong><small>未选择的项目不会启动对应采集器</small></div>
                         <span id="capture-feature-count">0 / 16 已启用</span>
                       </div>
-                      <div class="capture-feature-grid">
-                        <label><input type="checkbox" data-capture-feature="cpu_usage" checked><span><strong>CPU 利用率</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="cpu_frequency" checked><span><strong>CPU 频率</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="gpu_metrics" checked><span><strong>GPU 指标</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="memory_frequency" checked><span><strong>内存频率</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="foreground_window" checked><span><strong>前台应用 / 窗口</strong><small>中等</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="frame_rate"><span><strong>帧率 / 1% Low</strong><small>中等</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="frame_details"><span><strong>详细帧时间戳</strong><small>较高</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="harmony_hitches"><span><strong>Harmony hitch</strong><small>中等</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="touch_events"><span><strong>触控事件</strong><small>中等</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="target_process" checked><span><strong>目标应用资源</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="process_snapshots" checked><span><strong>全系统进程</strong><small>较高</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="hot_threads" checked><span><strong>热点线程</strong><small>较高</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="thermal" checked><span><strong>温度 / 热限制</strong><small>低干扰</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="scheduler" checked><span><strong>调度 / ADPF</strong><small>较高</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="runtime_settings" checked><span><strong>系统设置快照</strong><small>中等</small></span></label>
-                        <label><input type="checkbox" data-capture-feature="power_attribution" checked><span><strong>功耗来源归因</strong><small>较高</small></span></label>
+                      <div class="capture-feature-groups">
+                        <section class="capture-feature-group">
+                          <div class="capture-group-heading"><strong>基础资源</strong><small>连续采样 · 实时趋势</small></div>
+                          <div class="capture-feature-grid">
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="cpu_usage" checked><span class="feature-glyph">CPU</span><span class="feature-copy"><strong>CPU 利用率</strong><small>整机与逐核负载</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="cpu_frequency" checked><span class="feature-glyph">GHz</span><span class="feature-copy"><strong>CPU 频率</strong><small>集群频率与上限</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="gpu_metrics" checked><span class="feature-glyph">GPU</span><span class="feature-copy"><strong>GPU 指标</strong><small>频率、负载与渲染器</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="memory_frequency"><span class="feature-glyph">DDR</span><span class="feature-copy"><strong>内存频率</strong><small>默认关闭；需可读 DMC 节点</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="thermal" checked><span class="feature-glyph">°C</span><span class="feature-copy"><strong>温度 / 热限制</strong><small>传感器与严重度</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="target_process" checked><span class="feature-glyph">APP</span><span class="feature-copy"><strong>目标应用资源</strong><small>游戏进程 CPU 与内存</small></span><em class="feature-impact low">低</em><i></i></label>
+                          </div>
+                        </section>
+                        <section class="capture-feature-group" data-mode-only="performance">
+                          <div class="capture-group-heading"><strong>帧表现与交互</strong><small>游戏性能专用</small></div>
+                          <div class="capture-feature-grid">
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="frame_rate"><span class="feature-glyph">FPS</span><span class="feature-copy"><strong>帧率 / 1% Low</strong><small>BLAST / gfxinfo 帧节奏</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="frame_details"><span class="feature-glyph">P99</span><span class="feature-copy"><strong>详细帧时间戳</strong><small>渲染阶段与慢帧</small></span><em class="feature-impact high">高</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="harmony_hitches"><span class="feature-glyph">HIT</span><span class="feature-copy"><strong>Harmony hitch</strong><small>RenderService 累计计数</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="touch_events"><span class="feature-glyph">TAP</span><span class="feature-copy"><strong>触控事件</strong><small>系统已分发交互</small></span><em class="feature-impact medium">中</em><i></i></label>
+                          </div>
+                        </section>
+                        <section class="capture-feature-group">
+                          <div class="capture-group-heading"><strong>系统上下文</strong><small>按需开启以降低观察者开销</small></div>
+                          <div class="capture-feature-grid">
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="foreground_window" checked><span class="feature-glyph">WIN</span><span class="feature-copy"><strong>前台应用 / 窗口</strong><small>场景、显示与亮度</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="process_snapshots" checked><span class="feature-glyph">PROC</span><span class="feature-copy"><strong>全系统进程</strong><small>后台竞争与三方负载</small></span><em class="feature-impact high">高</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="hot_threads" checked><span class="feature-glyph">THR</span><span class="feature-copy"><strong>热点线程</strong><small>渲染、内核与 GC 线程</small></span><em class="feature-impact high">高</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="scheduler" checked><span class="feature-glyph">SCH</span><span class="feature-copy"><strong>调度 / ADPF</strong><small>cpuset、Governor、Hint</small></span><em class="feature-impact high">高</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="runtime_settings" checked><span class="feature-glyph">SET</span><span class="feature-copy"><strong>系统设置快照</strong><small>亮度、刷新率、网络等</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="power_attribution" checked><span class="feature-glyph">PWR</span><span class="feature-copy"><strong>功耗来源归因</strong><small>BatteryStats / UID / Wakelock</small></span><em class="feature-impact high">高</em><i></i></label>
+                          </div>
+                        </section>
                       </div>
                       <p class="capture-feature-note" id="capture-feature-note">基础电流、电压和设备时间戳始终保留。</p>
                     </div>
@@ -308,7 +324,7 @@
                 <article class="metric-card power-card"><div class="metric-top"><span>实时功率</span><i>BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">整机电池侧</small></article>
                 <article class="metric-card"><div class="metric-top"><span>放电电流</span><i>CURRENT</i></div><strong id="metric-current">--</strong><small id="metric-current-sub">正幅值</small></article>
                 <article class="metric-card"><div class="metric-top"><span>CPU 总负载</span><i>CPU</i></div><strong id="metric-cpu">--</strong><small id="metric-cpu-sub">全核心</small></article>
-                <article class="metric-card"><div class="metric-top"><span id="metric-memory-label">内存频率</span><i id="metric-memory-tag">DMC</i></div><strong id="metric-memory">--</strong><small id="metric-memory-sub">DRAM / DMC / MIF</small></article>
+                <article class="metric-card" id="metric-memory-card"><div class="metric-top"><span id="metric-memory-label">内存频率</span><i id="metric-memory-tag">DMC</i></div><strong id="metric-memory">--</strong><small id="metric-memory-sub">DRAM / DMC / MIF</small></article>
                 <article class="metric-card"><div class="metric-top"><span>电池温度</span><i>THERMAL</i></div><strong id="metric-temp">--</strong><small id="metric-temp-sub">BatteryService</small></article>
                 <article class="metric-card"><div class="metric-top"><span>累计能量</span><i>ENERGY</i></div><strong id="metric-energy">--</strong><small id="metric-energy-sub">有效区间积分</small></article>
               </div>
@@ -318,8 +334,8 @@
                 <article class="metric-card"><div class="metric-top"><span id="metric-one-low-label">1% Low</span><i id="metric-one-low-tag">LOW</i></div><strong id="metric-one-low">--</strong><small id="metric-one-low-sub">最慢 1% 帧换算</small></article>
                 <article class="metric-card"><div class="metric-top"><span id="metric-frame-p99-label">P99 帧耗时</span><i id="metric-frame-p99-tag">FRAME</i></div><strong id="metric-frame-p99">--</strong><small id="metric-frame-p99-sub">应用帧耗时</small></article>
                 <article class="metric-card"><div class="metric-top"><span id="metric-frame-issue-label">异常帧</span><i id="metric-frame-issue-tag">JANK</i></div><strong id="metric-frame-issue">--</strong><small id="metric-frame-issue-sub">截止时间 / VSync</small></article>
-                <article class="metric-card"><div class="metric-top"><span id="metric-render-resolution-label">渲染分辨率</span><i id="metric-render-resolution-tag">RENDER</i></div><strong id="metric-render-resolution">--</strong><small id="metric-render-resolution-sub">前台窗口边界</small></article>
-                <article class="metric-card interpolation-card"><div class="metric-top"><span id="metric-interpolation-label">插帧状态</span><i id="metric-interpolation-tag">MEMC</i></div><strong id="metric-interpolation">--</strong><small id="metric-interpolation-sub">等待显式系统证据</small></article>
+                <article class="metric-card" id="metric-render-resolution-card"><div class="metric-top"><span id="metric-render-resolution-label">渲染分辨率</span><i id="metric-render-resolution-tag">RENDER</i></div><strong id="metric-render-resolution">--</strong><small id="metric-render-resolution-sub">前台窗口边界</small></article>
+                <article class="metric-card interpolation-card" id="metric-interpolation-card"><div class="metric-top"><span id="metric-interpolation-label">插帧状态</span><i id="metric-interpolation-tag">MEMC</i></div><strong id="metric-interpolation">--</strong><small id="metric-interpolation-sub">等待显式系统证据</small></article>
               </div>
 
               <section class="panel chart-panel">
@@ -346,6 +362,11 @@
                   <div class="chart-empty" id="chart-empty"><span class="empty-wave" aria-hidden="true"></span><strong>等待遥测数据</strong><small>开始采集后，曲线将在这里实时更新</small></div>
                   <div class="chart-tooltip hidden" id="chart-tooltip"></div>
                 </div>
+              </section>
+
+              <section class="panel live-detail-panel">
+                <div class="panel-heading"><div><small>EXPANDED LIVE DATA</small><h2>实时数据明细</h2></div><span class="data-source" id="live-detail-count">等待数据</span></div>
+                <div class="live-detail-grid" id="live-detail-grid"><div class="empty-row">开始采集后，各项有效实时数据会在这里展开显示。</div></div>
               </section>
 
               <div class="details-grid">
@@ -375,7 +396,7 @@
                     <div data-platforms="android harmony"><dt>CPU Governor</dt><dd id="resource-governors">--</dd></div>
                     <div data-platforms="android harmony"><dt>ADPF / 调度会话</dt><dd id="resource-adpf">--</dd></div>
                     <div><dt>GPU 负载 / 频率</dt><dd id="resource-gpu">--</dd></div>
-                    <div data-platforms="android harmony"><dt>内存 / DMC 频率</dt><dd id="resource-memory">--</dd></div>
+                    <div data-platforms="android harmony" id="resource-memory-row"><dt>内存 / DMC 频率</dt><dd id="resource-memory">--</dd></div>
                     <div><dt>温控状态</dt><dd id="resource-thermal">--</dd></div>
                     <div><dt id="resource-window-label">前台窗口</dt><dd id="resource-window">--</dd></div>
                     <div data-platforms="android harmony"><dt>显示 / 应用节奏</dt><dd id="resource-cadence">--</dd></div>
@@ -400,8 +421,8 @@
                 <div class="panel-heading"><div><small>MEASUREMENT EVIDENCE</small><h2>性能判定依据</h2></div><span class="data-source">只读系统接口</span></div>
                 <div class="performance-evidence-grid">
                   <article><small id="performance-evidence-label-1">帧率来源</small><strong id="performance-frame-source">--</strong><span id="performance-frame-confidence">等待有效帧计数</span></article>
-                  <article><small id="performance-evidence-label-2">渲染尺寸来源</small><strong id="performance-render-source">--</strong><span id="performance-render-scale">等待前台窗口边界</span></article>
-                  <article><small id="performance-evidence-label-3">插帧判定</small><strong id="performance-interpolation-source">--</strong><span id="performance-interpolation-evidence">不会仅凭刷新倍率推断</span></article>
+                  <article id="performance-render-evidence"><small id="performance-evidence-label-2">渲染尺寸来源</small><strong id="performance-render-source">--</strong><span id="performance-render-scale">等待前台窗口边界</span></article>
+                  <article id="performance-interpolation-evidence-card"><small id="performance-evidence-label-3">插帧判定</small><strong id="performance-interpolation-source">--</strong><span id="performance-interpolation-evidence">不会仅凭刷新倍率推断</span></article>
                 </div>
               </section>
 

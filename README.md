@@ -24,8 +24,9 @@ is easier to audit after a one-hour robotic workflow:
   the GPU core clock.
 - Foreground package/activity/window, screen state, brightness, and refresh-rate
   residency. Android adds SurfaceFlinger mode-duration deltas plus foreground-window
-  `gfxinfo` UI frame-submission, frame-duration, and deadline counters; HarmonyOS
-  adds sampled compositor pacing and delivered touch interactions.
+  SurfaceView/BLAST presented-frame timestamps for native games, with `gfxinfo` UI
+  frame-submission, frame-duration, and deadline counters as the normal-View fallback;
+  HarmonyOS adds sampled compositor pacing and delivered touch interactions.
 - Native HarmonyOS HDC support for BatteryService, `/proc/stat`,
   `hidumper --cpufreq`, AbilityManager, PowerManagerService, `top`/`ps`, and
   ThermalService, plus RenderService display/FPS counters, WindowManager and
@@ -403,7 +404,9 @@ mobile-profiler demo --output profiler-runs\demo
 Useful recording options:
 
 - `--test-mode power|performance`: select the capture profile; `power` is the default.
-- `--performance-interval 2`: foreground display/window/gfxinfo cadence used by performance mode.
+- `--performance-interval 2`: foreground display/window/gfxinfo context cadence used by
+  performance mode; detected BLAST game layers are sampled every 0.5 seconds to avoid
+  overflowing SurfaceFlinger's short timestamp ring.
 - `--capture-preset auto|power-standard|performance-standard|low-overhead|harmony-smartperf`:
   select a collector preset; SmartPerf is available only for HarmonyOS Performance mode.
 - `--enable-feature NAME` / `--disable-feature NAME`: repeatable per-feature overrides.
@@ -461,6 +464,7 @@ The default Android long-session schedule limits expensive services:
 | Battery voltage | 5 s | BatteryService dump, held between reads |
 | Temperature | 10 s | BatteryService |
 | Foreground, display modes, Android `gfxinfo` frame counters | 10 s | ActivityManager + Display + gfxinfo |
+| Native-game presented frames when a foreground BLAST layer exists | 0.5 s | SurfaceFlinger `--latency` ring |
 | Whole-system processes + watched update/DEX services | 10 s | `top` + `ps -A` |
 | Hot threads + GC/kworker/kernel classification | 30 s | `top -H` |
 | Thermal sensors, severity, cooling, thresholds | 10 s | ThermalService / thermal HAL |

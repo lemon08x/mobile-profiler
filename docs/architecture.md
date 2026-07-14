@@ -103,8 +103,10 @@ share the same contracts as iOS and future adapters.
    disable the Android performance-context worker.
 4. Start an independent performance-context worker. Every 10 seconds it captures
    foreground/window state, display modes, brightness, and cumulative foreground
-   `gfxinfo` frame counters; SurfaceFlinger refresh-duration counters and GLES renderer
-   identity are sampled every 30 seconds and once more during finalization.
+   `gfxinfo` frame counters. When the foreground app exposes a SurfaceView/BLAST layer,
+   its SurfaceFlinger present-timestamp ring is sampled every 0.5 seconds and summarized
+   into FPS, 1% Low, and frame-interval windows. SurfaceFlinger refresh-duration counters
+   and GLES renderer identity are sampled every 30 seconds and once more during finalization.
 5. Start an independent low-frequency system-monitor worker. It captures
    processes every 10 seconds, hot threads every 30 seconds, ThermalService
    every 10 seconds, and cpuset/ActivityManager/ADPF state every 30 seconds.
@@ -283,6 +285,8 @@ observed power-source names, physical-sample age, and collector CPU overhead.
 - GPU devfreq/load when readable.
 - GPU UID active-duration deltas and per-PID memory snapshots otherwise.
 - Android SurfaceFlinger refresh-rate duration deltas and GLES renderer identity.
+- Foreground SurfaceView/BLAST present timestamps from SurfaceFlinger `--latency`,
+  deduplicated across the short ring buffer for native-game FPS and frame pacing.
 - Android foreground-window `gfxinfo` rendered-frame, deadline, jank, missed-vsync,
   and frame-duration histogram deltas without clearing global graphics statistics.
 - Periodic whole-system `top`/`ps` snapshots for apps, Android services, native
