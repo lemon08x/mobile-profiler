@@ -3,7 +3,7 @@
 ## Repository structure
 
 ```text
-mobile-power-profiler/
+mobile-profiler/
 |-- pyproject.toml
 |-- README.md
 |-- build-portable.bat
@@ -46,7 +46,7 @@ The profiler and BTR2 are independent processes and repositories.
 
 ```text
 Android device  <-- ADB -->+
-HarmonyOS phone <-- HDC -->+--> Mobile Power Profiler --> run directory
+HarmonyOS phone <-- HDC -->+--> Mobile Profiler --> run directory
              ^
              |
 robot/camera
@@ -152,7 +152,9 @@ device.
 
 1. A trusted USB connection creates a persistent RemotePairing record.
 2. The parent caches the validated Wi-Fi host/port under
-   `~/.mobile-power-profiler/ios-devices.json`.
+   `~/.mobile-profiler/ios-devices.json`, while reading the former
+   `.mobile-power-profiler` and `.android-power-profiler` locations as migration
+   fallbacks.
 3. Probe opens a userspace RSD tunnel, reads DiagnosticsService battery data,
    inspects DVT sysmon capabilities, and samples DVT Graphics availability.
 4. Record starts concurrent DVT sysmontap, Graphics, and application-state
@@ -434,7 +436,7 @@ Python installation or relocatable virtual environment.
 The source UI calls this same script and passes the running interpreter's full
 patch version explicitly. This avoids relying on an unrelated `python` command
 on `PATH`. The default output is
-`dist/mobile-power-profiler-portable(.zip)`. A portable bundle intentionally
+`dist/mobile-profiler-portable(.zip)`. A portable bundle intentionally
 contains documentation and examples but omits the source/build structure, so
 future software changes must be rebuilt from the source computer.
 

@@ -17,6 +17,7 @@ from .models import (
     CpuPolicy,
     CpuTimes,
     GpuSource,
+    MemorySource,
     RawSample,
     Sample,
     SchedulerSnapshot,
@@ -201,6 +202,55 @@ def collect_device_info(adb: str, device: str) -> Dict[str, object]:
     }
 
 
+POWER_SETTING_KEYS: Tuple[Tuple[str, str], ...] = (
+    ("system", "screen_brightness"),
+    ("system", "screen_brightness_mode"),
+    ("system", "screen_off_timeout"),
+    ("system", "peak_refresh_rate"),
+    ("system", "min_refresh_rate"),
+    ("global", "low_power"),
+    ("global", "adaptive_battery_management_enabled"),
+    ("global", "app_standby_enabled"),
+    ("global", "wifi_on"),
+    ("global", "bluetooth_on"),
+    ("global", "airplane_mode_on"),
+    ("secure", "location_mode"),
+    ("global", "window_animation_scale"),
+    ("global", "transition_animation_scale"),
+    ("global", "animator_duration_scale"),
+    ("global", "stay_on_while_plugged_in"),
+)
+
+
+def collect_android_runtime_settings_text(adb: str, device: str) -> str:
+    commands = []
+    for namespace, key in POWER_SETTING_KEYS:
+        commands.append(
+            f"app_setting=$(settings get {namespace} {key} 2>/dev/null); "
+            f"printf 'SETTING|{namespace}|{key}|%s\\n' \"$app_setting\""
+        )
+    result = adb_shell(adb, device, "\n".join(commands), timeout_s=25)
+    return result.stdout if result.ok else (result.stdout + "\n" + result.stderr).strip()
+
+
+def parse_android_runtime_settings(text: str) -> Dict[str, object]:
+    values: Dict[str, object] = {}
+    for line in text.splitlines():
+        parts = line.strip().split("|", 3)
+        if len(parts) != 4 or parts[0] != "SETTING":
+            continue
+        namespace, key, raw = parts[1], parts[2], parts[3].strip()
+        if raw.lower() in {"null", "none", ""}:
+            value: object = None
+        elif re.fullmatch(r"[-+]?\d+(?:\.\d+)?", raw):
+            parsed = float(raw)
+            value = int(parsed) if parsed.is_integer() else parsed
+        else:
+            value = raw
+        values[f"{namespace}.{key}"] = value
+    return values
+
+
 def _read_number(adb: str, device: str, path: str) -> Optional[float]:
     result = adb_shell(adb, device, ["cat", path], timeout_s=10)
     return first_number(result.stdout) if result.ok else None
@@ -346,6 +396,104 @@ def is_gpu_core_devfreq(identity: str) -> bool:
         token in value
         for token in ("kgsl-3d", "qcom,kgsl", "mali", "gpu0", "gpu@", "graphics")
     )
+
+
+def is_memory_devfreq(identity: str) -> bool:
+    value = identity.lower()
+    if any(
+        token in value
+        for token in (
+            "memlat",
+            "latfloor",
+            "gpubw",
+            "gpu-bw",
+            "bw_hwmon",
+            "busmon",
+            "cpubw",
+            "llccbw",
+            "l3",
+        )
+    ):
+        return False
+    return any(
+        token in value
+        for token in (
+            "dmc",
+            "dram",
+            "ddr",
+            "memory-controller",
+            "mem_ctrl",
+            "mif",
+        )
+    )
+
+
+def detect_memory_source(
+    adb: str,
+    device: str,
+) -> Tuple[Optional[MemorySource], Dict[str, object]]:
+    listed = adb_shell(
+        adb,
+        device,
+        "ls -d /sys/class/devfreq/* 2>/dev/null",
+        timeout_s=10,
+    )
+    candidates: List[Tuple[str, str]] = []
+    for directory in listed.stdout.split():
+        resolved = adb_shell(adb, device, ["readlink", "-f", directory], timeout_s=10)
+        identity = f"{directory.lower()} {resolved.stdout.lower()}"
+        if is_memory_devfreq(identity):
+            candidates.append((directory, identity.strip()))
+    candidates.extend(
+        [
+            (
+                "/sys/class/devfreq/dmc",
+                "generic dmc",
+            ),
+            (
+                "/sys/class/devfreq/mif",
+                "generic mif",
+            ),
+        ]
+    )
+
+    attempts: List[Dict[str, object]] = []
+    for directory, identity in dict.fromkeys(candidates):
+        path = f"{directory}/cur_freq"
+        value, status = _readable_number(adb, device, path)
+        attempts.append({"path": path, "identity": identity, "status": status})
+        if value is None:
+            continue
+        minimum = _read_number(adb, device, f"{directory}/min_freq")
+        maximum = _read_number(adb, device, f"{directory}/max_freq")
+        available = _read_numbers(adb, device, f"{directory}/available_frequencies")
+        source = MemorySource(
+            name=directory.rsplit("/", 1)[-1] or "memory",
+            frequency_path=path,
+            minimum_mhz=frequency_to_mhz(minimum) if minimum is not None else None,
+            maximum_mhz=frequency_to_mhz(maximum) if maximum is not None else None,
+            available_frequencies_mhz=sorted(
+                {frequency_to_mhz(item) for item in available if item > 0}
+            ),
+        )
+        return source, {
+            "available": True,
+            "source": source.name,
+            "frequency_path": path,
+            "identity": identity,
+            "initial_frequency_mhz": frequency_to_mhz(value),
+            "attempts": attempts,
+        }
+    return None, {
+        "available": False,
+        "source": None,
+        "frequency_path": None,
+        "attempts": attempts,
+        "limitations": (
+            "The production kernel did not expose a readable DRAM/DMC/MIF devfreq node. "
+            "Bandwidth-vote and memlat devices are intentionally not mislabeled as memory clock."
+        ),
+    }
 
 
 def detect_gpu_source(
@@ -619,6 +767,150 @@ def parse_android_surfaceflinger_performance(text: str) -> Dict[str, object]:
     }
 
 
+def parse_android_window_performance(
+    text: str,
+    foreground_package: Optional[str] = None,
+    foreground_activity: Optional[str] = None,
+) -> Dict[str, object]:
+    """Extract the foreground app window bounds as the best public render-target proxy."""
+
+    sections: List[Dict[str, object]] = []
+    current: Optional[Dict[str, object]] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        header = re.search(r"Window\s+#?\d*\s*Window\{[^}]*\s([^}\s]+)\}", line)
+        if header:
+            current = {"window": header.group(1), "lines": []}
+            sections.append(current)
+        if current is not None:
+            lines = current["lines"]
+            assert isinstance(lines, list)
+            lines.append(line)
+
+    if not sections and text.strip():
+        sections = [{"window": foreground_package, "lines": text.splitlines()}]
+
+    activity_token = str(foreground_activity or "").rsplit(".", 1)[-1].lower()
+
+    def score(item: Dict[str, object]) -> int:
+        window = str(item.get("window") or "").lower()
+        value = 0
+        if foreground_package and foreground_package.lower() in window:
+            value += 4
+        if activity_token and activity_token in window:
+            value += 2
+        return value
+
+    candidates: List[Dict[str, object]] = []
+    patterns = (
+        ("mFrame", 2, re.compile(r"\bmFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")),
+        ("frame", 1, re.compile(r"\bframe=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", re.I)),
+        (
+            "mBounds",
+            0,
+            re.compile(
+                r"\bmBounds=Rect\((-?\d+),\s*(-?\d+)\s*-\s*(-?\d+),\s*(-?\d+)\)"
+            ),
+        ),
+    )
+    for section in sections:
+        lines = section.get("lines", [])
+        body = "\n".join(str(item) for item in lines) if isinstance(lines, list) else ""
+        for source, source_priority, pattern in patterns:
+            for match in pattern.finditer(body):
+                left, top, right, bottom = (int(value) for value in match.groups())
+                width = right - left
+                height = bottom - top
+                if width <= 0 or height <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "window": section.get("window"),
+                        "render_width_px": width,
+                        "render_height_px": height,
+                        "render_resolution_source": f"WindowManager {source}",
+                        "score": score(section) + source_priority,
+                    }
+                )
+
+        requested = re.search(
+            r"\b(?:mRequestedWidth|requestedWidth)=(\d+).*?"
+            r"\b(?:mRequestedHeight|requestedHeight)=(\d+)",
+            body,
+            re.S,
+        )
+        if requested:
+            width, height = int(requested.group(1)), int(requested.group(2))
+            if width > 0 and height > 0:
+                candidates.append(
+                    {
+                        "window": section.get("window"),
+                        "render_width_px": width,
+                        "render_height_px": height,
+                        "render_resolution_source": "WindowManager requested size",
+                        "score": score(section) + 1,
+                    }
+                )
+
+    if not candidates:
+        return {}
+    selected = max(
+        candidates,
+        key=lambda item: (
+            int(item.get("score") or 0),
+            int(item.get("render_width_px") or 0) * int(item.get("render_height_px") or 0),
+        ),
+    )
+    return {key: value for key, value in selected.items() if key != "score"}
+
+
+def parse_android_frame_interpolation(text: str) -> Dict[str, object]:
+    """Classify explicit vendor MEMC/frame-interpolation switches without cadence guessing."""
+
+    evidence: List[str] = []
+    enabled = disabled = False
+    key_pattern = re.compile(
+        r"(?:memc|motion[_ .-]*(?:compensation|smoothing)|"
+        r"frame[_ .-]*interpolat|video[_ .-]*(?:motion|enhance)|iris.*memc)",
+        re.I,
+    )
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or not key_pattern.search(line):
+            continue
+        if line not in evidence:
+            evidence.append(line[:300])
+        value_match = re.search(r"(?:=|:\s*|\]:\s*\[)([^\]\s]+)", line)
+        value = value_match.group(1).strip("[],'\"").lower() if value_match else ""
+        if value in {"1", "true", "on", "enabled", "enable", "open"}:
+            enabled = True
+        elif value in {"0", "false", "off", "disabled", "disable", "closed", "close"}:
+            disabled = True
+
+    if enabled:
+        status = "detected"
+        label = "检测到已开启的插帧 / MEMC 开关"
+        confidence = "high"
+    elif disabled and evidence:
+        status = "disabled"
+        label = "检测到插帧 / MEMC 开关处于关闭状态"
+        confidence = "high"
+    elif evidence:
+        status = "indeterminate"
+        label = "发现插帧相关能力，但无法读取启用状态"
+        confidence = "medium"
+    else:
+        status = "unavailable"
+        label = "系统未公开可验证的插帧开关"
+        confidence = "low"
+    return {
+        "frame_interpolation_status": status,
+        "frame_interpolation_label": label,
+        "frame_interpolation_confidence": confidence,
+        "frame_interpolation_evidence": evidence[:20],
+    }
+
+
 def parse_android_gfxinfo(
     text: str,
     foreground_package: Optional[str] = None,
@@ -655,6 +947,79 @@ def parse_android_gfxinfo(
                 key: int(value)
                 for key, value in re.findall(r"(\d+)ms=(\d+)", line)
             }
+            continue
+        if line.startswith("Flags,"):
+            current["frame_stats_columns"] = [
+                value.strip() for value in line.split(",") if value.strip()
+            ]
+            current.setdefault("frame_records", [])
+            continue
+        if re.fullmatch(r"\d+(?:,\d*){10,},?", line):
+            values = [value.strip() for value in line.rstrip(",").split(",")]
+            columns = current.get("frame_stats_columns")
+            if not isinstance(columns, list) or len(columns) != len(values):
+                legacy_columns = [
+                    "Flags",
+                    "IntendedVsync",
+                    "Vsync",
+                    "OldestInputEvent",
+                    "NewestInputEvent",
+                    "HandleInputStart",
+                    "AnimationStart",
+                    "PerformTraversalsStart",
+                    "DrawStart",
+                    "SyncQueued",
+                    "SyncStart",
+                    "IssueDrawCommandsStart",
+                    "SwapBuffers",
+                    "FrameCompleted",
+                    "DequeueBufferDuration",
+                    "QueueBufferDuration",
+                    "GpuCompleted",
+                ]
+                timeline_columns = [
+                    "Flags",
+                    "FrameTimelineVsyncId",
+                    "IntendedVsync",
+                    "Vsync",
+                    "InputEventId",
+                    "HandleInputStart",
+                    "AnimationStart",
+                    "PerformTraversalsStart",
+                    "DrawStart",
+                    "FrameDeadline",
+                    "FrameStartTime",
+                    "SyncQueued",
+                    "SyncStart",
+                    "IssueDrawCommandsStart",
+                    "SwapBuffers",
+                    "FrameCompleted",
+                    "DequeueBufferDuration",
+                    "QueueBufferDuration",
+                    "GpuCompleted",
+                    "SwapBuffersCompleted",
+                    "DisplayPresentTime",
+                    "CommandSubmissionCompleted",
+                ]
+                if len(values) == len(legacy_columns):
+                    columns = legacy_columns
+                elif len(values) == len(timeline_columns):
+                    columns = timeline_columns
+                else:
+                    continue
+            record: Dict[str, object] = {}
+            invalid = False
+            for key, raw_value in zip(columns, values):
+                try:
+                    record[str(key)] = int(raw_value or "0")
+                except ValueError:
+                    invalid = True
+                    break
+            if invalid:
+                continue
+            records = current.setdefault("frame_records", [])
+            if isinstance(records, list):
+                records.append(record)
 
     candidates = [item for item in sections if isinstance(item.get("frame_counter_total"), int)]
     if not candidates:
@@ -748,6 +1113,7 @@ def build_sampler_script(
     interval_s: float,
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
+    memory_source: Optional[MemorySource] = None,
     voltage_period_s: float = 5.0,
     context_period_s: float = 10.0,
     refresh_period_s: float = 30.0,
@@ -848,6 +1214,14 @@ def build_sampler_script(
                     ]
                 )
 
+    if memory_source is not None:
+        body.extend(
+            [
+                f"mem_f=$(cat {memory_source.frequency_path} 2>/dev/null)",
+                "set -- $mem_f; mem_f=$1; [ -n \"$mem_f\" ] || mem_f=-1",
+            ]
+        )
+
     fields = ["$i", "$up", "$cur", "$volt", "$temp"]
     fields.extend(f"$g_{name}" for name in cpu_names)
     for core in core_ids:
@@ -857,6 +1231,8 @@ def build_sampler_script(
         fields.append("$gpu_f")
         if gpu_source.load_path:
             fields.append("$gpu_l")
+    if memory_source is not None:
+        fields.append("$mem_f")
     sample_format = "S|" + "|".join(["%s"] * len(fields)) + "\\n"
     sample_args = " ".join(f'\"{field}\"' for field in fields)
     body.append(f"printf '{sample_format}' {sample_args}")
@@ -882,6 +1258,7 @@ def parse_sampler_line(
     line: str,
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
+    memory_source: Optional[MemorySource] = None,
 ) -> RawSample | Sample | ContextSample | None:
     stripped = line.strip()
     if stripped.startswith("N|"):
@@ -923,6 +1300,11 @@ def parse_sampler_line(
                 gpu_load_pct=(
                     float(payload["gpu_load_pct"])
                     if isinstance(payload.get("gpu_load_pct"), (int, float))
+                    else None
+                ),
+                memory_frequency_mhz=(
+                    float(payload["memory_frequency_mhz"])
+                    if isinstance(payload.get("memory_frequency_mhz"), (int, float))
                     else None
                 ),
                 battery_temperature_c=(
@@ -985,6 +1367,8 @@ def parse_sampler_line(
     expected = 5 + 8 + len(core_ids) * 8 + len(policies)
     if gpu_source:
         expected += 1 + (1 if gpu_source.load_path else 0)
+    if memory_source is not None:
+        expected += 1
     if len(parts) != expected:
         return None
     try:
@@ -1004,11 +1388,15 @@ def parse_sampler_line(
         offset += 1
     gpu_frequency_raw = None
     gpu_load_raw = None
+    memory_frequency_raw = None
     if gpu_source:
         gpu_frequency_raw = values[offset] if values[offset] >= 0 else None
         offset += 1
         if gpu_source.load_path:
             gpu_load_raw = values[offset] if values[offset] >= 0 else None
+            offset += 1
+    if memory_source is not None:
+        memory_frequency_raw = values[offset] if values[offset] >= 0 else None
     return RawSample(
         index=int(values[0]),
         uptime_s=values[1],
@@ -1020,6 +1408,7 @@ def parse_sampler_line(
         frequencies_khz=frequencies,
         gpu_frequency_raw=gpu_frequency_raw,
         gpu_load_raw=gpu_load_raw,
+        memory_frequency_raw=memory_frequency_raw,
     )
 
 
@@ -1027,10 +1416,11 @@ def parse_raw_samples(
     text: str,
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
+    memory_source: Optional[MemorySource] = None,
 ) -> List[RawSample]:
     rows: List[RawSample] = []
     for line in text.splitlines():
-        parsed = parse_sampler_line(line, policies, gpu_source)
+        parsed = parse_sampler_line(line, policies, gpu_source, memory_source)
         if isinstance(parsed, RawSample):
             rows.append(parsed)
     return rows
@@ -1040,12 +1430,13 @@ def parse_normalized_samples(
     text: str,
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
+    memory_source: Optional[MemorySource] = None,
 ) -> List[Sample]:
     rows: List[Sample] = []
     base_uptime: Optional[float] = None
     last_uptime: Optional[float] = None
     for line in text.splitlines():
-        parsed = parse_sampler_line(line, policies, gpu_source)
+        parsed = parse_sampler_line(line, policies, gpu_source, memory_source)
         if not isinstance(parsed, Sample):
             continue
         if last_uptime is not None and parsed.uptime_s <= last_uptime:
@@ -1063,10 +1454,11 @@ def parse_context_samples(
     text: str,
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
+    memory_source: Optional[MemorySource] = None,
 ) -> List[ContextSample]:
     rows: List[ContextSample] = []
     for line in text.splitlines():
-        parsed = parse_sampler_line(line, policies, gpu_source)
+        parsed = parse_sampler_line(line, policies, gpu_source, memory_source)
         if isinstance(parsed, ContextSample):
             rows.append(parsed)
     return rows
@@ -1144,6 +1536,7 @@ _POWER_STATE_MARKER = "__APP_POWER_STATE__"
 _ANDROID_CONTEXT_MARKER = "__APP_ANDROID_CONTEXT__|"
 _ANDROID_DISPLAY_MARKER = "__APP_ANDROID_DISPLAY__"
 _ANDROID_SURFACE_MARKER = "__APP_ANDROID_SURFACE__"
+_ANDROID_WINDOW_MARKER = "__APP_ANDROID_WINDOW__"
 _ANDROID_GFXINFO_MARKER = "__APP_ANDROID_GFXINFO__"
 
 
@@ -1181,15 +1574,31 @@ def _timed_shell_output(
     )
 
 
-def _android_performance_context_script(include_surface_flinger: bool) -> str:
-    lines = [
-        "app_ctx_component=$(dumpsys activity activities 2>/dev/null | "
-        "awk '/mResumedActivity|topResumedActivity|mFocusedApp/ { for (n=1; n<=NF; n++) "
-        "if ($n ~ /\\//) { print $n; exit } }' | tr -d '},')",
-        "if [ -z \"$app_ctx_component\" ]; then app_ctx_component=$(dumpsys window windows 2>/dev/null | "
-        "awk '/mCurrentFocus|mFocusedApp/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) "
-        "{ print $n; exit } }' | tr -d '},'); fi",
-        "[ -n \"$app_ctx_component\" ] || app_ctx_component=unknown",
+def _android_performance_context_script(
+    include_surface_flinger: bool,
+    include_foreground: bool,
+    include_frame_rate: bool,
+    include_window: bool,
+    include_frame_details: bool,
+) -> str:
+    needs_component = include_foreground or include_window or include_frame_rate
+    lines = []
+    if needs_component:
+        lines.extend(
+            [
+                "app_ctx_component=$(dumpsys activity activities 2>/dev/null | "
+                "awk '/mResumedActivity|topResumedActivity|mFocusedApp/ { for (n=1; n<=NF; n++) "
+                "if ($n ~ /\\//) { print $n; exit } }' | tr -d '},')",
+                "if [ -z \"$app_ctx_component\" ]; then app_ctx_component=$(dumpsys window windows 2>/dev/null | "
+                "awk '/mCurrentFocus|mFocusedApp/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) "
+                "{ print $n; exit } }' | tr -d '},'); fi",
+                "[ -n \"$app_ctx_component\" ] || app_ctx_component=unknown",
+            ]
+        )
+    else:
+        lines.append("app_ctx_component=unknown")
+    lines.extend(
+        [
         "app_ctx_package=${app_ctx_component%%/*}",
         "app_ctx_screen=$(dumpsys power 2>/dev/null | "
         "awk -F= '/mWakefulnessRaw=/{print $2; exit} /mWakefulness=/{print $2; exit}')",
@@ -1204,21 +1613,38 @@ def _android_performance_context_script(include_surface_flinger: bool) -> str:
         "'mActiveRenderFrameRate[[:space:]]*=|mActiveSfDisplayMode[[:space:]]*=|"
         "DisplayMode\\{id=|supportedRefreshRates' | head -n 120",
         f"printf '{_ANDROID_SURFACE_MARKER}\\n'",
-    ]
-    if include_surface_flinger:
+        ]
+    )
+    if include_surface_flinger and include_frame_rate:
         lines.append(
             "dumpsys SurfaceFlinger 2>/dev/null | grep -E "
             "'^[[:space:]]*(ScreenOff:|[0-9]+([.][0-9]+)? Hz:|GLES:)'"
         )
-    lines.extend(
-        [
-            f"printf '{_ANDROID_GFXINFO_MARKER}\\n'",
+    lines.append(f"printf '{_ANDROID_WINDOW_MARKER}\\n'")
+    if include_window:
+        lines.append(
+            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "dumpsys window windows 2>/dev/null | awk -v pkg=\"$app_ctx_package\" "
+            "'/^[[:space:]]*Window #[0-9]+ Window\\{/ "
+            "{ capture=(index($0,pkg)>0); lines=0 } "
+            "capture && lines<80 { print; lines++ }'; fi"
+        )
+    lines.append(f"printf '{_ANDROID_GFXINFO_MARKER}\\n'")
+    if include_frame_rate and include_frame_details:
+        lines.append(
             "if [ \"$app_ctx_package\" != unknown ]; then "
             "dumpsys gfxinfo \"$app_ctx_package\" framestats 2>/dev/null | grep -E "
             "'^[[:space:]]*(Window:|Total frames rendered:|Janky frames:|"
-            "Number Missed Vsync:|Number Frame deadline missed:|HISTOGRAM:)' | head -n 120; fi",
-        ]
-    )
+            "Number Missed Vsync:|Number Frame deadline missed:|HISTOGRAM:|"
+            "Flags,|[0-9]+,)' | head -n 360; fi"
+        )
+    elif include_frame_rate:
+        lines.append(
+            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "dumpsys gfxinfo \"$app_ctx_package\" framestats 2>/dev/null | grep -E "
+            "'^[[:space:]]*(Window:|Total frames rendered:|Janky frames:|"
+            "Number Missed Vsync:|Number Frame deadline missed:|HISTOGRAM:)' | head -n 120; fi"
+        )
     return "\n".join(lines)
 
 
@@ -1226,12 +1652,22 @@ def collect_android_performance_context(
     adb: str,
     device: str,
     include_surface_flinger: bool = True,
+    include_foreground: bool = True,
+    include_frame_rate: bool = True,
+    include_window: bool = True,
+    include_frame_details: bool = False,
     cached_surface: Optional[Dict[str, object]] = None,
 ) -> Tuple[Optional[ContextSample], Dict[str, object], Optional[str]]:
     uptime_s, _, output, _, error = _timed_shell_output(
         adb,
         device,
-        _android_performance_context_script(include_surface_flinger),
+        _android_performance_context_script(
+            include_surface_flinger,
+            include_foreground,
+            include_frame_rate,
+            include_window,
+            include_frame_details,
+        ),
         timeout_s=25.0,
     )
     if uptime_s is None:
@@ -1240,6 +1676,7 @@ def collect_android_performance_context(
     sections: Dict[str, List[str]] = {
         _ANDROID_DISPLAY_MARKER: [],
         _ANDROID_SURFACE_MARKER: [],
+        _ANDROID_WINDOW_MARKER: [],
         _ANDROID_GFXINFO_MARKER: [],
     }
     current_section: Optional[str] = None
@@ -1286,14 +1723,21 @@ def collect_android_performance_context(
     performance: Dict[str, object] = dict(cached_surface or {})
     performance.update(surface_update)
     performance.update(display)
+    performance.update(
+        parse_android_window_performance(
+            "\n".join(sections[_ANDROID_WINDOW_MARKER]),
+            foreground_package,
+            foreground_activity,
+        )
+    )
     gfxinfo = parse_android_gfxinfo(
         "\n".join(sections[_ANDROID_GFXINFO_MARKER]),
         foreground_package,
         foreground_activity,
     )
     performance.update(gfxinfo)
-    performance["frame_data_available"] = bool(gfxinfo)
-    if not gfxinfo:
+    performance["frame_data_available"] = bool(gfxinfo) if include_frame_rate else False
+    if include_frame_rate and not gfxinfo:
         performance["frame_unavailable_reason"] = (
             "屏幕未处于亮屏交互状态，Android gfxinfo 未提供前台窗口帧计数。"
             if screen.lower() not in {"awake", "on"}
@@ -1323,7 +1767,17 @@ def collect_android_performance_context(
 def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     display_result = adb_shell(adb, device, ["dumpsys", "display"], timeout_s=30)
     surface_result = adb_shell(adb, device, ["dumpsys", "SurfaceFlinger"], timeout_s=30)
+    window_result = adb_shell(adb, device, ["dumpsys", "window", "windows"], timeout_s=30)
     touch_result = adb_shell(adb, device, ["getevent", "-lp"], timeout_s=20)
+    interpolation_result = adb_shell(
+        adb,
+        device,
+        "{ getprop; settings list system; settings list secure; settings list global; "
+        "} 2>/dev/null | grep -Ei "
+        "'memc|motion[_ .-]*(compensation|smoothing)|frame[_ .-]*interpolat|"
+        "video[_ .-]*(motion|enhance)|iris.*memc' | head -n 120",
+        timeout_s=35,
+    )
     brightness_result = adb_shell(
         adb,
         device,
@@ -1332,10 +1786,15 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     )
     display = parse_android_display_performance(display_result.stdout)
     surface = parse_android_surfaceflinger_performance(surface_result.stdout)
+    foreground = collect_foreground_package(adb, device)
+    window = parse_android_window_performance(window_result.stdout, foreground)
+    interpolation = parse_android_frame_interpolation(
+        interpolation_result.stdout + "\n" + surface_result.stdout
+    )
     touch = parse_android_touch_devices(touch_result.stdout)
-    performance: Dict[str, object] = {**display, **surface}
+    performance: Dict[str, object] = {**display, **surface, **window, **interpolation}
     performance["brightness_raw"] = first_number(brightness_result.stdout)
-    performance["foreground_window_name"] = collect_foreground_package(adb, device)
+    performance["foreground_window_name"] = foreground
     performance["touch_device_count"] = len(touch.get("devices", []))
     performance["touch_sampling_rate_available"] = False
     performance["touch_sampling_rate_reason"] = touch.get("sampling_rate_reason")
@@ -1343,6 +1802,7 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     for label, result in (
         ("display", display_result),
         ("SurfaceFlinger", surface_result),
+        ("window", window_result),
         ("input", touch_result),
     ):
         if not result.ok:
@@ -1357,6 +1817,10 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
             "display_modes": bool(display.get("supported_refresh_rates_hz")),
             "refresh_residency": bool(surface.get("refresh_rate_durations_s")),
             "gfxinfo_frame_counters": True,
+            "render_resolution": bool(window.get("render_width_px")),
+            "frame_interpolation_switch": bool(
+                interpolation.get("frame_interpolation_evidence")
+            ),
             "touch_devices": bool(touch.get("devices")),
             "touch_sampling_rate": False,
             "gpu_renderer": bool(surface.get("gpu_renderer")),
@@ -1577,13 +2041,21 @@ class AndroidPerformanceContextWorker:
         contexts: List[ContextSample],
         interval_s: float = 10.0,
         surface_interval_s: float = 30.0,
+        include_foreground: bool = True,
+        include_frame_rate: bool = True,
+        include_window: bool = True,
+        include_frame_details: bool = False,
     ) -> None:
         self.adb = adb
         self.device = device
         self.journal = journal
         self.contexts = contexts
-        self.interval_s = max(5.0, interval_s)
+        self.interval_s = max(1.0, interval_s)
         self.surface_interval_s = max(self.interval_s, surface_interval_s)
+        self.include_foreground = include_foreground
+        self.include_frame_rate = include_frame_rate
+        self.include_window = include_window
+        self.include_frame_details = include_frame_details
         self.warnings: List[str] = []
         self._warning_keys: set[str] = set()
         self._surface_state: Dict[str, object] = {}
@@ -1610,6 +2082,10 @@ class AndroidPerformanceContextWorker:
             self.adb,
             self.device,
             include_surface_flinger=include_surface_flinger,
+            include_foreground=self.include_foreground,
+            include_frame_rate=self.include_frame_rate,
+            include_window=self.include_window,
+            include_frame_details=self.include_frame_details,
             cached_surface=self._surface_state,
         )
         if surface_update:
@@ -1685,6 +2161,10 @@ class SystemMonitorWorker:
         thread_interval_s: float = 30.0,
         thermal_interval_s: float = 10.0,
         scheduler_interval_s: float = 30.0,
+        process_enabled: bool = True,
+        thread_enabled: bool = True,
+        thermal_enabled: bool = True,
+        scheduler_enabled: bool = True,
     ) -> None:
         self.adb = adb
         self.device = device
@@ -1693,6 +2173,10 @@ class SystemMonitorWorker:
         self.thread_interval_s = max(5.0, thread_interval_s)
         self.thermal_interval_s = max(2.0, thermal_interval_s)
         self.scheduler_interval_s = max(5.0, scheduler_interval_s)
+        self.process_enabled = process_enabled
+        self.thread_enabled = thread_enabled
+        self.thermal_enabled = thermal_enabled
+        self.scheduler_enabled = scheduler_enabled
         self.system_snapshot_count = 0
         self.thermal_snapshot_count = 0
         self.scheduler_snapshot_count = 0
@@ -1702,7 +2186,7 @@ class SystemMonitorWorker:
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
-            name="android-power-system-monitor",
+            name="mobile-profiler-system-monitor",
             daemon=True,
         )
 
@@ -1730,16 +2214,18 @@ class SystemMonitorWorker:
 
     def _run(self) -> None:
         now = time.monotonic()
-        next_process = now
-        next_thread = now
-        next_thermal = now
-        next_scheduler = now
+        next_process = now if self.process_enabled else math.inf
+        next_thread = now if self.thread_enabled else math.inf
+        next_thermal = now if self.thermal_enabled else math.inf
+        next_scheduler = now if self.scheduler_enabled else math.inf
         while not self._stop_event.is_set():
             now = time.monotonic()
             try:
-                if now >= next_process or now >= next_thread:
+                if (self.process_enabled and now >= next_process) or (
+                    self.thread_enabled and now >= next_thread
+                ):
                     process_due = now >= next_process
-                    include_threads = now >= next_thread
+                    include_threads = self.thread_enabled and now >= next_thread
                     snapshot, error = collect_system_snapshot(
                         self.adb,
                         self.device,
@@ -1752,17 +2238,21 @@ class SystemMonitorWorker:
                     if error:
                         self._warn_once("system", f"系统进程监控：{error}")
                     completed = time.monotonic()
-                    if process_due:
+                    if process_due and self.process_enabled:
                         next_process = self._advance_due(
                             next_process,
                             self.process_interval_s,
                             completed,
                         )
-                    if include_threads:
+                    if include_threads and self.thread_enabled:
                         next_thread = self._advance_due(next_thread, self.thread_interval_s, completed)
 
                 now = time.monotonic()
-                if now >= next_thermal and not self._stop_event.is_set():
+                if (
+                    self.thermal_enabled
+                    and now >= next_thermal
+                    and not self._stop_event.is_set()
+                ):
                     snapshot, error = collect_thermal_snapshot(self.adb, self.device)
                     if snapshot is not None:
                         self.journal.append_thermal_snapshot(snapshot)
@@ -1776,7 +2266,11 @@ class SystemMonitorWorker:
                     )
 
                 now = time.monotonic()
-                if now >= next_scheduler and not self._stop_event.is_set():
+                if (
+                    self.scheduler_enabled
+                    and now >= next_scheduler
+                    and not self._stop_event.is_set()
+                ):
                     include_pids: set[int] = set()
                     if self.latest_system is not None:
                         include_pids.update(
@@ -1881,6 +2375,7 @@ def collect_streaming_session(
     policies: Sequence[CpuPolicy],
     gpu_source: Optional[GpuSource],
     journal: RunJournal,
+    memory_source: Optional[MemorySource] = None,
     checkpoint_interval_s: float = 30.0,
     reconnect_timeout_s: float = 120.0,
     system_monitor_enabled: bool = False,
@@ -1891,6 +2386,14 @@ def collect_streaming_session(
     performance_context_enabled: bool = True,
     performance_context_interval_s: float = 10.0,
     performance_surface_interval_s: float = 30.0,
+    performance_foreground_enabled: bool = True,
+    performance_frame_rate_enabled: bool = True,
+    performance_window_enabled: bool = False,
+    performance_frame_details_enabled: bool = False,
+    process_snapshots_enabled: bool = True,
+    hot_threads_enabled: bool = True,
+    thermal_snapshots_enabled: bool = True,
+    scheduler_snapshots_enabled: bool = True,
 ) -> StreamCollectionResult:
     """Stream a wall-clock session while preserving every complete line on disk."""
 
@@ -1909,6 +2412,10 @@ def collect_streaming_session(
             result.contexts,
             interval_s=performance_context_interval_s,
             surface_interval_s=performance_surface_interval_s,
+            include_foreground=performance_foreground_enabled,
+            include_frame_rate=performance_frame_rate_enabled,
+            include_window=performance_window_enabled,
+            include_frame_details=performance_frame_details_enabled,
         )
         performance_monitor.start()
     if system_monitor_enabled:
@@ -1920,6 +2427,10 @@ def collect_streaming_session(
             thread_interval_s=thread_interval_s,
             thermal_interval_s=thermal_interval_s,
             scheduler_interval_s=scheduler_interval_s,
+            process_enabled=process_snapshots_enabled,
+            thread_enabled=hot_threads_enabled,
+            thermal_enabled=thermal_snapshots_enabled,
+            scheduler_enabled=scheduler_snapshots_enabled,
         )
         monitor.start()
     journal.checkpoint(
@@ -1946,6 +2457,7 @@ def collect_streaming_session(
                 interval_s,
                 policies,
                 gpu_source,
+                memory_source,
                 emit_context_samples=not performance_context_enabled,
             )
             argv = adb_prefix(adb, device) + ["shell", script]
@@ -1991,7 +2503,12 @@ def collect_streaming_session(
                             journal.append_stderr_line(line)
                         else:
                             journal.append_sampler_line(line)
-                            parsed = parse_sampler_line(line, policies, gpu_source)
+                            parsed = parse_sampler_line(
+                                line,
+                                policies,
+                                gpu_source,
+                                memory_source,
+                            )
                             if isinstance(parsed, RawSample):
                                 if result.raw_samples and parsed.uptime_s < (
                                     result.raw_samples[-1].uptime_s - 1.0
@@ -2109,28 +2626,53 @@ def collect_text(
     return (result.stdout + "\n" + result.stderr).strip()
 
 
-def collect_post_run_outputs(adb: str, device: str) -> Dict[str, str]:
+def collect_post_run_outputs(
+    adb: str,
+    device: str,
+    test_mode: str = "power",
+    capture_features: Optional[Dict[str, bool]] = None,
+) -> Dict[str, str]:
+    features = capture_features or {}
+
+    def enabled(name: str, default: bool = True) -> bool:
+        return bool(features.get(name, default))
+
     outputs: Dict[str, str] = {}
     commands: List[Tuple[str, List[str], float]] = [
         ("battery_end", ["dumpsys", "battery"], 15),
-        ("gpu_end", ["dumpsys", "gpu"], 45),
-        ("batterystats_usage", ["dumpsys", "batterystats", "--usage"], 60),
-        ("batterystats_checkin", ["dumpsys", "batterystats", "-c"], 60),
-        ("batterystats", ["dumpsys", "batterystats"], 90),
-        ("batterystats_wakeups", ["dumpsys", "batterystats", "--wakeups"], 45),
-        ("power_profile", ["dumpsys", "batterystats", "--power-profile"], 45),
-        ("cpuinfo", ["dumpsys", "cpuinfo"], 45),
-        ("thermalservice", ["dumpsys", "thermalservice"], 30),
-        ("display", ["dumpsys", "display"], 45),
-        ("power", ["dumpsys", "power"], 30),
-        ("packages", ["cmd", "package", "list", "packages", "-U"], 30),
     ]
+    if enabled("target_process") or enabled("process_snapshots"):
+        commands.append(("cpuinfo", ["dumpsys", "cpuinfo"], 45))
+    if enabled("thermal"):
+        commands.append(("thermalservice", ["dumpsys", "thermalservice"], 30))
+    if enabled("foreground_window") or enabled("frame_rate"):
+        commands.extend(
+            [
+                ("display", ["dumpsys", "display"], 45),
+                ("power", ["dumpsys", "power"], 30),
+            ]
+        )
+    if test_mode == "power" and enabled("power_attribution"):
+        commands.extend(
+            [
+                ("batterystats_usage", ["dumpsys", "batterystats", "--usage"], 60),
+                *(([("gpu_end", ["dumpsys", "gpu"], 45)]) if enabled("gpu_metrics") else []),
+                ("batterystats_checkin", ["dumpsys", "batterystats", "-c"], 60),
+                ("batterystats", ["dumpsys", "batterystats"], 90),
+                ("batterystats_wakeups", ["dumpsys", "batterystats", "--wakeups"], 45),
+                ("power_profile", ["dumpsys", "batterystats", "--power-profile"], 45),
+                ("packages", ["cmd", "package", "list", "packages", "-U"], 30),
+            ]
+        )
     for key, args, timeout_s in commands:
         outputs[key] = collect_text(adb, device, args, timeout_s=timeout_s)
-    outputs["screen_brightness"] = collect_text(
-        adb, device, ["settings", "get", "system", "screen_brightness"], timeout_s=10
-    ).strip()
-    outputs["peak_refresh_rate"] = collect_text(
-        adb, device, ["settings", "get", "system", "peak_refresh_rate"], timeout_s=10
-    ).strip()
+    if enabled("foreground_window") or enabled("frame_rate"):
+        outputs["screen_brightness"] = collect_text(
+            adb, device, ["settings", "get", "system", "screen_brightness"], timeout_s=10
+        ).strip()
+        outputs["peak_refresh_rate"] = collect_text(
+            adb, device, ["settings", "get", "system", "peak_refresh_rate"], timeout_s=10
+        ).strip()
+    if enabled("runtime_settings"):
+        outputs["runtime_settings_end"] = collect_android_runtime_settings_text(adb, device)
     return outputs

@@ -1,8 +1,8 @@
-# Mobile Power Profiler
+# Mobile Profiler
 
-中文文档：[Mobile Power Profiler 使用指南（含 BTR2 联动）](docs/usage-zh.md)
+中文文档：[Mobile Profiler 使用指南（含 BTR2 联动）](docs/usage-zh.md)
 
-A standalone mobile battery and resource profiler for long, multi-application
+A standalone mobile power and performance profiler for long, multi-application
 test sessions across Android, HarmonyOS, and iOS. Android uses ADB, native
 HarmonyOS uses DevEco Studio's HDC, and both run inside the standard-library
 core collector. iOS support is implemented through an optional, separately
@@ -71,8 +71,11 @@ toolchains directory. The executable can also be supplied with global
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .
-mobile-power-profiler --help
+mobile-profiler --help
 ```
+
+`mobile-profiler` is the primary command. The former `mobile-power-profiler`
+entry remains available as a compatibility alias for existing scripts.
 
 The Android/HarmonyOS core profiler has no Python runtime dependency outside
 the standard library. iOS uses a separate Python environment described below.
@@ -113,7 +116,7 @@ archiving, and comparison, then return to the source computer for a new ZIP.
 Launch the local dashboard and let it open in the default browser:
 
 ```powershell
-mobile-power-profiler ui
+mobile-profiler ui
 ```
 
 On Windows, you can also double-click `start-ui.bat` in the repository root.
@@ -131,6 +134,54 @@ recovery, evidence ZIP creation with optional attachments, two-phone
 comparison, and source-only Windows portable packaging. These operations call
 the same existing CLI or evidence workflows, so UI and command-line artifacts
 stay identical.
+
+The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
+test profile. It filters the device picker and changes connection controls,
+field labels, supported capture switches, capability guidance, live metrics,
+and performance context before a device is started. Android uses ADB,
+BatteryStats, gfxinfo and SurfaceFlinger; iOS uses RemoteXPC, DVT sysmond and
+PowerTelemetry; HarmonyOS uses HDC, BatteryService, RenderService, SmartPerf and
+the optional power-shell 602 capability-ceiling mode. The server validates that
+the manually selected platform matches the selected device, so a visual switch
+cannot accidentally launch the wrong collector.
+
+The live page has two capture profiles. **Power** is the default low-overhead
+endurance view. **Performance** switches the primary UI to foreground FPS,
+frame-time-derived 1% Low, P99 frame time, jank/deadline misses, foreground
+window render bounds, explicit MEMC/frame-interpolation evidence, CPU/GPU
+allocation, cpusets, governors, ADPF sessions, and thermal state. Cadence ratios
+alone are never treated as proof of interpolation because Android cannot
+distinguish hardware MEMC from ordinary repeated frames through generic public
+interfaces.
+
+Performance tests require a concrete target game or application identifier.
+On Android, **Scan phone applications** queries launcher activities on the
+selected device, prioritizes third-party apps, supports package/activity search,
+and writes the selected package into the existing target field. A manual package
+entry remains available for devices that restrict launcher queries. Power mode
+keeps the target package optional. Its default duration remains 3720 seconds;
+Performance mode defaults to 1920 seconds, with both 30-minute and 32-minute
+quick choices for the usual game-test window.
+
+The profiles also change the analysis contract, not only the visible cards.
+**Power** explains battery-current and power movement through task load,
+scheduler state, display/wireless settings, CPU/GPU clocks, readable
+DRAM/DMC/MIF frequency, background activity, BatteryStats, UID, wakelock, and
+component evidence. It does not expand the frame-latency path. **Performance**
+explains slow frames through VSync start delay, UI traversal/draw,
+RenderThread submission, GPU completion, BufferQueue/SurfaceFlinger/HWC
+back-pressure, scheduling, and thermal limits. In that mode whole-device power
+is retained only as a curve and summary; component, UID, wakelock, foreground
+energy, and third-party task power attribution are deliberately disabled.
+
+Capture work can be reduced independently from the selected analysis mode.
+The UI provides Power standard, Performance standard, Low overhead, and
+Harmony SmartPerf presets, followed by per-feature switches for CPU/GPU/DDR,
+frame data, touch, process/thread snapshots, thermal, scheduler, settings, and
+power attribution. Disabling a feature skips its collector where the platform
+allows it, and the report records the effective configuration and expected
+observer overhead. Current, voltage, and device timestamps remain the common
+base channel.
 
 The top bar also accepts `IP:PORT` and runs `adb connect` directly. For a
 USB-authorized device, **Wireless ADB** reads the phone's Wi-Fi IPv4, runs
@@ -167,17 +218,17 @@ After `PHONE_IP:8710` is `Connected`, remove USB and verify BatteryService is
 discharging. Probe and record with the prefixed identifier:
 
 ```powershell
-mobile-power-profiler --hdc $hdc probe `
+mobile-profiler --hdc $hdc probe `
   --platform harmony --device harmony:PHONE_IP:8710 --json
 
-mobile-power-profiler --hdc $hdc record `
+mobile-profiler --hdc $hdc record `
   --platform harmony `
   --device harmony:PHONE_IP:8710 `
   --duration 120 `
   --interval 1 `
   --session-mode `
   --require-unplugged `
-  --output power-runs\harmony-smoke
+  --output profiler-runs\harmony-smoke
 ```
 
 HarmonyOS uses BatteryService current/voltage/temperature, persistent HDC
@@ -190,6 +241,24 @@ counts. The production interface does **not** expose the panel hardware touch
 sampling rate, so the report leaves it unavailable instead of inferring 240/300 Hz.
 Android BatteryStats, ActivityManager, ADPF, and `dumpsys gpu` are likewise not
 relabeled as HarmonyOS evidence.
+
+In Performance mode, the optional **Harmony SmartPerf capture** preset uses the
+device `SP_daemon` at its native approximately one-second cadence. When the
+device exposes it, this adds target-app FPS/frame jitter, target PID CPU/PSS,
+per-core CPU utilization/frequency, GPU utilization/frequency, DDR frequency,
+temperature, current, and voltage. It requires a foreground or explicit package
+name and is independent of the **Device high-performance mode** switch.
+
+The high-performance switch changes the device policy with
+`power-shell setmode 602`; it does not enable SmartPerf collection. It is off by
+default, is intended for measuring the device capability ceiling, and can
+materially increase battery drain and temperature. The recorder reads the
+original mode, applies 602, and restores the original mode after normal
+completion, manual stop, or an exception. The report records both application
+and restoration status. USB-connected runs are suitable for functional and
+frame-performance checks, but USB power invalidates formal whole-device current,
+power, and endurance conclusions; use wireless HDC and an unplugged device for
+those results.
 
 ## iOS wireless workflow
 
@@ -210,51 +279,53 @@ On the iPhone, enable Developer Mode, unlock it, connect USB, and trust the
 computer. Create RemotePairing once:
 
 ```powershell
-mobile-power-profiler --ios-python $iosPython ios-pair --json
+mobile-profiler --ios-python $iosPython ios-pair --json
 ```
 
 When the command reports a Wi-Fi endpoint, remove USB. Probe and record using
 the cached `ios:UDID` device identifier:
 
 ```powershell
-mobile-power-profiler --ios-python $iosPython probe `
+mobile-profiler --ios-python $iosPython probe `
   --platform ios --device ios:00008150-EXAMPLE --json
 
-mobile-power-profiler --ios-python $iosPython record `
+mobile-profiler --ios-python $iosPython record `
   --platform ios `
   --device ios:00008150-EXAMPLE `
   --duration 120 `
   --interval 1 `
   --session-mode `
   --require-unplugged `
-  --output power-runs\ios-smoke
+  --output profiler-runs\ios-smoke
 ```
 
 The RemotePairing record is stored by `pymobiledevice3`; the last working
-host/port is cached under `~/.mobile-power-profiler/ios-devices.json`. iOS
+host/port is cached under `~/.mobile-profiler/ios-devices.json`. Existing
+`.mobile-power-profiler` and `.android-power-profiler` caches are read during
+migration. iOS
 physical power commonly refreshes only about every 20 seconds even though DVT
 CPU/GPU/process counters update at 0.5-1 second cadence. The report retains
 `power_sample_age_s` and `collector_cpu_pct`, and never converts DVT
 `powerScore` into mW or mixes it with physical whole-device power.
 
-For long-lived test evidence, keep `power-runs` outside the versioned program
+For long-lived test evidence, keep `profiler-runs` outside the versioned program
 directory and pass it explicitly when starting either source or portable UI:
 
 ```powershell
-.\start-ui.bat --output-root D:\MobilePowerData\power-runs
+.\start-ui.bat --output-root D:\MobileProfilerData\profiler-runs
 ```
 
 Preview the complete interface with synthetic live telemetry and no phone:
 
 ```powershell
-mobile-power-profiler ui --demo
+mobile-profiler ui --demo
 ```
 
 Useful UI options:
 
 ```powershell
-mobile-power-profiler ui --port 8765 --output-root power-runs
-mobile-power-profiler ui --no-browser
+mobile-profiler ui --port 8765 --output-root profiler-runs
+mobile-profiler ui --no-browser
 ```
 
 The default bind address is `127.0.0.1`; the dashboard is local-only unless
@@ -266,14 +337,14 @@ Use Wi-Fi ADB so the USB charging cable can remain disconnected. Confirm the
 phone is not externally powered before trusting current and energy values.
 
 ```powershell
-mobile-power-profiler probe --device 192.168.21.179:5555
+mobile-profiler probe --device 192.168.21.179:5555
 
-mobile-power-profiler record `
+mobile-profiler record `
   --device 192.168.21.179:5555 `
   --duration 3720 `
   --session-mode `
   --require-unplugged `
-  --output power-runs\btr2-round-001 `
+  --output profiler-runs\btr2-round-001 `
   --title "BTR2 one-hour workflow"
 ```
 
@@ -286,8 +357,8 @@ remains the target.
 After the run, optionally align BTR2's timestamped text log:
 
 ```powershell
-mobile-power-profiler import-log `
-  power-runs\btr2-round-001 `
+mobile-profiler import-log `
+  profiler-runs\btr2-round-001 `
   C:\path\to\btr2.log `
   --rules examples\btr2-log-rules.json
 ```
@@ -313,7 +384,7 @@ clock synchronization point are written every 30 seconds by default and after
 reconnects.
 
 ```powershell
-mobile-power-profiler recover power-runs\btr2-round-001
+mobile-profiler recover profiler-runs\btr2-round-001
 ```
 
 Recovery needs only the run directory. It can finalize data after Ctrl+C,
@@ -324,13 +395,20 @@ integration rather than interpolated as if they were measured.
 ## Other commands
 
 ```powershell
-mobile-power-profiler probe --device SERIAL
-mobile-power-profiler report RUN_DIR
-mobile-power-profiler demo --output power-runs\demo
+mobile-profiler probe --device SERIAL
+mobile-profiler report RUN_DIR
+mobile-profiler demo --output profiler-runs\demo
 ```
 
 Useful recording options:
 
+- `--test-mode power|performance`: select the capture profile; `power` is the default.
+- `--performance-interval 2`: foreground display/window/gfxinfo cadence used by performance mode.
+- `--capture-preset auto|power-standard|performance-standard|low-overhead|harmony-smartperf`:
+  select a collector preset; SmartPerf is available only for HarmonyOS Performance mode.
+- `--enable-feature NAME` / `--disable-feature NAME`: repeatable per-feature overrides.
+- `--harmony-high-performance`: temporarily apply HarmonyOS
+  `power-shell setmode 602`; valid only in HarmonyOS Performance mode.
 - `--package PACKAGE`: retain a named target app for BatteryStats/UID analysis.
 - `--session-mode`: do not default to the starting foreground package.
 - `--interval 1`: current, CPU, and frequency sampling interval.
@@ -356,15 +434,15 @@ the subcommand.
 `attachments/btr2/` directory. Package the complete auditable run with hashes:
 
 ```powershell
-mobile-power-profiler archive RUN_DIR --attach EXTRA_LOG --output RUN-evidence.zip
+mobile-profiler archive RUN_DIR --attach EXTRA_LOG --output RUN-evidence.zip
 ```
 
 Compare two completed runs after importing their respective BTR2 logs:
 
 ```powershell
-mobile-power-profiler compare RUN_A RUN_B `
+mobile-profiler compare RUN_A RUN_B `
   --label-a "Phone A" --label-b "Phone B" `
-  --output power-runs\compare-a-vs-b
+  --output profiler-runs\compare-a-vs-b
 ```
 
 The comparison emits `comparison.json` and a Chinese `comparison.html`, pairing
@@ -400,6 +478,8 @@ For HarmonyOS, BatteryService and `/proc/stat` use the selected sample interval;
 ThermalService snapshots use their configured monitor intervals. The foreground
 context cadence (5–10 seconds) also samples RenderService screen/fpsCount/recent
 composer timestamps, WindowManager focus, and MultimodalInput delivered events.
+The Harmony SmartPerf preset instead follows `SP_daemon`'s fixed approximately
+one-second output cadence for its enabled native metrics.
 All HarmonyOS rows use the device realtime epoch because production HDC shells
 may deny `/proc/uptime`.
 
@@ -443,8 +523,10 @@ report remains responsive while preserving the original data files.
 | Total battery power | Positive discharge-current magnitude multiplied by battery voltage |
 | CPU load/frequency | Kernel counters sampled per core and cpufreq policy |
 | CPU frequency impact | Android Power Profile estimate for same-device comparison |
-| GPU frequency/load | OEM kernel counter only when readable to the ADB shell |
+| GPU frequency/load | Android OEM kernel counter when readable; HarmonyOS SmartPerf can expose SP_daemon GPU frequency/load, while the platform-native Harmony path may expose only renderer identity |
 | GPU UID work | Driver activity duration, not electrical energy |
+| Harmony SmartPerf FPS/frame jitter | Target-app `SP_daemon` samples at an approximately one-second cadence; not a display-controller hardware counter |
+| Harmony high-performance mode | A device policy change to mode 602 for capability-ceiling testing, not a measurement source; compare it with a separate normal-mode run |
 | Process/thread CPU | Periodic whole-system snapshots, not a continuous scheduler trace |
 | Refresh-rate residency | RenderService `fpsCount` delta, converted to approximate time by count/rate |
 | Sampled compositor FPS/frame pacing | Periodic recent RenderService submissions; not app-internal render-loop FPS |

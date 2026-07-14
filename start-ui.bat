@@ -2,7 +2,7 @@
 setlocal
 
 cd /d "%~dp0"
-title Mobile Power Profiler UI
+title Mobile Profiler UI
 
 if exist ".venv\Scripts\python.exe" (
     set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
@@ -24,7 +24,7 @@ set "IOS_PYTHON_EXE="
 if defined IOS_PYTHON if exist "%IOS_PYTHON%" set "IOS_PYTHON_EXE=%IOS_PYTHON%"
 if not defined IOS_PYTHON_EXE if exist ".venv-ios\Scripts\python.exe" set "IOS_PYTHON_EXE=%CD%\.venv-ios\Scripts\python.exe"
 
-echo Starting Mobile Power Profiler UI...
+echo Starting Mobile Profiler UI...
 echo Dashboard port: automatically select an available local port.
 if defined IOS_PYTHON_EXE echo iOS sidecar runtime: %IOS_PYTHON_EXE%
 echo.

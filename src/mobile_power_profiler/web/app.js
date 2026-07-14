@@ -5,15 +5,124 @@
   const $$ = selector => Array.from(document.querySelectorAll(selector));
   const svgNs = "http://www.w3.org/2000/svg";
 
+  const storageMigrations = [
+    ["mobile-profiler-platform", "mobile-power-platform"],
+    ["mobile-profiler-import-log-path", "android-power-import-log-path"],
+    ["mobile-profiler-import-rules-path", "android-power-import-rules-path"],
+    ["mobile-profiler-import-match", "android-power-import-match"],
+    ["mobile-profiler-archive-attachments", "android-power-archive-attachments"],
+    ["mobile-profiler-archive-output", "android-power-archive-output"],
+    ["mobile-profiler-portable-output", "android-power-portable-output"],
+  ];
+  ["android", "ios", "harmony"].forEach(platform => {
+    storageMigrations.push([
+      `mobile-profiler-address-${platform}`,
+      `mobile-power-address-${platform}`,
+      ...(platform === "android" ? ["android-power-adb-address"] : []),
+    ]);
+    storageMigrations.push([
+      `mobile-profiler-device-${platform}`,
+      `mobile-power-device-${platform}`,
+      ...(platform === "android" ? ["android-power-device"] : []),
+    ]);
+  });
+  storageMigrations.forEach(([currentKey, ...legacyKeys]) => {
+    if (localStorage.getItem(currentKey) !== null) return;
+    const legacyValue = legacyKeys.map(key => localStorage.getItem(key)).find(value => value !== null);
+    if (legacyValue !== undefined) localStorage.setItem(currentKey, legacyValue);
+  });
+  const storedPlatform = localStorage.getItem("mobile-profiler-platform");
+
   const app = {
     state: null,
     metric: "power_mw",
+    testMode: "power",
+    platform: ["android", "ios", "harmony"].includes(storedPlatform)
+      ? storedPlatform
+      : "android",
     polling: false,
     activeView: location.hash.replace("#", "") || "live",
     consoleClearedAt: 0,
     currentRunName: null,
     chartGeometry: null,
     notifiedWarnings: new Set(),
+    scannedApps: [],
+    scannedAppsDevice: "",
+    scannedAppsSource: "",
+    selectedScannedPackage: "",
+  };
+
+  const platformProfiles = {
+    android: {
+      title: "Android 平台",
+      description: "ADB、BatteryStats、gfxinfo、SurfaceFlinger 与 Android 调度接口",
+      deviceKicker: "ANDROID DEVICE",
+      addressLabel: "ADB IP",
+      addressPlaceholder: "192.168.1.20:5555",
+      connectLabel: "连接 ADB",
+      packageLabel: "重点应用包名",
+      packagePlaceholder: "com.example.app",
+      desktopLabel: "桌面 / Launcher",
+      schedulerLabel: "调度上下文",
+      performanceIntervalHint: "读取前台窗口 gfxinfo；更低周期会增加测试工具开销。",
+      probeTitle: "Android 设备能力检查",
+      probeDescription: "确认电池供电、电流传感器、CPU policy、GPU 节点、gfxinfo 与 SurfaceFlinger 能力。",
+      probePlaceholder: "选择在线 Android 设备后运行 Probe。该操作只读，不会开始采集或重置 BatteryStats。",
+      powerDescription: "以电流功率为主，解释任务负载、调度、频率与 Android 设置为何影响续航。",
+      performanceDescription: "以 FPS、1% Low、gfxinfo 帧时间戳、SurfaceFlinger、调度与热限制为主。",
+      powerNote: "建议先运行 Probe，确认 powered 为空、BatteryStats 和电流命令可用。",
+      performanceNote: "性能模式会提高 gfxinfo、进程和调度快照频率；建议关闭录屏、悬浮窗与其他调试工具。",
+    },
+    ios: {
+      title: "iOS 平台",
+      description: "RemoteXPC、DVT sysmond、PowerTelemetry 与事件驱动的前台应用状态",
+      deviceKicker: "IOS DEVICE",
+      addressLabel: "RemoteXPC",
+      addressPlaceholder: "使用 USB 信任与无线配对",
+      connectLabel: "创建配对",
+      packageLabel: "目标 Bundle ID",
+      packagePlaceholder: "com.example.iosapp",
+      desktopLabel: "主屏幕 / Home Screen",
+      schedulerLabel: "DVT 资源上下文",
+      performanceIntervalHint: "iOS 性能数据跟随 DVT 主采样周期，不单独轮询帧窗口。",
+      probeTitle: "iOS 设备能力检查",
+      probeDescription: "确认 RemoteXPC、PowerTelemetry、DVT CPU/GPU/进程数据和无线端点状态。",
+      probePlaceholder: "选择已信任或已完成 RemotePairing 的 iPhone 后运行 Probe；不会修改设备设置。",
+      powerDescription: "以物理整机功耗、电流和温度为主，并记录 DVT 进程资源与观察者开销。",
+      performanceDescription: "聚焦 DVT CPU/GPU、目标进程、系统负载与观察者开销；当前不提供通用应用 FPS。",
+      powerNote: "正式物理功耗测试需完成 RemotePairing 后拔掉 USB；PowerTelemetry 通常约 20 秒更新一次。",
+      performanceNote: "iOS 性能模式记录 DVT CPU/GPU/进程资源和整机功耗，不把 powerScore 当作物理功耗。",
+    },
+    harmony: {
+      title: "HarmonyOS 平台",
+      description: "HDC、BatteryService、RenderService、SmartPerf 与 power-shell 设备策略",
+      deviceKicker: "HARMONYOS DEVICE",
+      addressLabel: "HDC IP",
+      addressPlaceholder: "192.168.1.20:8710",
+      connectLabel: "连接 HDC",
+      packageLabel: "重点应用包名",
+      packagePlaceholder: "com.example.harmonyapp",
+      desktopLabel: "桌面 / Launcher",
+      schedulerLabel: "CPU / 调度上下文",
+      performanceIntervalHint: "读取 RenderService/前台窗口；SmartPerf 使用设备原生约 1 秒节奏。",
+      probeTitle: "HarmonyOS 设备能力检查",
+      probeDescription: "确认 BatteryService、CPU/GPU/DDR、RenderService、SmartPerf 和 power-shell 能力。",
+      probePlaceholder: "选择在线 HarmonyOS HDC 设备后运行 Probe；该操作只读，不会切换高性能模式。",
+      powerDescription: "以 BatteryService 电流功率为主，解释 CPU/GPU/DDR、任务负载与系统状态。",
+      performanceDescription: "以 SmartPerf/RenderService 帧表现、CPU/GPU/DDR、调度、热限制和 602 能力上限为主。",
+      powerNote: "正式功耗测试请使用无线 HDC 并拔掉 USB，确认 BatteryService 处于放电状态。",
+      performanceNote: "SmartPerf 采集与设备 602 高性能模式相互独立；能力上限测试会明显增加功耗和温度。",
+    },
+  };
+
+  const platformUnavailableFeatures = {
+    android: new Set(["harmony_hitches"]),
+    harmony: new Set(["hot_threads", "runtime_settings", "power_attribution"]),
+    ios: new Set([
+      "cpu_frequency", "memory_frequency", "frame_rate", "frame_details",
+      "harmony_hitches", "touch_events", "hot_threads", "scheduler",
+      "runtime_settings", "power_attribution",
+    ]),
   };
 
   const metricDefinitions = {
@@ -41,6 +150,14 @@
       unit: "%",
       digits: 1,
     },
+    memory_frequency_mhz: {
+      title: "内存 / DMC 频率",
+      legend: "Memory frequency",
+      color: "#f1d267",
+      value: point => finite(point.memory_frequency_mhz) ? Number(point.memory_frequency_mhz) : null,
+      unit: "MHz",
+      digits: 0,
+    },
     temperature_c: {
       title: "电池温度",
       legend: "Battery temperature",
@@ -56,6 +173,44 @@
       value: point => finite(point.voltage_mv) ? Number(point.voltage_mv) / 1000 : null,
       unit: "V",
       digits: 3,
+    },
+    frame_rate_fps: {
+      title: "实时帧率",
+      legend: "Foreground frame rate",
+      color: "#4bc6e8",
+      value: point => finite(point.frame_rate_fps) ? Number(point.frame_rate_fps) : null,
+      unit: "FPS",
+      digits: 1,
+      series: "performance",
+      secondaryLabel: "1% LOW",
+      secondaryQuantile: .01,
+    },
+    frame_time_ms: {
+      title: "帧耗时 P95",
+      legend: "Frame time",
+      color: "#9e8cff",
+      value: point => finite(point.frame_time_p95_ms) ? Number(point.frame_time_p95_ms) : finite(point.frame_time_average_ms) ? Number(point.frame_time_average_ms) : null,
+      unit: "ms",
+      digits: 2,
+      series: "performance",
+      secondaryLabel: "P99",
+      secondaryQuantile: .99,
+    },
+    gpu_load_pct: {
+      title: "GPU 负载",
+      legend: "GPU utilization",
+      color: "#35d49a",
+      value: point => finite(point.gpu_load_pct) ? Number(point.gpu_load_pct) : null,
+      unit: "%",
+      digits: 1,
+    },
+    gpu_frequency_mhz: {
+      title: "GPU 频率",
+      legend: "GPU frequency",
+      color: "#ffb45c",
+      value: point => finite(point.gpu_frequency_mhz) ? Number(point.gpu_frequency_mhz) : null,
+      unit: "MHz",
+      digits: 0,
     },
   };
 
@@ -131,11 +286,178 @@
     return `${bytes.toFixed(0)} B`;
   }
 
+  function selectedPlatform() {
+    return app.platform || "android";
+  }
+
+  function applyPlatformVisibility() {
+    $$('[data-platforms]').forEach(element => {
+      const platforms = String(element.dataset.platforms || "").split(/\s+/).filter(Boolean);
+      element.classList.toggle("hidden", !platforms.includes(selectedPlatform()));
+    });
+  }
+
+  function updatePlatformCounts(devices = app.state?.devices || []) {
+    ["android", "ios", "harmony"].forEach(platform => {
+      const count = Array.isArray(devices)
+        ? devices.filter(device => devicePlatform(device) === platform && device.state === "device").length
+        : 0;
+      const target = $(`#platform-count-${platform}`);
+      if (target) target.textContent = String(count);
+    });
+  }
+
+  function updatePlatformPresentation() {
+    const platform = selectedPlatform();
+    const profile = platformProfiles[platform];
+    document.body.dataset.platform = platform;
+    $("#platform-title").textContent = profile.title;
+    $("#platform-description").textContent = profile.description;
+    $("#device-picker-kicker").textContent = profile.deviceKicker;
+    $("#device-select").setAttribute("aria-label", `${platformLabel(platform)} 设备`);
+    $("#connection-address-label").textContent = profile.addressLabel;
+    $("#adb-address-input").placeholder = profile.addressPlaceholder;
+    $("#connect-address").textContent = profile.connectLabel;
+    const performance = app.testMode === "performance";
+    const targetLabel = performance
+      ? platform === "ios" ? "目标游戏 Bundle ID" : "目标游戏 / 应用包名"
+      : profile.packageLabel;
+    $("#package-input-label").innerHTML = `${targetLabel} <span>${performance ? "必填" : "可选"}</span>`;
+    $("#package-input").placeholder = profile.packagePlaceholder;
+    $("#package-input").setAttribute("aria-required", performance ? "true" : "false");
+    $("#package-input-hint").textContent = performance
+      ? platform === "android"
+        ? "从上方扫描结果选择后会自动填写；扫描失败时也可手工输入包名。"
+        : `性能测试必须填写目标${platform === "ios" ? "游戏 Bundle ID" : "游戏 / 应用包名"}。`
+      : "功耗测试可留空；填写后会保留目标应用的资源与归因上下文。";
+    $("#start-context-input").querySelector('option[value="desktop"]').textContent = profile.desktopLabel;
+    $("#scheduler-interval-label").textContent = profile.schedulerLabel;
+    $("#performance-interval-hint").textContent = profile.performanceIntervalHint;
+    $("#probe-view-title").textContent = profile.probeTitle;
+    $("#probe-view-description").textContent = profile.probeDescription;
+    $("#probe-placeholder-copy").textContent = profile.probePlaceholder;
+    $("#power-mode-subtitle").textContent = platform === "ios"
+      ? "PowerTelemetry / 电流"
+      : platform === "harmony" ? "BatteryService / 电流" : "默认 · 电流 / 功率";
+    $("#performance-mode-subtitle").textContent = platform === "ios"
+      ? "CPU / GPU / 进程"
+      : platform === "harmony" ? "SmartPerf / 1% Low / 602" : "FPS / 1% Low / 调度";
+    const ios = platform === "ios";
+    const harmony = platform === "harmony";
+    $("#metric-fps-label").textContent = ios ? "CPU 总负载" : "实时帧率";
+    $("#metric-fps-tag").textContent = ios ? "CPU" : "FPS";
+    $("#metric-one-low-label").textContent = ios ? "GPU 利用率" : "1% Low";
+    $("#metric-one-low-tag").textContent = ios ? "GPU" : "LOW";
+    $("#metric-frame-p99-label").textContent = ios ? "采集器开销" : "P99 帧耗时";
+    $("#metric-frame-p99-tag").textContent = ios ? "OVERHEAD" : "FRAME";
+    $("#metric-frame-issue-label").textContent = ios ? "整机功耗" : "异常帧";
+    $("#metric-frame-issue-tag").textContent = ios ? "POWER" : "JANK";
+    $("#metric-render-resolution-label").textContent = ios ? "前台应用" : "渲染分辨率";
+    $("#metric-render-resolution-tag").textContent = ios ? "APP" : "RENDER";
+    $("#metric-interpolation-label").textContent = ios ? "电池温度" : "插帧状态";
+    $("#metric-interpolation-tag").textContent = ios ? "THERMAL" : "MEMC";
+    $("#metric-memory-label").textContent = ios ? "采集器开销" : "内存频率";
+    $("#metric-memory-tag").textContent = ios ? "OVERHEAD" : "DMC";
+
+    $("#cluster-panel-title").textContent = ios
+      ? "DVT 进程 CPU"
+      : app.testMode === "performance" ? "CPU 调度分配" : "集群状态";
+    $("#cluster-panel-source").textContent = ios
+      ? "DVT sysmond"
+      : app.testMode === "performance" ? "load / frequency / topology" : "kernel counters";
+    $("#resource-panel-kicker").textContent = ios ? "DVT RESOURCE TELEMETRY" : harmony ? "HARMONY RESOURCE TELEMETRY" : "RESOURCE SCHEDULING";
+    $("#resource-panel-title").textContent = ios ? "iOS 性能资源" : harmony ? "HarmonyOS 资源调度" : "资源调度分配";
+    $("#resource-window-label").textContent = ios ? "前台应用" : "前台窗口";
+    $("#performance-evidence-label-1").textContent = ios ? "性能数据源" : "帧率来源";
+    $("#performance-evidence-label-2").textContent = ios ? "整机功耗来源" : "渲染尺寸来源";
+    $("#performance-evidence-label-3").textContent = ios ? "观察者开销" : "插帧判定";
+
+    $("#performance-view-kicker").textContent = ios ? "IOS DVT PERFORMANCE CONTEXT" : harmony ? "HARMONY FRAME PERFORMANCE" : "FRAME PERFORMANCE CONTEXT";
+    $("#performance-view-title").textContent = ios ? "iOS 资源与系统负载" : harmony ? "HarmonyOS 帧表现与资源调度" : "帧表现与资源调度";
+    $("#performance-view-description").textContent = ios
+      ? "围绕 DVT CPU/GPU、目标进程、物理整机功耗、温度和采集器开销分析性能。"
+      : harmony
+        ? "围绕 SmartPerf/RenderService 帧节奏、1% Low、CPU/GPU/DDR、调度、热限制和 602 能力上限分析性能。"
+        : "围绕刷新率、1% Low、帧延迟、渲染链路、CPU/GPU/内存资源、调度和热限制分析游戏性能。";
+    const statLabels = ios
+      ? ["CPU LOAD", "GPU LOAD", "SYSTEM LOAD", "OBSERVER CPU"]
+      : ["REFRESH RATE", "FRAME RATE", "FRAME P95", "TOUCHES"];
+    statLabels.forEach((label, index) => { $(`#performance-stat-label-${index + 1}`).textContent = label; });
+    $("#performance-list-kicker").textContent = ios ? "DVT RESOURCE SUMMARY" : "REFRESH RESIDENCY";
+    $("#performance-list-title").textContent = ios ? "资源采样摘要" : "刷新档位驻留";
+    $("#performance-switch-label").textContent = ios ? "前台状态" : "刷新切换";
+    $("#performance-frame-count-label").textContent = ios ? "进程快照" : "采样帧数";
+    $("#performance-window-label").textContent = ios ? "前台应用" : "前台窗口";
+    $("#performance-display-label").textContent = ios ? "显示参数" : "分辨率 / 亮度";
+    $("#interference-table-kicker").textContent = ios ? "BACKGROUND RESOURCE WATCH" : harmony ? "HARMONY RESOURCE INTERFERENCE" : "SCHEDULING INTERFERENCE";
+    $("#interference-table-title").textContent = ios ? "后台资源异常" : harmony ? "资源竞争异常" : "调度竞争异常";
+    $("#performance-observability-note").innerHTML = ios
+      ? "<strong>边界：</strong>iOS 当前页面展示 DVT 诊断遥测和 PowerTelemetry 整机物理功耗，不提供通用应用 FPS、Core Animation 详细帧时间戳或 Android 调度接口。"
+      : harmony
+        ? "<strong>边界：</strong>HarmonyOS 使用 SmartPerf/RenderService 的应用帧抖动与合成节奏；量产 HDC 不提供 Android gfxinfo 的逐阶段 framestats，整机功耗只记录趋势和汇总。"
+        : "<strong>边界：</strong>帧率与帧耗时来自平台公开的合成器或前台窗口统计；详细 framestats 用于分析 UI / RenderThread 到 BufferQueue 的延迟。整机功耗只记录趋势和汇总，不拆分第三方任务、UID 或组件来源。";
+    $("#power-pressure-kicker").textContent = ios ? "IOS POWER OBSERVABILITY" : harmony ? "HARMONY POWER PRESSURE" : "POWER PRESSURE";
+    $("#power-pressure-title").textContent = ios ? "iOS 功耗与观察者开销" : harmony ? "HarmonyOS 功耗压力解释" : "功耗压力解释";
+    $("#power-pressure-source").textContent = ios ? "PowerTelemetry / DVT / observer" : harmony ? "CPU / GPU / DDR / 进程 / 系统状态" : "负载 / 频率 / 设置与整机功率";
+    $("#power-pressure-driver-title").textContent = ios ? "物理功耗" : "资源驱动";
+    $("#power-pressure-task-title").textContent = ios ? "进程资源" : "任务负载";
+    $("#power-pressure-setting-title").textContent = ios ? "采集器影响" : harmony ? "系统状态" : "设置参数";
+    $("#power-pressure-note").innerHTML = ios
+      ? "<strong>边界：</strong>PowerTelemetry SystemLoad 是整机物理功耗；DVT powerScore 仅为相对诊断分数，collector_cpu_pct 用于记录工具自身开销。"
+      : harmony
+        ? "<strong>边界：</strong>BatteryService 电流是整机电池侧数据；CPU/GPU/DDR 与进程相关性用于解释趋势，不等于独立电源轨或 Android BatteryStats 归因。"
+        : "<strong>边界：</strong>相关系数用于解释电流 / 功率和资源压力是否同步变化，不代表独立硬件电源轨，也不能把多个压力项直接相加。";
+    applyPlatformVisibility();
+  }
+
+  function setPlatform(platform, { fromRun = false, initial = false } = {}) {
+    const nextPlatform = ["android", "ios", "harmony"].includes(platform) ? platform : "android";
+    const active = app.state?.active;
+    if (!fromRun && active?.running && nextPlatform !== activePlatform(active)) {
+      notify("测试进行中无法切换平台", "停止当前测试后再选择其他平台。", "error");
+      return;
+    }
+    const previousPlatform = app.platform;
+    app.platform = nextPlatform;
+    if (!fromRun) localStorage.setItem("mobile-profiler-platform", nextPlatform);
+    $$(".platform-switch [data-platform]").forEach(button => {
+      const selected = button.dataset.platform === nextPlatform;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-checked", selected ? "true" : "false");
+      button.disabled = Boolean(active?.running);
+    });
+    updatePlatformPresentation();
+    if (initial || previousPlatform !== nextPlatform) {
+      const savedAddress = localStorage.getItem(`mobile-profiler-address-${nextPlatform}`);
+      $("#adb-address-input").value = savedAddress || "";
+    }
+    if (!fromRun && previousPlatform !== nextPlatform) {
+      resetAppScanner({ clearPackage: true });
+      app.metric = app.testMode === "performance"
+        ? nextPlatform === "ios" ? "cpu_pct" : "frame_rate_fps"
+        : "power_mw";
+    }
+    if (nextPlatform !== "harmony" && $("#capture-preset-input")?.value === "harmony-smartperf") {
+      $("#capture-preset-input").value = "auto";
+    }
+    if (!fromRun && previousPlatform !== nextPlatform) applyCapturePreset();
+    else updateCaptureFeatureControls();
+    if (!initial && app.state) {
+      renderDevices(app.state);
+      renderProbe(app.state);
+      setTestMode(app.testMode, { initial: true });
+      renderPerformanceMetrics(app.state.active);
+      renderPerformanceResources(app.state.active);
+      renderSystem(app.state.active);
+      renderChart();
+    }
+  }
+
   function activePlatform(active) {
     const selected = Array.isArray(app.state?.devices)
       ? app.state.devices.find(device => device.serial === selectedDevice())
       : null;
-    return String(active?.platform || active?.metadata?.platform || selected?.platform || "android").toLowerCase();
+    return String(active?.platform || active?.metadata?.platform || selected?.platform || selectedPlatform()).toLowerCase();
   }
 
   function formatDuration(value) {
@@ -163,6 +485,227 @@
       minute: "2-digit",
       hour12: false,
     });
+  }
+
+  function syncDurationPreset() {
+    const duration = Number($("#duration-input")?.value);
+    $$('[data-duration]').forEach(button => {
+      button.classList.toggle("active", Number(button.dataset.duration) === duration);
+    });
+  }
+
+  const modeDefaults = {
+    power: {
+      "duration-input": 3720,
+      "interval-input": 1,
+      "process-interval-input": 10,
+      "thread-interval-input": 30,
+      "thermal-interval-input": 10,
+      "scheduler-interval-input": 30,
+    },
+    performance: {
+      "duration-input": 1920,
+      "interval-input": .5,
+      "process-interval-input": 2,
+      "thread-interval-input": 5,
+      "thermal-interval-input": 5,
+      "scheduler-interval-input": 5,
+    },
+  };
+
+  const captureFeatureNames = [
+    "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+    "foreground_window", "frame_rate", "frame_details", "harmony_hitches",
+    "touch_events", "target_process", "process_snapshots", "hot_threads",
+    "thermal", "scheduler", "runtime_settings", "power_attribution",
+  ];
+
+  const capturePresetFeatures = {
+    "power-standard": new Set([
+      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "foreground_window", "target_process", "process_snapshots", "hot_threads",
+      "thermal", "scheduler", "runtime_settings", "power_attribution",
+    ]),
+    "performance-standard": new Set([
+      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "foreground_window", "frame_rate", "frame_details", "harmony_hitches",
+      "touch_events", "target_process", "process_snapshots", "hot_threads",
+      "thermal", "scheduler",
+    ]),
+    "harmony-smartperf": new Set([
+      "cpu_usage", "cpu_frequency", "gpu_metrics", "memory_frequency",
+      "foreground_window", "frame_rate", "frame_details", "target_process", "thermal",
+    ]),
+  };
+
+  function selectedDeviceInfo() {
+    return (app.state?.devices || []).find(device => device.serial === selectedDevice()) || null;
+  }
+
+  function effectiveCapturePreset() {
+    const requested = $("#capture-preset-input")?.value || "auto";
+    if (requested !== "auto") return requested;
+    return app.testMode === "performance" ? "performance-standard" : "power-standard";
+  }
+
+  function presetFeatureSet(preset) {
+    if (preset !== "low-overhead") return capturePresetFeatures[preset] || new Set();
+    return new Set(app.testMode === "performance"
+      ? ["cpu_usage", "foreground_window", "frame_rate", "target_process", "thermal"]
+      : ["cpu_usage", "foreground_window"]);
+  }
+
+  function applyCapturePreset() {
+    const preset = effectiveCapturePreset();
+    const enabled = presetFeatureSet(preset);
+    $$('[data-capture-feature]').forEach(input => {
+      input.checked = enabled.has(input.dataset.captureFeature);
+    });
+    updateCaptureFeatureControls();
+  }
+
+  function updateCaptureFeatureControls({ overridden = false } = {}) {
+    const platform = selectedPlatform();
+    const performance = app.testMode === "performance";
+    const smartPerfOption = $("#capture-preset-input")?.querySelector('option[value="harmony-smartperf"]');
+    if (smartPerfOption) smartPerfOption.disabled = platform !== "harmony" || !performance;
+    if ((!performance || platform !== "harmony") && $("#capture-preset-input")?.value === "harmony-smartperf") {
+      $("#capture-preset-input").value = "auto";
+      applyCapturePreset();
+      return;
+    }
+
+    const highPerformanceRow = $("#harmony-high-performance-row");
+    const highPerformanceInput = $("#harmony-high-performance-input");
+    const showHighPerformance = platform === "harmony" && performance;
+    highPerformanceRow?.classList.toggle("hidden", !showHighPerformance);
+    if (!showHighPerformance && highPerformanceInput) highPerformanceInput.checked = false;
+
+    const forcedOff = new Set(platformUnavailableFeatures[platform] || []);
+    if (performance) forcedOff.add("power_attribution");
+    $$('[data-capture-feature]').forEach(input => {
+      const name = input.dataset.captureFeature;
+      const disabled = forcedOff.has(name) || Boolean(app.state?.active?.running);
+      if (forcedOff.has(name)) input.checked = false;
+      input.disabled = disabled;
+      const row = input.closest("label");
+      row?.classList.toggle("feature-unavailable", forcedOff.has(name));
+      if (row) row.title = forcedOff.has(name) ? `${platformLabel(platform)} 当前采集后端不提供此项目` : "";
+    });
+
+    const values = Object.fromEntries($$('[data-capture-feature]').map(input => [
+      input.dataset.captureFeature,
+      input.checked,
+    ]));
+    if (values.frame_details && !values.frame_rate) {
+      const frameRate = $('[data-capture-feature="frame_rate"]');
+      if (frameRate) frameRate.checked = true;
+    }
+    if (values.harmony_hitches && !values.foreground_window) {
+      const foreground = $('[data-capture-feature="foreground_window"]');
+      if (foreground) foreground.checked = true;
+    }
+    if (values.hot_threads && !values.process_snapshots) {
+      const processes = $('[data-capture-feature="process_snapshots"]');
+      if (processes) processes.checked = true;
+    }
+
+    const inputs = $$('[data-capture-feature]');
+    const count = inputs.filter(input => input.checked).length;
+    $("#capture-feature-count").textContent = `${count} / ${inputs.length} 已启用`;
+    $("#system-monitor-input").checked = [
+      "process_snapshots", "hot_threads", "thermal", "scheduler",
+    ].some(name => Boolean($(`[data-capture-feature="${name}"]`)?.checked));
+    const presetLabel = $("#capture-preset-input")?.selectedOptions?.[0]?.textContent || "采集预设";
+    $("#capture-preset-hint").textContent = overridden
+      ? `${presetLabel} · 已逐项覆盖；基础电流、电压和时间戳仍保留。`
+      : `${presetLabel} · 可继续逐项关闭以降低测试干扰。`;
+    $("#capture-feature-note").textContent = showHighPerformance
+      ? "SmartPerf 采集与设备高性能模式相互独立；高性能模式会改变设备功耗和热状态。"
+      : platform === "ios"
+        ? "iOS 仅启用 DVT/PowerTelemetry 实际可提供的项目；基础电流、电压和时间戳保留。"
+        : "基础电流、电压和设备时间戳始终保留。";
+  }
+
+  function applyModeDefaults(previousMode, nextMode) {
+    if (previousMode === nextMode) return;
+    Object.entries(modeDefaults[nextMode]).forEach(([id, nextValue]) => {
+      const input = document.getElementById(id);
+      if (!input) return;
+      const previousDefault = modeDefaults[previousMode]?.[id];
+      if (previousDefault === undefined || Number(input.value) === Number(previousDefault)) {
+        input.value = String(nextValue);
+      }
+    });
+    syncDurationPreset();
+  }
+
+  function setTestMode(mode, { fromRun = false, initial = false } = {}) {
+    const nextMode = mode === "performance" ? "performance" : "power";
+    const active = app.state?.active;
+    if (!fromRun && active?.running && nextMode !== (active.test_mode || "power")) {
+      notify("测试进行中无法切换采集档位", "停止当前测试后再选择另一种模式。", "error");
+      return;
+    }
+    const previousMode = app.testMode;
+    app.testMode = nextMode;
+    document.body.dataset.testMode = nextMode;
+    if (
+      (!fromRun && !initial)
+      || (fromRun && initial && !active?.running)
+    ) {
+      applyModeDefaults(previousMode, nextMode);
+    }
+    if (!fromRun && !initial && $("#capture-preset-input")?.value === "auto") {
+      applyCapturePreset();
+    }
+
+    $$("[data-test-mode]").forEach(button => {
+      const selected = button.dataset.testMode === nextMode;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+      button.disabled = Boolean(active?.running);
+    });
+
+    const performance = nextMode === "performance";
+    const profile = platformProfiles[selectedPlatform()];
+    if (!performance && app.activeView === "system") switchView("live");
+    $("#test-mode-title").textContent = performance ? "性能测试模式" : "功耗测试模式";
+    $("#test-mode-description").textContent = performance ? profile.performanceDescription : profile.powerDescription;
+    $("#capture-config-title").textContent = performance ? "性能采集配置" : "功耗采集配置";
+    $("#capture-mode-badge").lastChild.textContent = performance ? " PERFORMANCE" : " POWER";
+    $("#advanced-setting-count").textContent = performance ? "采集项可裁剪" : "采集项可裁剪";
+    $("#control-note").textContent = performance ? profile.performanceNote : profile.powerNote;
+    updatePlatformPresentation();
+    syncDurationPreset();
+    updateAppScannerAvailability();
+
+    const monitorInput = $("#system-monitor-input");
+    monitorInput.disabled = Boolean(active?.running);
+    updateCaptureFeatureControls();
+
+    const iosPerformance = performance && selectedPlatform() === "ios";
+    const validMetrics = performance
+      ? iosPerformance
+        ? new Set(["cpu_pct", "gpu_load_pct", "power_mw", "temperature_c"])
+        : new Set(["frame_rate_fps", "frame_time_ms", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz"])
+      : new Set(["power_mw", "current_ma", "cpu_pct", "memory_frequency_mhz", "temperature_c", "voltage_mv"]);
+    if (previousMode !== nextMode && iosPerformance) app.metric = "cpu_pct";
+    else if (!validMetrics.has(app.metric)) app.metric = performance ? iosPerformance ? "cpu_pct" : "frame_rate_fps" : "power_mw";
+    $$("[data-metric]").forEach(button => {
+      button.classList.toggle("active", button.dataset.metric === app.metric);
+    });
+    const startLabel = $("#start-record")?.querySelector("span:last-child");
+    if (startLabel && !active?.running) {
+      startLabel.textContent = performance ? "开始性能测试" : "开始功耗测试";
+    }
+    if (!initial) {
+      renderPerformanceMetrics(active);
+      renderPerformanceResources(active);
+      renderPowerPressure(active);
+      renderRenderPipeline(active);
+      renderChart();
+    }
   }
 
   function percentile(values, fraction) {
@@ -254,6 +797,116 @@
     return $("#device-select").value || "";
   }
 
+  function resetAppScanner({ clearPackage = false } = {}) {
+    const packageInput = $("#package-input");
+    if (
+      clearPackage
+      && app.selectedScannedPackage
+      && packageInput?.value.trim() === app.selectedScannedPackage
+    ) {
+      packageInput.value = "";
+    }
+    app.scannedApps = [];
+    app.scannedAppsDevice = "";
+    app.scannedAppsSource = "";
+    app.selectedScannedPackage = "";
+    const search = $("#app-search-input");
+    const select = $("#app-select");
+    if (search) {
+      search.value = "";
+      search.disabled = true;
+    }
+    if (select) {
+      select.innerHTML = '<option value="">请先扫描手机应用</option>';
+      select.disabled = true;
+    }
+    if ($("#app-picker-status")) $("#app-picker-status").textContent = "尚未扫描";
+    if ($("#app-picker-selection")) {
+      $("#app-picker-selection").textContent = packageInput?.value.trim()
+        ? `${packageInput.value.trim()} · 手工输入`
+        : "未选择目标应用";
+    }
+  }
+
+  function renderAppOptions() {
+    const select = $("#app-select");
+    const search = $("#app-search-input");
+    if (!select || !search) return;
+    const query = search.value.trim().toLowerCase();
+    const apps = Array.isArray(app.scannedApps) ? app.scannedApps : [];
+    const filtered = apps.filter(item => {
+      const searchable = [
+        item.package,
+        item.activity,
+        item.component,
+        ...(Array.isArray(item.activities) ? item.activities : []),
+      ].filter(Boolean).join(" ").toLowerCase();
+      return !query || searchable.includes(query);
+    });
+    select.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = filtered.length ? "请选择测试游戏 / 应用" : query ? "没有匹配的应用" : "未发现应用";
+    select.appendChild(placeholder);
+    [
+      [true, "第三方应用"],
+      [false, "系统应用"],
+    ].forEach(([userApp, label]) => {
+      const matching = filtered.filter(item => Boolean(item.user_app) === userApp);
+      if (!matching.length) return;
+      const group = document.createElement("optgroup");
+      group.label = label;
+      matching.forEach(item => {
+        const option = document.createElement("option");
+        option.value = item.package || "";
+        option.textContent = item.package || "Unknown package";
+        option.title = item.component || item.package || "";
+        group.appendChild(option);
+      });
+      select.appendChild(group);
+    });
+    const packageValue = $("#package-input").value.trim();
+    if (filtered.some(item => item.package === packageValue)) select.value = packageValue;
+    const noun = app.scannedAppsSource === "third-party-packages-fallback" ? "第三方包" : "可启动应用";
+    $("#app-picker-status").textContent = query
+      ? `匹配 ${filtered.length} / ${apps.length} 个${noun}`
+      : `已扫描 ${apps.length} 个${noun}`;
+    const scannedMatch = apps.some(item => item.package === packageValue);
+    $("#app-picker-selection").textContent = packageValue
+      ? `${packageValue} · ${scannedMatch ? "已选择" : "手工输入"}`
+      : "未选择目标应用";
+    const running = Boolean(app.state?.active?.running);
+    const currentScan = Boolean(app.scannedAppsDevice && app.scannedAppsDevice === selectedDevice());
+    search.disabled = !currentScan || running;
+    select.disabled = !currentScan || running || !filtered.length;
+  }
+
+  function updateAppScannerAvailability(device = selectedDeviceInfo()) {
+    const running = Boolean(app.state?.active?.running);
+    const androidReady = Boolean(
+      device
+      && devicePlatform(device) === "android"
+      && device.state === "device"
+    );
+    if (app.scannedAppsDevice && device?.serial && app.scannedAppsDevice !== device.serial) {
+      resetAppScanner({ clearPackage: true });
+    }
+    const currentScan = Boolean(
+      androidReady
+      && app.scannedAppsDevice
+      && app.scannedAppsDevice === device.serial
+    );
+    const scanButton = $("#scan-apps");
+    if (scanButton) scanButton.disabled = !androidReady || running;
+    const search = $("#app-search-input");
+    const select = $("#app-select");
+    if (search) search.disabled = !currentScan || running;
+    if (select) {
+      const hasOptions = Boolean(select.querySelector('option[value]:not([value=""])'));
+      select.disabled = !currentScan || running || !hasOptions;
+    }
+  }
+
   function devicePlatform(device) {
     return String(device?.platform || "android").toLowerCase();
   }
@@ -289,14 +942,23 @@
 
   function renderDevices(state) {
     const select = $("#device-select");
-    const previous = select.value || localStorage.getItem("android-power-device") || "";
-    const devices = Array.isArray(state.devices) ? state.devices : [];
+    const platform = selectedPlatform();
+    const allDevices = Array.isArray(state.devices) ? state.devices : [];
+    const currentValue = select.value || "";
+    const currentMatchesPlatform = allDevices.some(
+      device => device.serial === currentValue && devicePlatform(device) === platform
+    );
+    const previous = (currentMatchesPlatform ? currentValue : "")
+      || localStorage.getItem(`mobile-profiler-device-${platform}`)
+      || "";
+    const devices = allDevices.filter(device => devicePlatform(device) === platform);
+    updatePlatformCounts(allDevices);
     select.innerHTML = "";
     const ready = devices.filter(device => device.state === "device");
     if (!devices.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = state.device_error ? "设备运行时不可用" : "未发现设备";
+      option.textContent = state.device_error ? `${platformLabel(platform)} 运行时不可用` : `未发现 ${platformLabel(platform)} 设备`;
       select.appendChild(option);
     } else {
       [
@@ -315,15 +977,16 @@
           option.dataset.connectionType = type;
           option.dataset.platform = devicePlatform(device);
           const name = [device.model, device.product].filter(Boolean).join(" / ");
-          const platform = platformLabel(devicePlatform(device));
-          option.textContent = `${platform} · ${name || "Device"} · ${device.serial} · ${device.state}`;
+          option.textContent = `${name || platformLabel(platform) + " Device"} · ${device.serial} · ${device.state}`;
           option.disabled = device.state !== "device";
           group.appendChild(option);
         });
         select.appendChild(group);
       });
     }
-    const activeSerial = state.active?.running ? state.active.device_serial : "";
+    const activeSerial = state.active?.running && activePlatform(state.active) === platform
+      ? state.active.device_serial
+      : "";
     const preferred = activeSerial || previous;
     const preferredDevice = devices.find(device => device.serial === preferred);
     if (preferredDevice && (preferredDevice.state === "device" || deviceConnectionType(preferredDevice) === "wireless")) {
@@ -334,7 +997,7 @@
     select.disabled = Boolean(state.active?.running);
     const chosen = devices.find(device => device.serial === select.value);
     const chosenType = deviceConnectionType(chosen);
-    const chosenPlatform = devicePlatform(chosen);
+    const chosenPlatform = chosen ? devicePlatform(chosen) : platform;
     const deviceState = $("#device-state");
     deviceState.classList.toggle("online", Boolean(chosen?.state === "device"));
     deviceState.classList.toggle("error", Boolean(state.device_error || (chosen && chosen.state !== "device")));
@@ -344,6 +1007,8 @@
     $("#enable-harmony-tcpip").disabled = !chosen || chosenPlatform !== "harmony" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || Boolean(state.active?.running);
     $("#disconnect-wireless").disabled = !chosen || chosenPlatform !== "android" || chosenType !== "wireless" || Boolean(state.active?.running);
+    updateAppScannerAvailability(chosen);
+    updateCaptureFeatureControls();
   }
 
   function renderMetrics(active) {
@@ -353,6 +1018,9 @@
     $("#metric-power").textContent = finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--";
     $("#metric-current").textContent = formatMetric(latest.current_ma, "mA", 0);
     $("#metric-cpu").textContent = formatMetric(latest.cpu_pct, "%", 1);
+    $("#metric-memory").textContent = isIos
+      ? formatMetric(latest.collector_cpu_pct, "%", 2)
+      : formatMetric(latest.memory_frequency_mhz, "MHz", 0);
     $("#metric-temp").textContent = formatMetric(latest.temperature_c, "°C", 1);
     $("#metric-energy").textContent = formatMetric(summary.energy_mwh, "mWh", 2);
     const averagePower = finite(summary.average_power_mw) ? `AVG ${(Number(summary.average_power_mw) / 1000).toFixed(3)} W` : "整机电池侧";
@@ -364,8 +1032,297 @@
     $("#metric-cpu-sub").textContent = isIos && finite(summary.average_collector_cpu_pct)
       ? `${averageCpu} · collector ${Number(summary.average_collector_cpu_pct).toFixed(1)}%`
       : averageCpu;
+    const memory = active?.memory || {};
+    $("#metric-memory-sub").textContent = isIos
+      ? finite(summary.average_collector_cpu_pct)
+        ? `AVG ${Number(summary.average_collector_cpu_pct).toFixed(2)}%`
+        : "observer CPU"
+      : finite(memory.p95_frequency_mhz)
+        ? `P95 ${Number(memory.p95_frequency_mhz).toFixed(0)} MHz · 高频 ${formatNumber(memory.high_frequency_share_pct, 1)}%`
+        : memory.limitations || "DRAM / DMC / MIF";
     $("#metric-temp-sub").textContent = finite(latest.voltage_mv) ? `${(Number(latest.voltage_mv) / 1000).toFixed(3)} V` : isIos ? "DiagnosticsService" : "BatteryService";
     $("#metric-energy-sub").textContent = active?.sample_count ? `${active.sample_count} samples` : "有效区间积分";
+  }
+
+  function renderPerformanceMetrics(active) {
+    if (activePlatform(active) === "ios") {
+      const latest = active?.latest || {};
+      const summary = active?.summary || {};
+      const context = active?.context || {};
+      $("#metric-fps").textContent = formatMetric(latest.cpu_pct, "%", 1);
+      $("#metric-fps-sub").textContent = "DVT 进程 CPU / 逻辑核心归一化";
+      $("#metric-one-low").textContent = formatMetric(latest.gpu_load_pct, "%", 1);
+      $("#metric-one-low-sub").textContent = "DVT GPU utilization";
+      const overhead = finite(latest.collector_cpu_pct)
+        ? latest.collector_cpu_pct
+        : summary.average_collector_cpu_pct;
+      $("#metric-frame-p99").textContent = formatMetric(overhead, "%", 2);
+      $("#metric-frame-p99-sub").textContent = "sysmond / DTServiceHub / pairing daemon";
+      $("#metric-frame-issue").textContent = finite(latest.power_mw)
+        ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W`
+        : "--";
+      $("#metric-frame-issue-sub").textContent = finite(latest.power_sample_age_s)
+        ? `PowerTelemetry · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
+        : "PowerTelemetry SystemLoad";
+      $("#metric-render-resolution").textContent = context.foreground_package
+        || active?.metadata?.target_package
+        || "--";
+      $("#metric-render-resolution-sub").textContent = context.foreground_activity
+        || "事件驱动的 application state";
+      const interpolationCard = $(".interpolation-card");
+      interpolationCard.classList.remove("detected", "disabled", "indeterminate", "unavailable");
+      $("#metric-interpolation").textContent = formatMetric(latest.temperature_c, "°C", 1);
+      $("#metric-interpolation-sub").textContent = "iOS battery diagnostics";
+      return;
+    }
+    const performance = active?.performance || {};
+    const fps = finite(performance.sampled_frame_rate_fps)
+      ? Number(performance.sampled_frame_rate_fps)
+      : finite(performance.sampled_compositor_fps)
+        ? Number(performance.sampled_compositor_fps)
+        : null;
+    const oneLow = finite(performance.one_percent_low_fps)
+      ? Number(performance.one_percent_low_fps)
+      : null;
+    const p99 = finite(performance.frame_metric_p99_ms)
+      ? Number(performance.frame_metric_p99_ms)
+      : null;
+    const issuePct = finite(performance.frame_issue_pct)
+      ? Number(performance.frame_issue_pct)
+      : finite(performance.missed_vsync_interval_pct)
+        ? Number(performance.missed_vsync_interval_pct)
+        : null;
+
+    $("#metric-fps").textContent = fps === null ? "--" : fps.toFixed(1) + " FPS";
+    $("#metric-fps-sub").textContent = finite(performance.current_refresh_rate_hz)
+      ? "显示 " + Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz · " + Number(performance.frame_sample_count || 0).toLocaleString("zh-CN") + " 帧"
+      : performance.frame_unavailable_reason || "等待前台窗口帧计数";
+    $("#metric-one-low").textContent = oneLow === null ? "--" : oneLow.toFixed(1) + " FPS";
+    $("#metric-one-low-sub").textContent = performance.one_percent_low_source || "最慢 1% 帧换算";
+    $("#metric-frame-p99").textContent = p99 === null ? "--" : p99.toFixed(2) + " ms";
+    $("#metric-frame-p99-sub").textContent = finite(performance.frame_metric_p95_ms)
+      ? "P95 " + Number(performance.frame_metric_p95_ms).toFixed(2) + " ms"
+      : performance.frame_metric_label || "应用帧耗时";
+    $("#metric-frame-issue").textContent = issuePct === null ? "--" : issuePct.toFixed(2) + "%";
+    $("#metric-frame-issue-sub").textContent = performance.frame_issue_label || "截止时间 / VSync";
+
+    const renderWidth = performance.render_width_px;
+    const renderHeight = performance.render_height_px;
+    $("#metric-render-resolution").textContent = finite(renderWidth) && finite(renderHeight)
+      ? Number(renderWidth).toFixed(0) + " × " + Number(renderHeight).toFixed(0)
+      : "--";
+    $("#metric-render-resolution-sub").textContent = performance.render_resolution_estimated
+      ? "显示分辨率回退值"
+      : performance.render_resolution_source || "等待前台窗口边界";
+
+    const interpolationLabels = {
+      detected: "已开启",
+      disabled: "已关闭",
+      indeterminate: "待确认",
+      unavailable: "不可读",
+    };
+    const interpolationStatus = String(performance.frame_interpolation_status || "unavailable");
+    const interpolationCard = $(".interpolation-card");
+    interpolationCard.classList.remove("detected", "disabled", "indeterminate", "unavailable");
+    interpolationCard.classList.add(interpolationStatus);
+    $("#metric-interpolation").textContent = interpolationLabels[interpolationStatus] || "待确认";
+    $("#metric-interpolation-sub").textContent = performance.frame_interpolation_label || "等待显式系统证据";
+  }
+
+  function renderPerformanceResources(active) {
+    if (activePlatform(active) === "ios") {
+      const latest = active?.latest || {};
+      const context = active?.context || {};
+      const monitor = active?.system_monitor || {};
+      $("#resource-gpu").textContent = finite(latest.gpu_load_pct)
+        ? `${Number(latest.gpu_load_pct).toFixed(1)}%`
+        : "--";
+      $("#resource-thermal").textContent = finite(latest.temperature_c)
+        ? `${Number(latest.temperature_c).toFixed(1)} °C`
+        : "--";
+      $("#resource-window").textContent = context.foreground_package
+        || active?.metadata?.target_package
+        || "--";
+      $("#resource-ios-overhead").textContent = finite(latest.collector_cpu_pct)
+        ? `${Number(latest.collector_cpu_pct).toFixed(2)}%`
+        : finite(active?.summary?.average_collector_cpu_pct)
+          ? `${Number(active.summary.average_collector_cpu_pct).toFixed(2)}% AVG`
+          : "--";
+      $("#resource-ios-power-age").textContent = finite(latest.power_sample_age_s)
+        ? `${Number(latest.power_sample_age_s).toFixed(1)} s`
+        : "--";
+      $("#resource-whole-power").textContent = finite(latest.power_mw)
+        ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W · 物理整机`
+        : "--";
+      $("#resource-snapshot-source").textContent = Number(monitor.system_snapshot_count || 0)
+        ? `${Number(monitor.system_snapshot_count)} DVT snapshots`
+        : "DVT sysmond";
+      $("#performance-frame-source").textContent = "iOS DVT sysmond / GPU counters";
+      $("#performance-frame-confidence").textContent = "CPU、GPU 和进程资源为诊断遥测，不包含通用应用 FPS";
+      $("#performance-render-source").textContent = "PowerTelemetryData.SystemLoad";
+      $("#performance-render-scale").textContent = finite(latest.power_sample_age_s)
+        ? `物理功耗样本年龄 ${Number(latest.power_sample_age_s).toFixed(1)} s`
+        : "物理功耗通常约 20 秒更新一次";
+      $("#performance-interpolation-source").textContent = "collector_cpu_pct";
+      $("#performance-interpolation-evidence").textContent = finite(latest.collector_cpu_pct)
+        ? `当前归一化采集器 CPU ${Number(latest.collector_cpu_pct).toFixed(2)}%`
+        : "报告保留 sysmond、DTServiceHub 与配对服务的观察者开销";
+      return;
+    }
+    const platform = activePlatform(active);
+    const performance = active?.performance || {};
+    const context = active?.context || {};
+    const monitor = active?.system_monitor || {};
+    const scheduler = monitor.scheduler || {};
+    const cpusets = scheduler.cpusets || {};
+    const policies = Array.isArray(scheduler.cpu_policies) ? scheduler.cpu_policies : [];
+    const processStates = Array.isArray(scheduler.watched_processes) ? scheduler.watched_processes : [];
+    const hintSessions = Array.isArray(scheduler.hint_sessions) ? scheduler.hint_sessions : [];
+    const foregroundPackage = context.foreground_package || "";
+    const foregroundProcess = processStates.find(item => item.name === foregroundPackage)
+      || processStates.find(item => foregroundPackage && String(item.name || "").startsWith(foregroundPackage + ":"))
+      || null;
+
+    $("#resource-top-app-cpuset").textContent = cpusets["top-app"] || "--";
+    $("#resource-foreground-sched").textContent = foregroundProcess
+      ? "group " + String(foregroundProcess.current_sched_group ?? "--")
+        + " / procState " + String(foregroundProcess.current_proc_state ?? "--")
+        + " / adj " + String(foregroundProcess.oom_adj ?? "--")
+      : foregroundPackage ? foregroundPackage + " · 等待调度快照" : "--";
+    const governors = [...new Set(policies.map(item => item.governor).filter(Boolean))];
+    $("#resource-governors").textContent = governors.length
+      ? governors.join(" / ")
+      : policies.length ? "仅公开频率上下限" : "--";
+    const graphicsHints = hintSessions.filter(item => item.graphics_pipeline).length;
+    $("#resource-adpf").textContent = hintSessions.length
+      ? String(hintSessions.length) + " 个活动会话" + (graphicsHints ? " · " + String(graphicsHints) + " 个图形管线" : "")
+      : scheduler.availability?.hint_session_supported === false ? "设备不支持" : "0 / 等待快照";
+
+    const latest = active?.latest || {};
+    const gpuParts = [];
+    if (finite(latest.gpu_load_pct)) gpuParts.push(Number(latest.gpu_load_pct).toFixed(1) + "%");
+    if (finite(latest.gpu_frequency_mhz)) gpuParts.push(Number(latest.gpu_frequency_mhz).toFixed(0) + " MHz");
+    $("#resource-gpu").textContent = gpuParts.join(" / ") || "--";
+    $("#resource-memory").textContent = finite(latest.memory_frequency_mhz)
+      ? Number(latest.memory_frequency_mhz).toFixed(0) + " MHz"
+      : "--";
+    const thermal = monitor.thermal || {};
+    $("#resource-thermal").textContent = finite(thermal.status)
+      ? (thermalStatusDefinitions[Number(thermal.status)] || "状态 " + String(thermal.status))
+      : "--";
+    $("#resource-window").textContent = performance.foreground_window_name || context.foreground_activity || "--";
+
+    const cadenceParts = [];
+    if (finite(performance.current_refresh_rate_hz)) cadenceParts.push(Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz");
+    if (finite(performance.sampled_frame_rate_fps)) cadenceParts.push(Number(performance.sampled_frame_rate_fps).toFixed(1) + " FPS");
+    if (finite(performance.cadence_multiplier)) cadenceParts.push("约 " + Number(performance.cadence_multiplier).toFixed(0) + "×");
+    $("#resource-cadence").textContent = cadenceParts.join(" / ") || "--";
+    $("#resource-whole-power").textContent = finite(latest.power_mw)
+      ? (Number(latest.power_mw) / 1000).toFixed(3) + " W · 只记录整机"
+      : "--";
+    $("#resource-snapshot-source").textContent = Number(monitor.scheduler_snapshot_count || 0)
+      ? String(monitor.scheduler_snapshot_count) + " snapshots"
+      : platform === "harmony" ? "PowerManager / SmartPerf" : "cpuset / ADPF";
+
+    $("#performance-frame-source").textContent = performance.frame_source || "平台窗口 / 合成器计数";
+    $("#performance-frame-confidence").textContent = performance.one_percent_low_confidence
+      ? "1% Low 置信度：" + performance.one_percent_low_confidence
+      : performance.frame_unavailable_reason || "等待有效帧计数";
+    $("#performance-render-source").textContent = performance.render_resolution_source || "--";
+    $("#performance-render-scale").textContent = finite(performance.render_scale_pct)
+      ? "相对显示模式 " + Number(performance.render_scale_pct).toFixed(1) + "%"
+      : "等待前台窗口边界";
+    $("#performance-interpolation-source").textContent = performance.frame_interpolation_label || "--";
+    const interpolationEvidence = Array.isArray(performance.frame_interpolation_evidence)
+      ? performance.frame_interpolation_evidence
+      : [];
+    $("#performance-interpolation-evidence").textContent = interpolationEvidence.length
+      ? interpolationEvidence[0]
+      : "无显式开关时，不会仅凭刷新倍率推断插帧。";
+  }
+
+  function renderPowerPressure(active) {
+    if (activePlatform(active) === "ios") {
+      const latest = active?.latest || {};
+      const summary = active?.summary || {};
+      const processes = Array.isArray(active?.system_monitor?.processes)
+        ? active.system_monitor.processes
+        : [];
+      const physicalRows = [
+        ["当前整机功耗", finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--", "PowerTelemetry SystemLoad"],
+        ["平均整机功耗", finite(summary.average_power_mw) ? `${(Number(summary.average_power_mw) / 1000).toFixed(3)} W` : "--", "有效物理样本"],
+        ["物理样本年龄", finite(latest.power_sample_age_s) ? `${Number(latest.power_sample_age_s).toFixed(1)} s` : "--", "通常约 20 秒刷新"],
+      ];
+      $("#power-pressure-driver-list").innerHTML = physicalRows.map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item[0])}</strong><small>${escapeHtml(item[2])}</small></div><b>${escapeHtml(item[1])}</b></div>`).join("");
+      $("#power-pressure-task-list").innerHTML = processes.length ? processes.slice(0, 7).map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item.name || item.command || "process")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${formatBytes(item.resident_bytes)}</small></div><b>${formatNumber(item.cpu_pct, 1)}%</b></div>`).join("") : '<div class="empty-row">等待 DVT 进程快照</div>';
+      const overhead = finite(latest.collector_cpu_pct)
+        ? Number(latest.collector_cpu_pct)
+        : finite(summary.average_collector_cpu_pct) ? Number(summary.average_collector_cpu_pct) : null;
+      $("#power-pressure-setting-list").innerHTML = [
+        ["collector_cpu_pct", overhead === null ? "--" : `${overhead.toFixed(2)}%`, "sysmond / DTServiceHub / pairing daemon"],
+        ["GPU utilization", finite(latest.gpu_load_pct) ? `${Number(latest.gpu_load_pct).toFixed(1)}%` : "--", "DVT 诊断遥测"],
+        ["相对 powerScore", "仅旁证", "不转换为 mW 或应用物理功耗"],
+      ].map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item[0])}</strong><small>${escapeHtml(item[2])}</small></div><b>${escapeHtml(item[1])}</b></div>`).join("");
+      return;
+    }
+    const pressure = active?.power_pressure || {};
+    const drivers = Array.isArray(pressure.drivers) ? pressure.drivers : [];
+    const tasks = Array.isArray(pressure.tasks) ? pressure.tasks : [];
+    const settings = pressure.settings || active?.runtime_settings || {};
+    const settingRows = Array.isArray(settings.rows) ? settings.rows : [];
+    const platform = activePlatform(active);
+    $("#power-pressure-driver-list").innerHTML = drivers.length ? drivers.slice(0, 7).map(item => {
+      const correlation = finite(item.correlation) ? Number(item.correlation) : null;
+      const width = correlation === null ? 0 : clamp(Math.abs(correlation) * 100, 0, 100);
+      return `<div class="pressure-row"><div><strong>${escapeHtml(item.label || item.key || "资源")}</strong><small>${Number(item.sample_count || 0)} samples</small></div><div class="pressure-track"><span style="width:${width.toFixed(1)}%"></span></div><b>${correlation === null ? "--" : `r=${correlation.toFixed(2)}`}</b></div>`;
+    }).join("") : '<div class="empty-row">等待至少 3 个有效样本</div>';
+    $("#power-pressure-task-list").innerHTML = tasks.length ? tasks.slice(0, 7).map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item.name || "unknown")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${escapeHtml(item.state || "--")}</small></div><b>${formatNumber(item.cpu_pct, 1)}%</b></div>`).join("") : '<div class="empty-row">等待系统进程快照</div>';
+    if (settingRows.length) {
+      $("#power-pressure-setting-list").innerHTML = settingRows.slice(0, 8).map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item.label || item.key)}</strong><small>${escapeHtml(item.impact || "")}</small></div><b>${escapeHtml(item.end ?? item.start ?? "--")}${item.changed ? "*" : ""}</b></div>`).join("");
+    } else if (platform === "harmony") {
+      const context = active?.context || {};
+      const performance = active?.performance || {};
+      const mode = active?.metadata?.device_performance_mode || {};
+      const harmonyRows = [
+        ["屏幕状态", context.screen_state || "--", "PowerManagerService"],
+        ["刷新率", finite(performance.current_refresh_rate_hz) ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz` : "--", "RenderService"],
+        ["设备性能模式", mode.applied ? `602${mode.restored ? " → 已恢复" : ""}` : mode.requested ? "请求失败或待确认" : "正常模式", "power-shell"],
+      ];
+      $("#power-pressure-setting-list").innerHTML = harmonyRows.map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item[0])}</strong><small>${escapeHtml(item[2])}</small></div><b>${escapeHtml(item[1])}</b></div>`).join("");
+    } else {
+      $("#power-pressure-setting-list").innerHTML = '<div class="empty-row">等待设置快照</div>';
+    }
+  }
+
+  function renderRenderPipeline(active) {
+    const platform = activePlatform(active);
+    const render = active?.render_performance || {};
+    const pipeline = render.pipeline || active?.performance?.render_pipeline || {};
+    const dominant = render.dominant_stage || pipeline.dominant_stage || {};
+    const stages = Array.isArray(pipeline.stages) ? pipeline.stages : [];
+    const monitorThreads = Array.isArray(active?.system_monitor?.threads) ? active.system_monitor.threads : [];
+    const threads = Array.isArray(render.render_threads) && render.render_threads.length
+      ? render.render_threads
+      : monitorThreads.filter(item => /renderthread|surfaceflinger|renderengine|composer|hwc|gpu|main/i.test(`${item.name || ""} ${item.process || ""}`)).slice(0, 10);
+    const power = render.power_recording || {};
+    $("#render-pipeline-dominant").textContent = dominant.label || "--";
+    $("#render-pipeline-dominant-detail").textContent = finite(dominant.p95_ms)
+      ? `P95 ${Number(dominant.p95_ms).toFixed(2)} ms · P99 ${formatNumber(dominant.p99_ms, 2)} ms`
+      : pipeline.limitations || (platform === "harmony"
+        ? "HarmonyOS 量产接口提供帧抖动与合成节奏，不提供 Android framestats 阶段时间戳"
+        : "等待详细帧时间戳");
+    $("#render-pipeline-source").textContent = pipeline.available
+      ? `${Number(pipeline.frame_count || 0)} detailed frames`
+      : platform === "harmony" ? "SmartPerf frame jitter / RenderService" : "gfxinfo framestats";
+    const averageWholePower = finite(power.average_power_mw) ? power.average_power_mw : active?.summary?.average_power_mw;
+    $("#performance-whole-power").textContent = finite(averageWholePower)
+      ? `${(Number(averageWholePower) / 1000).toFixed(3)} W`
+      : "--";
+    $("#render-pipeline-stage-list").innerHTML = stages.length ? stages.slice(0, 10).map(item => `<div class="pipeline-row"><div><strong>${escapeHtml(item.label || item.key)}</strong><small>${Number(item.sample_count || 0)} frames</small></div><div class="pipeline-track"><span style="width:${clamp(Number(item.p95_ms || 0) / Math.max(16.67, ...stages.map(stage => Number(stage.p95_ms || 0))) * 100, 0, 100).toFixed(1)}%"></span></div><b>${formatNumber(item.p95_ms, 2)} ms</b></div>`).join("") : `<div class="empty-row">${platform === "harmony" ? "当前仅提供帧抖动与合成节奏，不拆分 Android 渲染阶段" : "等待详细 framestats"}</div>`;
+    $("#render-thread-list").innerHTML = threads.length ? threads.slice(0, 10).map(item => {
+      const cpu = finite(item.cpu_pct) ? item.cpu_pct : finite(item.average_when_visible_cpu_pct) ? item.average_when_visible_cpu_pct : item.maximum_cpu_pct;
+      return `<div class="pipeline-row compact"><div><strong>${escapeHtml(item.name || "thread")}</strong><small>${escapeHtml(item.process || "--")} · ${escapeHtml(item.pid ?? "--")}/${escapeHtml(item.tid ?? "--")}</small></div><b>${formatNumber(cpu, 1)}%</b></div>`;
+    }).join("") : `<div class="empty-row">${platform === "harmony" ? "HarmonyOS 当前不启用全系统热点线程扫描" : "等待线程快照"}</div>`;
   }
 
   function renderSession(active) {
@@ -384,7 +1341,10 @@
     if (running) orbit.classList.add("active");
     if (["complete", "collected", "recovered"].includes(status)) orbit.classList.add("complete");
     $("#session-kicker").textContent = kicker;
-    $("#session-title").textContent = active ? `${label} · ${active.title || active.run_name || "Power session"}` : "等待开始新的采集";
+    const defaultSessionTitle = (active?.test_mode || active?.metadata?.test_mode) === "performance"
+      ? "Performance session"
+      : "Power session";
+    $("#session-title").textContent = active ? `${label} · ${active.title || active.run_name || defaultSessionTitle}` : "等待开始新的采集";
     const elapsed = Number(active?.elapsed_s || 0);
     const requested = Number(active?.requested_duration_s || 0);
     $("#session-time").textContent = `${formatDuration(elapsed)} / ${formatDuration(requested)}`;
@@ -400,11 +1360,31 @@
       control.disabled = running;
     });
     $("#start-record").disabled = running || !selectedDevice();
-    $("#start-record").querySelector("span:last-child").textContent = running ? "采集中" : "开始采集";
+    $("#start-record").querySelector("span:last-child").textContent = running
+      ? "采集中"
+      : app.testMode === "performance" ? "开始性能测试" : "开始功耗测试";
+    $$("[data-test-mode]").forEach(button => { button.disabled = running; });
+    $$(".platform-switch [data-platform]").forEach(button => { button.disabled = running; });
+    $("#system-monitor-input").disabled = running;
+    updateCaptureFeatureControls();
   }
 
   function renderClusters(active) {
     const container = $("#cluster-list");
+    if (activePlatform(active) === "ios") {
+      const processes = Array.isArray(active?.system_monitor?.processes)
+        ? active.system_monitor.processes.slice(0, 6)
+        : [];
+      if (!processes.length) {
+        container.innerHTML = '<div class="empty-row">等待 DVT 进程 CPU 数据</div>';
+        return;
+      }
+      container.innerHTML = processes.map(process => {
+        const load = finite(process.cpu_pct) ? clamp(Number(process.cpu_pct), 0, 100) : 0;
+        return `<div class="cluster-row"><div class="cluster-name"><strong>${escapeHtml(process.name || process.command || "process")}</strong><small>PID ${escapeHtml(process.pid ?? "--")}</small></div><div class="cluster-bar"><span style="width:${load.toFixed(1)}%"></span></div><div class="cluster-load">${finite(process.cpu_pct) ? `${Number(process.cpu_pct).toFixed(1)}%` : "--"}</div><div class="cluster-frequency"><span>${formatBytes(process.resident_bytes)}</span><small> memory</small></div></div>`;
+      }).join("");
+      return;
+    }
     const clusters = Array.isArray(active?.clusters) ? active.clusters : [];
     if (!clusters.length) {
       container.innerHTML = '<div class="empty-row">等待 CPU 数据</div>';
@@ -426,28 +1406,131 @@
   function renderContext(active) {
     const context = active?.context || {};
     const performance = active?.performance || context.performance || {};
+    const pressure = active?.power_pressure || {};
+    const settings = active?.runtime_settings || {};
+    const monitor = active?.system_monitor || {};
+    const scheduler = monitor.scheduler || {};
     const battery = active?.battery || {};
     $("#context-package").textContent = context.foreground_package || "--";
     $("#context-activity").textContent = [context.foreground_activity, performance.foreground_window_name].filter(Boolean).join(" / ") || "--";
     $("#context-screen").textContent = context.screen_state || "--";
-    const refresh = finite(performance.current_refresh_rate_hz) ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz` : finite(context.refresh_rate_hz) ? `${Number(context.refresh_rate_hz).toFixed(0)} Hz` : "--";
-    const sampledFrameRate = finite(performance.sampled_frame_rate_fps) ? performance.sampled_frame_rate_fps : performance.sampled_compositor_fps;
-    const frameRateUnit = performance.frame_rate_unit || "FPS";
-    const fps = finite(sampledFrameRate) ? `${Number(sampledFrameRate).toFixed(1)} ${frameRateUnit}` : "--";
-    $("#context-display").textContent = `${refresh} / ${fps}`;
-    const frameMetricP95 = finite(performance.frame_metric_p95_ms) ? performance.frame_metric_p95_ms : performance.frame_interval_p95_ms;
-    const frameIssuePct = finite(performance.frame_issue_pct) ? performance.frame_issue_pct : performance.missed_vsync_interval_pct;
-    const frameP95 = finite(frameMetricP95) ? `${Number(frameMetricP95).toFixed(2)} ms P95` : "--";
-    const missed = finite(frameIssuePct) ? `${Number(frameIssuePct).toFixed(2)}% 异常` : "--";
-    $("#context-frame").textContent = `${frameP95} / ${missed}`;
-    const touches = finite(performance.touch_interaction_count) ? `${Number(performance.touch_interaction_count).toFixed(0)} 次` : "--";
-    const touchRate = finite(performance.touch_interactions_per_minute) ? `${Number(performance.touch_interactions_per_minute).toFixed(1)}/min` : "采样率不可读";
-    $("#context-touch").textContent = `${touches} / ${touchRate}`;
+    if (activePlatform(active) === "ios") {
+      const latest = active?.latest || {};
+      $("#context-display-settings").textContent = "当前 sidecar 不采集亮度 / 刷新率设置";
+      $("#context-pressure-driver").textContent = finite(latest.gpu_load_pct)
+        ? `GPU ${Number(latest.gpu_load_pct).toFixed(1)}%`
+        : finite(latest.cpu_pct) ? `CPU ${Number(latest.cpu_pct).toFixed(1)}%` : "等待 DVT 样本";
+      const processes = Array.isArray(monitor.processes) ? monitor.processes : [];
+      const leading = processes.length ? [...processes].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0] : null;
+      $("#context-pressure-task").textContent = leading
+        ? `${leading.name || "process"} · ${formatNumber(leading.cpu_pct, 1)}% CPU`
+        : "等待 DVT 进程快照";
+      $("#context-power-scheduler").textContent = "iOS 不公开 Android cpuset / Governor / ADPF";
+      const voltage = finite(latest.voltage_mv) ? `${(Number(latest.voltage_mv) / 1000).toFixed(3)} V` : "--";
+      const level = finite(battery.level_pct) ? `${Number(battery.level_pct).toFixed(0)}%` : "--";
+      $("#context-battery").textContent = `${voltage} / ${level}`;
+      $("#context-reconnect").textContent = String(active?.checkpoint?.reconnect_count ?? active?.metadata?.reconnect_count ?? 0);
+      $("#context-source").textContent = context.source || "iOS DVT application state";
+      return;
+    }
+    const startSettings = settings.start || {};
+    const refresh = finite(performance.current_refresh_rate_hz)
+      ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz`
+      : finite(context.refresh_rate_hz) ? `${Number(context.refresh_rate_hz).toFixed(0)} Hz` : "--";
+    const brightness = startSettings["system.screen_brightness"] ?? performance.brightness_raw ?? "--";
+    const lowPower = String(startSettings["global.low_power"] ?? "--") === "1" ? "省电开" : "省电关";
+    $("#context-display-settings").textContent = `${brightness} brightness / ${refresh} / ${lowPower}`;
+    const leadingDriver = pressure.leading_driver || {};
+    $("#context-pressure-driver").textContent = leadingDriver.label
+      ? `${leadingDriver.label} · r=${formatNumber(leadingDriver.correlation, 2)}`
+      : "等待相关性样本";
+    const tasks = Array.isArray(pressure.tasks) ? pressure.tasks : [];
+    const leadingTask = tasks.length ? [...tasks].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0] : null;
+    $("#context-pressure-task").textContent = leadingTask
+      ? `${leadingTask.name || "unknown"} · ${formatNumber(leadingTask.cpu_pct, 1)}% CPU`
+      : "等待进程快照";
+    const policies = Array.isArray(scheduler.cpu_policies) ? scheduler.cpu_policies : [];
+    const governors = [...new Set(policies.map(item => item.governor).filter(Boolean))];
+    const topApp = scheduler.cpusets?.["top-app"] || "--";
+    $("#context-power-scheduler").textContent = `${topApp} / ${governors.join(" / ") || "governor --"}`;
     const voltage = finite(active?.latest?.voltage_mv) ? `${(Number(active.latest.voltage_mv) / 1000).toFixed(3)} V` : "--";
     const level = finite(battery.level_pct) ? `${Number(battery.level_pct).toFixed(0)}%` : "--";
     $("#context-battery").textContent = `${voltage} / ${level}`;
     $("#context-reconnect").textContent = String(active?.checkpoint?.reconnect_count ?? active?.metadata?.reconnect_count ?? 0);
     $("#context-source").textContent = context.source || "sampler";
+  }
+
+  function renderIosPerformanceSystem(active, monitor, processes, priority, hottest) {
+    const latest = active?.latest || {};
+    const context = active?.context || {};
+    const systemCount = Number(monitor.system_snapshot_count || 0);
+    $("#performance-snapshot-status").textContent = systemCount
+      ? `${systemCount} 个 DVT 进程快照`
+      : active?.running ? "等待首个 DVT 性能样本" : "尚无 DVT 性能样本";
+    $("#performance-refresh-value").textContent = formatMetric(latest.cpu_pct, "%", 1);
+    $("#performance-refresh-label").textContent = "DVT 进程 CPU 归一化";
+    $("#performance-fps-value").textContent = formatMetric(latest.gpu_load_pct, "%", 1);
+    $("#performance-fps-label").textContent = "DVT GPU utilization";
+    $("#performance-frame-value").textContent = finite(latest.power_mw)
+      ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W`
+      : "--";
+    $("#performance-frame-label").textContent = finite(latest.power_sample_age_s)
+      ? `PowerTelemetry · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
+      : "PowerTelemetry SystemLoad";
+    $("#performance-touch-value").textContent = formatMetric(latest.collector_cpu_pct, "%", 2);
+    $("#performance-touch-label").textContent = "归一化采集器 CPU 开销";
+
+    const resourceRows = [
+      { label: "CPU", value: latest.cpu_pct, unit: "%", scale: 100 },
+      { label: "GPU", value: latest.gpu_load_pct, unit: "%", scale: 100 },
+      { label: "Observer", value: latest.collector_cpu_pct, unit: "%", scale: 25 },
+    ];
+    $("#performance-residency-source").textContent = "DVT / PowerTelemetry";
+    $("#performance-residency-list").innerHTML = resourceRows.map(item => {
+      const value = finite(item.value) ? Number(item.value) : null;
+      const share = value === null ? 0 : clamp(value / item.scale * 100, 0, 100);
+      return `<div class="performance-residency-row"><div><strong>${escapeHtml(item.label)}</strong><small>${value === null ? "--" : `${value.toFixed(item.label === "Observer" ? 2 : 1)} ${item.unit}`}</small></div><div class="performance-residency-track"><span style="width:${share.toFixed(1)}%"></span></div><b>${value === null ? "--" : value.toFixed(1)}</b></div>`;
+    }).join("");
+
+    $("#performance-window-value").textContent = context.foreground_package || active?.metadata?.target_package || "--";
+    $("#performance-display-value").textContent = "iOS 显示参数未由当前 sidecar 采集";
+    $("#performance-gpu-value").textContent = finite(latest.gpu_load_pct)
+      ? `${Number(latest.gpu_load_pct).toFixed(1)}% utilization`
+      : "--";
+    $("#performance-temperature-value").textContent = hottest && finite(hottest.value_c)
+      ? `${Number(hottest.value_c).toFixed(1)} °C · ${hottest.name || "sensor"}`
+      : finite(latest.temperature_c) ? `${Number(latest.temperature_c).toFixed(1)} °C · battery` : "--";
+    $("#performance-switch-value").textContent = context.foreground_package ? "事件驱动" : "--";
+    $("#performance-frame-count").textContent = String(systemCount);
+
+    const thermal = monitor.thermal || {};
+    const thermalStatus = finite(thermal.status) ? Number(thermal.status) : 0;
+    const overhead = finite(latest.collector_cpu_pct) ? Number(latest.collector_cpu_pct) : 0;
+    const banner = $("#system-priority-banner");
+    const hasIssue = priority.length > 0 || thermalStatus > 0 || overhead >= 10;
+    banner.classList.toggle("active", hasIssue);
+    banner.classList.toggle("idle", !hasIssue);
+    if (priority.length) {
+      const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
+      $("#system-priority-title").textContent = "检测到 iOS 后台资源竞争";
+      $("#system-priority-detail").textContent = `${leading.name || leading.watch_name || "后台进程"} 当前 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
+      $("#system-priority-badge").textContent = "ACTIVE";
+    } else if (overhead >= 10) {
+      $("#system-priority-title").textContent = "采集器开销偏高";
+      $("#system-priority-detail").textContent = `collector_cpu_pct 为 ${overhead.toFixed(2)}%，建议关闭进程快照或提高采样周期。`;
+      $("#system-priority-badge").textContent = "OBSERVER";
+    } else if (thermalStatus > 0) {
+      $("#system-priority-title").textContent = `检测到热状态 ${thermalStatus}`;
+      $("#system-priority-detail").textContent = "请结合 DVT CPU/GPU 与电池温度判断持续性能下降。";
+      $("#system-priority-badge").textContent = "THERMAL";
+    } else {
+      $("#system-priority-title").textContent = "未检测到明显 iOS 性能干扰";
+      $("#system-priority-detail").textContent = "DVT 进程、GPU、温度和观察者开销均未触发异常阈值。";
+      $("#system-priority-badge").textContent = "CLEAR";
+    }
+
+    $("#watched-process-body").innerHTML = priority.length ? priority.map(item => `<tr class="priority-row"><td><span class="process-identity"><strong>${escapeHtml(item.watch_label || item.watch_name || item.name || "unknown")}</strong><small>${escapeHtml(item.command || item.name || "--")}</small></span></td><td>${escapeHtml(item.pid ?? "--")}</td><td>${finite(item.cpu_pct) ? `${Number(item.cpu_pct).toFixed(1)}%` : "--"}</td><td><span class="activity-pill active">ACTIVE</span></td></tr>`).join("") : '<tr><td colspan="4" class="table-empty">未检测到明显 iOS 后台异常。</td></tr>';
+    $("#system-process-body").innerHTML = processes.length ? processes.slice(0, 5).map(item => `<tr><td><span class="process-identity"><strong>${escapeHtml(item.name || item.command || "unknown")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${escapeHtml(item.user || "--")}</small></span></td><td><strong class="cpu-value">${formatNumber(item.cpu_pct, 1)}%</strong></td><td>${finite(item.mem_pct) ? `${formatNumber(item.mem_pct, 1)}%` : formatBytes(item.resident_bytes)}</td><td>${escapeHtml(item.state || "--")}</td></tr>`).join("") : '<tr><td colspan="4" class="table-empty">暂无 DVT 进程快照。</td></tr>';
   }
 
   function renderSystem(active) {
@@ -462,6 +1545,10 @@
     const temperatures = Array.isArray(thermal.temperatures) ? thermal.temperatures : [];
     const thermalTemperatures = temperatures.filter(isThermalTemperature);
     const hottest = thermalTemperatures.length ? [...thermalTemperatures].sort((a, b) => Number(b.value_c || 0) - Number(a.value_c || 0))[0] : null;
+    if (isIos) {
+      renderIosPerformanceSystem(active, monitor, processes, priority, hottest);
+      return;
+    }
     const contextCount = Number(performance.context_sample_count || 0);
     const systemCount = Number(monitor.system_snapshot_count || 0);
     $("#performance-snapshot-status").textContent = contextCount
@@ -518,7 +1605,7 @@
       const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
       const names = priority.map(item => item.watch_label || item.watch_name || item.name).filter(Boolean);
       $("#system-priority-title").textContent = `检测到 ${names.join(" / ")}`;
-      $("#system-priority-detail").textContent = `${leading.watch_impact || "后台系统活动可能同时影响性能、存储 I/O、温度与功耗。"} 当前最高 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
+      $("#system-priority-detail").textContent = `后台系统活动可能造成 CPU 调度竞争、I/O 阻塞或缓存压力。当前最高 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
       $("#system-priority-badge").textContent = "ACTIVE";
     } else if (hasFrameIssue) {
       $("#system-priority-title").textContent = "检测到帧节奏异常";
@@ -526,7 +1613,7 @@
       $("#system-priority-badge").textContent = "FRAME";
     } else if (thermalStatus > 0) {
       $("#system-priority-title").textContent = `检测到热状态 ${thermalStatus}`;
-      $("#system-priority-detail").textContent = `平台热严重度为 ${thermalStatusDefinitions[thermalStatus] || "升高"}；请结合温度与同期功率判断是否降频。`;
+      $("#system-priority-detail").textContent = `平台热严重度为 ${thermalStatusDefinitions[thermalStatus] || "升高"}；请结合 CPU/GPU 频率上限判断是否发生热降频。`;
       $("#system-priority-badge").textContent = "THERMAL";
     } else {
       $("#system-priority-title").textContent = "未检测到明显性能干扰";
@@ -572,10 +1659,14 @@
     const svg = $("#live-chart");
     const empty = $("#chart-empty");
     const active = app.state?.active;
-    const series = Array.isArray(active?.series) ? active.series : [];
     const definition = metricDefinitions[app.metric];
+    const sourceSeries = definition.series === "performance"
+      ? active?.performance_series
+      : active?.series;
+    const series = Array.isArray(sourceSeries) ? sourceSeries : [];
     $("#chart-title").textContent = definition.title;
     $("#chart-legend").textContent = definition.legend;
+    $("#chart-secondary-label").textContent = definition.secondaryLabel || "P95";
     $(".legend-line").style.background = definition.color;
     svg.style.setProperty("--chart-color", definition.color);
     const points = series
@@ -592,7 +1683,7 @@
     empty.classList.add("hidden");
     const values = points.map(point => Number(point.value));
     const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const p95 = percentile(values, .95);
+    const p95 = percentile(values, definition.secondaryQuantile ?? .95);
     $("#chart-average").textContent = `${average.toFixed(definition.digits)} ${definition.unit}`;
     $("#chart-p95").textContent = p95 === null ? "--" : `${p95.toFixed(definition.digits)} ${definition.unit}`;
 
@@ -613,7 +1704,7 @@
       minValue -= padding;
       maxValue += padding;
     }
-    if (app.metric === "cpu_pct") {
+    if (app.metric === "cpu_pct" || app.metric === "gpu_load_pct") {
       minValue = Math.max(0, minValue);
       maxValue = Math.min(100, Math.max(10, maxValue));
     }
@@ -650,15 +1741,84 @@
   }
 
   function renderActive(active) {
-    if (active?.run_name !== app.currentRunName) {
+    const isNewRun = active?.run_name !== app.currentRunName;
+    if (isNewRun) {
       app.currentRunName = active?.run_name || null;
       app.consoleClearedAt = 0;
       app.notifiedWarnings.clear();
     }
+    if (active && (isNewRun || active.running)) {
+      if (active.running) {
+        setPlatform(active.platform || active.metadata?.platform || selectedPlatform(), {
+          fromRun: true,
+          initial: true,
+        });
+      }
+      setTestMode(active.test_mode || active.metadata?.test_mode || "power", {
+        fromRun: true,
+        initial: true,
+      });
+      if (isNewRun && active.running && active.config) {
+        const config = active.config;
+        [
+          ["duration-input", "duration"],
+          ["interval-input", "interval"],
+          ["checkpoint-input", "checkpoint_interval"],
+          ["reconnect-input", "reconnect_timeout"],
+          ["process-interval-input", "process_interval"],
+          ["thread-interval-input", "thread_interval"],
+          ["thermal-interval-input", "thermal_interval"],
+          ["scheduler-interval-input", "scheduler_interval"],
+          ["performance-interval-input", "performance_interval"],
+        ].forEach(([id, key]) => {
+          if (finite(config[key])) document.getElementById(id).value = String(config[key]);
+        });
+        [
+          ["title-input", config.title],
+          ["run-name-input", active.run_name || config.run_name],
+          ["package-input", config.package],
+          ["start-note-input", config.start_note],
+          ["gpu-path-input", config.gpu_frequency_path],
+        ].forEach(([id, value]) => {
+          if (value !== null && value !== undefined) document.getElementById(id).value = String(value);
+        });
+        [
+          ["start-context-input", config.start_context],
+          ["current-unit-input", config.current_unit],
+        ].forEach(([id, value]) => {
+          if (value) document.getElementById(id).value = String(value);
+        });
+        [
+          ["session-mode-input", "session_mode"],
+          ["unplugged-input", "require_unplugged"],
+          ["no-reset-input", "no_reset"],
+          ["full-history-input", "full_history"],
+          ["system-monitor-input", "system_monitor"],
+          ["harmony-high-performance-input", "harmony_high_performance"],
+        ].forEach(([id, key]) => {
+          document.getElementById(id).checked = Boolean(config[key]);
+        });
+        syncDurationPreset();
+      }
+      if (isNewRun && active.config?.capture_features) {
+        $("#capture-preset-input").value = active.config.capture_preset || "auto";
+        $$('[data-capture-feature]').forEach(input => {
+          if (Object.prototype.hasOwnProperty.call(active.config.capture_features, input.dataset.captureFeature)) {
+            input.checked = Boolean(active.config.capture_features[input.dataset.captureFeature]);
+          }
+        });
+        $("#harmony-high-performance-input").checked = Boolean(active.config.harmony_high_performance);
+        updateCaptureFeatureControls();
+      }
+    }
     renderSession(active);
     renderMetrics(active);
+    renderPerformanceMetrics(active);
     renderClusters(active);
     renderContext(active);
+    renderPerformanceResources(active);
+    renderPowerPressure(active);
+    renderRenderPipeline(active);
     renderSystem(active);
     renderConsole(active);
     renderChart();
@@ -735,6 +1895,8 @@
       ["Battery current / voltage", "HarmonyOS BatteryService", Boolean(data.capabilities?.battery_service && data.current_command_ok)],
       ["CPU utilization", "persistent HDC /proc/stat", Boolean(data.capabilities?.proc_stat)],
       ["CPU frequency", "hidumper --cpufreq", Boolean(data.capabilities?.cpufreq)],
+      ["SmartPerf native capture", data.smartperf?.command || "SP_daemon", Boolean(data.capabilities?.smartperf_daemon)],
+      ["Device high-performance mode", `current ${data.power_mode?.current_mode || "--"} · power-shell 602`, Boolean(data.capabilities?.performance_power_mode)],
       ["Foreground Ability", data.foreground_package || "AbilityManager", Boolean(data.capabilities?.ability_manager)],
       ["Display refresh modes", `${data.display?.refresh_rate_hz || "--"} Hz · ${(data.display?.supported_refresh_rates_hz || []).join("/") || "modes n/a"}`, Boolean(data.capabilities?.display_modes)],
       ["Compositor frame pacing", `${formatNumber(data.performance?.compositor_fps, 1)} FPS sampled`, Boolean(data.capabilities?.render_service_fps)],
@@ -744,7 +1906,7 @@
       ["GPU renderer", data.performance?.gpu_renderer || data.gpu_probe?.model || "renderer n/a", Boolean(data.capabilities?.gpu_renderer)],
       ["Temperature sensors", `${data.system_monitor?.thermal_sensor_count || 0} sensors`, Boolean(data.capabilities?.thermal_service)],
       ["Background interference", "HarmonyOS top + ps", Boolean(data.capabilities?.process_top)],
-      ["GPU frequency / load", data.gpu_probe?.reason || "HDC permission restricted", false],
+      ["GPU frequency / load", data.gpu_probe?.reason || "HDC permission restricted", Boolean(data.capabilities?.smartperf_gpu_metrics)],
     ] : [
       ["Fuel-gauge current", "cmd battery current_now", Boolean(data.current_command_ok)],
       ["GPU frequency", `${gpuModel} · ${data.gpu_probe?.provider || "OEM sysfs"}`, gpuFrequencyAvailable],
@@ -764,8 +1926,8 @@
   }
 
   function renderHistory(state) {
-    $("#history-root").textContent = `采集根目录：${state?.output_root || "power-runs"}`;
-    $("#output-root-hint").textContent = `保存在 ${state?.output_root || "power-runs"}`;
+    $("#history-root").textContent = `采集根目录：${state?.output_root || "profiler-runs"}`;
+    $("#output-root-hint").textContent = `保存在 ${state?.output_root || "profiler-runs"}`;
     const history = Array.isArray(state?.history) ? state.history : [];
     const body = $("#history-body");
     if (!history.length) {
@@ -933,6 +2095,14 @@
   function render(state) {
     app.state = state;
     setServerState(true, state.demo_mode ? "Demo preview enabled" : "Local dashboard");
+    if (state.active?.running) {
+      setPlatform(state.active.platform || state.active.metadata?.platform || selectedPlatform(), {
+        fromRun: true,
+        initial: true,
+      });
+    } else {
+      updatePlatformPresentation();
+    }
     renderDevices(state);
     renderActive(state.active);
     renderProbe(state);
@@ -959,8 +2129,17 @@
   }
 
   function recordPayload() {
+    const captureFeatures = Object.fromEntries($$('[data-capture-feature]').map(input => [
+      input.dataset.captureFeature,
+      input.checked,
+    ]));
     return {
       device: selectedDevice(),
+      platform: selectedPlatform(),
+      test_mode: app.testMode,
+      capture_preset: $("#capture-preset-input").value,
+      capture_features: captureFeatures,
+      harmony_high_performance: $("#harmony-high-performance-input").checked,
       title: $("#title-input").value.trim(),
       run_name: $("#run-name-input").value.trim(),
       duration: Number($("#duration-input").value),
@@ -981,39 +2160,87 @@
       thread_interval: Number($("#thread-interval-input").value),
       thermal_interval: Number($("#thermal-interval-input").value),
       scheduler_interval: Number($("#scheduler-interval-input").value),
+      performance_interval: Number($("#performance-interval-input").value),
     };
   }
 
   function bindEvents() {
     $$(".nav-item").forEach(button => button.addEventListener("click", () => switchView(button.dataset.view)));
+    $$(".platform-switch [data-platform]").forEach(button => button.addEventListener("click", () => {
+      setPlatform(button.dataset.platform);
+    }));
+    $$("[data-test-mode]").forEach(button => button.addEventListener("click", () => {
+      setTestMode(button.dataset.testMode);
+    }));
     window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
     window.addEventListener("resize", () => requestAnimationFrame(renderChart));
     document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshState(); });
 
     $("#device-select").addEventListener("change", event => {
-      localStorage.setItem("android-power-device", event.target.value);
+      localStorage.setItem(`mobile-profiler-device-${selectedPlatform()}`, event.target.value);
+      if (app.scannedAppsDevice && app.scannedAppsDevice !== event.target.value) {
+        resetAppScanner({ clearPackage: true });
+      }
       renderDevices(app.state);
       renderProbe(app.state);
+      updateCaptureFeatureControls();
     });
 
-    const savedAdbAddress = localStorage.getItem("android-power-adb-address");
-    if (savedAdbAddress) $("#adb-address-input").value = savedAdbAddress;
+    $("#capture-preset-input").addEventListener("change", () => applyCapturePreset());
+    $$('[data-capture-feature]').forEach(input => input.addEventListener("change", () => {
+      if (input.dataset.captureFeature === "frame_rate" && !input.checked) {
+        $('[data-capture-feature="frame_details"]').checked = false;
+      }
+      if (input.dataset.captureFeature === "frame_details" && input.checked) {
+        $('[data-capture-feature="frame_rate"]').checked = true;
+      }
+      if (input.dataset.captureFeature === "foreground_window" && !input.checked) {
+        $('[data-capture-feature="harmony_hitches"]').checked = false;
+      }
+      if (input.dataset.captureFeature === "harmony_hitches" && input.checked) {
+        $('[data-capture-feature="foreground_window"]').checked = true;
+      }
+      if (input.dataset.captureFeature === "hot_threads" && input.checked) {
+        $('[data-capture-feature="process_snapshots"]').checked = true;
+      }
+      if (input.dataset.captureFeature === "process_snapshots" && !input.checked) {
+        $('[data-capture-feature="hot_threads"]').checked = false;
+      }
+      updateCaptureFeatureControls({ overridden: true });
+    }));
+    $("#system-monitor-input").addEventListener("change", event => {
+      ["process_snapshots", "hot_threads", "thermal", "scheduler"].forEach(name => {
+        const input = $(`[data-capture-feature="${name}"]`);
+        if (input && !input.disabled) input.checked = event.target.checked;
+      });
+      updateCaptureFeatureControls({ overridden: true });
+    });
+    $("#harmony-high-performance-input").addEventListener("change", event => {
+      if (!event.target.checked) return;
+      const confirmed = confirm(
+        "设备高性能模式会在测试期间切换到 HarmonyOS power-shell 602，显著增加功耗和温度。\n\n程序会在正常结束、停止或异常退出时恢复原模式。是否启用？"
+      );
+      if (!confirmed) event.target.checked = false;
+    });
+
     $("#adb-connect-form").addEventListener("submit", async event => {
       event.preventDefault();
+      const platform = selectedPlatform();
+      if (platform === "ios") return;
       const address = $("#adb-address-input").value.trim();
       if (!address) {
-        notify("请输入 ADB 或 HDC 地址", "例如 192.168.1.20:5555，或 harmony:192.168.1.20:8710。", "error");
+        notify(`请输入 ${platform === "harmony" ? "HDC" : "ADB"} 地址`, platformProfiles[platform].addressPlaceholder, "error");
         return;
       }
-      const isHarmony = /^harmony:/i.test(address);
+      const isHarmony = platform === "harmony";
       setBusy(true, `正在连接 ${address}...`);
       try {
         const result = await api(isHarmony ? "/api/harmony/connect" : "/api/connect", {
           method: "POST",
           body: JSON.stringify({ address }),
         });
-        localStorage.setItem("android-power-adb-address", address);
-        localStorage.setItem("android-power-device", result.serial || address);
+        localStorage.setItem(`mobile-profiler-address-${platform}`, address);
+        localStorage.setItem(`mobile-profiler-device-${platform}`, result.serial || address);
         const transport = isHarmony ? "HDC" : "ADB";
         notify(result.connected ? `${transport} 设备已连接` : `${transport} 命令已执行`, result.output || address, result.connected ? "success" : "error", 7000);
         await refreshState();
@@ -1040,9 +2267,9 @@
         });
         if (result.suggested_address) {
           $("#adb-address-input").value = result.suggested_address;
-          localStorage.setItem("android-power-adb-address", result.suggested_address);
+          localStorage.setItem("mobile-profiler-address-android", result.suggested_address);
           if (result.connected) {
-            localStorage.setItem("android-power-device", result.suggested_address);
+            localStorage.setItem("mobile-profiler-device-android", result.suggested_address);
           }
         }
         const detail = result.connected
@@ -1075,10 +2302,10 @@
         });
         if (result.suggested_address) {
           const prefixedAddress = `harmony:${result.suggested_address}`;
-          $("#adb-address-input").value = prefixedAddress;
-          localStorage.setItem("android-power-adb-address", prefixedAddress);
+          $("#adb-address-input").value = result.suggested_address;
+          localStorage.setItem("mobile-profiler-address-harmony", result.suggested_address);
           if (result.connected) {
-            localStorage.setItem("android-power-device", result.suggested_device || prefixedAddress);
+            localStorage.setItem("mobile-profiler-device-harmony", result.suggested_device || prefixedAddress);
           }
         }
         const detail = result.connected
@@ -1138,8 +2365,8 @@
           method: "POST",
           body: JSON.stringify({ address }),
         });
-        if (localStorage.getItem("android-power-device") === address) {
-          localStorage.removeItem("android-power-device");
+        if (localStorage.getItem("mobile-profiler-device-android") === address) {
+          localStorage.removeItem("mobile-profiler-device-android");
         }
         notify("无线 ADB 已断开", result.output || address, "success", 7000);
         await refreshState();
@@ -1154,7 +2381,10 @@
       const button = $("#refresh-devices");
       button.classList.add("loading");
       try {
-        await api("/api/devices/refresh", { method: "POST", body: "{}" });
+        await api("/api/devices/refresh", {
+          method: "POST",
+          body: JSON.stringify({ platform: selectedPlatform() }),
+        });
         await refreshState();
       } catch (error) {
         notify("设备刷新失败", error.message, "error");
@@ -1163,14 +2393,67 @@
       }
     });
 
+    $("#scan-apps").addEventListener("click", async () => {
+      const device = selectedDevice();
+      const selected = selectedDeviceInfo();
+      if (!device || devicePlatform(selected) !== "android" || selected?.state !== "device") {
+        notify("请选择在线 Android 设备", "应用扫描需要一台已授权且处于 device 状态的手机。", "error");
+        return;
+      }
+      setBusy(true, "正在扫描手机上的可启动应用...");
+      try {
+        const result = await api("/api/apps", {
+          method: "POST",
+          body: JSON.stringify({ device, platform: "android" }),
+        });
+        app.scannedApps = Array.isArray(result.apps) ? result.apps : [];
+        app.scannedAppsDevice = result.device || device;
+        app.scannedAppsSource = result.source || "launcher-activities";
+        $("#app-search-input").value = "";
+        const currentPackage = $("#package-input").value.trim();
+        app.selectedScannedPackage = app.scannedApps.some(item => item.package === currentPackage)
+          ? currentPackage
+          : "";
+        renderAppOptions();
+        updateAppScannerAvailability(selected);
+        const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+        notify(
+          "手机应用扫描完成",
+          `${app.scannedApps.length} 个${result.source === "third-party-packages-fallback" ? "第三方包" : "可启动应用"}${warnings.length ? ` · ${warnings.join("；")}` : ""}`,
+          warnings.length ? "error" : "success",
+          8000,
+        );
+      } catch (error) {
+        resetAppScanner();
+        updateAppScannerAvailability(selected);
+        notify("应用扫描失败", `${error.message}；仍可手工输入游戏包名。`, "error", 9000);
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    $("#app-search-input").addEventListener("input", renderAppOptions);
+    $("#app-select").addEventListener("change", event => {
+      const packageName = event.target.value;
+      if (!packageName) return;
+      $("#package-input").value = packageName;
+      app.selectedScannedPackage = packageName;
+      renderAppOptions();
+    });
+    $("#package-input").addEventListener("input", event => {
+      const packageName = event.target.value.trim();
+      app.selectedScannedPackage = app.scannedApps.some(item => item.package === packageName)
+        ? packageName
+        : "";
+      renderAppOptions();
+    });
+
     $$("[data-duration]").forEach(button => button.addEventListener("click", () => {
       $("#duration-input").value = button.dataset.duration;
-      $$("[data-duration]").forEach(item => item.classList.toggle("active", item === button));
+      syncDurationPreset();
     }));
 
-    $("#duration-input").addEventListener("input", event => {
-      $$("[data-duration]").forEach(item => item.classList.toggle("active", Number(item.dataset.duration) === Number(event.target.value)));
-    });
+    $("#duration-input").addEventListener("input", syncDurationPreset);
 
     $$("[data-metric]").forEach(button => button.addEventListener("click", () => {
       app.metric = button.dataset.metric;
@@ -1182,7 +2465,12 @@
       event.preventDefault();
       const payload = recordPayload();
       if (!payload.device) {
-        notify("请选择设备", "需要一台处于 device 状态的 Android、HarmonyOS 或 iOS 设备。", "error");
+        notify("请选择设备", `需要一台处于 device 状态的 ${platformLabel(selectedPlatform())} 设备。`, "error");
+        return;
+      }
+      if (payload.test_mode === "performance" && !payload.package) {
+        notify("请选择测试游戏 / 应用", "性能测试必须绑定具体包名；Android 可先扫描手机应用后选择。", "error", 8000);
+        $("#package-input").focus();
         return;
       }
       setBusy(true, "正在启动采集...");
@@ -1239,7 +2527,11 @@
       try {
         const entry = await api("/api/probe", {
           method: "POST",
-          body: JSON.stringify({ device, gpu_frequency_path: $("#gpu-path-input").value.trim() }),
+          body: JSON.stringify({
+            device,
+            platform: selectedPlatform(),
+            gpu_frequency_path: $("#gpu-path-input").value.trim(),
+          }),
         });
         app.state.probes = { ...(app.state.probes || {}), [device]: entry };
         renderProbe(app.state);
@@ -1260,16 +2552,16 @@
 
     $("#refresh-history").addEventListener("click", async () => {
       await refreshState();
-      notify("历史记录已刷新", app.state?.output_root || "power-runs", "success", 2500);
+      notify("历史记录已刷新", app.state?.output_root || "profiler-runs", "success", 2500);
     });
 
     const savedToolFields = {
-      "import-log-path": "android-power-import-log-path",
-      "import-rules-path": "android-power-import-rules-path",
-      "import-match-input": "android-power-import-match",
-      "archive-attachments-input": "android-power-archive-attachments",
-      "archive-output-path": "android-power-archive-output",
-      "portable-output-directory": "android-power-portable-output",
+      "import-log-path": "mobile-profiler-import-log-path",
+      "import-rules-path": "mobile-profiler-import-rules-path",
+      "import-match-input": "mobile-profiler-import-match",
+      "archive-attachments-input": "mobile-profiler-archive-attachments",
+      "archive-output-path": "mobile-profiler-archive-output",
+      "portable-output-directory": "mobile-profiler-portable-output",
     };
     Object.entries(savedToolFields).forEach(([id, key]) => {
       const saved = localStorage.getItem(key);
@@ -1312,9 +2604,9 @@
         notify("信息不完整", "请选择运行记录并填写 BTR2 日志路径。", "error");
         return;
       }
-      localStorage.setItem("android-power-import-log-path", payload.log_path);
-      localStorage.setItem("android-power-import-rules-path", payload.rules_path);
-      localStorage.setItem("android-power-import-match", payload.match);
+      localStorage.setItem("mobile-profiler-import-log-path", payload.log_path);
+      localStorage.setItem("mobile-profiler-import-rules-path", payload.rules_path);
+      localStorage.setItem("mobile-profiler-import-match", payload.match);
       await runToolOperation(
         "/api/import-log",
         payload,
@@ -1331,8 +2623,8 @@
         output_path: $("#archive-output-path").value.trim(),
       };
       if (!payload.run_name) return notify("请选择运行记录", "没有可归档的采集目录。", "error");
-      localStorage.setItem("android-power-archive-attachments", payload.attachments);
-      localStorage.setItem("android-power-archive-output", payload.output_path);
+      localStorage.setItem("mobile-profiler-archive-attachments", payload.attachments);
+      localStorage.setItem("mobile-profiler-archive-output", payload.output_path);
       await runToolOperation(
         "/api/archive",
         payload,
@@ -1367,8 +2659,8 @@
     $("#portable-build-form").addEventListener("submit", async event => {
       event.preventDefault();
       const outputDirectory = $("#portable-output-directory").value.trim();
-      if (!confirm(`确认重新构建便携包？\n\n输出目录：${outputDirectory || "dist\\mobile-power-profiler-portable"}\n已有同名目录和 ZIP 会被替换。`)) return;
-      localStorage.setItem("android-power-portable-output", outputDirectory);
+      if (!confirm(`确认重新构建便携包？\n\n输出目录：${outputDirectory || "dist\\mobile-profiler-portable"}\n已有同名目录和 ZIP 会被替换。`)) return;
+      localStorage.setItem("mobile-profiler-portable-output", outputDirectory);
       await runToolOperation(
         "/api/build-portable",
         {
@@ -1418,6 +2710,8 @@
   }
 
   bindEvents();
+  setPlatform(app.platform, { initial: true });
+  setTestMode("power", { initial: true });
   switchView(app.activeView);
   pollLoop();
 })();

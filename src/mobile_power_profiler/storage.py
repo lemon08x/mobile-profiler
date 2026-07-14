@@ -238,6 +238,11 @@ def sample_to_dict(sample: Sample) -> Dict[str, object]:
             round(sample.gpu_frequency_mhz, 4) if sample.gpu_frequency_mhz is not None else None
         ),
         "gpu_load_pct": round(sample.gpu_load_pct, 4) if sample.gpu_load_pct is not None else None,
+        "memory_frequency_mhz": (
+            round(sample.memory_frequency_mhz, 4)
+            if sample.memory_frequency_mhz is not None
+            else None
+        ),
         "battery_temperature_c": (
             round(sample.battery_temperature_c, 4)
             if sample.battery_temperature_c is not None
@@ -280,6 +285,7 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
         "battery_temperature_c",
         "gpu_frequency_mhz",
         "gpu_load_pct",
+        "memory_frequency_mhz",
         "power_source",
         "power_sample_age_s",
         "collector_cpu_pct",
@@ -310,6 +316,11 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
                     "" if sample.gpu_frequency_mhz is None else f"{sample.gpu_frequency_mhz:.4f}"
                 ),
                 "gpu_load_pct": "" if sample.gpu_load_pct is None else f"{sample.gpu_load_pct:.4f}",
+                "memory_frequency_mhz": (
+                    ""
+                    if sample.memory_frequency_mhz is None
+                    else f"{sample.memory_frequency_mhz:.4f}"
+                ),
                 "power_source": sample.power_source,
                 "power_sample_age_s": (
                     "" if sample.power_sample_age_s is None else f"{sample.power_sample_age_s:.4f}"
@@ -359,7 +370,7 @@ def read_samples_csv(path: Path) -> List[Sample]:
             name
             for name in fieldnames
             if name.endswith("_mhz")
-            and name not in {"gpu_frequency_mhz"}
+            and name not in {"gpu_frequency_mhz", "memory_frequency_mhz"}
             and not name.startswith("signed_")
         ]
         cluster_fields = [name for name in fieldnames if name.endswith("_load_pct")]
@@ -401,6 +412,7 @@ def read_samples_csv(path: Path) -> List[Sample]:
                     },
                     gpu_frequency_mhz=_optional_float(row, "gpu_frequency_mhz"),
                     gpu_load_pct=_optional_float(row, "gpu_load_pct"),
+                    memory_frequency_mhz=_optional_float(row, "memory_frequency_mhz"),
                     battery_temperature_c=_optional_float(row, "battery_temperature_c"),
                     power_source=row.get("power_source") or "battery_current_voltage",
                     power_sample_age_s=_optional_float(row, "power_sample_age_s"),

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import bisect
 import math
+import re
 import statistics
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from .collector import frequency_to_mhz
+from .collector import frequency_to_mhz, parse_android_runtime_settings
+from .features import capture_features_from_metadata
 from .models import (
     ContextSample,
     CpuPolicy,
@@ -123,6 +125,11 @@ def convert_samples(
         gpu_load_pct = None
         if raw.gpu_load_raw is not None:
             gpu_load_pct = max(0.0, min(100.0, raw.gpu_load_raw))
+        memory_frequency_mhz = (
+            frequency_to_mhz(raw.memory_frequency_raw)
+            if raw.memory_frequency_raw is not None
+            else None
+        )
 
         samples.append(
             Sample(
@@ -142,6 +149,7 @@ def convert_samples(
                 },
                 gpu_frequency_mhz=gpu_frequency_mhz,
                 gpu_load_pct=gpu_load_pct,
+                memory_frequency_mhz=memory_frequency_mhz,
                 battery_temperature_c=(
                     raw.temperature_tenths_c / 10.0
                     if raw.temperature_tenths_c is not None
@@ -165,6 +173,46 @@ def percentile(values: Sequence[float], quantile: float) -> Optional[float]:
     ordered = sorted(values)
     index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * quantile) - 1))
     return ordered[index]
+
+
+def histogram_percentile(
+    histogram: Dict[float, int],
+    quantile: float,
+) -> Optional[float]:
+    total = sum(max(0, count) for count in histogram.values())
+    if total <= 0:
+        return None
+    threshold = total * max(0.0, min(1.0, quantile))
+    cumulative = 0
+    for bucket, count in sorted(histogram.items()):
+        cumulative += max(0, count)
+        if cumulative >= threshold:
+            return bucket
+    return max(histogram) if histogram else None
+
+
+def histogram_slowest_average(
+    histogram: Dict[float, int],
+    fraction: float = 0.01,
+) -> Optional[float]:
+    """Return the weighted average duration of the slowest fraction of frames."""
+
+    total = sum(max(0, count) for count in histogram.values())
+    if total <= 0:
+        return None
+    remaining = max(1, math.ceil(total * max(0.0, min(1.0, fraction))))
+    weighted = 0.0
+    selected = 0
+    for bucket, count in sorted(histogram.items(), reverse=True):
+        take = min(max(0, count), remaining)
+        if take <= 0:
+            continue
+        weighted += bucket * take
+        selected += take
+        remaining -= take
+        if remaining <= 0:
+            break
+    return weighted / selected if selected > 0 else None
 
 
 def median_absolute_deviation(values: Sequence[float]) -> float:
@@ -574,6 +622,107 @@ def analyze_gpu(
             "prerelease_game_driver": end_dump.get("prerelease_game_driver"),
         },
         "limitations": limitations,
+    }
+
+
+def analyze_memory_frequency(
+    samples: Sequence[Sample],
+    metadata: Dict[str, object],
+) -> Dict[str, object]:
+    rows = [
+        sample
+        for sample in samples
+        if isinstance(sample.memory_frequency_mhz, (int, float))
+        and float(sample.memory_frequency_mhz) > 0
+    ]
+    source = metadata.get("memory_source")
+    source = source if isinstance(source, dict) else {}
+    probe = metadata.get("memory_probe")
+    probe = probe if isinstance(probe, dict) else {}
+    if not rows:
+        return {
+            "available": False,
+            "source": source or None,
+            "probe": probe,
+            "timeline": [],
+            "limitations": probe.get("limitations")
+            or "No readable DRAM/DMC/MIF frequency source was exposed.",
+        }
+
+    frequencies = [float(item.memory_frequency_mhz or 0.0) for item in rows]
+    powers = [float(item.power_mw) for item in rows]
+    currents = [float(item.current_ma) for item in rows]
+    hardware_max = source.get("maximum_mhz")
+    observed_min = min(frequencies)
+    observed_max = max(frequencies)
+    range_max = (
+        float(hardware_max)
+        if isinstance(hardware_max, (int, float)) and float(hardware_max) > 0
+        else observed_max
+    )
+    low_threshold = observed_min + (range_max - observed_min) * 0.35
+    high_threshold = observed_min + (range_max - observed_min) * 0.75
+    high_rows = [
+        item for item in rows if float(item.memory_frequency_mhz or 0.0) >= high_threshold
+    ]
+    lower_rows = [
+        item for item in rows if float(item.memory_frequency_mhz or 0.0) < high_threshold
+    ]
+    high_power = (
+        statistics.fmean(item.power_mw for item in high_rows) if high_rows else None
+    )
+    lower_power = (
+        statistics.fmean(item.power_mw for item in lower_rows) if lower_rows else None
+    )
+    residency_counts = {"low": 0, "medium": 0, "high": 0}
+    for value in frequencies:
+        if value < low_threshold:
+            residency_counts["low"] += 1
+        elif value < high_threshold:
+            residency_counts["medium"] += 1
+        else:
+            residency_counts["high"] += 1
+    total = len(frequencies)
+    return {
+        "available": True,
+        "source": source or None,
+        "probe": probe,
+        "average_frequency_mhz": statistics.fmean(frequencies),
+        "minimum_frequency_mhz": observed_min,
+        "p95_frequency_mhz": percentile(frequencies, 0.95),
+        "maximum_frequency_mhz": observed_max,
+        "hardware_maximum_mhz": hardware_max,
+        "power_correlation": _pearson(frequencies, powers),
+        "current_correlation": _pearson(frequencies, currents),
+        "high_frequency_threshold_mhz": high_threshold,
+        "high_frequency_share_pct": len(high_rows) / total * 100.0 if total else 0.0,
+        "high_frequency_average_power_mw": high_power,
+        "lower_frequency_average_power_mw": lower_power,
+        "high_frequency_power_delta_mw": (
+            high_power - lower_power
+            if isinstance(high_power, (int, float))
+            and isinstance(lower_power, (int, float))
+            else None
+        ),
+        "residency": {
+            key: value / total * 100.0 if total else 0.0
+            for key, value in residency_counts.items()
+        },
+        "timeline": [
+            {
+                "elapsed_s": item.elapsed_s,
+                "frequency_mhz": item.memory_frequency_mhz,
+                "power_mw": item.power_mw,
+                "current_ma": item.current_ma,
+                "cpu_pct": item.cpu_pct,
+                "gpu_load_pct": item.gpu_load_pct,
+            }
+            for item in rows
+        ],
+        "limitations": (
+            "The value is a readable DMC/DRAM/MIF devfreq clock. It does not expose "
+            "per-channel bandwidth, cache hit rate, or an electrical memory rail."
+        ),
     }
 
 
@@ -2587,6 +2736,594 @@ def analyze_test_items(
     }
 
 
+def analyze_performance_test_items(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    events: Sequence[ExternalEvent],
+    performance_analysis: Dict[str, object],
+    thermal_analysis: Dict[str, object],
+    scheduler_analysis: Dict[str, object],
+    max_gap_s: float,
+    sample_interval_s: float,
+) -> Dict[str, object]:
+    """Aggregate explicit test spans around frame behavior, not power attribution."""
+    session_start = samples[0].uptime_s
+    session_end = samples[-1].uptime_s
+    minimum_reliable_duration_s = max(3.0 * sample_interval_s, sample_interval_s + 2.0)
+    definitions: Dict[Tuple[str, str], Dict[str, object]] = {}
+    occurrences: List[Dict[str, object]] = []
+
+    duration_events = [
+        item
+        for item in events
+        if isinstance(item.duration_s, (int, float))
+        and float(item.duration_s or 0.0) > 0
+        and item.device_uptime_s < session_end
+        and item.device_uptime_s + float(item.duration_s or 0.0) > session_start
+    ]
+    source_mode = "external_events" if duration_events else "foreground_activity"
+    if duration_events:
+        for event in sorted(duration_events, key=lambda item: item.device_uptime_s):
+            start = max(session_start, event.device_uptime_s)
+            end = min(session_end, event.device_uptime_s + float(event.duration_s or 0.0))
+            if end <= start:
+                continue
+            key = (event.phase or "测试", event.name or "未命名测试项")
+            occurrence = {
+                "phase": key[0],
+                "name": key[1],
+                "start_uptime_s": start,
+                "end_uptime_s": end,
+                "source": event.source,
+                "metadata": event.metadata,
+            }
+            occurrences.append(occurrence)
+            row = definitions.setdefault(
+                key,
+                {
+                    "phase": key[0],
+                    "name": key[1],
+                    "comparison_key": str(event.metadata.get("test") or key[1]),
+                    "source": event.source,
+                    "windows": [],
+                },
+            )
+            row["windows"].append((start, end))  # type: ignore[union-attr]
+    else:
+        ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+        context_uptimes = [item.uptime_s for item in ordered_contexts]
+        current = _context_at(ordered_contexts, context_uptimes, session_start)
+        cursor = session_start
+
+        def context_key(context: Optional[ContextSample]) -> Tuple[str, str]:
+            package = context.foreground_package if context else None
+            activity = context.foreground_activity if context else None
+            return package or "前台活动", activity or package or "未知前台活动"
+
+        def append_window(
+            key: Tuple[str, str],
+            start: float,
+            end: float,
+            context: Optional[ContextSample],
+        ) -> None:
+            if end <= start:
+                return
+            source = context.source if context and context.source else "platform_context_sampler"
+            occurrences.append(
+                {
+                    "phase": key[0],
+                    "name": key[1],
+                    "start_uptime_s": start,
+                    "end_uptime_s": end,
+                    "source": source,
+                    "metadata": {},
+                }
+            )
+            row = definitions.setdefault(
+                key,
+                {
+                    "phase": key[0],
+                    "name": key[1],
+                    "comparison_key": key[1],
+                    "source": source,
+                    "windows": [],
+                },
+            )
+            row["windows"].append((start, end))  # type: ignore[union-attr]
+
+        current_key = context_key(current)
+        for following in (
+            item for item in ordered_contexts if session_start < item.uptime_s < session_end
+        ):
+            next_key = context_key(following)
+            if next_key == current_key:
+                current = following
+                continue
+            append_window(current_key, cursor, following.uptime_s, current)
+            current = following
+            current_key = next_key
+            cursor = following.uptime_s
+        append_window(current_key, cursor, session_end, current)
+
+    frame_timeline = performance_analysis.get("frame_rate_timeline", [])
+    frame_timeline = frame_timeline if isinstance(frame_timeline, list) else []
+    render_pipeline = performance_analysis.get("render_pipeline", {})
+    render_pipeline = render_pipeline if isinstance(render_pipeline, dict) else {}
+    detailed_frames = render_pipeline.get("timeline", [])
+    detailed_frames = detailed_frames if isinstance(detailed_frames, list) else []
+    thermal_timeline = thermal_analysis.get("timeline", [])
+    thermal_timeline = thermal_timeline if isinstance(thermal_timeline, list) else []
+    scheduler_timeline = scheduler_analysis.get("timeline", [])
+    scheduler_timeline = scheduler_timeline if isinstance(scheduler_timeline, list) else []
+
+    def values_in_windows(
+        field: str,
+        windows: Sequence[Tuple[float, float]],
+    ) -> List[float]:
+        return [
+            float(getattr(sample, field))
+            for sample in samples
+            if _time_in_windows(sample.uptime_s, windows)
+            and isinstance(getattr(sample, field), (int, float))
+        ]
+
+    def analyze_windows(windows: Sequence[Tuple[float, float]]) -> Dict[str, object]:
+        valid_windows = _merge_time_windows(windows)
+        duration_s = sum(end - start for start, end in valid_windows)
+        period_rows = [
+            item
+            for item in frame_timeline
+            if isinstance(item, dict)
+            and isinstance(item.get("uptime_s"), (int, float))
+            and _time_in_windows(float(item["uptime_s"]), valid_windows)
+        ]
+        detailed = [
+            item
+            for item in detailed_frames
+            if isinstance(item, dict)
+            and isinstance(item.get("context_uptime_s"), (int, float))
+            and _time_in_windows(float(item["context_uptime_s"]), valid_windows)
+        ]
+        frame_count = sum(int(item.get("frame_count") or 0) for item in period_rows)
+        frame_duration_s = sum(float(item.get("duration_s") or 0.0) for item in period_rows)
+        average_fps = frame_count / frame_duration_s if frame_duration_s > 0 else None
+        detailed_totals = [
+            float(item["total_ms"])
+            for item in detailed
+            if isinstance(item.get("total_ms"), (int, float))
+        ]
+        if detailed_totals:
+            slow_count = max(1, math.ceil(len(detailed_totals) * 0.01))
+            slow_average_ms = statistics.fmean(
+                sorted(detailed_totals, reverse=True)[:slow_count]
+            )
+            one_percent_low = 1000.0 / slow_average_ms if slow_average_ms > 0 else None
+            frame_p95 = percentile(detailed_totals, 0.95)
+            frame_p99 = percentile(detailed_totals, 0.99)
+            frame_metric_source = "Android gfxinfo detailed framestats"
+        else:
+            one_low_values = [
+                float(item["one_percent_low_fps"])
+                for item in period_rows
+                if isinstance(item.get("one_percent_low_fps"), (int, float))
+            ]
+            rate_values = [
+                float(item["frame_rate_fps"])
+                for item in period_rows
+                if isinstance(item.get("frame_rate_fps"), (int, float))
+            ]
+            one_percent_low = (
+                min(one_low_values)
+                if one_low_values
+                else percentile(rate_values, 0.01)
+            )
+            p95_values = [
+                float(item["frame_time_p95_ms"])
+                for item in period_rows
+                if isinstance(item.get("frame_time_p95_ms"), (int, float))
+            ]
+            p99_values = [
+                float(item["frame_time_p99_ms"])
+                for item in period_rows
+                if isinstance(item.get("frame_time_p99_ms"), (int, float))
+            ]
+            frame_p95 = max(p95_values) if p95_values else None
+            frame_p99 = max(p99_values) if p99_values else None
+            frame_metric_source = "periodic frame counter windows"
+
+        deadline_missed = sum(
+            int(item.get("deadline_missed_count") or 0) for item in period_rows
+        )
+        if detailed and not period_rows:
+            deadline_missed = sum(1 for item in detailed if item.get("deadline_missed"))
+            issue_denominator = len(detailed)
+        else:
+            issue_denominator = frame_count
+        frame_issue_pct = (
+            deadline_missed / issue_denominator * 100.0
+            if issue_denominator > 0
+            else None
+        )
+
+        stage_rows: List[Dict[str, object]] = []
+        stage_labels = {
+            str(item.get("key")): str(item.get("label"))
+            for item in render_pipeline.get("stages", [])
+            if isinstance(item, dict) and item.get("key")
+        }
+        for key, label in stage_labels.items():
+            stage_values = [
+                float(item[key])
+                for item in detailed
+                if isinstance(item.get(key), (int, float))
+            ]
+            if stage_values:
+                stage_rows.append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "sample_count": len(stage_values),
+                        "average_ms": statistics.fmean(stage_values),
+                        "p95_ms": percentile(stage_values, 0.95),
+                        "p99_ms": percentile(stage_values, 0.99),
+                        "maximum_ms": max(stage_values),
+                    }
+                )
+        stage_rows.sort(key=lambda item: float(item.get("p95_ms") or 0.0), reverse=True)
+
+        cpu_values = values_in_windows("cpu_pct", valid_windows)
+        gpu_load_values = values_in_windows("gpu_load_pct", valid_windows)
+        gpu_frequency_values = values_in_windows("gpu_frequency_mhz", valid_windows)
+        memory_values = values_in_windows("memory_frequency_mhz", valid_windows)
+        power_values = values_in_windows("power_mw", valid_windows)
+        thermal_points = [
+            item
+            for item in thermal_timeline
+            if isinstance(item, dict)
+            and isinstance(item.get("uptime_s"), (int, float))
+            and _time_in_windows(float(item["uptime_s"]), valid_windows)
+        ]
+        thermal_values = [
+            float(item["maximum_temperature_c"])
+            for item in thermal_points
+            if isinstance(item.get("maximum_temperature_c"), (int, float))
+        ]
+        maximum_thermal_status = max(
+            (int(item.get("status") or 0) for item in thermal_points),
+            default=0,
+        )
+        scheduler_points = [
+            item
+            for item in scheduler_timeline
+            if isinstance(item, dict)
+            and isinstance(item.get("uptime_s"), (int, float))
+            and _time_in_windows(float(item["uptime_s"]), valid_windows)
+        ]
+        return {
+            "duration_s": duration_s,
+            "frame_count": frame_count or len(detailed),
+            "average_fps": average_fps,
+            "one_percent_low_fps": one_percent_low,
+            "frame_p95_ms": frame_p95,
+            "frame_p99_ms": frame_p99,
+            "frame_issue_count": deadline_missed,
+            "frame_issue_pct": frame_issue_pct,
+            "frame_metric_source": frame_metric_source,
+            "detailed_frame_count": len(detailed),
+            "dominant_stage": stage_rows[0] if stage_rows else None,
+            "stages": stage_rows,
+            "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
+            "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
+            "average_gpu_load_pct": (
+                statistics.fmean(gpu_load_values) if gpu_load_values else None
+            ),
+            "maximum_gpu_load_pct": max(gpu_load_values) if gpu_load_values else None,
+            "average_gpu_frequency_mhz": (
+                statistics.fmean(gpu_frequency_values) if gpu_frequency_values else None
+            ),
+            "maximum_gpu_frequency_mhz": (
+                max(gpu_frequency_values) if gpu_frequency_values else None
+            ),
+            "average_memory_frequency_mhz": (
+                statistics.fmean(memory_values) if memory_values else None
+            ),
+            "p95_memory_frequency_mhz": percentile(memory_values, 0.95),
+            "maximum_temperature_c": max(thermal_values) if thermal_values else None,
+            "maximum_thermal_status": maximum_thermal_status,
+            "throttling_observed": maximum_thermal_status > 0,
+            "scheduler": scheduler_points[-1] if scheduler_points else None,
+            "average_whole_device_power_mw": (
+                statistics.fmean(power_values) if power_values else None
+            ),
+        }
+
+    rows: List[Dict[str, object]] = []
+    for definition in definitions.values():
+        windows = definition.get("windows", [])
+        if not isinstance(windows, list):
+            continue
+        metrics = analyze_windows(windows)
+        rows.append(
+            {
+                **{key: value for key, value in definition.items() if key != "windows"},
+                **metrics,
+                "occurrence_count": len(windows),
+                "windows": [
+                    {
+                        "start_uptime_s": start,
+                        "end_uptime_s": end,
+                        "start_elapsed_s": start - session_start,
+                        "end_elapsed_s": end - session_start,
+                    }
+                    for start, end in windows
+                ],
+                "confidence": (
+                    "low"
+                    if float(metrics.get("duration_s") or 0.0) < minimum_reliable_duration_s
+                    or int(metrics.get("frame_count") or 0) < 30
+                    else "high"
+                    if int(metrics.get("detailed_frame_count") or 0) >= 100
+                    else "medium"
+                ),
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            float(item.get("frame_issue_pct") or 0.0),
+            float(item.get("frame_p99_ms") or 0.0),
+        ),
+        reverse=True,
+    )
+
+    span_rows: List[Dict[str, object]] = []
+    for occurrence in occurrences:
+        start = float(occurrence["start_uptime_s"])
+        end = float(occurrence["end_uptime_s"])
+        metrics = analyze_windows([(start, end)])
+        span_rows.append(
+            {
+                **occurrence,
+                **metrics,
+                "start_elapsed_s": start - session_start,
+                "end_elapsed_s": end - session_start,
+                "confidence": (
+                    "low"
+                    if end - start < minimum_reliable_duration_s
+                    or int(metrics.get("frame_count") or 0) < 30
+                    else "medium"
+                ),
+            }
+        )
+
+    overlap_count = 0
+    ordered_spans = sorted(span_rows, key=lambda item: float(item["start_uptime_s"]))
+    for current, following in zip(ordered_spans, ordered_spans[1:]):
+        if (
+            float(following["start_uptime_s"]) < float(current["end_uptime_s"])
+            and (current.get("phase"), current.get("name"))
+            != (following.get("phase"), following.get("name"))
+        ):
+            overlap_count += 1
+
+    return {
+        "available": bool(rows),
+        "analysis_mode": "performance",
+        "source_mode": source_mode,
+        "source_label": (
+            "导入的持续测试事件" if source_mode == "external_events" else "前台应用 / Ability 区间"
+        ),
+        "minimum_reliable_duration_s": minimum_reliable_duration_s,
+        "row_count": len(rows),
+        "span_count": len(span_rows),
+        "overlap_count": overlap_count,
+        "rows": rows,
+        "spans": span_rows,
+        "instant_events": [
+            {
+                "name": item.name,
+                "phase": item.phase,
+                "elapsed_s": item.device_uptime_s - session_start,
+                "source": item.source,
+            }
+            for item in events
+            if not item.duration_s and session_start <= item.device_uptime_s <= session_end
+        ],
+        "limitations": (
+            "Frame metrics are aggregated inside each test window. Detailed framestats are used when "
+            "available; otherwise periodic counter windows provide conservative P95/P99 and 1% Low context. "
+            "Whole-device power is recorded only as a session context and is not attributed to processes, UIDs, or components."
+        ),
+    }
+
+
+def analyze_android_frame_pipeline(
+    contexts: Sequence[ContextSample],
+) -> Dict[str, object]:
+    seen_by_window: Dict[str, set[int]] = {}
+    initialized_windows: set[str] = set()
+    frames: List[Dict[str, object]] = []
+
+    def timestamp(record: Dict[str, object], key: str) -> Optional[int]:
+        value = record.get(key)
+        if not isinstance(value, (int, float)):
+            return None
+        parsed = int(value)
+        return parsed if 0 < parsed < 9_000_000_000_000_000_000 else None
+
+    def duration_ms(
+        record: Dict[str, object],
+        end_key: str,
+        start_key: str,
+    ) -> Optional[float]:
+        end = timestamp(record, end_key)
+        start = timestamp(record, start_key)
+        if end is None or start is None or end < start:
+            return None
+        value = (end - start) / 1_000_000.0
+        return value if value <= 5000.0 else None
+
+    for context in sorted(contexts, key=lambda item: item.uptime_s):
+        records = context.performance.get("frame_records")
+        if not isinstance(records, list) or not records:
+            continue
+        window = str(
+            context.performance.get("foreground_window_name")
+            or context.foreground_activity
+            or context.foreground_package
+            or "unknown"
+        )
+        seen = seen_by_window.setdefault(window, set())
+        parsed_records: List[Tuple[int, Dict[str, object]]] = []
+        for raw in records:
+            if not isinstance(raw, dict):
+                continue
+            frame_id = timestamp(raw, "FrameTimelineVsyncId")
+            intended = timestamp(raw, "IntendedVsync")
+            key = frame_id or intended
+            if key is None:
+                continue
+            parsed_records.append((key, raw))
+        if window not in initialized_windows:
+            seen.update(key for key, _ in parsed_records)
+            initialized_windows.add(window)
+            continue
+        for key, record in parsed_records:
+            if key in seen:
+                continue
+            seen.add(key)
+            if int(record.get("Flags") or 0) != 0:
+                continue
+            total_ms = duration_ms(record, "FrameCompleted", "IntendedVsync")
+            if total_ms is None:
+                continue
+            intended = timestamp(record, "IntendedVsync")
+            deadline = timestamp(record, "FrameDeadline")
+            completed = timestamp(record, "FrameCompleted")
+            dequeue = record.get("DequeueBufferDuration")
+            queue = record.get("QueueBufferDuration")
+            stages = {
+                "vsync_delay_ms": duration_ms(record, "Vsync", "IntendedVsync"),
+                "input_ms": duration_ms(record, "AnimationStart", "HandleInputStart"),
+                "animation_ms": duration_ms(
+                    record,
+                    "PerformTraversalsStart",
+                    "AnimationStart",
+                ),
+                "traversal_ms": duration_ms(
+                    record,
+                    "DrawStart",
+                    "PerformTraversalsStart",
+                ),
+                "draw_ms": duration_ms(record, "SyncQueued", "DrawStart"),
+                "sync_ms": duration_ms(
+                    record,
+                    "IssueDrawCommandsStart",
+                    "SyncStart",
+                ),
+                "command_ms": duration_ms(
+                    record,
+                    "SwapBuffers",
+                    "IssueDrawCommandsStart",
+                ),
+                "gpu_wait_ms": duration_ms(record, "GpuCompleted", "SwapBuffers"),
+                "post_swap_ms": duration_ms(
+                    record,
+                    "FrameCompleted",
+                    "SwapBuffers",
+                ),
+                "dequeue_ms": (
+                    float(dequeue) / 1_000_000.0
+                    if isinstance(dequeue, (int, float)) and 0 <= float(dequeue) < 5e9
+                    else None
+                ),
+                "queue_ms": (
+                    float(queue) / 1_000_000.0
+                    if isinstance(queue, (int, float)) and 0 <= float(queue) < 5e9
+                    else None
+                ),
+            }
+            frames.append(
+                {
+                    "frame_id": key,
+                    "window": window,
+                    "context_uptime_s": context.uptime_s,
+                    "intended_vsync_ns": intended,
+                    "total_ms": total_ms,
+                    "deadline_missed": bool(
+                        deadline is not None
+                        and completed is not None
+                        and completed > deadline
+                    ),
+                    **stages,
+                }
+            )
+
+    stage_labels = {
+        "vsync_delay_ms": "VSync / 调度起步",
+        "input_ms": "输入处理",
+        "animation_ms": "动画",
+        "traversal_ms": "布局 / 遍历",
+        "draw_ms": "UI 绘制",
+        "sync_ms": "同步 / 上传准备",
+        "command_ms": "渲染命令提交",
+        "gpu_wait_ms": "GPU 完成等待",
+        "post_swap_ms": "BufferQueue / 合成等待",
+        "dequeue_ms": "DequeueBuffer",
+        "queue_ms": "QueueBuffer",
+    }
+    stage_rows: List[Dict[str, object]] = []
+    for key, label in stage_labels.items():
+        values = [
+            float(item[key])
+            for item in frames
+            if isinstance(item.get(key), (int, float))
+        ]
+        if not values:
+            continue
+        stage_rows.append(
+            {
+                "key": key,
+                "label": label,
+                "sample_count": len(values),
+                "average_ms": statistics.fmean(values),
+                "p95_ms": percentile(values, 0.95),
+                "p99_ms": percentile(values, 0.99),
+                "maximum_ms": max(values),
+            }
+        )
+    stage_rows.sort(key=lambda item: float(item.get("p95_ms") or 0.0), reverse=True)
+    totals = [float(item["total_ms"]) for item in frames]
+    deadline_missed = sum(1 for item in frames if item.get("deadline_missed"))
+    return {
+        "available": bool(frames),
+        "frame_count": len(frames),
+        "average_total_ms": statistics.fmean(totals) if totals else None,
+        "p95_total_ms": percentile(totals, 0.95),
+        "p99_total_ms": percentile(totals, 0.99),
+        "maximum_total_ms": max(totals) if totals else None,
+        "deadline_missed_count": deadline_missed,
+        "deadline_missed_pct": (
+            deadline_missed / len(frames) * 100.0 if frames else None
+        ),
+        "dominant_stage": stage_rows[0] if stage_rows else None,
+        "stages": stage_rows,
+        "slow_frames": sorted(
+            frames,
+            key=lambda item: float(item.get("total_ms") or 0.0),
+            reverse=True,
+        )[:30],
+        "timeline": sorted(
+            frames,
+            key=lambda item: int(item.get("intended_vsync_ns") or 0),
+        ),
+        "limitations": (
+            "Stages are derived from Android gfxinfo framestats timestamps for newly observed "
+            "foreground-window frames. They describe the app UI/RenderThread submission path; "
+            "DisplayPresentTime and hardware-composer internals may remain unavailable."
+        ),
+    }
+
+
 def analyze_performance_contexts(
     contexts: Sequence[ContextSample],
     metadata: Optional[Dict[str, object]] = None,
@@ -2601,8 +3338,14 @@ def analyze_performance_contexts(
     performance_contexts = [
         item for item in ordered if isinstance(item.performance, dict) and item.performance
     ]
+    render_pipeline = analyze_android_frame_pipeline(performance_contexts)
     latest_context = performance_contexts[-1] if performance_contexts else None
     latest = latest_context.performance if latest_context is not None else probe
+
+    def latest_value(key: str) -> object:
+        value = latest.get(key) if isinstance(latest, dict) else None
+        return probe.get(key) if value in (None, "", [], {}) else value
+
     platform = str(metadata.get("platform") or latest.get("platform") or "").lower()
     is_android = platform == "android"
 
@@ -2748,6 +3491,7 @@ def analyze_performance_contexts(
     counter_janky = 0
     counter_histogram: Dict[float, int] = {}
     counter_pair_count = 0
+    counter_timeline: List[Dict[str, object]] = []
 
     for previous, current in zip(counter_frame_contexts, counter_frame_contexts[1:]):
         previous_package = str(previous.foreground_package or "")
@@ -2770,6 +3514,7 @@ def analyze_performance_contexts(
         counter_frame_count += delta_total
         counter_frame_duration_s += elapsed
         counter_frame_rates.append(delta_total / elapsed)
+        pair_counters = {"deadline": 0, "vsync": 0, "janky": 0}
 
         for source_key, target_name in (
             ("frame_counter_deadline_missed", "deadline"),
@@ -2785,6 +3530,7 @@ def analyze_performance_contexts(
             delta = int(current_value) - int(previous_value)
             if delta < 0:
                 continue
+            pair_counters[target_name] = delta
             if target_name == "deadline":
                 counter_deadline_missed += delta
             elif target_name == "vsync":
@@ -2794,6 +3540,7 @@ def analyze_performance_contexts(
 
         previous_histogram = previous.performance.get("frame_histogram_ms")
         current_histogram = current.performance.get("frame_histogram_ms")
+        pair_histogram: Dict[float, int] = {}
         if isinstance(previous_histogram, dict) and isinstance(current_histogram, dict):
             for key in set(previous_histogram) | set(current_histogram):
                 try:
@@ -2805,18 +3552,41 @@ def analyze_performance_contexts(
                     continue
                 if bucket >= 0 and delta > 0:
                     counter_histogram[bucket] = counter_histogram.get(bucket, 0) + delta
+                    pair_histogram[bucket] = pair_histogram.get(bucket, 0) + delta
 
-    def histogram_percentile(histogram: Dict[float, int], percentile: float) -> Optional[float]:
-        total = sum(max(0, count) for count in histogram.values())
-        if total <= 0:
-            return None
-        threshold = total * percentile
-        cumulative = 0
-        for bucket, count in sorted(histogram.items()):
-            cumulative += max(0, count)
-            if cumulative >= threshold:
-                return bucket
-        return max(histogram) if histogram else None
+        pair_histogram_count = sum(pair_histogram.values())
+        pair_average_ms = (
+            sum(bucket * count for bucket, count in pair_histogram.items())
+            / pair_histogram_count
+            if pair_histogram_count > 0
+            else None
+        )
+        pair_slowest_ms = histogram_slowest_average(pair_histogram, 0.01)
+        counter_timeline.append(
+            {
+                "uptime_s": current.uptime_s,
+                "duration_s": elapsed,
+                "frame_count": delta_total,
+                "frame_rate_fps": delta_total / elapsed,
+                "frame_time_average_ms": pair_average_ms,
+                "frame_time_p95_ms": histogram_percentile(pair_histogram, 0.95),
+                "frame_time_p99_ms": histogram_percentile(pair_histogram, 0.99),
+                "one_percent_low_fps": (
+                    1000.0 / pair_slowest_ms
+                    if isinstance(pair_slowest_ms, (int, float)) and pair_slowest_ms > 0
+                    else None
+                ),
+                "deadline_missed_count": pair_counters["deadline"],
+                "missed_vsync_count": pair_counters["vsync"],
+                "janky_frame_count": pair_counters["janky"],
+                "frame_issue_pct": (
+                    pair_counters["deadline"] / delta_total * 100.0
+                    if delta_total > 0
+                    else 0.0
+                ),
+                "refresh_rate_hz": current.refresh_rate_hz,
+            }
+        )
 
     histogram_count = sum(counter_histogram.values())
     counter_frame_average_ms = (
@@ -2825,6 +3595,14 @@ def analyze_performance_contexts(
         else None
     )
     counter_frame_p95_ms = histogram_percentile(counter_histogram, 0.95)
+    counter_frame_p99_ms = histogram_percentile(counter_histogram, 0.99)
+    counter_slowest_frame_average_ms = histogram_slowest_average(counter_histogram, 0.01)
+    counter_one_percent_low_fps = (
+        1000.0 / counter_slowest_frame_average_ms
+        if isinstance(counter_slowest_frame_average_ms, (int, float))
+        and counter_slowest_frame_average_ms > 0
+        else None
+    )
 
     def weighted_frame_value(key: str) -> Optional[float]:
         values = [
@@ -2858,6 +3636,8 @@ def analyze_performance_contexts(
     compositor_minimum_fps = min(fps_values) if fps_values else None
     compositor_frame_average_ms = weighted_frame_value("frame_interval_average_ms")
     compositor_frame_p95_ms = max(p95_values) if p95_values else None
+    compositor_frame_p99_ms = weighted_frame_value("frame_interval_p99_ms")
+    compositor_one_percent_low_fps = weighted_frame_value("one_percent_low_fps")
     compositor_missed_pct = (
         missed_intervals / frame_sample_count * 100.0 if frame_sample_count > 0 else None
     )
@@ -2872,6 +3652,18 @@ def analyze_performance_contexts(
         reported_frame_sample_count = counter_frame_count
         frame_metric_average_ms = counter_frame_average_ms
         frame_metric_p95_ms = counter_frame_p95_ms
+        frame_metric_p99_ms = counter_frame_p99_ms
+        one_percent_low_fps = counter_one_percent_low_fps
+        one_percent_low_source = (
+            "Android gfxinfo frame-time histogram slowest 1%"
+            if counter_one_percent_low_fps is not None
+            else "Android gfxinfo counter-window 1st percentile"
+        )
+        if one_percent_low_fps is None and counter_frame_rates:
+            one_percent_low_fps = percentile(counter_frame_rates, 0.01)
+        one_percent_low_confidence = (
+            "high" if counter_one_percent_low_fps is not None else "medium"
+        )
         frame_issue_count = counter_deadline_missed
         frame_issue_pct = (
             counter_deadline_missed / counter_frame_count * 100.0
@@ -2889,6 +3681,21 @@ def analyze_performance_contexts(
         reported_frame_sample_count = frame_sample_count
         frame_metric_average_ms = compositor_frame_average_ms
         frame_metric_p95_ms = compositor_frame_p95_ms
+        frame_metric_p99_ms = compositor_frame_p99_ms
+        one_percent_low_fps = (
+            compositor_one_percent_low_fps
+            if compositor_one_percent_low_fps is not None
+            else percentile(fps_values, 0.01) if fps_values else None
+        )
+        one_percent_low_source = (
+            "HarmonyOS SmartPerf frame-jitter slowest 1%"
+            if compositor_one_percent_low_fps is not None
+            else "RenderService sampled-window 1st percentile" if fps_values else None
+        )
+        one_percent_low_confidence = (
+            "high" if compositor_one_percent_low_fps is not None
+            else "medium" if fps_values else None
+        )
         frame_issue_count = missed_intervals
         frame_issue_pct = compositor_missed_pct
         if is_android:
@@ -2898,10 +3705,13 @@ def analyze_performance_contexts(
             frame_metric_label = "应用帧耗时 P95"
             frame_issue_label = "超出帧截止时间"
         else:
+            smartperf_rows = any(item.get("smartperf_source") for item in frame_rows)
             frame_rate_source = (
-                "HarmonyOS RenderService composer fps sampled windows" if frame_rows else None
+                "HarmonyOS SmartPerf SP_daemon app FPS and frame jitter"
+                if smartperf_rows
+                else "HarmonyOS RenderService composer fps sampled windows" if frame_rows else None
             )
-            frame_rate_label = "合成器 FPS"
+            frame_rate_label = "应用 FPS" if smartperf_rows else "合成器 FPS"
             frame_rate_unit = "FPS"
             frame_metric_label = "帧间隔 P95"
             frame_issue_label = "跨越刷新槽位"
@@ -2963,6 +3773,92 @@ def analyze_performance_contexts(
         and counter_pair_count > 0
         else None
     )
+    display_to_frame_ratio = (
+        current_refresh / sampled_frame_rate
+        if isinstance(sampled_frame_rate, (int, float))
+        and sampled_frame_rate >= 15.0
+        and isinstance(current_refresh, (int, float))
+        and current_refresh > 0
+        else None
+    )
+    cadence_multiplier = None
+    if isinstance(display_to_frame_ratio, (int, float)):
+        rounded_multiplier = round(display_to_frame_ratio)
+        if 2 <= rounded_multiplier <= 4 and abs(display_to_frame_ratio - rounded_multiplier) <= 0.12:
+            cadence_multiplier = rounded_multiplier
+
+    interpolation_status = str(latest_value("frame_interpolation_status") or "unavailable")
+    interpolation_label = str(
+        latest_value("frame_interpolation_label") or "系统未公开可验证的插帧开关"
+    )
+    interpolation_confidence = str(
+        latest_value("frame_interpolation_confidence") or "low"
+    )
+    interpolation_evidence = latest_value("frame_interpolation_evidence")
+    interpolation_evidence = (
+        list(interpolation_evidence)
+        if isinstance(interpolation_evidence, list)
+        else []
+    )
+    if interpolation_status == "unavailable" and cadence_multiplier is not None:
+        interpolation_status = "indeterminate"
+        interpolation_label = (
+            f"显示刷新率约为应用提交率 {cadence_multiplier} 倍；"
+            "仅凭系统计数无法区分重复帧与插帧"
+        )
+
+    display_width = latest_value("display_width_px")
+    display_height = latest_value("display_height_px")
+    render_width = latest_value("render_width_px")
+    render_height = latest_value("render_height_px")
+    render_resolution_estimated = False
+    render_resolution_source = latest_value("render_resolution_source")
+    if not isinstance(render_width, (int, float)) or not isinstance(
+        render_height, (int, float)
+    ):
+        render_width = display_width
+        render_height = display_height
+        render_resolution_source = (
+            "active display mode fallback"
+            if isinstance(render_width, (int, float))
+            and isinstance(render_height, (int, float))
+            else None
+        )
+        render_resolution_estimated = bool(render_resolution_source)
+    render_scale_pct = (
+        min(float(render_width) / float(display_width), float(render_height) / float(display_height))
+        * 100.0
+        if isinstance(render_width, (int, float))
+        and isinstance(render_height, (int, float))
+        and isinstance(display_width, (int, float))
+        and isinstance(display_height, (int, float))
+        and display_width > 0
+        and display_height > 0
+        else None
+    )
+
+    frame_rate_timeline = list(counter_timeline)
+    if not frame_rate_timeline:
+        frame_rate_timeline = [
+            {
+                "uptime_s": item.uptime_s,
+                "duration_s": None,
+                "frame_count": item.performance.get("frame_sample_count"),
+                "frame_rate_fps": item.performance.get("compositor_fps"),
+                "frame_time_average_ms": item.performance.get("frame_interval_average_ms"),
+                "frame_time_p95_ms": item.performance.get("frame_interval_p95_ms"),
+                "frame_time_p99_ms": item.performance.get("frame_interval_p99_ms"),
+                "one_percent_low_fps": item.performance.get("one_percent_low_fps"),
+                "frame_issue_pct": (
+                    float(item.performance.get("missed_vsync_interval_count") or 0)
+                    / float(item.performance.get("frame_sample_count") or 1)
+                    * 100.0
+                ),
+                "refresh_rate_hz": item.refresh_rate_hz,
+            }
+            for item in performance_contexts
+            if isinstance(item.performance.get("compositor_fps"), (int, float))
+        ]
 
     gpu_probe = metadata.get("gpu_probe", {})
     gpu_probe = gpu_probe if isinstance(gpu_probe, dict) else {}
@@ -3000,9 +3896,17 @@ def analyze_performance_contexts(
         "frame_rate_label": frame_rate_label,
         "frame_rate_unit": frame_rate_unit,
         "frame_overproduction_ratio": frame_overproduction_ratio,
+        "display_to_frame_ratio": display_to_frame_ratio,
+        "cadence_multiplier": cadence_multiplier,
         "frame_metric_average_ms": frame_metric_average_ms,
         "frame_metric_p95_ms": frame_metric_p95_ms,
+        "frame_metric_p99_ms": frame_metric_p99_ms,
         "frame_metric_label": frame_metric_label,
+        "one_percent_low_fps": one_percent_low_fps,
+        "one_percent_low_source": one_percent_low_source,
+        "one_percent_low_confidence": one_percent_low_confidence,
+        "frame_rate_timeline": frame_rate_timeline,
+        "render_pipeline": render_pipeline,
         "frame_issue_count": frame_issue_count,
         "frame_issue_pct": frame_issue_pct,
         "frame_issue_label": frame_issue_label,
@@ -3032,16 +3936,25 @@ def analyze_performance_contexts(
             or "The platform does not expose the touch controller hardware scan rate."
         ),
         "touch_devices": touch_devices,
-        "foreground_window_name": latest.get("foreground_window_name"),
-        "foreground_window_id": latest.get("foreground_window_id"),
-        "foreground_window_pid": latest.get("foreground_window_pid"),
-        "display_width_px": latest.get("display_width_px"),
-        "display_height_px": latest.get("display_height_px"),
-        "brightness_raw": latest.get("brightness_raw"),
-        "gpu_renderer": latest.get("gpu_renderer") or probe.get("gpu_renderer") or gpu_probe.get("model"),
-        "gpu_vendor": latest.get("gpu_vendor") or probe.get("gpu_vendor") or gpu_probe.get("vendor"),
+        "foreground_window_name": latest_value("foreground_window_name"),
+        "foreground_window_id": latest_value("foreground_window_id"),
+        "foreground_window_pid": latest_value("foreground_window_pid"),
+        "display_width_px": display_width,
+        "display_height_px": display_height,
+        "render_width_px": render_width,
+        "render_height_px": render_height,
+        "render_resolution_source": render_resolution_source,
+        "render_resolution_estimated": render_resolution_estimated,
+        "render_scale_pct": render_scale_pct,
+        "brightness_raw": latest_value("brightness_raw"),
+        "gpu_renderer": latest_value("gpu_renderer") or gpu_probe.get("model"),
+        "gpu_vendor": latest_value("gpu_vendor") or gpu_probe.get("vendor"),
+        "frame_interpolation_status": interpolation_status,
+        "frame_interpolation_label": interpolation_label,
+        "frame_interpolation_confidence": interpolation_confidence,
+        "frame_interpolation_evidence": interpolation_evidence,
         "frame_source": frame_rate_source,
-        "frame_unavailable_reason": latest.get("frame_unavailable_reason"),
+        "frame_unavailable_reason": latest_value("frame_unavailable_reason"),
         "limitations": (
             (
                 "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
@@ -3055,12 +3968,396 @@ def analyze_performance_contexts(
                 )
             )
             + "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed "
-            "and is not inferred."
+            "and is not inferred. Frame interpolation is reported as enabled or disabled only when an "
+            "explicit vendor switch is readable; a refresh/application cadence ratio alone cannot "
+            "distinguish MEMC from ordinary frame repetition."
         ),
     }
 
 
+def analyze_runtime_settings(
+    metadata: Dict[str, object],
+    raw_outputs: Dict[str, str],
+) -> Dict[str, object]:
+    start = metadata.get("runtime_settings_start")
+    start = dict(start) if isinstance(start, dict) else parse_android_runtime_settings(
+        raw_outputs.get("runtime_settings_start", "")
+    )
+    end = parse_android_runtime_settings(raw_outputs.get("runtime_settings_end", ""))
+    labels = {
+        "system.screen_brightness": ("屏幕亮度", "亮度越高通常越直接增加显示功耗。"),
+        "system.screen_brightness_mode": ("自动亮度", "自动亮度会随环境改变显示负载。"),
+        "system.screen_off_timeout": ("自动熄屏", "较长熄屏时间会延长显示与前台任务活动。"),
+        "system.peak_refresh_rate": ("最高刷新率", "较高刷新率会增加显示、合成和应用提交压力。"),
+        "system.min_refresh_rate": ("最低刷新率", "较高最低档位会减少低刷新率省电机会。"),
+        "global.low_power": ("省电模式", "省电模式会改变调度、后台与显示策略。"),
+        "global.adaptive_battery_management_enabled": (
+            "自适应电池",
+            "自适应电池会限制后台应用活动。",
+        ),
+        "global.app_standby_enabled": ("应用待机", "应用待机会影响后台任务频率。"),
+        "global.wifi_on": ("Wi-Fi", "无线网络活动可能带来射频与系统任务压力。"),
+        "global.bluetooth_on": ("蓝牙", "蓝牙扫描和连接会增加无线子系统活动。"),
+        "global.airplane_mode_on": ("飞行模式", "飞行模式会显著改变蜂窝与无线压力。"),
+        "secure.location_mode": ("定位模式", "定位会影响 GNSS、Wi-Fi 扫描与传感器任务。"),
+        "global.window_animation_scale": ("窗口动画倍率", "动画倍率影响前台渲染持续时间。"),
+        "global.transition_animation_scale": ("转场动画倍率", "转场动画影响合成与渲染持续时间。"),
+        "global.animator_duration_scale": ("动画时长倍率", "动画时长会改变持续渲染时间。"),
+        "global.stay_on_while_plugged_in": ("充电常亮", "常亮设置会影响显示持续时间。"),
+    }
+    rows = []
+    for key in labels:
+        start_value = start.get(key)
+        end_value = end.get(key, start_value)
+        if start_value is None and end_value is None:
+            continue
+        label, impact = labels[key]
+        rows.append(
+            {
+                "key": key,
+                "label": label,
+                "start": start_value,
+                "end": end_value,
+                "changed": start_value != end_value,
+                "impact": impact,
+            }
+        )
+    return {
+        "available": bool(rows),
+        "start": start,
+        "end": end,
+        "changed_count": sum(1 for item in rows if item["changed"]),
+        "rows": rows,
+    }
+
+
+def analyze_power_pressure(
+    samples: Sequence[Sample],
+    system_analysis: Dict[str, object],
+    scheduler_analysis: Dict[str, object],
+    thermal_analysis: Dict[str, object],
+    memory_analysis: Dict[str, object],
+    settings_analysis: Dict[str, object],
+) -> Dict[str, object]:
+    powers = [float(item.power_mw) for item in samples]
+    drivers: List[Dict[str, object]] = []
+
+    def add_driver(
+        key: str,
+        label: str,
+        values: Sequence[Optional[float]],
+        detail: str,
+    ) -> None:
+        pairs = [
+            (float(value), float(sample.power_mw))
+            for sample, value in zip(samples, values)
+            if isinstance(value, (int, float))
+        ]
+        if len(pairs) < 3:
+            return
+        correlation = _pearson(
+            [item[0] for item in pairs],
+            [item[1] for item in pairs],
+        )
+        drivers.append(
+            {
+                "key": key,
+                "label": label,
+                "correlation": correlation,
+                "sample_count": len(pairs),
+                "detail": detail,
+            }
+        )
+
+    add_driver(
+        "cpu",
+        "CPU 总负载",
+        [item.cpu_pct for item in samples],
+        "观察整机 CPU 活动与电池侧功率是否同步。",
+    )
+    cluster_names = sorted(
+        {name for item in samples for name in item.frequencies_mhz}
+    )
+    for name in cluster_names:
+        add_driver(
+            f"cpu_frequency:{name}",
+            f"{name} 频率",
+            [item.frequencies_mhz.get(name) for item in samples],
+            "高频驻留会提高 CPU 电压/频率压力，但仍需结合负载判断。",
+        )
+        add_driver(
+            f"cpu_load:{name}",
+            f"{name} 负载",
+            [item.cluster_cpu_pct.get(name) for item in samples],
+            "集群负载用于区分空转高频和实际计算压力。",
+        )
+    add_driver(
+        "gpu_load",
+        "GPU 负载",
+        [item.gpu_load_pct for item in samples],
+        "GPU 活动与功率同步时，图形负载可能是主要压力来源。",
+    )
+    add_driver(
+        "gpu_frequency",
+        "GPU 频率",
+        [item.gpu_frequency_mhz for item in samples],
+        "GPU 高频驻留用于解释图形负载阶段的功率抬升。",
+    )
+    add_driver(
+        "memory_frequency",
+        "内存 / DMC 频率",
+        [item.memory_frequency_mhz for item in samples],
+        "内存频率同步抬升通常表示带宽、缓存未命中或数据搬运压力增加。",
+    )
+    add_driver(
+        "temperature",
+        "电池温度",
+        [item.battery_temperature_c for item in samples],
+        "温度与功率同升更多表示长期负载累积，不代表瞬时因果。",
+    )
+    drivers.sort(
+        key=lambda item: abs(float(item.get("correlation") or 0.0)),
+        reverse=True,
+    )
+
+    processes = system_analysis.get("top_processes", [])
+    tasks = []
+    if isinstance(processes, list):
+        tasks = sorted(
+            (
+                {
+                    "name": item.get("name") or item.get("command"),
+                    "category": item.get("category"),
+                    "average_cpu_pct": item.get("average_cpu_pct"),
+                    "maximum_cpu_pct": item.get("maximum_cpu_pct"),
+                    "power_delta_when_visible_mw": item.get(
+                        "power_delta_when_visible_mw"
+                    ),
+                    "power_correlation": item.get("power_correlation"),
+                    "seen_snapshots": item.get("seen_snapshots"),
+                }
+                for item in processes
+                if isinstance(item, dict)
+            ),
+            key=lambda item: (
+                float(item.get("power_delta_when_visible_mw") or 0.0),
+                float(item.get("average_cpu_pct") or 0.0),
+            ),
+            reverse=True,
+        )[:20]
+
+    leading = drivers[0] if drivers else None
+    explanations = []
+    if leading and isinstance(leading.get("correlation"), (int, float)):
+        correlation = float(leading["correlation"])
+        explanations.append(
+            {
+                "level": "measured",
+                "title": f"电流变化与{leading['label']}最同步",
+                "detail": (
+                    f"相关系数 {correlation:.2f}；{leading['detail']}"
+                    "相关性用于解释同时变化，不等同于独立电源轨归因。"
+                ),
+            }
+        )
+    if memory_analysis.get("available"):
+        delta = memory_analysis.get("high_frequency_power_delta_mw")
+        explanations.append(
+            {
+                "level": "counter",
+                "title": "内存频率压力",
+                "detail": (
+                    f"高频驻留 {float(memory_analysis.get('high_frequency_share_pct') or 0.0):.1f}%；"
+                    + (
+                        f"高频样本平均功率较低频样本高 {float(delta):.1f} mW。"
+                        if isinstance(delta, (int, float))
+                        else "当前样本不足以计算高低频功率差。"
+                    )
+                ),
+            }
+        )
+    return {
+        "available": bool(drivers or tasks),
+        "power_distribution": {
+            "median_mw": statistics.median(powers) if powers else None,
+            "p95_mw": percentile(powers, 0.95),
+            "maximum_mw": max(powers) if powers else None,
+        },
+        "drivers": drivers,
+        "tasks": tasks,
+        "scheduler": scheduler_analysis,
+        "thermal": thermal_analysis,
+        "memory": memory_analysis,
+        "settings": settings_analysis,
+        "explanations": explanations,
+        "limitations": (
+            "Drivers are ranked by time-aligned correlation with whole-device battery power. "
+            "They explain pressure patterns but are not independent rail measurements and must not be added."
+        ),
+    }
+
+
+def analyze_render_performance(
+    performance: Dict[str, object],
+    system_analysis: Dict[str, object],
+    scheduler_analysis: Dict[str, object],
+    thermal_analysis: Dict[str, object],
+    cpu_analysis: Dict[str, object],
+    gpu_analysis: Dict[str, object],
+    memory_analysis: Dict[str, object],
+    summary: Dict[str, object],
+) -> Dict[str, object]:
+    pipeline = performance.get("render_pipeline")
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    hot_threads = system_analysis.get("hot_threads", [])
+    hot_threads = hot_threads if isinstance(hot_threads, list) else []
+    render_threads = [
+        item
+        for item in hot_threads
+        if isinstance(item, dict)
+        and re.search(
+            r"renderthread|surfaceflinger|renderengine|composer|hwc|gpu|main",
+            f"{item.get('name') or ''} {item.get('process') or ''}",
+            re.I,
+        )
+    ][:20]
+    bottlenecks: List[Dict[str, object]] = []
+    dominant = pipeline.get("dominant_stage")
+    if isinstance(dominant, dict):
+        key = str(dominant.get("key") or "")
+        stage_hints = {
+            "vsync_delay_ms": "帧在 VSync 后才开始，优先检查主线程/RenderThread 调度、cpuset 与系统抢占。",
+            "input_ms": "输入处理阶段偏长，检查主线程事件处理和同步阻塞。",
+            "animation_ms": "动画阶段偏长，检查动画计算、属性更新与主线程工作量。",
+            "traversal_ms": "布局/遍历阶段偏长，检查 View 层级、布局重算和 UI 主线程。",
+            "draw_ms": "UI 绘制阶段偏长，检查过度绘制、DisplayList 构建和复杂 Canvas 操作。",
+            "sync_ms": "同步/上传准备偏长，检查 RenderThread、纹理上传和资源创建。",
+            "command_ms": "渲染命令提交偏长，检查 RenderThread 与驱动提交压力。",
+            "gpu_wait_ms": "GPU 完成等待偏长，优先检查着色器、分辨率、带宽和 GPU 饱和。",
+            "post_swap_ms": "Swap 后等待偏长，检查 BufferQueue、SurfaceFlinger、HWC 和显示合成背压。",
+            "dequeue_ms": "DequeueBuffer 偏长，可能存在缓冲区不足或下游合成背压。",
+            "queue_ms": "QueueBuffer 偏长，可能存在 SurfaceFlinger/HWC 提交等待。",
+        }
+        bottlenecks.append(
+            {
+                "stage": dominant.get("label"),
+                "p95_ms": dominant.get("p95_ms"),
+                "severity": (
+                    "high"
+                    if float(dominant.get("p95_ms") or 0.0) >= 8.0
+                    else "medium"
+                ),
+                "detail": stage_hints.get(key, "该阶段在慢帧中占用时间最高。"),
+            }
+        )
+    if float(gpu_analysis.get("average_load_pct") or 0.0) >= 85.0:
+        bottlenecks.append(
+            {
+                "stage": "GPU",
+                "severity": "high",
+                "detail": "GPU 平均负载超过 85%，慢帧更可能受着色、分辨率或带宽限制。",
+            }
+        )
+    if thermal_analysis.get("throttling_observed"):
+        bottlenecks.append(
+            {
+                "stage": "Thermal",
+                "severity": "high",
+                "detail": "测试期间出现热限制，CPU/GPU 频率上限变化可能扩大帧延迟。",
+            }
+        )
+    return {
+        "available": bool(pipeline.get("available") or render_threads or bottlenecks),
+        "pipeline": pipeline,
+        "bottlenecks": bottlenecks,
+        "render_threads": render_threads,
+        "scheduler": {
+            "maximum_hint_session_count": scheduler_analysis.get(
+                "maximum_hint_session_count"
+            ),
+            "cpusets": scheduler_analysis.get("cpusets"),
+            "process_states": scheduler_analysis.get("process_states"),
+        },
+        "cpu": {
+            "clusters": cpu_analysis.get("clusters"),
+        },
+        "gpu": {
+            "frequency_available": gpu_analysis.get("frequency_available"),
+            "load_available": gpu_analysis.get("load_available"),
+            "average_frequency_mhz": gpu_analysis.get("average_frequency_mhz"),
+            "maximum_frequency_mhz": gpu_analysis.get("maximum_frequency_mhz"),
+            "average_load_pct": gpu_analysis.get("average_load_pct"),
+            "maximum_load_pct": gpu_analysis.get("maximum_load_pct"),
+        },
+        "memory": memory_analysis,
+        "thermal": {
+            "throttling_observed": thermal_analysis.get("throttling_observed"),
+            "maximum_status": thermal_analysis.get("maximum_status"),
+            "hottest_sensor": thermal_analysis.get("hottest_sensor"),
+        },
+        "power_recording": {
+            "average_power_mw": summary.get("average_power_mw"),
+            "p95_power_mw": summary.get("p95_power_mw"),
+            "maximum_power_mw": summary.get("maximum_power_mw"),
+            "energy_mwh": summary.get("energy_mwh"),
+            "note": "仅记录整机功耗，不执行组件、UID 或第三方任务功耗归因。",
+        },
+    }
+
+
+def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    findings: List[Dict[str, str]] = []
+    fps = performance.get("sampled_frame_rate_fps")
+    one_low = performance.get("one_percent_low_fps")
+    p99 = performance.get("frame_metric_p99_ms")
+    if isinstance(fps, (int, float)):
+        findings.append(
+            {
+                "level": "measured",
+                "title": "帧表现",
+                "detail": (
+                    f"平均提交帧率 {float(fps):.1f} FPS，"
+                    f"1% Low {float(one_low):.1f} FPS，"
+                    f"P99 帧耗时 {float(p99):.2f} ms。"
+                    if isinstance(one_low, (int, float))
+                    and isinstance(p99, (int, float))
+                    else f"平均提交帧率 {float(fps):.1f} FPS。"
+                ),
+            }
+        )
+    for item in render.get("bottlenecks", []) if isinstance(render.get("bottlenecks"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        findings.append(
+            {
+                "level": str(item.get("severity") or "counter"),
+                "title": f"可能的帧延迟来源：{item.get('stage') or '渲染链路'}",
+                "detail": str(item.get("detail") or ""),
+            }
+        )
+    power = render.get("power_recording", {})
+    if isinstance(power, dict) and isinstance(power.get("average_power_mw"), (int, float)):
+        findings.append(
+            {
+                "level": "measured",
+                "title": "整机功耗记录",
+                "detail": (
+                    f"平均 {float(power['average_power_mw']) / 1000.0:.3f} W；"
+                    "性能模式不继续拆分第三方任务或组件功耗来源。"
+                ),
+            }
+        )
+    return findings
+
+
 def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
+    test_mode = str(analysis.get("test_mode") or "power")
+    if test_mode == "performance":
+        return build_performance_findings(analysis)
     platform = str(analysis.get("platform") or "android").lower()
     summary = analysis["summary"]
     cpu = analysis.get("cpu", {})
@@ -3082,6 +4379,32 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
             ),
         }
     ]
+    pressure = analysis.get("power_pressure", {})
+    pressure = pressure if isinstance(pressure, dict) else {}
+    for item in pressure.get("explanations", []) if isinstance(pressure.get("explanations"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        findings.append(
+            {
+                "level": str(item.get("level") or "counter"),
+                "title": str(item.get("title") or "功耗压力解释"),
+                "detail": str(item.get("detail") or ""),
+            }
+        )
+    runtime_settings = analysis.get("runtime_settings", {})
+    runtime_settings = runtime_settings if isinstance(runtime_settings, dict) else {}
+    if int(runtime_settings.get("changed_count") or 0) > 0:
+        findings.append(
+            {
+                "level": "context",
+                "title": "测试期间系统设置发生变化",
+                "detail": (
+                    f"亮度、刷新率、省电或无线等设置中有 "
+                    f"{int(runtime_settings.get('changed_count') or 0)} 项前后不一致，"
+                    "续航对比时应先固定这些变量。"
+                ),
+            }
+        )
 
     clusters = cpu.get("clusters", []) if isinstance(cpu, dict) else []
     modeled_clusters = [
@@ -3303,73 +4626,6 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
                     "detail": f"采集期间显示渲染刷新率为 {active_refresh:.0f} Hz。",
                 }
             )
-
-        sampled_fps = performance.get("sampled_frame_rate_fps")
-        if not isinstance(sampled_fps, (int, float)):
-            sampled_fps = performance.get("sampled_compositor_fps")
-        frame_p95 = performance.get("frame_metric_p95_ms")
-        if not isinstance(frame_p95, (int, float)):
-            frame_p95 = performance.get("frame_interval_p95_ms")
-        missed_pct = performance.get("frame_issue_pct")
-        if not isinstance(missed_pct, (int, float)):
-            missed_pct = performance.get("missed_vsync_interval_pct")
-        frame_rate_label = str(performance.get("frame_rate_label") or "帧率")
-        frame_rate_unit = str(performance.get("frame_rate_unit") or "FPS")
-        frame_metric_label = str(performance.get("frame_metric_label") or "帧指标 P95")
-        frame_issue_label = str(performance.get("frame_issue_label") or "帧异常")
-        if isinstance(sampled_fps, (int, float)):
-            level = (
-                "measured"
-                if isinstance(missed_pct, (int, float)) and missed_pct >= 1.0
-                else "context"
-            )
-            frame_p95_text = (
-                f"{frame_metric_label} {float(frame_p95):.2f} ms，"
-                if isinstance(frame_p95, (int, float))
-                else f"{frame_metric_label}不可用，"
-            )
-            findings.append(
-                {
-                    "level": level,
-                    "title": frame_rate_label,
-                    "detail": (
-                        f"{frame_rate_label} {float(sampled_fps):.1f} {frame_rate_unit}，"
-                        f"{frame_p95_text}"
-                        f"{frame_issue_label}占 {float(missed_pct or 0.0):.2f}%。"
-                    ),
-                }
-            )
-            overproduction_ratio = performance.get("frame_overproduction_ratio")
-            if (
-                isinstance(overproduction_ratio, (int, float))
-                and overproduction_ratio > 1.1
-                and isinstance(performance.get("current_refresh_rate_hz"), (int, float))
-            ):
-                findings.append(
-                    {
-                        "level": "measured",
-                        "title": "帧提交速率高于显示刷新",
-                        "detail": (
-                            f"gfxinfo 记录到 {float(sampled_fps):.1f} 帧/s 的 UI 提交，"
-                            f"当前显示为 {float(performance.get('current_refresh_rate_hz') or 0.0):.0f} Hz。"
-                            "这不是可见 FPS，通常表示同一刷新周期内多次提交或多个渲染目标，"
-                            "可能增加 CPU/GPU 与合成开销。"
-                        ),
-                    }
-                )
-
-        touch_count = performance.get("touch_interaction_count")
-        if isinstance(touch_count, (int, float)):
-            findings.append(
-                {
-                    "level": "context",
-                    "title": "触控交互",
-                    "detail": (
-                        f"会话快照中新识别 {int(touch_count)} 次触摸按下交互。"
-                        "系统未公开面板硬件触控采样率，因此报告不推断 240/300 Hz 等规格。"
-                    ),
-                }
-            )
     elif isinstance(active_refresh, (int, float)):
         findings.append(
             {
@@ -3424,7 +4680,69 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
     return findings
 
 
-def _analysis_data_sources(platform: str) -> List[Dict[str, str]]:
+def _analysis_data_sources(
+    platform: str,
+    test_mode: str = "power",
+    capture_configuration: Optional[Dict[str, object]] = None,
+) -> List[Dict[str, str]]:
+    capture_configuration = capture_configuration or {}
+    backend = str(capture_configuration.get("backend") or "")
+    if test_mode == "performance":
+        platform_frame_source = (
+            "iOS DVT graphics/application-state counters"
+            if platform == "ios"
+            else "HarmonyOS SmartPerf SP_daemon app FPS and frame jitter"
+            if platform == "harmony" and backend == "harmony_smartperf"
+            else "HarmonyOS RenderService screen/fpsCount/composer fps"
+            if platform == "harmony"
+            else "Android gfxinfo frame counters and detailed framestats"
+        )
+        platform_system_source = (
+            "iOS DVT sysmontap"
+            if platform == "ios"
+            else "HarmonyOS top + ps over HDC"
+            if platform == "harmony"
+            else "Periodic toybox top/ps thread snapshots"
+        )
+        platform_scheduler_source = (
+            "iOS public runtime context"
+            if platform == "ios"
+            else "HarmonyOS PowerManagerService + cpufreq capability snapshots"
+            if platform == "harmony"
+            else "cgroup files + ActivityManager + performance_hint"
+        )
+        return [
+            {
+                "metric": "Frame rate, 1% Low and frame latency",
+                "source": platform_frame_source,
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Render pipeline stages",
+                "source": platform_frame_source,
+                "kind": "measured counters",
+            },
+            {
+                "metric": "CPU, GPU and memory frequency context",
+                "source": "Platform utilization, cpufreq and readable devfreq counters",
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Render and compositor thread activity",
+                "source": platform_system_source,
+                "kind": "measured counters",
+            },
+            {
+                "metric": "Scheduler and thermal context",
+                "source": platform_scheduler_source,
+                "kind": "context",
+            },
+            {
+                "metric": "Whole-device power recording",
+                "source": "Battery current and voltage telemetry",
+                "kind": "measured",
+            },
+        ]
     if platform == "ios":
         return [
             {
@@ -3474,6 +4792,34 @@ def _analysis_data_sources(platform: str) -> List[Dict[str, str]]:
             },
         ]
     if platform == "harmony":
+        if backend == "harmony_smartperf":
+            return [
+                {
+                    "metric": "Battery current, voltage and temperature",
+                    "source": "HarmonyOS SmartPerf SP_daemon",
+                    "kind": "measured",
+                },
+                {
+                    "metric": "CPU/GPU/DDR and target process resources",
+                    "source": "HarmonyOS SmartPerf SP_daemon",
+                    "kind": "measured counters",
+                },
+                {
+                    "metric": "Application FPS and frame jitter",
+                    "source": "HarmonyOS SmartPerf SP_daemon",
+                    "kind": "measured counters",
+                },
+                {
+                    "metric": "Foreground window and display context",
+                    "source": "HarmonyOS RenderService/WindowManager probe",
+                    "kind": "context",
+                },
+                {
+                    "metric": "Test phases and actions",
+                    "source": "Imported timestamped logs aligned to HarmonyOS device realtime",
+                    "kind": "context",
+                },
+            ]
         return [
             {
                 "metric": "Battery current, voltage and temperature",
@@ -3548,6 +4894,16 @@ def _analysis_data_sources(platform: str) -> List[Dict[str, str]]:
             "kind": "model",
         },
         {
+            "metric": "Memory frequency pressure",
+            "source": "Readable DRAM/DMC/MIF devfreq clock",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "Runtime settings pressure",
+            "source": "Android settings snapshot at test start/end",
+            "kind": "context",
+        },
+        {
             "metric": "GPU activity",
             "source": "OEM devfreq/KGSL when readable; dumpsys gpu UID work and memory otherwise",
             "kind": "measured counters",
@@ -3603,10 +4959,23 @@ def analyze_run(
 ) -> Dict[str, object]:
     if len(samples) < 2:
         raise RuntimeError("at least two samples are required")
+    capture_configuration = metadata.get("capture_configuration", {})
+    capture_configuration = (
+        capture_configuration if isinstance(capture_configuration, dict) else {}
+    )
+    capture_features = capture_features_from_metadata(metadata)
+
+    def feature(name: str) -> bool:
+        return bool(capture_features.get(name, True))
+
     powers = [sample.power_mw for sample in samples]
     currents = [sample.current_ma for sample in samples]
     signed_currents = [sample.signed_current_ma for sample in samples]
-    cpus = [sample.cpu_pct for sample in samples if sample.cpu_pct is not None]
+    cpus = (
+        [sample.cpu_pct for sample in samples if sample.cpu_pct is not None]
+        if feature("cpu_usage")
+        else []
+    )
     power_sample_ages = [
         sample.power_sample_age_s
         for sample in samples
@@ -3619,6 +4988,10 @@ def analyze_run(
     ]
     power_sources = sorted({sample.power_source for sample in samples if sample.power_source})
     platform = str(metadata.get("platform") or "android").lower()
+    test_mode = str(metadata.get("test_mode") or "power").strip().lower()
+    if test_mode not in {"power", "performance"}:
+        test_mode = "power"
+    power_mode = test_mode == "power"
     duration_s = samples[-1].uptime_s - samples[0].uptime_s
     configured_interval = metadata.get("sample_interval_s")
     observed_intervals = [
@@ -3660,24 +5033,75 @@ def analyze_run(
         )
     if metadata.get("session_mode") and not contexts:
         analysis_warnings.append(
-            "会话模式没有采集到前台应用上下文，因此无法按应用拆分整机实测能量。"
+            "会话模式没有采集到前台窗口上下文，因此无法按测试项聚合帧表现。"
+            if not power_mode
+            else "会话模式没有采集到前台应用上下文，因此无法按应用拆分整机实测能量。"
         )
     monitor_config = metadata.get("system_monitor", {})
-    if isinstance(monitor_config, dict) and monitor_config.get("enabled") and not system_snapshots:
+    if (
+        isinstance(monitor_config, dict)
+        and monitor_config.get("enabled")
+        and feature("process_snapshots")
+        and not system_snapshots
+    ):
         analysis_warnings.append(
             "已启用全系统监控，但未恢复到任何进程快照。"
         )
 
-    package_uids, package_to_uid = parse_package_uids(raw_outputs.get("packages", ""))
-    usage = parse_battery_usage(raw_outputs.get("batterystats_usage", ""), package_uids)
-    stats_window = extract_stats_window(raw_outputs.get("batterystats", ""))
-    power_profile = parse_power_profile(raw_outputs.get("power_profile", ""))
+    package_uids, package_to_uid = (
+        parse_package_uids(raw_outputs.get("packages", ""))
+        if power_mode and feature("power_attribution")
+        else ({}, {})
+    )
+    usage = (
+        parse_battery_usage(raw_outputs.get("batterystats_usage", ""), package_uids)
+        if power_mode and feature("power_attribution")
+        else {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": (
+                "性能模式不执行 BatteryStats 组件或 UID 功耗归因。"
+                if not power_mode
+                else "功耗来源归因已在采集配置中关闭。"
+            ),
+            "capacity_mah": None,
+            "components": [],
+            "uids": [],
+        }
+    )
+    stats_window = (
+        extract_stats_window(raw_outputs.get("batterystats", ""))
+        if power_mode and feature("power_attribution")
+        else {}
+    )
+    power_profile = (
+        parse_power_profile(raw_outputs.get("power_profile", ""))
+        if power_mode and feature("power_attribution")
+        else {}
+    )
     display = parse_display(
         raw_outputs.get("display", ""),
         raw_outputs.get("screen_brightness", ""),
         raw_outputs.get("peak_refresh_rate", ""),
     )
     performance_analysis = analyze_performance_contexts(contexts, metadata)
+    if not feature("frame_rate"):
+        performance_analysis.update(
+            {
+                "sampled_compositor_fps": None,
+                "minimum_sampled_compositor_fps": None,
+                "sampled_frame_rate_fps": None,
+                "minimum_sampled_frame_rate_fps": None,
+                "frame_metric_average_ms": None,
+                "frame_metric_p95_ms": None,
+                "frame_metric_p99_ms": None,
+                "one_percent_low_fps": None,
+                "frame_rate_timeline": [],
+                "frame_sample_count": 0,
+                "frame_source": None,
+                "frame_unavailable_reason": "帧率与帧间隔采集已关闭。",
+            }
+        )
     if not isinstance(display.get("active_refresh_hz"), (int, float)) and isinstance(
         performance_analysis.get("current_refresh_rate_hz"), (int, float)
     ):
@@ -3692,7 +5116,11 @@ def analyze_run(
         display["brightness_raw"] = performance_analysis["brightness_raw"]
     thermal_post_run = parse_thermal(raw_outputs.get("thermalservice", ""))
     processes = parse_cpu_processes(raw_outputs.get("cpuinfo", ""))
-    wakelocks = extract_kernel_wakelocks(raw_outputs.get("batterystats", ""))
+    wakelocks = (
+        extract_kernel_wakelocks(raw_outputs.get("batterystats", ""))
+        if power_mode and feature("power_attribution")
+        else []
+    )
 
     policies = metadata.get("cpu_policies", [])
     cpu_analysis = analyze_cpu(
@@ -3701,8 +5129,20 @@ def analyze_run(
         power_profile,
         max_gap_s,
     )
+    if not feature("cpu_usage") and not feature("cpu_frequency"):
+        cpu_analysis = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "CPU 利用率与频率采集均已关闭。",
+            "clusters": [],
+            "timeline": [],
+        }
     if platform == "harmony":
-        cpu_analysis["source"] = "HarmonyOS /proc/stat + hidumper --cpufreq"
+        cpu_analysis["source"] = (
+            "HarmonyOS SmartPerf SP_daemon"
+            if capture_configuration.get("backend") == "harmony_smartperf"
+            else "HarmonyOS /proc/stat + hidumper --cpufreq"
+        )
         cpu_analysis["limitations"] = (
             "CPU utilization and cluster frequency are measured counters. HarmonyOS does not expose an "
             "Android Power Profile equivalent here, so no CPU rail power is modeled."
@@ -3711,21 +5151,53 @@ def analyze_run(
     target_package = metadata.get("target_package")
     if not target_package and not metadata.get("session_mode"):
         target_package = metadata.get("foreground_package")
-    target_uid = package_to_uid.get(str(target_package)) if target_package else None
-    target_usage = next(
-        (item for item in usage.get("uids", []) if item.get("uid") == target_uid),
-        None,
+    target_uid = (
+        package_to_uid.get(str(target_package))
+        if power_mode and feature("power_attribution") and target_package
+        else None
     )
-    target_network = parse_checkin_network(raw_outputs.get("batterystats_checkin", ""), target_uid)
+    target_usage = (
+        next(
+            (item for item in usage.get("uids", []) if item.get("uid") == target_uid),
+            None,
+        )
+        if power_mode and feature("power_attribution")
+        else None
+    )
+    target_network = (
+        parse_checkin_network(raw_outputs.get("batterystats_checkin", ""), target_uid)
+        if power_mode and feature("power_attribution")
+        else None
+    )
     gpu_analysis = analyze_gpu(
         samples,
         metadata,
-        raw_outputs,
+        raw_outputs if power_mode and feature("power_attribution") else {},
         package_uids,
         target_uid,
         duration_s,
         system_snapshots,
     )
+    if not feature("gpu_metrics"):
+        gpu_analysis.update(
+            {
+                "frequency_available": False,
+                "load_available": False,
+                "analysis_disabled": True,
+                "reason": "GPU 指标采集已关闭。",
+                "timeline": [],
+            }
+        )
+    if not power_mode:
+        gpu_analysis["work_by_uid"] = []
+        gpu_analysis["target_work"] = None
+        gpu_analysis["work_source_available"] = False
+        gpu_analysis["memory"] = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "性能模式不采集或分析进程级 GPU 内存功耗归因。",
+            "processes": [],
+        }
 
     start_battery = metadata.get("battery_start", {})
     end_battery = metadata.get("battery_end", {})
@@ -3767,19 +5239,48 @@ def analyze_run(
         else None
     )
 
-    components = component_power_estimates(
-        usage,
-        stats_window,
-        average_voltage_mv,
-        power_profile,
-        display,
+    components = (
+        component_power_estimates(
+            usage,
+            stats_window,
+            average_voltage_mv,
+            power_profile,
+            display,
+        )
+        if power_mode and feature("power_attribution")
+        else []
     )
-    application_analysis = analyze_applications(samples, contexts, max_gap_s)
-    event_analysis = analyze_external_events(
-        samples,
-        events,
-        max_gap_s,
-        sample_interval_s,
+    application_analysis = (
+        analyze_applications(samples, contexts, max_gap_s)
+        if power_mode and feature("foreground_window")
+        else {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": (
+                "性能模式不按前台应用分配整机实测能量。"
+                if not power_mode
+                else "前台应用与窗口采集已关闭。"
+            ),
+            "rows": [],
+            "transitions": [],
+        }
+    )
+    event_analysis = (
+        analyze_external_events(
+            samples,
+            events,
+            max_gap_s,
+            sample_interval_s,
+        )
+        if power_mode
+        else {
+            "available": bool(events),
+            "analysis_mode": "performance",
+            "event_count": len(events),
+            "instant_count": sum(1 for event in events if not event.duration_s),
+            "rows": [],
+            "spans": [],
+        }
     )
     system_analysis = analyze_system_activity(
         samples,
@@ -3787,6 +5288,16 @@ def analyze_run(
         max_gap_s,
         thermal_snapshots,
     )
+    if not feature("process_snapshots") and not feature("target_process"):
+        system_analysis.update(
+            {
+                "available": False,
+                "analysis_disabled": True,
+                "reason": "进程与目标应用资源采集均已关闭。",
+                "top_processes": [],
+                "hot_threads": [],
+            }
+        )
     thermal_history = analyze_thermal_history(samples, thermal_snapshots)
     if thermal_history.get("available"):
         thermal: Dict[str, object] = {
@@ -3798,6 +5309,24 @@ def analyze_run(
     else:
         thermal = {**thermal_post_run, **thermal_history, "post_run": thermal_post_run}
     scheduler_analysis = analyze_scheduler_history(samples, scheduler_snapshots)
+    if not feature("thermal"):
+        thermal = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "温度与热限制采集已关闭。",
+            "sensors": [],
+            "post_run": {},
+        }
+    if not feature("scheduler"):
+        scheduler_analysis = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "调度与资源分配快照已关闭。",
+            "cpusets": {},
+            "cpu_policies": [],
+            "hint_sessions": [],
+            "watched_processes": [],
+        }
     if platform == "harmony":
         thermal["status"] = None
         thermal["latest_status"] = None
@@ -3817,80 +5346,166 @@ def analyze_run(
             "HarmonyOS snapshots retain cpufreq and PowerManager state. Android cpuset, ActivityManager and "
             "ADPF HintSession concepts are not present and remain explicitly unavailable."
         )
-    test_item_analysis = analyze_test_items(
-        samples,
-        contexts,
-        events,
-        system_snapshots,
-        system_analysis,
-        thermal,
-        scheduler_analysis,
-        max_gap_s,
-        sample_interval_s,
+    if not power_mode:
+        for collection_name in ("top_processes", "hot_threads"):
+            collection = system_analysis.get(collection_name, [])
+            if not isinstance(collection, list):
+                continue
+            for item in collection:
+                if not isinstance(item, dict):
+                    continue
+                for key in (
+                    "average_power_when_visible_mw",
+                    "power_delta_when_visible_mw",
+                    "power_correlation",
+                    "average_relative_power_score",
+                    "maximum_relative_power_score",
+                ):
+                    item.pop(key, None)
+        system_analysis["power_attribution_disabled"] = True
+        system_analysis["power_attribution_note"] = (
+            "性能模式仅把进程和线程 CPU 活动作为调度竞争证据，不分析其功耗来源。"
+        )
+
+    summary_analysis: Dict[str, object] = {
+        "duration_s": duration_s,
+        "covered_duration_s": covered_duration_s,
+        "missing_duration_s": missing_duration_s,
+        "coverage_pct": covered_duration_s / duration_s * 100.0 if duration_s > 0 else 0.0,
+        "sample_count": len(samples),
+        "current_semantics": "positive magnitude",
+        "average_current_ma": time_weighted_current_ma,
+        "minimum_current_ma": min(currents),
+        "maximum_current_ma": max(currents),
+        "average_signed_current_ma": statistics.fmean(signed_currents),
+        "average_voltage_mv": average_voltage_mv,
+        "average_power_mw": time_weighted_power_mw,
+        "median_power_mw": statistics.median(powers),
+        "p95_power_mw": percentile(powers, 0.95),
+        "minimum_power_mw": min(powers),
+        "maximum_power_mw": max(powers),
+        "energy_mwh": energy_mwh,
+        "discharge_mah": discharge_mah,
+        "energy_per_minute_mwh": energy_mwh / duration_s * 60.0 if duration_s > 0 else None,
+        "mah_per_minute": discharge_mah / duration_s * 60.0 if duration_s > 0 else None,
+        "average_cpu_pct": statistics.fmean(cpus) if cpus else None,
+        "maximum_cpu_pct": max(cpus) if cpus else None,
+        "power_sources": power_sources,
+        "average_power_sample_age_s": (
+            statistics.fmean(power_sample_ages) if power_sample_ages else None
+        ),
+        "maximum_power_sample_age_s": max(power_sample_ages) if power_sample_ages else None,
+        "average_collector_cpu_pct": (
+            statistics.fmean(collector_cpu_values) if collector_cpu_values else None
+        ),
+        "maximum_collector_cpu_pct": (
+            max(collector_cpu_values) if collector_cpu_values else None
+        ),
+        "capacity_mah": capacity_mah,
+        "drain_pct_per_hour": drain_pct_per_hour,
+        "full_runtime_h": full_runtime_h,
+        "remaining_runtime_h": remaining_runtime_h,
+        "temperature_delta_c": (
+            float(end_battery.get("temperature_c")) - float(start_battery.get("temperature_c"))
+            if isinstance(start_battery, dict)
+            and isinstance(end_battery, dict)
+            and isinstance(start_battery.get("temperature_c"), (int, float))
+            and isinstance(end_battery.get("temperature_c"), (int, float))
+            else None
+        ),
+    }
+    memory_analysis = analyze_memory_frequency(samples, metadata)
+    if not feature("memory_frequency"):
+        memory_analysis = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "内存频率采集已关闭。",
+            "timeline": [],
+        }
+    settings_analysis = (
+        analyze_runtime_settings(metadata, raw_outputs)
+        if feature("runtime_settings")
+        else {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "系统设置快照已关闭。",
+            "rows": [],
+        }
     )
+    if power_mode:
+        test_item_analysis = analyze_test_items(
+            samples,
+            contexts,
+            events,
+            system_snapshots,
+            system_analysis,
+            thermal,
+            scheduler_analysis,
+            max_gap_s,
+            sample_interval_s,
+        )
+        power_pressure = analyze_power_pressure(
+            samples,
+            system_analysis,
+            scheduler_analysis,
+            thermal,
+            memory_analysis,
+            settings_analysis,
+        )
+        render_performance: Dict[str, object] = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "功耗模式不展开帧延迟和渲染链路归因。",
+        }
+    else:
+        test_item_analysis = analyze_performance_test_items(
+            samples,
+            contexts,
+            events,
+            performance_analysis,
+            thermal,
+            scheduler_analysis,
+            max_gap_s,
+            sample_interval_s,
+        )
+        power_pressure = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "性能模式只记录整机功耗，不分析任务、组件或 UID 功耗来源。",
+        }
+        render_performance = analyze_render_performance(
+            performance_analysis,
+            system_analysis,
+            scheduler_analysis,
+            thermal,
+            cpu_analysis,
+            gpu_analysis,
+            memory_analysis,
+            summary_analysis,
+        )
     analysis: Dict[str, object] = {
         "platform": platform,
-        "summary": {
-            "duration_s": duration_s,
-            "covered_duration_s": covered_duration_s,
-            "missing_duration_s": missing_duration_s,
-            "coverage_pct": covered_duration_s / duration_s * 100.0 if duration_s > 0 else 0.0,
-            "sample_count": len(samples),
-            "current_semantics": "positive magnitude",
-            "average_current_ma": time_weighted_current_ma,
-            "minimum_current_ma": min(currents),
-            "maximum_current_ma": max(currents),
-            "average_signed_current_ma": statistics.fmean(signed_currents),
-            "average_voltage_mv": average_voltage_mv,
-            "average_power_mw": time_weighted_power_mw,
-            "median_power_mw": statistics.median(powers),
-            "p95_power_mw": percentile(powers, 0.95),
-            "minimum_power_mw": min(powers),
-            "maximum_power_mw": max(powers),
-            "energy_mwh": energy_mwh,
-            "discharge_mah": discharge_mah,
-            "energy_per_minute_mwh": energy_mwh / duration_s * 60.0 if duration_s > 0 else None,
-            "mah_per_minute": discharge_mah / duration_s * 60.0 if duration_s > 0 else None,
-            "average_cpu_pct": statistics.fmean(cpus) if cpus else None,
-            "maximum_cpu_pct": max(cpus) if cpus else None,
-            "power_sources": power_sources,
-            "average_power_sample_age_s": (
-                statistics.fmean(power_sample_ages) if power_sample_ages else None
-            ),
-            "maximum_power_sample_age_s": max(power_sample_ages) if power_sample_ages else None,
-            "average_collector_cpu_pct": (
-                statistics.fmean(collector_cpu_values) if collector_cpu_values else None
-            ),
-            "maximum_collector_cpu_pct": (
-                max(collector_cpu_values) if collector_cpu_values else None
-            ),
-            "capacity_mah": capacity_mah,
-            "drain_pct_per_hour": drain_pct_per_hour,
-            "full_runtime_h": full_runtime_h,
-            "remaining_runtime_h": remaining_runtime_h,
-            "temperature_delta_c": (
-                float(end_battery.get("temperature_c")) - float(start_battery.get("temperature_c"))
-                if isinstance(start_battery, dict)
-                and isinstance(end_battery, dict)
-                and isinstance(start_battery.get("temperature_c"), (int, float))
-                and isinstance(end_battery.get("temperature_c"), (int, float))
-                else None
-            ),
-        },
-        "buckets": build_buckets(samples),
-        "long_windows": build_long_windows(samples, contexts, max_gap_s),
-        "spikes": detect_spikes(samples),
+        "test_mode": test_mode,
+        "capture_configuration": capture_configuration,
+        "summary": summary_analysis,
+        "buckets": build_buckets(samples) if power_mode else [],
+        "long_windows": build_long_windows(samples, contexts, max_gap_s) if power_mode else [],
+        "spikes": detect_spikes(samples) if power_mode else [],
         "cpu": cpu_analysis,
         "frequency_summary": cpu_analysis.get("clusters", []),
         "gpu": gpu_analysis,
         "battery_usage": usage,
         "components": components,
-        "target_app": {
-            "package": target_package,
-            "uid": target_uid,
-            "usage": target_usage,
-            "network": target_network,
-        }
+        "target_app": (
+            {
+                "package": target_package,
+                "uid": target_uid,
+                "usage": target_usage,
+                "network": target_network,
+            }
+            if power_mode
+            else {"package": target_package}
+        )
         if target_package
         else None,
         "processes": processes,
@@ -3898,13 +5513,17 @@ def analyze_run(
         "wakelocks": wakelocks,
         "display": display,
         "performance": performance_analysis,
+        "memory": memory_analysis,
+        "runtime_settings": settings_analysis,
+        "power_pressure": power_pressure,
+        "render_performance": render_performance,
         "thermal": thermal,
         "scheduler": scheduler_analysis,
         "applications": application_analysis,
         "external_events": event_analysis,
         "test_items": test_item_analysis,
         "stats_window": stats_window,
-        "data_sources": _analysis_data_sources(platform),
+        "data_sources": _analysis_data_sources(platform, test_mode, capture_configuration),
         "warnings": analysis_warnings,
     }
     analysis["findings"] = build_findings(analysis)

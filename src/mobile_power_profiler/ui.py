@@ -23,9 +23,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
-from .analysis import analyze_performance_contexts, convert_samples
+from .analysis import (
+    analyze_memory_frequency,
+    analyze_performance_contexts,
+    analyze_runtime_settings,
+    convert_samples,
+)
 from .collector import adb_connection_type, adb_shell, list_adb_devices, parse_sampler_line
 from .evidence import create_evidence_archive
+from .features import capture_feature_names, capture_preset_names
 from .ios import DEFAULT_IOS_PYTHON, list_ios_devices, pair_ios_device
 from .harmony import (
     DEFAULT_HDC,
@@ -37,6 +43,7 @@ from .models import (
     ContextSample,
     CpuPolicy,
     GpuSource,
+    MemorySource,
     RawSample,
     Sample,
     SchedulerSnapshot,
@@ -49,6 +56,11 @@ MAX_LIVE_POINTS = 900
 MAX_LOG_LINES = 500
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_UI_DURATION_S = 62 * 60
+DEFAULT_PERFORMANCE_UI_DURATION_S = 32 * 60
+ANDROID_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
+ANDROID_COMPONENT_RE = re.compile(
+    r"^(?P<package>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/(?P<activity>\S+)$"
+)
 
 
 def _read_json(path: Path) -> Dict[str, object]:
@@ -105,7 +117,7 @@ def _bounded_int(
 def sanitize_run_name(value: object) -> str:
     text = str(value or "").strip()
     if not text:
-        return datetime.now().strftime("android-power-%Y%m%d-%H%M%S")
+        return datetime.now().strftime("mobile-profile-%Y%m%d-%H%M%S")
     normalized: List[str] = []
     for character in text:
         if character.isalnum() or character in {"-", "_", "."}:
@@ -116,7 +128,7 @@ def sanitize_run_name(value: object) -> str:
             normalized.append("-")
     result = re.sub(r"-+", "-", "".join(normalized)).strip("-. ")
     if not result or result in {".", ".."}:
-        return datetime.now().strftime("android-power-%Y%m%d-%H%M%S")
+        return datetime.now().strftime("mobile-profile-%Y%m%d-%H%M%S")
     return result[:96]
 
 
@@ -155,6 +167,54 @@ def parse_device_ipv4_addresses(text: str) -> List[Dict[str, object]]:
     return addresses
 
 
+def parse_android_package_list(text: str) -> List[str]:
+    packages = set()
+    for line in (text or "").splitlines():
+        value = line.strip()
+        if value.startswith("package:"):
+            value = value[len("package:") :].strip()
+        if ANDROID_PACKAGE_RE.fullmatch(value):
+            packages.add(value)
+    return sorted(packages, key=str.casefold)
+
+
+def parse_android_launcher_activities(
+    text: str,
+    third_party_packages: Sequence[str] = (),
+) -> List[Dict[str, object]]:
+    third_party = set(third_party_packages)
+    by_package: Dict[str, Dict[str, object]] = {}
+    for line in (text or "").splitlines():
+        value = line.strip()
+        match = ANDROID_COMPONENT_RE.fullmatch(value)
+        if match is None:
+            continue
+        package = match.group("package")
+        activity = match.group("activity")
+        component = f"{package}/{activity}"
+        entry = by_package.get(package)
+        if entry is None:
+            entry = {
+                "package": package,
+                "activity": activity,
+                "component": component,
+                "activities": [],
+                "user_app": package in third_party,
+                "launchable": True,
+            }
+            by_package[package] = entry
+        activities = entry["activities"]
+        if isinstance(activities, list) and component not in activities:
+            activities.append(component)
+    return sorted(
+        by_package.values(),
+        key=lambda item: (
+            not bool(item.get("user_app")),
+            str(item.get("package") or "").casefold(),
+        ),
+    )
+
+
 def _policies_from_metadata(metadata: Dict[str, object]) -> List[CpuPolicy]:
     policies: List[CpuPolicy] = []
     raw = metadata.get("cpu_policies", [])
@@ -176,6 +236,16 @@ def _gpu_from_metadata(metadata: Dict[str, object]) -> Optional[GpuSource]:
         return None
     try:
         return GpuSource(**raw)
+    except TypeError:
+        return None
+
+
+def _memory_from_metadata(metadata: Dict[str, object]) -> Optional[MemorySource]:
+    raw = metadata.get("memory_source")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return MemorySource(**raw)
     except TypeError:
         return None
 
@@ -215,6 +285,20 @@ def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+def _pearson(values: Sequence[float], powers: Sequence[float]) -> Optional[float]:
+    if len(values) != len(powers) or len(values) < 3:
+        return None
+    mean_values = statistics.fmean(values)
+    mean_powers = statistics.fmean(powers)
+    numerator = sum(
+        (value - mean_values) * (power - mean_powers)
+        for value, power in zip(values, powers)
+    )
+    left = math.sqrt(sum((value - mean_values) ** 2 for value in values))
+    right = math.sqrt(sum((power - mean_powers) ** 2 for power in powers))
+    return numerator / (left * right) if left > 0 and right > 0 else None
+
+
 class LiveTelemetryReader:
     """Incrementally parse an append-only run journal for the dashboard."""
 
@@ -223,8 +307,10 @@ class LiveTelemetryReader:
         self.metadata: Dict[str, object] = {}
         self.policies: List[CpuPolicy] = []
         self.gpu_source: Optional[GpuSource] = None
+        self.memory_source: Optional[MemorySource] = None
         self.raw_samples: List[RawSample] = []
         self.normalized_samples: List[Sample] = []
+        self.stream_contexts: List[ContextSample] = []
         self.contexts: List[ContextSample] = []
         self.system_snapshots: List[SystemSnapshot] = []
         self.thermal_snapshots: List[ThermalSnapshot] = []
@@ -250,6 +336,7 @@ class LiveTelemetryReader:
         self.metadata = metadata
         self.policies = _policies_from_metadata(metadata)
         self.gpu_source = _gpu_from_metadata(metadata)
+        self.memory_source = _memory_from_metadata(metadata)
         self._metadata_mtime_ns = stat.st_mtime_ns
 
     def _refresh_stream(self) -> None:
@@ -265,7 +352,7 @@ class LiveTelemetryReader:
             self._stream_remainder = b""
             self.raw_samples.clear()
             self.normalized_samples.clear()
-            self.contexts.clear()
+            self.stream_contexts.clear()
         if size == self._stream_offset:
             return
         try:
@@ -280,7 +367,12 @@ class LiveTelemetryReader:
         self._stream_remainder = lines.pop() if lines else b""
         for raw_line in lines:
             line = raw_line.decode("utf-8", errors="replace")
-            parsed = parse_sampler_line(line, self.policies, self.gpu_source)
+            parsed = parse_sampler_line(
+                line,
+                self.policies,
+                self.gpu_source,
+                self.memory_source,
+            )
             if isinstance(parsed, RawSample):
                 if self.raw_samples and parsed.uptime_s <= self.raw_samples[-1].uptime_s:
                     continue
@@ -299,9 +391,12 @@ class LiveTelemetryReader:
                 )
                 self.normalized_samples.append(parsed)
             elif isinstance(parsed, ContextSample):
-                if self.contexts and parsed.uptime_s <= self.contexts[-1].uptime_s:
+                if (
+                    self.stream_contexts
+                    and parsed.uptime_s <= self.stream_contexts[-1].uptime_s
+                ):
                     continue
-                self.contexts.append(parsed)
+                self.stream_contexts.append(parsed)
 
     def _refresh_jsonl(self, name: str, target: List[object], model: object) -> None:
         path = self.output_dir / name
@@ -338,6 +433,7 @@ class LiveTelemetryReader:
     def refresh(self) -> None:
         self._refresh_metadata()
         self._refresh_stream()
+        self._refresh_jsonl("contexts.jsonl", self.contexts, ContextSample)
         self._refresh_jsonl("system-snapshots.jsonl", self.system_snapshots, SystemSnapshot)
         self._refresh_jsonl("thermal-snapshots.jsonl", self.thermal_snapshots, ThermalSnapshot)
         self._refresh_jsonl(
@@ -391,15 +487,28 @@ class LiveTelemetryReader:
         powers = [sample.power_mw for sample in samples]
         currents = [sample.current_ma for sample in samples]
         cpu_values = [sample.cpu_pct for sample in samples if sample.cpu_pct is not None]
+        context_map: Dict[tuple[object, ...], ContextSample] = {}
+        for context in sorted(
+            [*self.stream_contexts, *self.contexts],
+            key=lambda item: item.uptime_s,
+        ):
+            key = (
+                round(context.uptime_s, 4),
+                context.source,
+                context.foreground_package,
+                context.foreground_activity,
+            )
+            context_map[key] = context
+        contexts = sorted(context_map.values(), key=lambda item: item.uptime_s)
 
         latest_context: Optional[ContextSample] = None
         if latest is not None:
-            for context in self.contexts:
+            for context in contexts:
                 if context.uptime_s > latest.uptime_s:
                     break
                 latest_context = context
-        elif self.contexts:
-            latest_context = self.contexts[-1]
+        elif contexts:
+            latest_context = contexts[-1]
 
         clusters: List[Dict[str, object]] = []
         if latest is not None:
@@ -439,10 +548,127 @@ class LiveTelemetryReader:
             if latest_system is not None
             else []
         )
-        performance = analyze_performance_contexts(self.contexts, self.metadata)
+        performance = analyze_performance_contexts(contexts, self.metadata)
+        session_start_uptime = samples[0].uptime_s if samples else None
+        performance_timeline = performance.get("frame_rate_timeline", [])
+        performance_series = [
+            {
+                **item,
+                "elapsed_s": max(
+                    0.0,
+                    float(item.get("uptime_s") or 0.0) - session_start_uptime,
+                ),
+            }
+            for item in performance_timeline
+            if isinstance(item, dict)
+            and session_start_uptime is not None
+            and isinstance(item.get("uptime_s"), (int, float))
+        ] if isinstance(performance_timeline, list) else []
+
+        memory_analysis = analyze_memory_frequency(samples, self.metadata) if samples else {
+            "available": False,
+            "timeline": [],
+        }
+        settings_analysis = analyze_runtime_settings(self.metadata, {})
+        pressure_drivers: List[Dict[str, object]] = []
+
+        def add_pressure_driver(
+            key: str,
+            label: str,
+            values: Sequence[Optional[float]],
+        ) -> None:
+            pairs = [
+                (float(value), float(sample.power_mw))
+                for sample, value in zip(samples, values)
+                if isinstance(value, (int, float))
+            ]
+            if len(pairs) < 3:
+                return
+            pressure_drivers.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "correlation": _pearson(
+                        [item[0] for item in pairs],
+                        [item[1] for item in pairs],
+                    ),
+                    "sample_count": len(pairs),
+                }
+            )
+
+        add_pressure_driver("cpu", "CPU 总负载", [item.cpu_pct for item in samples])
+        add_pressure_driver("gpu_load", "GPU 负载", [item.gpu_load_pct for item in samples])
+        add_pressure_driver(
+            "gpu_frequency",
+            "GPU 频率",
+            [item.gpu_frequency_mhz for item in samples],
+        )
+        add_pressure_driver(
+            "memory_frequency",
+            "内存 / DMC 频率",
+            [item.memory_frequency_mhz for item in samples],
+        )
+        add_pressure_driver(
+            "temperature",
+            "电池温度",
+            [item.battery_temperature_c for item in samples],
+        )
+        pressure_drivers.sort(
+            key=lambda item: abs(float(item.get("correlation") or 0.0)),
+            reverse=True,
+        )
+        live_tasks = []
+        if latest_system is not None:
+            live_tasks = [
+                {
+                    "pid": item.get("pid"),
+                    "name": item.get("name") or item.get("command"),
+                    "cpu_pct": item.get("cpu_pct"),
+                    "memory_kb": item.get("memory_kb") or item.get("rss_kb"),
+                    "state": item.get("state"),
+                }
+                for item in latest_system.processes[:8]
+                if isinstance(item, dict)
+            ]
+        power_pressure = {
+            "available": bool(pressure_drivers or live_tasks or settings_analysis.get("available")),
+            "drivers": pressure_drivers,
+            "leading_driver": pressure_drivers[0] if pressure_drivers else None,
+            "tasks": live_tasks,
+            "memory": memory_analysis,
+            "settings": settings_analysis,
+            "scheduler": asdict(latest_scheduler) if latest_scheduler else None,
+        }
+
+        render_threads = []
+        if latest_thread_system is not None:
+            render_threads = [
+                item
+                for item in latest_thread_system.threads
+                if isinstance(item, dict)
+                and re.search(
+                    r"renderthread|surfaceflinger|renderengine|composer|hwc|gpu|main",
+                    f"{item.get('name') or ''} {item.get('process') or ''}",
+                    re.I,
+                )
+            ][:12]
+        render_pipeline = performance.get("render_pipeline", {})
+        render_pipeline = render_pipeline if isinstance(render_pipeline, dict) else {}
+        render_performance = {
+            "available": bool(render_pipeline.get("available") or render_threads),
+            "pipeline": render_pipeline,
+            "dominant_stage": render_pipeline.get("dominant_stage"),
+            "render_threads": render_threads,
+            "power_recording": {
+                "average_power_mw": statistics.fmean(powers) if powers else None,
+                "p95_power_mw": _percentile(powers, 0.95),
+                "note": "性能模式只记录整机功耗，不分析组件、UID 或第三方任务功耗来源。",
+            },
+        }
 
         return {
             "metadata": self.metadata,
+            "test_mode": str(self.metadata.get("test_mode") or "power"),
             "sample_count": len(samples),
             "elapsed_s": elapsed,
             "requested_duration_s": requested_duration,
@@ -459,6 +685,7 @@ class LiveTelemetryReader:
                     "temperature_c": latest.battery_temperature_c,
                     "gpu_frequency_mhz": latest.gpu_frequency_mhz,
                     "gpu_load_pct": latest.gpu_load_pct,
+                    "memory_frequency_mhz": latest.memory_frequency_mhz,
                     "power_source": latest.power_source,
                     "power_sample_age_s": latest.power_sample_age_s,
                     "collector_cpu_pct": latest.collector_cpu_pct,
@@ -492,13 +719,19 @@ class LiveTelemetryReader:
                     "temperature_c": sample.battery_temperature_c,
                     "gpu_frequency_mhz": sample.gpu_frequency_mhz,
                     "gpu_load_pct": sample.gpu_load_pct,
+                    "memory_frequency_mhz": sample.memory_frequency_mhz,
                     "power_sample_age_s": sample.power_sample_age_s,
                 }
                 for sample in displayed
             ],
+            "performance_series": performance_series,
             "clusters": clusters,
             "context": asdict(latest_context) if latest_context is not None else None,
             "performance": performance,
+            "memory": memory_analysis,
+            "runtime_settings": settings_analysis,
+            "power_pressure": power_pressure,
+            "render_performance": render_performance,
             "battery": battery if isinstance(battery, dict) else {},
             "warnings": list(dict.fromkeys(warnings)),
             "system_monitor": {
@@ -658,7 +891,11 @@ class ActiveRun:
         if checkpoint.get("status") and running and status == "starting":
             status = str(checkpoint["status"])
 
-        title = str(metadata.get("title") or self.config.get("title") or "Power session")
+        test_mode = str(
+            metadata.get("test_mode") or self.config.get("test_mode") or "power"
+        )
+        default_title = "Performance session" if test_mode == "performance" else "Power session"
+        title = str(metadata.get("title") or self.config.get("title") or default_title)
         device = metadata.get("device", {})
         report_exists = (self.output_dir / "report.html").exists() and not running
         with self._lock:
@@ -676,6 +913,7 @@ class ActiveRun:
             "finished_at": self.finished_at,
             "device": device if isinstance(device, dict) else {},
             "platform": str(metadata.get("platform") or self.config.get("platform") or "android"),
+            "test_mode": test_mode,
             "device_serial": str(
                 metadata.get("device_id")
                 or metadata.get("adb_serial")
@@ -683,6 +921,7 @@ class ActiveRun:
                 or ""
             ),
             "checkpoint": checkpoint,
+            "config": dict(self.config),
             "logs": logs,
             "report_ready": report_exists,
             "command": self.command,
@@ -893,12 +1132,17 @@ class DashboardManager:
         self,
         force: bool = False,
         *,
+        refresh_android: Optional[bool] = None,
         refresh_ios: Optional[bool] = None,
         refresh_harmony: Optional[bool] = None,
     ) -> tuple[List[Dict[str, str]], Optional[str]]:
         now = time.time()
         with self._lock:
-            refresh_android_now = force or now - self._android_device_cache_at >= 3.0
+            refresh_android_now = (
+                bool(refresh_android)
+                if refresh_android is not None
+                else force or now - self._android_device_cache_at >= 3.0
+            )
             refresh_harmony_now = (
                 bool(refresh_harmony)
                 if refresh_harmony is not None
@@ -1200,6 +1444,13 @@ class DashboardManager:
         if selected is None:
             raise RuntimeError(error or f"Device {device!r} is not available")
         platform = str(selected.get("platform") or "android")
+        requested_platform = str(payload.get("platform") or platform).strip().lower()
+        if requested_platform not in {"android", "ios", "harmony"}:
+            raise ValueError("platform must be android, ios, or harmony")
+        if requested_platform != platform:
+            raise ValueError(
+                f"Selected {platform} device does not match the requested {requested_platform} UI platform"
+            )
         command = self._base_command() + [
             "probe",
             "--platform",
@@ -1236,6 +1487,120 @@ class DashboardManager:
         with self._lock:
             self.probe_cache[device] = entry
         return entry
+
+    def scan_android_apps(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        if not device:
+            raise ValueError("Select an Android device before scanning applications")
+        requested_platform = str(payload.get("platform") or "android").strip().lower()
+        if requested_platform != "android":
+            raise ValueError("Application scanning is currently available only for Android")
+        devices, error = self.devices(
+            force=True,
+            refresh_android=True,
+            refresh_ios=False,
+            refresh_harmony=False,
+        )
+        if error:
+            raise RuntimeError(error)
+        selected = next(
+            (
+                item
+                for item in devices
+                if item.get("serial") == device and item.get("state") == "device"
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Android device {device!r} is not ready")
+        if str(selected.get("platform") or "android") != "android":
+            raise ValueError("Selected device is not an Android device")
+
+        third_party_result = adb_shell(
+            self.adb,
+            device,
+            ["pm", "list", "packages", "-3"],
+            timeout_s=20,
+        )
+        third_party_packages = parse_android_package_list(
+            third_party_result.stdout if third_party_result.ok else ""
+        )
+
+        launcher_commands = [
+            [
+                "cmd",
+                "package",
+                "query-activities",
+                "--brief",
+                "--components",
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER",
+            ],
+            [
+                "pm",
+                "query-activities",
+                "--brief",
+                "--components",
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER",
+            ],
+        ]
+        launcher_result = None
+        apps: List[Dict[str, object]] = []
+        source = "launcher-activities"
+        for command in launcher_commands:
+            launcher_result = adb_shell(self.adb, device, command, timeout_s=30)
+            if not launcher_result.ok:
+                continue
+            apps = parse_android_launcher_activities(
+                launcher_result.stdout,
+                third_party_packages,
+            )
+            if apps:
+                break
+
+        warnings: List[str] = []
+        if not third_party_result.ok:
+            warnings.append(
+                third_party_result.stderr.strip()
+                or third_party_result.stdout.strip()
+                or "Unable to classify third-party packages"
+            )
+        if not apps:
+            if not third_party_packages:
+                detail = ""
+                if launcher_result is not None:
+                    detail = launcher_result.stderr.strip() or launcher_result.stdout.strip()
+                raise RuntimeError(detail or "No Android applications were found")
+            source = "third-party-packages-fallback"
+            apps = [
+                {
+                    "package": package,
+                    "activity": None,
+                    "component": None,
+                    "activities": [],
+                    "user_app": True,
+                    "launchable": False,
+                }
+                for package in third_party_packages
+            ]
+            warnings.append(
+                "The device did not expose launcher activities; showing third-party packages instead"
+            )
+
+        return {
+            "device": device,
+            "platform": "android",
+            "source": source,
+            "count": len(apps),
+            "apps": apps,
+            "warnings": warnings,
+            "scanned_at": time.time(),
+        }
 
     def pair_ios(self, payload: Dict[str, object]) -> Dict[str, object]:
         device = str(payload.get("device") or "").strip() or None
@@ -1281,13 +1646,47 @@ class DashboardManager:
         if selected is None:
             raise RuntimeError(f"Device {device!r} is not ready")
         platform = str(selected.get("platform") or "android")
+        requested_platform = str(payload.get("platform") or platform).strip().lower()
+        if requested_platform not in {"android", "ios", "harmony"}:
+            raise ValueError("platform must be android, ios, or harmony")
+        if requested_platform != platform:
+            raise ValueError(
+                f"Selected {platform} device does not match the requested {requested_platform} UI platform"
+            )
+        test_mode = str(payload.get("test_mode") or "power").strip().lower()
+        if test_mode not in {"power", "performance"}:
+            raise ValueError("test mode must be power or performance")
+        capture_preset = str(payload.get("capture_preset") or "auto").strip().lower()
+        if capture_preset not in set(capture_preset_names()):
+            raise ValueError("unknown capture preset")
+        raw_capture_features = payload.get("capture_features")
+        capture_features: Dict[str, bool] = {}
+        if raw_capture_features is not None:
+            if not isinstance(raw_capture_features, dict):
+                raise ValueError("capture features must be an object")
+            allowed_features = set(capture_feature_names())
+            unknown = sorted(set(str(key) for key in raw_capture_features) - allowed_features)
+            if unknown:
+                raise ValueError(f"unknown capture feature: {unknown[0]}")
+            capture_features = {
+                name: bool(raw_capture_features[name])
+                for name in capture_feature_names()
+                if name in raw_capture_features
+            }
+        harmony_high_performance = bool(payload.get("harmony_high_performance", False))
+        if harmony_high_performance and (platform != "harmony" or test_mode != "performance"):
+            raise ValueError(
+                "HarmonyOS high-performance mode requires a HarmonyOS performance test"
+            )
 
         duration = _bounded_int(
             payload.get("duration"),
             "duration",
             2,
             604800,
-            DEFAULT_UI_DURATION_S,
+            DEFAULT_PERFORMANCE_UI_DURATION_S
+            if test_mode == "performance"
+            else DEFAULT_UI_DURATION_S,
         )
         interval = _bounded_float(payload.get("interval"), "interval", 0.2, 60.0, 1.0)
         checkpoint = _bounded_float(
@@ -1332,6 +1731,13 @@ class DashboardManager:
             1800.0,
             30.0,
         )
+        performance_interval = _bounded_float(
+            payload.get("performance_interval"),
+            "performance interval",
+            1.0,
+            60.0,
+            2.0 if test_mode == "performance" else 10.0,
+        )
         current_unit = str(payload.get("current_unit") or "auto")
         if current_unit not in {"auto", "ma", "ua"}:
             raise ValueError("current unit must be auto, ma, or ua")
@@ -1347,6 +1753,10 @@ class DashboardManager:
 
         title = str(payload.get("title") or "").strip()[:200]
         package = str(payload.get("package") or "").strip()[:200]
+        if test_mode == "performance" and not package:
+            raise ValueError(
+                "Performance tests require a target game or application package"
+            )
         start_context = str(payload.get("start_context") or "desktop").strip()
         if start_context not in {"desktop", "app", "other", "unknown"}:
             raise ValueError("start context must be desktop, app, other, or unknown")
@@ -1361,6 +1771,10 @@ class DashboardManager:
         config: Dict[str, object] = {
             "device": device,
             "platform": platform,
+            "test_mode": test_mode,
+            "capture_preset": capture_preset,
+            "capture_features": capture_features,
+            "harmony_high_performance": harmony_high_performance,
             "duration": duration,
             "interval": interval,
             "checkpoint_interval": checkpoint,
@@ -1381,11 +1795,16 @@ class DashboardManager:
             "thread_interval": thread_interval,
             "thermal_interval": thermal_interval,
             "scheduler_interval": scheduler_interval,
+            "performance_interval": performance_interval,
         }
         command = self._base_command() + [
             "record",
             "--platform",
             platform,
+            "--test-mode",
+            test_mode,
+            "--capture-preset",
+            capture_preset,
             "--device",
             device,
             "--duration",
@@ -1410,6 +1829,8 @@ class DashboardManager:
             str(thermal_interval),
             "--scheduler-interval",
             str(scheduler_interval),
+            "--performance-interval",
+            str(performance_interval),
         ]
         if title:
             command.extend(["--title", title])
@@ -1427,7 +1848,13 @@ class DashboardManager:
             command.append("--no-reset")
         if full_history:
             command.append("--full-history")
-        if not system_monitor:
+        for name, enabled in capture_features.items():
+            command.extend(
+                ["--enable-feature" if enabled else "--disable-feature", name]
+            )
+        if harmony_high_performance:
+            command.append("--harmony-high-performance")
+        if not system_monitor and not capture_features:
             command.append("--no-system-monitor")
 
         creationflags = 0
@@ -1435,6 +1862,7 @@ class DashboardManager:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -1699,7 +2127,7 @@ class DashboardManager:
         output_dir = (
             Path(raw_output).expanduser().resolve()
             if raw_output and Path(raw_output).expanduser().is_absolute()
-            else (self.source_root / (raw_output or "dist/mobile-power-profiler-portable")).resolve()
+            else (self.source_root / (raw_output or "dist/mobile-profiler-portable")).resolve()
         )
         try:
             output_dir.relative_to(dist_root)
@@ -1779,7 +2207,7 @@ class DashboardManager:
 
     def tooling_state(self) -> Dict[str, object]:
         default_output = (
-            self.source_root / "dist" / "mobile-power-profiler-portable"
+            self.source_root / "dist" / "mobile-profiler-portable"
             if self.source_root is not None
             else None
         )
@@ -1892,6 +2320,30 @@ class DashboardManager:
             )
         latest = series[-1]
         powers = [float(item["power_mw"]) for item in series]
+        performance_series = [
+            {
+                "elapsed_s": float(index),
+                "uptime_s": 100000.0 + index,
+                "frame_rate_fps": max(
+                    52.0,
+                    118.0
+                    - 12.0 * math.exp(-((index - 122.0) / 16.0) ** 2)
+                    - 3.0 * max(0.0, math.sin(index / 9.0)),
+                ),
+                "frame_time_average_ms": 8.5,
+                "frame_time_p95_ms": (
+                    9.2 + 15.0 * math.exp(-((index - 122.0) / 12.0) ** 2)
+                ),
+                "frame_time_p99_ms": (
+                    12.0 + 26.0 * math.exp(-((index - 122.0) / 10.0) ** 2)
+                ),
+                "frame_issue_pct": (
+                    0.4 + 3.2 * math.exp(-((index - 122.0) / 14.0) ** 2)
+                ),
+                "refresh_rate_hz": 120.0,
+            }
+            for index in range(2, 240, 2)
+        ]
         return {
             "status": "demo",
             "running": False,
@@ -1928,6 +2380,7 @@ class DashboardManager:
                 "energy_mwh": sum(powers) / 3600.0,
             },
             "series": series,
+            "performance_series": performance_series,
             "clusters": [
                 {
                     "name": "policy0",
@@ -1978,6 +2431,16 @@ class DashboardManager:
                 ],
                 "sampled_compositor_fps": 117.8,
                 "minimum_sampled_compositor_fps": 92.4,
+                "sampled_frame_rate_fps": 117.8,
+                "minimum_sampled_frame_rate_fps": 92.4,
+                "one_percent_low_fps": 88.6,
+                "one_percent_low_source": "demo frame-time histogram slowest 1%",
+                "one_percent_low_confidence": "high",
+                "frame_metric_p95_ms": 16.72,
+                "frame_metric_p99_ms": 28.4,
+                "frame_issue_pct": 0.84,
+                "frame_issue_label": "超出帧截止时间",
+                "frame_source": "Android gfxinfo frame counter delta",
                 "frame_interval_average_ms": 8.49,
                 "frame_interval_p95_ms": 16.72,
                 "frame_sample_count": 2140,
@@ -1994,6 +2457,15 @@ class DashboardManager:
                 "foreground_window_id": 108,
                 "display_width_px": 1320,
                 "display_height_px": 2856,
+                "render_width_px": 1260,
+                "render_height_px": 2736,
+                "render_resolution_source": "WindowManager mFrame",
+                "render_resolution_estimated": False,
+                "render_scale_pct": 95.5,
+                "frame_interpolation_status": "indeterminate",
+                "frame_interpolation_label": "发现显示倍率，但无显式 MEMC 开关证据",
+                "frame_interpolation_confidence": "low",
+                "frame_interpolation_evidence": [],
                 "brightness_raw": 23707,
                 "gpu_renderer": "Maleoon 920C",
             },
@@ -2090,7 +2562,7 @@ class DashboardManager:
                 },
                 "scheduler": {
                     "uptime_s": 100230.0,
-                    "cpusets": {"foreground": "0-7", "background": "0-3", "system-background": "0-3", "restricted": "0-7"},
+                    "cpusets": {"top-app": "0-7", "foreground": "0-7", "background": "0-3", "system-background": "0-3", "restricted": "0-7"},
                     "cpu_policies": [
                         {"name": "policy0", "governor": None, "cpuinfo_min_khz": 339000, "cpuinfo_max_khz": 2400000, "status": "limits-only"},
                         {"name": "policy4", "governor": None, "cpuinfo_min_khz": 622000, "cpuinfo_max_khz": 3300000, "status": "limits-only"},
@@ -2250,6 +2722,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self._read_json_body()
             if path == "/api/probe":
                 result = self.server.manager.probe(payload)
+            elif path == "/api/apps":
+                result = self.server.manager.scan_android_apps(payload)
             elif path == "/api/connect":
                 result = self.server.manager.connect_device(payload)
             elif path == "/api/harmony/connect":
@@ -2281,7 +2755,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path == "/api/build-portable":
                 result = self.server.manager.build_portable_bundle(payload)
             elif path == "/api/devices/refresh":
-                devices, error = self.server.manager.devices(force=True)
+                platform = str(payload.get("platform") or "").strip().lower()
+                if platform and platform not in {"android", "ios", "harmony"}:
+                    raise ValueError("platform must be android, ios, or harmony")
+                devices, error = self.server.manager.devices(
+                    force=True,
+                    refresh_android=platform == "android" if platform else None,
+                    refresh_ios=platform == "ios" if platform else None,
+                    refresh_harmony=platform == "harmony" if platform else None,
+                )
                 result = {"devices": devices, "error": error}
             else:
                 self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
@@ -2325,7 +2807,7 @@ def serve_dashboard(
     actual_port = int(server.server_address[1])
     browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{browser_host}:{actual_port}/"
-    print("Mobile Power Profiler UI")
+    print("Mobile Profiler UI")
     print(f"Dashboard: {url}")
     print(f"Run root: {manager.output_root}")
     print("Press Ctrl+C to stop the UI server.")

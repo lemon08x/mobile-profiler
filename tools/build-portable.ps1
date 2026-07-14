@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $repoRoot "dist\mobile-power-profiler-portable"
+    $OutputDirectory = Join-Path $repoRoot "dist\mobile-profiler-portable"
 }
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
 $repoPath = [System.IO.Path]::GetFullPath($repoRoot)
@@ -25,8 +25,8 @@ if ($PythonVersion -notmatch '^\d+\.\d+\.\d+$') {
     throw "PythonVersion must use major.minor.patch, for example 3.13.7."
 }
 
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mobile-power-profiler-portable-" + [Guid]::NewGuid().ToString("N"))
-$stage = Join-Path $temporaryRoot "mobile-power-profiler-portable"
+$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mobile-profiler-portable-" + [Guid]::NewGuid().ToString("N"))
+$stage = Join-Path $temporaryRoot "mobile-profiler-portable"
 $runtime = Join-Path $stage "python-runtime"
 $sitePackages = Join-Path $stage "site-packages"
 New-Item -ItemType Directory -Force -Path $runtime, $sitePackages | Out-Null
@@ -49,7 +49,7 @@ try {
     }
     Expand-Archive -LiteralPath $embedZip -DestinationPath $runtime -Force
 
-    Write-Host "Copying Mobile Power Profiler into the portable site-packages..."
+    Write-Host "Copying Mobile Profiler into the portable site-packages..."
     Copy-Item -LiteralPath (Join-Path $repoRoot "src\mobile_power_profiler") -Destination (Join-Path $sitePackages "mobile_power_profiler") -Recurse -Force
 
     $pth = Get-ChildItem -LiteralPath $runtime -Filter "python*._pth" | Select-Object -First 1
@@ -112,28 +112,28 @@ setlocal
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 if exist "%ROOT%platform-tools\adb.exe" set "PATH=%ROOT%platform-tools;%PATH%"
-if not exist "%ROOT%power-runs" mkdir "%ROOT%power-runs"
-"%ROOT%python-runtime\python.exe" -m mobile_power_profiler ui --output-root "%ROOT%power-runs" %*
+if not exist "%ROOT%profiler-runs" mkdir "%ROOT%profiler-runs"
+"%ROOT%python-runtime\python.exe" -m mobile_power_profiler ui --output-root "%ROOT%profiler-runs" %*
 endlocal
 '@
     Set-Content -LiteralPath (Join-Path $stage "start-ui.bat") -Value $uiLauncher -Encoding ascii
 
     $portableReadme = @'
-Mobile Power Profiler Portable Bundle
-======================================
+Mobile Profiler Portable Bundle
+===============================
 
 1. Extract the complete directory. Do not copy start-ui.bat by itself.
 2. Double-click start-ui.bat to launch the local dashboard.
 3. Command-line entry: profiler.cmd --help
-4. Captures are stored under the local power-runs directory by default.
+4. Captures are stored under the local profiler-runs directory by default.
 5. When platform-tools is bundled, the UI can run adb connect IP:PORT.
 6. The Tools & Delivery page can import BTR2 logs, rebuild/recover reports,
    create evidence ZIPs, and compare two completed runs.
 7. Full Chinese guide: docs\usage-zh.md
 
 This bundle uses an independent Embedded Python runtime. The target computer
-does not need Python, a virtual environment, or pip. mobile-power-profiler is
-already installed under the bundled site-packages directory.
+does not need Python, a virtual environment, or pip. Mobile Profiler is already
+included under the bundled site-packages directory.
 
 Software rebuilding is intentionally disabled in a portable installation.
 Make code changes in the complete source project, run its tests, and execute
@@ -141,7 +141,7 @@ build-portable.bat (or use the source UI Tools & Delivery page) to create a new
 portable ZIP.
 '@
     Set-Content -LiteralPath (Join-Path $stage "README-PORTABLE.txt") -Value $portableReadme -Encoding utf8
-    New-Item -ItemType Directory -Force -Path (Join-Path $stage "power-runs") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $stage "profiler-runs") | Out-Null
 
     Write-Host "Validating portable runtime..."
     & (Join-Path $runtime "python.exe") -m mobile_power_profiler --help | Out-Null

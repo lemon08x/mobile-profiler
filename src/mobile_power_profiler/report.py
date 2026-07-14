@@ -262,8 +262,8 @@ def _performance_cards(analysis: Dict[str, object]) -> str:
     frame_metric_label = str(performance.get("frame_metric_label") or "最差抽样 P95")
     frame_issue_label = str(performance.get("frame_issue_label") or "跨越刷新槽位")
     frame_unavailable_reason = str(performance.get("frame_unavailable_reason") or "")
-    touches = performance.get("touch_interaction_count")
-    touch_rate = performance.get("touch_interactions_per_minute")
+    one_percent_low = performance.get("one_percent_low_fps")
+    one_percent_low_source = str(performance.get("one_percent_low_source") or "")
     cards = [
         (
             "当前刷新率",
@@ -295,15 +295,15 @@ def _performance_cards(analysis: Dict[str, object]) -> str:
             "counter",
         ),
         (
-            "触摸交互",
-            shown(touches, 0),
-            "次",
+            "1% Low",
+            shown(one_percent_low, 1),
+            frame_rate_unit,
             (
-                f"{shown(touch_rate, 1)} 次/分钟 · 硬件触控采样率未公开"
-                if isinstance(touch_rate, (int, float))
-                else "硬件触控采样率未公开"
+                one_percent_low_source
+                if isinstance(one_percent_low, (int, float))
+                else frame_unavailable_reason or "当前会话没有足够的帧耗时样本"
             ),
-            "context",
+            "counter",
         ),
     ]
     return "".join(
@@ -360,13 +360,34 @@ def _performance_context_rows(analysis: Dict[str, object]) -> str:
         if hottest
         else "—"
     )
+    render_width = performance.get("render_width_px")
+    render_height = performance.get("render_height_px")
+    render_resolution = (
+        f"{int(render_width)} × {int(render_height)}"
+        if isinstance(render_width, (int, float))
+        and isinstance(render_height, (int, float))
+        else "—"
+    )
+    interpolation_label = str(
+        performance.get("frame_interpolation_label") or "系统未公开可验证的插帧开关"
+    )
     rows = [
         ("前台窗口", performance.get("foreground_window_name") or "—", f"Window #{performance.get('foreground_window_id') or '—'}"),
         ("显示", resolution, f"亮度原始值 {_number(performance.get('brightness_raw'), 0)}"),
+        (
+            "渲染分辨率",
+            render_resolution,
+            str(performance.get("render_resolution_source") or "窗口边界不可用"),
+        ),
+        (
+            "插帧 / MEMC",
+            interpolation_label,
+            f"置信度 {performance.get('frame_interpolation_confidence') or 'low'}；不凭刷新倍率单独推断",
+        ),
         ("支持刷新率", supported_text, f"切换 {int(performance.get('refresh_switch_count') or 0)} 次"),
         ("GPU", performance.get("gpu_renderer") or "—", performance.get("gpu_vendor") or "RenderService renderer"),
         ("最高温度", hottest_text, "仅在严重度或温升异常时形成结论"),
-        ("触控边界", "硬件采样率不可用", "仅展示系统公开的触摸设备能力与已分发交互"),
+        ("触控边界", "硬件触控采样率未公开", "仅展示系统公开的触摸设备能力与已分发交互"),
     ]
     return "".join(
         "<tr>"
@@ -376,6 +397,282 @@ def _performance_context_rows(analysis: Dict[str, object]) -> str:
         "</tr>"
         for label, value, detail in rows
     )
+
+
+def _power_pressure_driver_rows(analysis: Dict[str, object]) -> str:
+    pressure = analysis.get("power_pressure", {})
+    pressure = pressure if isinstance(pressure, dict) else {}
+    rows = []
+    for item in pressure.get("drivers", []) if isinstance(pressure.get("drivers"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        correlation = item.get("correlation")
+        direction = (
+            "同向"
+            if isinstance(correlation, (int, float)) and float(correlation) >= 0
+            else "反向"
+            if isinstance(correlation, (int, float))
+            else "不可用"
+        )
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("label"))}</strong></td>'
+            f'<td>{_number(correlation, 2)}</td>'
+            f'<td>{_escape(direction)}</td>'
+            f'<td>{int(item.get("sample_count") or 0)}</td>'
+            f'<td><span class="cell-sub">{_escape(item.get("detail"))}</span></td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">当前样本不足以计算资源压力与整机功率的时间相关性。</td></tr>'
+
+
+def _power_pressure_task_rows(analysis: Dict[str, object]) -> str:
+    pressure = analysis.get("power_pressure", {})
+    pressure = pressure if isinstance(pressure, dict) else {}
+    rows = []
+    for item in pressure.get("tasks", []) if isinstance(pressure.get("tasks"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(_display_label(item.get("category"), CATEGORY_LABELS))}</span></td>'
+            f'<td>{_number(item.get("average_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("maximum_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("power_delta_when_visible_mw"), 0)} mW</td>'
+            f'<td>{_number(item.get("power_correlation"), 2)}</td>'
+            f'<td>{int(item.get("seen_snapshots") or 0)}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="6" class="empty-cell">没有可用的周期任务快照；仍可使用 CPU/GPU/内存频率压力分析。</td></tr>'
+
+
+def _runtime_setting_rows(analysis: Dict[str, object]) -> str:
+    settings = analysis.get("runtime_settings", {})
+    settings = settings if isinstance(settings, dict) else {}
+    rows = []
+    for item in settings.get("rows", []) if isinstance(settings.get("rows"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("label"))}</strong><span class="cell-sub">{_escape(item.get("key"))}</span></td>'
+            f'<td>{_escape(item.get("start"))}</td>'
+            f'<td>{_escape(item.get("end"))}</td>'
+            f'<td>{"是" if item.get("changed") else "否"}</td>'
+            f'<td><span class="cell-sub">{_escape(item.get("impact"))}</span></td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">未恢复到可读的 Android 系统设置快照。</td></tr>'
+
+
+def _memory_pressure_summary(analysis: Dict[str, object]) -> str:
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    if not memory.get("available"):
+        return (
+            '<div class="availability-note"><strong>内存频率不可用</strong>'
+            f'<span>{_escape(memory.get("limitations") or "设备未暴露可读的 DRAM/DMC/MIF devfreq 节点。")}</span></div>'
+        )
+    delta = memory.get("high_frequency_power_delta_mw")
+    delta_text = (
+        f'高频样本比低频样本高 {_number(delta, 0)} mW'
+        if isinstance(delta, (int, float))
+        else "高低频样本不足以计算功率差"
+    )
+    return (
+        '<div class="metric-grid">'
+        '<article class="metric-card"><div class="metric-top"><span>平均内存频率</span><span class="source-tag counter">计数器</span></div>'
+        f'<div class="metric-value">{_number(memory.get("average_frequency_mhz"), 0)} <small>MHz</small></div>'
+        f'<div class="metric-context">P95 {_number(memory.get("p95_frequency_mhz"), 0)} MHz</div></article>'
+        '<article class="metric-card"><div class="metric-top"><span>高频驻留</span><span class="source-tag counter">压力</span></div>'
+        f'<div class="metric-value">{_number(memory.get("high_frequency_share_pct"))} <small>%</small></div>'
+        f'<div class="metric-context">{_escape(delta_text)}</div></article>'
+        '<article class="metric-card"><div class="metric-top"><span>功率相关性</span><span class="source-tag context">相关</span></div>'
+        f'<div class="metric-value">{_number(memory.get("power_correlation"), 2)}</div>'
+        '<div class="metric-context">只表示同一时间轴变化，不是内存电源轨测量</div></article>'
+        '</div>'
+    )
+
+
+def _render_pipeline_rows(analysis: Dict[str, object]) -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    pipeline = render.get("pipeline", {})
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    rows = []
+    for item in pipeline.get("stages", []) if isinstance(pipeline.get("stages"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("label"))}</strong></td>'
+            f'<td>{int(item.get("sample_count") or 0)}</td>'
+            f'<td>{_number(item.get("average_ms"), 2)} ms</td>'
+            f'<td>{_number(item.get("p95_ms"), 2)} ms</td>'
+            f'<td>{_number(item.get("p99_ms"), 2)} ms</td>'
+            f'<td>{_number(item.get("maximum_ms"), 2)} ms</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="6" class="empty-cell">当前平台没有恢复到可用的详细 framestats 阶段时间戳。</td></tr>'
+
+
+def _slow_frame_rows(analysis: Dict[str, object]) -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    pipeline = render.get("pipeline", {})
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    rows = []
+    for item in pipeline.get("slow_frames", [])[:20] if isinstance(pipeline.get("slow_frames"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        stage_values = [
+            (key, value)
+            for key, value in item.items()
+            if str(key).endswith("_ms")
+            and key != "total_ms"
+            and isinstance(value, (int, float))
+        ]
+        dominant_key, dominant_value = max(stage_values, key=lambda pair: float(pair[1])) if stage_values else ("—", None)
+        rows.append(
+            "<tr>"
+            f'<td>{_escape(item.get("frame_id"))}</td>'
+            f'<td><strong>{_number(item.get("total_ms"), 2)} ms</strong><span class="cell-sub">{_escape(item.get("window"))}</span></td>'
+            f'<td>{"是" if item.get("deadline_missed") else "否"}</td>'
+            f'<td>{_escape(dominant_key.replace("_ms", ""))}</td>'
+            f'<td>{_number(dominant_value, 2)} ms</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">没有可展示的详细慢帧记录。</td></tr>'
+
+
+def _render_thread_rows(analysis: Dict[str, object]) -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    rows = []
+    for item in render.get("render_threads", []) if isinstance(render.get("render_threads"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(item.get("process"))}</span></td>'
+            f'<td>{_escape(item.get("pid"))} / {_escape(item.get("tid"))}</td>'
+            f'<td>{_number(item.get("average_when_visible_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("maximum_cpu_pct"))}%</td>'
+            f'<td>{int(item.get("seen_snapshots") or 0)}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">未恢复到 RenderThread、SurfaceFlinger、RenderEngine 或 Composer 热点线程。</td></tr>'
+
+
+def _performance_process_rows(analysis: Dict[str, object]) -> str:
+    system = analysis.get("system", {})
+    system = system if isinstance(system, dict) else {}
+    rows = []
+    for item in system.get("top_processes", [])[:10] if isinstance(system.get("top_processes"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(item.get("name") or item.get("command"))}</strong><span class="cell-sub">{_escape(item.get("user"))}</span></td>'
+            f'<td>{_number(item.get("average_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("average_when_visible_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("maximum_cpu_pct"))}%</td>'
+            f'<td>{int(item.get("seen_snapshots") or 0)}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty-cell">没有可用的进程调度快照。</td></tr>'
+
+
+def _performance_interference_status(analysis: Dict[str, object]) -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    bottlenecks = render.get("bottlenecks", [])
+    bottlenecks = bottlenecks if isinstance(bottlenecks, list) else []
+    if not bottlenecks:
+        return (
+            '<div class="priority-callout"><span class="status-dot good"></span><div>'
+            '<strong>未形成明确的帧延迟瓶颈结论</strong>'
+            '<span>继续结合详细 framestats、RenderThread / SurfaceFlinger 热点、GPU 饱和、调度与热限制检查。</span>'
+            '</div></div>'
+        )
+    leading = bottlenecks[0] if isinstance(bottlenecks[0], dict) else {}
+    return (
+        '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
+        f'<strong>主要帧延迟线索：{_escape(leading.get("stage") or "渲染链路")}</strong>'
+        f'<span>{_escape(leading.get("detail"))}</span>'
+        '</div></div>'
+    )
+
+
+def _performance_power_recording(analysis: Dict[str, object]) -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    power = render.get("power_recording", {})
+    power = power if isinstance(power, dict) else {}
+    return (
+        '<div class="availability-note"><strong>整机功耗仅记录</strong>'
+        f'<span>平均 {_number(power.get("average_power_mw"), 0)} mW · '
+        f'P95 {_number(power.get("p95_power_mw"), 0)} mW · '
+        f'峰值 {_number(power.get("maximum_power_mw"), 0)} mW · '
+        f'能量 {_number(power.get("energy_mwh"), 2)} mWh。'
+        '性能模式不继续拆分组件、UID、Wakelock 或第三方任务功耗来源。</span></div>'
+    )
+
+
+def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    rows = []
+    for item in test_items.get("rows", []) if isinstance(test_items.get("rows"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        windows = item.get("windows", [])
+        windows = windows if isinstance(windows, list) else []
+        first_start = windows[0].get("start_elapsed_s") if windows and isinstance(windows[0], dict) else 0
+        last_end = windows[-1].get("end_elapsed_s") if windows and isinstance(windows[-1], dict) else first_start
+        dominant = item.get("dominant_stage", {})
+        dominant = dominant if isinstance(dominant, dict) else {}
+        rows.append(
+            f'<tr class="test-item-row" data-test-start="{_number(first_start, 3, "0")}" data-test-end="{_number(last_end, 3, "0")}">'
+            f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(item.get("phase"))} · {int(item.get("occurrence_count") or 0)} 次</span></td>'
+            f'<td>{_number(item.get("duration_s"), 1)} s</td>'
+            f'<td>{_number(item.get("average_fps"), 1)} FPS</td>'
+            f'<td>{_number(item.get("one_percent_low_fps"), 1)} FPS</td>'
+            f'<td>{_number(item.get("frame_p95_ms"), 2)} / {_number(item.get("frame_p99_ms"), 2)} ms</td>'
+            f'<td>{_number(item.get("frame_issue_pct"), 2)}%<span class="cell-sub">{int(item.get("frame_issue_count") or 0)} 帧</span></td>'
+            f'<td>{_escape(dominant.get("label") or "—")}<span class="cell-sub">P95 {_number(dominant.get("p95_ms"), 2)} ms</span></td>'
+            f'<td>{_number(item.get("average_cpu_pct"))}% / {_number(item.get("maximum_cpu_pct"))}%</td>'
+            f'<td>{_number(item.get("average_gpu_load_pct"))}% / {_number(item.get("maximum_gpu_load_pct"))}%</td>'
+            f'<td>{_number(item.get("average_memory_frequency_mhz"), 0)} / {_number(item.get("p95_memory_frequency_mhz"), 0)} MHz</td>'
+            f'<td>{"是" if item.get("throttling_observed") else "否"}<span class="cell-sub">{_number(item.get("maximum_temperature_c"))} °C</span></td>'
+            f'<td>{_number(item.get("average_whole_device_power_mw"), 0)} mW<span class="cell-sub">只记录整机</span></td>'
+            f'<td>{_escape(_display_label(item.get("confidence"), CONFIDENCE_LABELS))}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="13" class="empty-cell">没有可用的性能测试项区间。</td></tr>'
+
+
+def _performance_test_item_span_rows(analysis: Dict[str, object]) -> str:
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    rows = []
+    for item in test_items.get("spans", []) if isinstance(test_items.get("spans"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            f'<tr class="test-item-row" data-test-start="{_number(item.get("start_elapsed_s"), 3, "0")}" data-test-end="{_number(item.get("end_elapsed_s"), 3, "0")}">'
+            f'<td>{_number(item.get("start_elapsed_s"), 1)} s</td>'
+            f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(item.get("phase"))}</span></td>'
+            f'<td>{_number(item.get("duration_s"), 1)} s</td>'
+            f'<td>{_number(item.get("average_fps"), 1)} FPS</td>'
+            f'<td>{_number(item.get("one_percent_low_fps"), 1)} FPS</td>'
+            f'<td>{_number(item.get("frame_p95_ms"), 2)} / {_number(item.get("frame_p99_ms"), 2)} ms</td>'
+            f'<td>{_number(item.get("frame_issue_pct"), 2)}%</td>'
+            f'<td>{_number(item.get("average_whole_device_power_mw"), 0)} mW</td>'
+            f'<td>{_escape(_display_label(item.get("confidence"), CONFIDENCE_LABELS))}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="9" class="empty-cell">没有可用的单次性能测试明细。</td></tr>'
 
 
 def _cpu_rows(analysis: Dict[str, object]) -> Tuple[str, str, str]:
@@ -424,6 +721,26 @@ def _cpu_rows(analysis: Dict[str, object]) -> Tuple[str, str, str]:
     if not table_rows:
         table_rows.append('<tr><td colspan="7" class="empty-cell">CPU 集群数据不可用。</td></tr>')
     return "".join(table_rows), "".join(residency_rows), "".join(selector_buttons)
+
+
+def _performance_cpu_rows(analysis: Dict[str, object]) -> str:
+    cpu = analysis.get("cpu", {})
+    clusters = cpu.get("clusters", []) if isinstance(cpu, dict) else []
+    rows = []
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        label = _display_label(cluster.get("label", cluster.get("name")), CLUSTER_LABELS)
+        cores = ", ".join(str(value) for value in cluster.get("cores", [])) or "—"
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(label)}</strong><span class="cell-sub">CPU {_escape(cores)}</span></td>'
+            f'<td>{_number(cluster.get("average_load_pct"))}%</td>'
+            f'<td>{_number(cluster.get("load_weighted_mhz"), 0)} MHz</td>'
+            f'<td>{_number(cluster.get("maximum_mhz"), 0)} / {_number(cluster.get("hardware_max_mhz"), 0)} MHz</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="4" class="empty-cell">CPU 集群数据不可用。</td></tr>'
 
 
 def _process_rows(analysis: Dict[str, object]) -> str:
@@ -574,10 +891,17 @@ def _test_item_status(analysis: Dict[str, object]) -> str:
         )
     overlap = int(test_items.get("overlap_count") or 0)
     overlap_note = (
-        f"检测到 {overlap} 组重叠测试区间，重叠行的能量不能相加。"
+        f"检测到 {overlap} 组重叠测试区间，重叠行不能作为独立样本直接相加。"
         if overlap
         else "测试项之间未检测到重叠区间。"
     )
+    if str(test_items.get("analysis_mode") or "power") == "performance":
+        return (
+            '<div class="priority-callout"><span class="status-dot good"></span><div>'
+            f'<strong>已按{_escape(test_items.get("source_label"))}生成 {int(test_items.get("row_count") or 0)} 个性能测试项</strong>'
+            f'<span>{_escape(overlap_note)} 帧率、1% Low、P95/P99、渲染阶段、调度与热状态在测试窗口内聚合；功耗只保留整机均值。</span>'
+            "</div></div>"
+        )
     return (
         '<div class="priority-callout"><span class="status-dot good"></span><div>'
         f'<strong>已按{_escape(test_items.get("source_label"))}生成 {int(test_items.get("row_count") or 0)} 个测试项</strong>'
@@ -969,6 +1293,57 @@ def _source_rows(analysis: Dict[str, object]) -> str:
     )
 
 
+def _capture_configuration_rows(metadata: Dict[str, object]) -> str:
+    configuration = metadata.get("capture_configuration", {})
+    configuration = configuration if isinstance(configuration, dict) else {}
+    rows = []
+    preset = configuration.get("preset_label") or configuration.get("preset") or "旧版默认配置"
+    backend = configuration.get("backend") or "platform_native"
+    rows.append(
+        "<tr>"
+        f"<td><strong>采集预设</strong></td><td>{_escape(preset)}</td>"
+        f"<td><span class=\"source-tag context\">{_escape(backend)}</span></td>"
+        "<td>电流、电压与设备时间戳为基础通道，始终保留。</td>"
+        "</tr>"
+    )
+    feature_rows = configuration.get("feature_rows", [])
+    if isinstance(feature_rows, list):
+        overhead_labels = {"low": "低", "medium": "中", "high": "高"}
+        for item in feature_rows:
+            if not isinstance(item, dict):
+                continue
+            enabled = bool(item.get("enabled"))
+            rows.append(
+                "<tr>"
+                f"<td><strong>{_escape(item.get('label') or item.get('key'))}</strong>"
+                f"<span class=\"cell-sub\">{_escape(item.get('description') or '')}</span></td>"
+                f"<td><span class=\"source-tag {'measured' if enabled else 'context'}\">"
+                f"{'启用' if enabled else '关闭'}</span></td>"
+                f"<td>{_escape(overhead_labels.get(str(item.get('overhead')), item.get('overhead') or '--'))}</td>"
+                f"<td>{_escape(item.get('reason') or '')}</td>"
+                "</tr>"
+            )
+    mode = metadata.get("device_performance_mode", {})
+    if isinstance(mode, dict) and mode.get("requested"):
+        applied = bool(mode.get("applied"))
+        restored = mode.get("restored")
+        status = "已启用并恢复" if applied and restored else "已启用，恢复待确认" if applied else "启用失败"
+        detail = (
+            f"原模式 {mode.get('original_mode', '--')}，测试模式 602，"
+            f"结束后模式 {mode.get('restored_mode', '--')}。"
+        )
+        rows.append(
+            "<tr>"
+            "<td><strong>HarmonyOS 设备高性能模式</strong>"
+            "<span class=\"cell-sub\">power-shell setmode 602</span></td>"
+            f"<td><span class=\"source-tag {'measured' if applied and restored else 'context'}\">{_escape(status)}</span></td>"
+            "<td>设备状态变更</td>"
+            f"<td>{_escape(detail)}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
 def _application_rows(analysis: Dict[str, object]) -> str:
     applications = analysis.get("applications", {})
     rows = []
@@ -1112,7 +1487,7 @@ def _report_bundle(bundle: Dict[str, object], threshold: int = 1200) -> Dict[str
 
 REPORT_FRAGMENT = r"""
 <style>
-  #mobile-power-profiler {
+  #mobile-profiler {
     --app-bg: #111315;
     --app-surface: #191c1f;
     --app-surface-2: #202429;
@@ -1132,10 +1507,12 @@ REPORT_FRAGMENT = r"""
     font-family: Inter, "Segoe UI", Arial, sans-serif;
     letter-spacing: 0;
   }
-  #mobile-power-profiler * { box-sizing: border-box; }
-  #mobile-power-profiler button, #mobile-power-profiler input { font: inherit; }
-  #mobile-power-profiler button { letter-spacing: 0; }
-  #mobile-power-profiler .app-topbar {
+  #mobile-profiler * { box-sizing: border-box; }
+  #mobile-profiler[data-test-mode="power"] [data-report-only="performance"],
+  #mobile-profiler[data-test-mode="performance"] [data-report-only="power"] { display: none !important; }
+  #mobile-profiler button, #mobile-profiler input { font: inherit; }
+  #mobile-profiler button { letter-spacing: 0; }
+  #mobile-profiler .app-topbar {
     min-height: 58px;
     display: flex;
     align-items: center;
@@ -1145,15 +1522,15 @@ REPORT_FRAGMENT = r"""
     border-bottom: 1px solid var(--app-border);
     background: #151719;
   }
-  #mobile-power-profiler .brand-block, #mobile-power-profiler .session-block,
-  #mobile-power-profiler .device-block, #mobile-power-profiler .metric-top,
-  #mobile-power-profiler .view-heading, #mobile-power-profiler .chart-toolbar,
-  #mobile-power-profiler .status-line, #mobile-power-profiler .legend-row {
+  #mobile-profiler .brand-block, #mobile-profiler .session-block,
+  #mobile-profiler .device-block, #mobile-profiler .metric-top,
+  #mobile-profiler .view-heading, #mobile-profiler .chart-toolbar,
+  #mobile-profiler .status-line, #mobile-profiler .legend-row {
     display: flex;
     align-items: center;
   }
-  #mobile-power-profiler .brand-block { gap: 10px; min-width: 190px; }
-  #mobile-power-profiler .brand-mark {
+  #mobile-profiler .brand-block { gap: 10px; min-width: 190px; }
+  #mobile-profiler .brand-mark {
     width: 26px;
     height: 26px;
     border: 1px solid var(--series-1);
@@ -1163,23 +1540,23 @@ REPORT_FRAGMENT = r"""
     color: var(--series-1);
     font-weight: 500;
   }
-  #mobile-power-profiler .brand-block strong { display: block; font-size: 15px; font-weight: 500; }
-  #mobile-power-profiler .brand-block span, #mobile-power-profiler .session-block span,
-  #mobile-power-profiler .device-block span { color: var(--app-muted); font-size: 12px; }
-  #mobile-power-profiler .session-block { gap: 9px; min-width: 0; }
-  #mobile-power-profiler .session-block div { min-width: 0; }
-  #mobile-power-profiler .session-block strong, #mobile-power-profiler .device-block strong {
+  #mobile-profiler .brand-block strong { display: block; font-size: 15px; font-weight: 500; }
+  #mobile-profiler .brand-block span, #mobile-profiler .session-block span,
+  #mobile-profiler .device-block span { color: var(--app-muted); font-size: 12px; }
+  #mobile-profiler .session-block { gap: 9px; min-width: 0; }
+  #mobile-profiler .session-block div { min-width: 0; }
+  #mobile-profiler .session-block strong, #mobile-profiler .device-block strong {
     display: block;
     font-size: 13px;
     font-weight: 500;
     overflow-wrap: anywhere;
   }
-  #mobile-power-profiler .device-block { gap: 10px; justify-content: flex-end; text-align: right; }
-  #mobile-power-profiler .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--series-1); flex: 0 0 auto; }
-  #mobile-power-profiler .status-dot.good { background: var(--series-2); }
-  #mobile-power-profiler .status-dot.warning { background: var(--series-3); }
-  #mobile-power-profiler .app-workspace { display: grid; grid-template-columns: 178px minmax(0, 1fr); }
-  #mobile-power-profiler .side-tabs {
+  #mobile-profiler .device-block { gap: 10px; justify-content: flex-end; text-align: right; }
+  #mobile-profiler .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--series-1); flex: 0 0 auto; }
+  #mobile-profiler .status-dot.good { background: var(--series-2); }
+  #mobile-profiler .status-dot.warning { background: var(--series-3); }
+  #mobile-profiler .app-workspace { display: grid; grid-template-columns: 178px minmax(0, 1fr); }
+  #mobile-profiler .side-tabs {
     border-right: 1px solid var(--app-border);
     padding: 14px 10px;
     display: flex;
@@ -1187,7 +1564,7 @@ REPORT_FRAGMENT = r"""
     gap: 4px;
     background: #151719;
   }
-  #mobile-power-profiler .nav-tab {
+  #mobile-profiler .nav-tab {
     border: 0;
     background: transparent;
     color: var(--app-muted);
@@ -1196,37 +1573,37 @@ REPORT_FRAGMENT = r"""
     border-radius: 5px;
     cursor: pointer;
   }
-  #mobile-power-profiler .nav-tab:hover { background: var(--app-surface-2); color: var(--app-text); }
-  #mobile-power-profiler .nav-tab[aria-selected="true"] { background: var(--app-surface-2); color: var(--app-text); box-shadow: inset 2px 0 0 var(--series-1); }
-  #mobile-power-profiler .app-content { min-width: 0; padding: 22px; }
-  #mobile-power-profiler .app-view[hidden] { display: none; }
-  #mobile-power-profiler .app-view { display: grid; gap: 22px; min-width: 0; }
-  #mobile-power-profiler .view-heading { justify-content: space-between; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
-  #mobile-power-profiler h1, #mobile-power-profiler h2, #mobile-power-profiler h3,
-  #mobile-power-profiler p { margin: 0; letter-spacing: 0; }
-  #mobile-power-profiler h1 { font-size: 22px; font-weight: 500; }
-  #mobile-power-profiler h2 { font-size: 16px; font-weight: 500; }
-  #mobile-power-profiler h3 { font-size: 14px; font-weight: 500; }
-  #mobile-power-profiler .view-heading p, #mobile-power-profiler .section-copy,
-  #mobile-power-profiler .metric-context, #mobile-power-profiler .cell-sub,
-  #mobile-power-profiler .finding-row p, #mobile-power-profiler .availability-note span {
+  #mobile-profiler .nav-tab:hover { background: var(--app-surface-2); color: var(--app-text); }
+  #mobile-profiler .nav-tab[aria-selected="true"] { background: var(--app-surface-2); color: var(--app-text); box-shadow: inset 2px 0 0 var(--series-1); }
+  #mobile-profiler .app-content { min-width: 0; padding: 22px; }
+  #mobile-profiler .app-view[hidden] { display: none; }
+  #mobile-profiler .app-view { display: grid; gap: 22px; min-width: 0; }
+  #mobile-profiler .view-heading { justify-content: space-between; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
+  #mobile-profiler h1, #mobile-profiler h2, #mobile-profiler h3,
+  #mobile-profiler p { margin: 0; letter-spacing: 0; }
+  #mobile-profiler h1 { font-size: 22px; font-weight: 500; }
+  #mobile-profiler h2 { font-size: 16px; font-weight: 500; }
+  #mobile-profiler h3 { font-size: 14px; font-weight: 500; }
+  #mobile-profiler .view-heading p, #mobile-profiler .section-copy,
+  #mobile-profiler .metric-context, #mobile-profiler .cell-sub,
+  #mobile-profiler .finding-row p, #mobile-profiler .availability-note span {
     color: var(--app-muted);
     font-size: 12px;
   }
-  #mobile-power-profiler .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 10px; }
-  #mobile-power-profiler .metric-card {
+  #mobile-profiler .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 10px; }
+  #mobile-profiler .metric-card {
     background: var(--app-surface);
     border: 1px solid var(--app-border);
     border-radius: 6px;
     padding: 13px 14px;
     min-width: 0;
   }
-  #mobile-power-profiler .metric-card.compact { max-width: 260px; }
-  #mobile-power-profiler .metric-top { justify-content: space-between; gap: 8px; color: var(--app-muted); font-size: 12px; }
-  #mobile-power-profiler .metric-value { margin-top: 12px; font-size: 25px; font-weight: 500; white-space: nowrap; }
-  #mobile-power-profiler .metric-value small { color: var(--app-muted); font-size: 12px; font-weight: 400; }
-  #mobile-power-profiler .metric-context { margin-top: 5px; overflow-wrap: anywhere; }
-  #mobile-power-profiler .source-tag {
+  #mobile-profiler .metric-card.compact { max-width: 260px; }
+  #mobile-profiler .metric-top { justify-content: space-between; gap: 8px; color: var(--app-muted); font-size: 12px; }
+  #mobile-profiler .metric-value { margin-top: 12px; font-size: 25px; font-weight: 500; white-space: nowrap; }
+  #mobile-profiler .metric-value small { color: var(--app-muted); font-size: 12px; font-weight: 400; }
+  #mobile-profiler .metric-context { margin-top: 5px; overflow-wrap: anywhere; }
+  #mobile-profiler .source-tag {
     display: inline-flex;
     align-items: center;
     width: fit-content;
@@ -1238,16 +1615,16 @@ REPORT_FRAGMENT = r"""
     font-size: 11px;
     white-space: nowrap;
   }
-  #mobile-power-profiler .source-tag.measured { color: var(--series-2); border-color: color-mix(in srgb, var(--series-2) 55%, var(--app-border)); }
-  #mobile-power-profiler .source-tag.counter, #mobile-power-profiler .source-tag.driver { color: var(--series-1); border-color: color-mix(in srgb, var(--series-1) 55%, var(--app-border)); }
-  #mobile-power-profiler .source-tag.model { color: var(--series-3); border-color: color-mix(in srgb, var(--series-3) 55%, var(--app-border)); }
-  #mobile-power-profiler .source-tag.medium { color: var(--series-1); border-color: color-mix(in srgb, var(--series-1) 55%, var(--app-border)); }
-  #mobile-power-profiler .source-tag.low { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 55%, var(--app-border)); }
-  #mobile-power-profiler .source-tag.high { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 70%, var(--app-border)); background: rgba(228, 111, 111, .08); }
-  #mobile-power-profiler .analysis-section { min-width: 0; border-top: 1px solid var(--app-border); padding-top: 16px; }
-  #mobile-power-profiler .chart-toolbar { justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
-  #mobile-power-profiler .segment-control { display: inline-flex; border: 1px solid var(--app-border); border-radius: 5px; overflow: hidden; }
-  #mobile-power-profiler .segment-button {
+  #mobile-profiler .source-tag.measured { color: var(--series-2); border-color: color-mix(in srgb, var(--series-2) 55%, var(--app-border)); }
+  #mobile-profiler .source-tag.counter, #mobile-profiler .source-tag.driver { color: var(--series-1); border-color: color-mix(in srgb, var(--series-1) 55%, var(--app-border)); }
+  #mobile-profiler .source-tag.model { color: var(--series-3); border-color: color-mix(in srgb, var(--series-3) 55%, var(--app-border)); }
+  #mobile-profiler .source-tag.medium { color: var(--series-1); border-color: color-mix(in srgb, var(--series-1) 55%, var(--app-border)); }
+  #mobile-profiler .source-tag.low { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 55%, var(--app-border)); }
+  #mobile-profiler .source-tag.high { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 70%, var(--app-border)); background: rgba(228, 111, 111, .08); }
+  #mobile-profiler .analysis-section { min-width: 0; border-top: 1px solid var(--app-border); padding-top: 16px; }
+  #mobile-profiler .chart-toolbar { justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  #mobile-profiler .segment-control { display: inline-flex; border: 1px solid var(--app-border); border-radius: 5px; overflow: hidden; }
+  #mobile-profiler .segment-button {
     border: 0;
     border-right: 1px solid var(--app-border);
     color: var(--app-muted);
@@ -1255,111 +1632,111 @@ REPORT_FRAGMENT = r"""
     padding: 6px 10px;
     cursor: pointer;
   }
-  #mobile-power-profiler .segment-button:last-child { border-right: 0; }
-  #mobile-power-profiler .segment-button:hover { color: var(--app-text); background: var(--app-surface-2); }
-  #mobile-power-profiler .segment-button.active { background: var(--app-text); color: var(--app-bg); }
-  #mobile-power-profiler .chart-surface {
+  #mobile-profiler .segment-button:last-child { border-right: 0; }
+  #mobile-profiler .segment-button:hover { color: var(--app-text); background: var(--app-surface-2); }
+  #mobile-profiler .segment-button.active { background: var(--app-text); color: var(--app-bg); }
+  #mobile-profiler .chart-surface {
     background: var(--app-surface);
     border: 1px solid var(--app-border);
     border-radius: 6px;
     min-width: 0;
     overflow: hidden;
   }
-  #mobile-power-profiler .chart-surface svg { display: block; width: 100%; height: auto; min-height: 260px; }
-  #mobile-power-profiler .chart-surface .grid { stroke: var(--app-border); stroke-width: 1; }
-  #mobile-power-profiler .chart-surface .axis-text, #mobile-power-profiler .chart-surface .lane-label { fill: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .chart-surface .lane-value { fill: var(--app-text); font-size: 11px; }
-  #mobile-power-profiler .chart-surface .crosshair { stroke: var(--app-muted); stroke-width: 1; }
-  #mobile-power-profiler .chart-surface .selected-point { fill: var(--app-bg); stroke-width: 2; }
-  #mobile-power-profiler .chart-surface .event-span { fill: var(--series-3); opacity: .12; }
-  #mobile-power-profiler .chart-surface .event-line { stroke: var(--series-3); stroke-width: 1; }
-  #mobile-power-profiler .chart-surface .app-band { opacity: .78; }
-  #mobile-power-profiler .chart-surface .test-band { fill: var(--series-1); opacity: .28; }
-  #mobile-power-profiler .chart-surface .activity-band { opacity: .72; }
-  #mobile-power-profiler .chart-surface .thermal-band { fill: var(--series-4); opacity: .2; }
-  #mobile-power-profiler .chart-surface .scheduler-band { fill: var(--series-6); opacity: .38; }
-  #mobile-power-profiler .chart-surface .focus-window { fill: var(--series-1); opacity: .06; stroke: var(--series-1); stroke-width: 1; }
-  #mobile-power-profiler .chart-surface .band-label { fill: var(--app-text); font-size: 11px; }
-  #mobile-power-profiler .sample-control { padding: 10px 12px 12px; border-top: 1px solid var(--app-border); }
-  #mobile-power-profiler .sample-control input { width: 100%; accent-color: var(--series-1); }
-  #mobile-power-profiler .sample-detail { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--app-muted); font-size: 12px; }
-  #mobile-power-profiler .sample-detail strong { color: var(--app-text); font-weight: 500; }
-  #mobile-power-profiler .split-layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .8fr); gap: 22px; }
-  #mobile-power-profiler .data-table-wrap { overflow-x: auto; max-width: 100%; }
-  #mobile-power-profiler table { width: 100%; border-collapse: collapse; min-width: 620px; }
-  #mobile-power-profiler th, #mobile-power-profiler td { border-bottom: 1px solid var(--app-border); padding: 9px 8px; text-align: left; vertical-align: middle; font-size: 12px; }
-  #mobile-power-profiler th { color: var(--app-muted); font-weight: 400; }
-  #mobile-power-profiler td strong { display: block; font-weight: 500; }
-  #mobile-power-profiler .test-item-row { cursor: pointer; }
-  #mobile-power-profiler .test-item-row:hover td { background: rgba(79, 195, 215, .055); }
-  #mobile-power-profiler .cell-sub { display: block; margin-top: 2px; }
-  #mobile-power-profiler .empty-cell { color: var(--app-muted); }
-  #mobile-power-profiler .finding-list { display: grid; gap: 0; }
-  #mobile-power-profiler .finding-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--app-border); }
-  #mobile-power-profiler .finding-row strong { font-size: 13px; font-weight: 500; }
-  #mobile-power-profiler .finding-row p { margin-top: 3px; overflow-wrap: anywhere; }
-  #mobile-power-profiler .residency-list { display: grid; gap: 15px; }
-  #mobile-power-profiler .residency-row { display: grid; grid-template-columns: 150px minmax(180px, 1fr) 150px; gap: 12px; align-items: center; }
-  #mobile-power-profiler .residency-row > div:first-child { display: grid; }
-  #mobile-power-profiler .residency-row > div:first-child span { color: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .stacked-bar { height: 10px; display: flex; overflow: hidden; background: var(--app-surface-2); }
-  #mobile-power-profiler .band-low { background: var(--series-2); }
-  #mobile-power-profiler .band-balanced { background: var(--series-1); }
-  #mobile-power-profiler .band-high { background: var(--series-3); }
-  #mobile-power-profiler .residency-values { display: flex; justify-content: flex-end; gap: 10px; color: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .status-line { gap: 9px; flex-wrap: wrap; }
-  #mobile-power-profiler .status-line strong { margin-left: auto; font-size: 12px; font-weight: 500; }
-  #mobile-power-profiler .availability-note { border-left: 3px solid var(--series-3); padding: 8px 11px; display: grid; gap: 3px; background: var(--app-surface); }
-  #mobile-power-profiler .availability-note strong { font-size: 13px; font-weight: 500; }
-  #mobile-power-profiler .priority-callout { display: flex; align-items: center; gap: 11px; padding: 13px 15px; border: 1px solid var(--app-border); border-left: 3px solid var(--series-2); background: var(--app-surface); }
-  #mobile-power-profiler .priority-callout.active { border-left-color: var(--series-3); background: rgba(240, 161, 94, .07); }
-  #mobile-power-profiler .priority-callout div { display: grid; gap: 3px; }
-  #mobile-power-profiler .priority-callout strong { font-size: 13px; font-weight: 550; }
-  #mobile-power-profiler .priority-callout span { color: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .contributor-list { display: grid; gap: 12px; }
-  #mobile-power-profiler .contributor-row { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(180px, 2fr) 70px; gap: 12px; align-items: center; }
-  #mobile-power-profiler .contributor-row > div:first-child { display: grid; }
-  #mobile-power-profiler .contributor-row span { color: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .bar-track { height: 8px; background: var(--app-surface-2); overflow: hidden; }
-  #mobile-power-profiler .bar-track > span { display: block; height: 100%; background: var(--series-3); }
-  #mobile-power-profiler .contributor-value { text-align: right; font-size: 12px; }
-  #mobile-power-profiler .warning-list { margin: 0; padding-left: 18px; color: var(--series-3); font-size: 12px; }
-  #mobile-power-profiler .metadata-block { margin: 0; padding: 13px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; color: var(--app-muted); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
-  #mobile-power-profiler .legend-row { gap: 14px; flex-wrap: wrap; color: var(--app-muted); font-size: 11px; }
-  #mobile-power-profiler .legend-row span { display: inline-flex; align-items: center; gap: 5px; }
-  #mobile-power-profiler .legend-swatch { width: 9px; height: 9px; display: inline-block; }
+  #mobile-profiler .chart-surface svg { display: block; width: 100%; height: auto; min-height: 260px; }
+  #mobile-profiler .chart-surface .grid { stroke: var(--app-border); stroke-width: 1; }
+  #mobile-profiler .chart-surface .axis-text, #mobile-profiler .chart-surface .lane-label { fill: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .chart-surface .lane-value { fill: var(--app-text); font-size: 11px; }
+  #mobile-profiler .chart-surface .crosshair { stroke: var(--app-muted); stroke-width: 1; }
+  #mobile-profiler .chart-surface .selected-point { fill: var(--app-bg); stroke-width: 2; }
+  #mobile-profiler .chart-surface .event-span { fill: var(--series-3); opacity: .12; }
+  #mobile-profiler .chart-surface .event-line { stroke: var(--series-3); stroke-width: 1; }
+  #mobile-profiler .chart-surface .app-band { opacity: .78; }
+  #mobile-profiler .chart-surface .test-band { fill: var(--series-1); opacity: .28; }
+  #mobile-profiler .chart-surface .activity-band { opacity: .72; }
+  #mobile-profiler .chart-surface .thermal-band { fill: var(--series-4); opacity: .2; }
+  #mobile-profiler .chart-surface .scheduler-band { fill: var(--series-6); opacity: .38; }
+  #mobile-profiler .chart-surface .focus-window { fill: var(--series-1); opacity: .06; stroke: var(--series-1); stroke-width: 1; }
+  #mobile-profiler .chart-surface .band-label { fill: var(--app-text); font-size: 11px; }
+  #mobile-profiler .sample-control { padding: 10px 12px 12px; border-top: 1px solid var(--app-border); }
+  #mobile-profiler .sample-control input { width: 100%; accent-color: var(--series-1); }
+  #mobile-profiler .sample-detail { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--app-muted); font-size: 12px; }
+  #mobile-profiler .sample-detail strong { color: var(--app-text); font-weight: 500; }
+  #mobile-profiler .split-layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .8fr); gap: 22px; }
+  #mobile-profiler .data-table-wrap { overflow-x: auto; max-width: 100%; }
+  #mobile-profiler table { width: 100%; border-collapse: collapse; min-width: 620px; }
+  #mobile-profiler th, #mobile-profiler td { border-bottom: 1px solid var(--app-border); padding: 9px 8px; text-align: left; vertical-align: middle; font-size: 12px; }
+  #mobile-profiler th { color: var(--app-muted); font-weight: 400; }
+  #mobile-profiler td strong { display: block; font-weight: 500; }
+  #mobile-profiler .test-item-row { cursor: pointer; }
+  #mobile-profiler .test-item-row:hover td { background: rgba(79, 195, 215, .055); }
+  #mobile-profiler .cell-sub { display: block; margin-top: 2px; }
+  #mobile-profiler .empty-cell { color: var(--app-muted); }
+  #mobile-profiler .finding-list { display: grid; gap: 0; }
+  #mobile-profiler .finding-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--app-border); }
+  #mobile-profiler .finding-row strong { font-size: 13px; font-weight: 500; }
+  #mobile-profiler .finding-row p { margin-top: 3px; overflow-wrap: anywhere; }
+  #mobile-profiler .residency-list { display: grid; gap: 15px; }
+  #mobile-profiler .residency-row { display: grid; grid-template-columns: 150px minmax(180px, 1fr) 150px; gap: 12px; align-items: center; }
+  #mobile-profiler .residency-row > div:first-child { display: grid; }
+  #mobile-profiler .residency-row > div:first-child span { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .stacked-bar { height: 10px; display: flex; overflow: hidden; background: var(--app-surface-2); }
+  #mobile-profiler .band-low { background: var(--series-2); }
+  #mobile-profiler .band-balanced { background: var(--series-1); }
+  #mobile-profiler .band-high { background: var(--series-3); }
+  #mobile-profiler .residency-values { display: flex; justify-content: flex-end; gap: 10px; color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .status-line { gap: 9px; flex-wrap: wrap; }
+  #mobile-profiler .status-line strong { margin-left: auto; font-size: 12px; font-weight: 500; }
+  #mobile-profiler .availability-note { border-left: 3px solid var(--series-3); padding: 8px 11px; display: grid; gap: 3px; background: var(--app-surface); }
+  #mobile-profiler .availability-note strong { font-size: 13px; font-weight: 500; }
+  #mobile-profiler .priority-callout { display: flex; align-items: center; gap: 11px; padding: 13px 15px; border: 1px solid var(--app-border); border-left: 3px solid var(--series-2); background: var(--app-surface); }
+  #mobile-profiler .priority-callout.active { border-left-color: var(--series-3); background: rgba(240, 161, 94, .07); }
+  #mobile-profiler .priority-callout div { display: grid; gap: 3px; }
+  #mobile-profiler .priority-callout strong { font-size: 13px; font-weight: 550; }
+  #mobile-profiler .priority-callout span { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .contributor-list { display: grid; gap: 12px; }
+  #mobile-profiler .contributor-row { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(180px, 2fr) 70px; gap: 12px; align-items: center; }
+  #mobile-profiler .contributor-row > div:first-child { display: grid; }
+  #mobile-profiler .contributor-row span { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .bar-track { height: 8px; background: var(--app-surface-2); overflow: hidden; }
+  #mobile-profiler .bar-track > span { display: block; height: 100%; background: var(--series-3); }
+  #mobile-profiler .contributor-value { text-align: right; font-size: 12px; }
+  #mobile-profiler .warning-list { margin: 0; padding-left: 18px; color: var(--series-3); font-size: 12px; }
+  #mobile-profiler .metadata-block { margin: 0; padding: 13px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; color: var(--app-muted); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+  #mobile-profiler .legend-row { gap: 14px; flex-wrap: wrap; color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .legend-row span { display: inline-flex; align-items: center; gap: 5px; }
+  #mobile-profiler .legend-swatch { width: 9px; height: 9px; display: inline-block; }
   @media (max-width: 980px) {
-    #mobile-power-profiler .metric-grid { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
-    #mobile-power-profiler .split-layout { grid-template-columns: 1fr; }
-    #mobile-power-profiler .residency-row { grid-template-columns: 130px minmax(160px, 1fr); }
-    #mobile-power-profiler .residency-values { grid-column: 2; justify-content: flex-start; }
+    #mobile-profiler .metric-grid { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
+    #mobile-profiler .split-layout { grid-template-columns: 1fr; }
+    #mobile-profiler .residency-row { grid-template-columns: 130px minmax(160px, 1fr); }
+    #mobile-profiler .residency-values { grid-column: 2; justify-content: flex-start; }
   }
   @media (max-width: 720px) {
-    #mobile-power-profiler .app-topbar { align-items: flex-start; flex-wrap: wrap; }
-    #mobile-power-profiler .session-block { order: 3; width: 100%; }
-    #mobile-power-profiler .app-workspace { grid-template-columns: 1fr; }
-    #mobile-power-profiler .side-tabs { border-right: 0; border-bottom: 1px solid var(--app-border); flex-direction: row; overflow-x: auto; padding: 8px 10px; }
-    #mobile-power-profiler .nav-tab { flex: 0 0 auto; text-align: center; }
-    #mobile-power-profiler .nav-tab[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--series-1); }
-    #mobile-power-profiler .app-content { padding: 16px 12px; }
-    #mobile-power-profiler .metric-grid { grid-template-columns: 1fr 1fr; }
-    #mobile-power-profiler .residency-row { grid-template-columns: 1fr; }
-    #mobile-power-profiler .residency-values { grid-column: 1; }
-    #mobile-power-profiler .contributor-row { grid-template-columns: minmax(0, 1fr) 65px; }
-    #mobile-power-profiler .contributor-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
+    #mobile-profiler .app-topbar { align-items: flex-start; flex-wrap: wrap; }
+    #mobile-profiler .session-block { order: 3; width: 100%; }
+    #mobile-profiler .app-workspace { grid-template-columns: 1fr; }
+    #mobile-profiler .side-tabs { border-right: 0; border-bottom: 1px solid var(--app-border); flex-direction: row; overflow-x: auto; padding: 8px 10px; }
+    #mobile-profiler .nav-tab { flex: 0 0 auto; text-align: center; }
+    #mobile-profiler .nav-tab[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--series-1); }
+    #mobile-profiler .app-content { padding: 16px 12px; }
+    #mobile-profiler .metric-grid { grid-template-columns: 1fr 1fr; }
+    #mobile-profiler .residency-row { grid-template-columns: 1fr; }
+    #mobile-profiler .residency-values { grid-column: 1; }
+    #mobile-profiler .contributor-row { grid-template-columns: minmax(0, 1fr) 65px; }
+    #mobile-profiler .contributor-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
   }
   @media (max-width: 440px) {
-    #mobile-power-profiler .metric-grid { grid-template-columns: 1fr; }
-    #mobile-power-profiler .device-block { width: 100%; justify-content: flex-start; text-align: left; }
-    #mobile-power-profiler .metric-value { font-size: 22px; }
-    #mobile-power-profiler .sample-detail { display: grid; grid-template-columns: 1fr; }
+    #mobile-profiler .metric-grid { grid-template-columns: 1fr; }
+    #mobile-profiler .device-block { width: 100%; justify-content: flex-start; text-align: left; }
+    #mobile-profiler .metric-value { font-size: 22px; }
+    #mobile-profiler .sample-detail { display: grid; grid-template-columns: 1fr; }
   }
 </style>
-<div id="mobile-power-profiler">
+<div id="mobile-profiler" data-test-mode="@@TEST_MODE@@">
   <header class="app-topbar">
     <div class="brand-block">
       <span class="brand-mark">P</span>
-      <div><strong>PowerScope Mobile</strong><span>移动设备电池与系统资源分析</span></div>
+      <div><strong>PowerScope Mobile</strong><span>@@REPORT_SUBTITLE@@</span></div>
     </div>
     <div class="session-block">
       <span class="status-dot good"></span>
@@ -1374,27 +1751,33 @@ REPORT_FRAGMENT = r"""
     <nav class="side-tabs" role="tablist" aria-label="报告页面">
       <button type="button" class="nav-tab" role="tab" aria-selected="true" data-view="overview">概览</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="timeline">时间线</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="flow">测试流程</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="flow" data-report-only="power">测试流程</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="test-items">测试项分析</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="applications">应用</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="pressure" data-report-only="power">功耗压力</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="pipeline" data-report-only="performance">渲染链路</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="applications" data-report-only="power">应用</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="cpu">CPU</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system">性能上下文</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system" data-report-only="performance">性能上下文</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="gpu">GPU</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="attribution">功耗归因</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="attribution" data-report-only="power">功耗归因</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="data">数据质量</button>
     </nav>
     <main class="app-content">
       <section class="app-view" data-panel="overview">
-        <div class="view-heading"><div><h1>测试概览</h1><p>@@GENERATED@@</p></div><span class="source-tag measured">电量计整机实测</span></div>
-        <div class="metric-grid">@@SUMMARY_CARDS@@</div>
+        <div class="view-heading"><div><h1>@@OVERVIEW_TITLE@@</h1><p>@@GENERATED@@</p></div><span class="source-tag measured">@@OVERVIEW_TAG@@</span></div>
+        <div class="metric-grid" data-report-only="power">@@SUMMARY_CARDS@@</div>
+        <div class="metric-grid" data-report-only="performance">@@PERFORMANCE_CARDS@@</div>
+        <div data-report-only="performance">@@PERFORMANCE_POWER_RECORDING@@</div>
         <section class="analysis-section">
           <div class="chart-toolbar">
-            <div><h2>实测遥测</h2><p class="section-copy">电流、电压与资源计数器统一使用设备 uptime 时间轴。</p></div>
+            <div><h2>实测遥测</h2><p class="section-copy">@@OVERVIEW_COPY@@</p></div>
             <div class="segment-control" aria-label="概览指标">
-              <button type="button" class="segment-button active" data-overview-metric="power_mw">功率</button>
-              <button type="button" class="segment-button" data-overview-metric="current_ma">电流</button>
+              <button type="button" class="segment-button active" data-overview-metric="power_mw" data-report-only="power">功率</button>
+              <button type="button" class="segment-button" data-overview-metric="current_ma" data-report-only="power">电流</button>
               <button type="button" class="segment-button" data-overview-metric="cpu_pct">CPU</button>
-              <button type="button" class="segment-button" data-overview-metric="voltage_mv">电压</button>
+              <button type="button" class="segment-button" data-overview-metric="frame_rate_fps" data-report-only="performance">FPS</button>
+              <button type="button" class="segment-button" data-overview-metric="frame_time_ms" data-report-only="performance">帧耗时</button>
+              <button type="button" class="segment-button" data-overview-metric="voltage_mv" data-report-only="power">电压</button>
               @@GPU_METRIC_BUTTON@@
             </div>
           </div>
@@ -1406,20 +1789,24 @@ REPORT_FRAGMENT = r"""
             </div>
           </div>
         </section>
-        <div class="split-layout">
+        <div class="split-layout" data-report-only="power">
           <section class="analysis-section"><h2>资源汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
           <section class="analysis-section"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
+        </div>
+        <div class="split-layout" data-report-only="performance">
+          <section class="analysis-section"><h2>性能上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
+          <section class="analysis-section"><h2>帧表现结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         </div>
       </section>
 
       <section class="app-view" data-panel="timeline" hidden>
-        <div class="view-heading"><div><h1>对齐时间线</h1><p>整机实测、CPU 集群与 GPU 证据位于同一时间轴。</p></div></div>
+        <div class="view-heading"><div><h1>对齐时间线</h1><p>@@TIMELINE_COPY@@</p></div></div>
         <section class="analysis-section">
           <div class="chart-surface"><svg id="timeline-chart" role="img" aria-label="Aligned telemetry lanes"></svg></div>
         </section>
       </section>
 
-      <section class="app-view" data-panel="flow" hidden>
+      <section class="app-view" data-panel="flow" data-report-only="power" hidden>
         <div class="view-heading"><div><h1>测试流程</h1><p>前台应用与导入测试事件均已对齐至电池侧实测功率。</p></div><span class="source-tag counter">按设备 uptime 对齐</span></div>
         <section class="analysis-section">
           <div class="chart-surface"><svg id="flow-chart" role="img" aria-label="Power, foreground applications and external events on one timeline"></svg></div>
@@ -1440,12 +1827,30 @@ REPORT_FRAGMENT = r"""
           </div>
           <div class="chart-surface"><svg id="test-item-chart" role="img" aria-label="Per-test power, foreground activity, system activity, thermal and scheduler lanes"></svg></div>
         </section>
-        <section class="analysis-section"><h2>测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>单次执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th><th>系统干扰</th><th>前台应用</th></tr></thead><tbody>@@TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="power"><h2>功耗测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="performance"><h2>性能测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th><th>异常帧</th><th>主要延迟阶段</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>内存频率 平均 / P95</th><th>热限制</th><th>整机功耗记录</th><th>置信度</th></tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="power"><h2>单次执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th><th>系统干扰</th><th>前台应用</th></tr></thead><tbody>@@TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="performance"><h2>单次性能执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th><th>异常帧</th><th>整机功耗</th><th>置信度</th></tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
         <div class="availability-note"><strong>解读边界</strong><span>@@TEST_ITEM_BOUNDARY@@</span></div>
       </section>
 
-      <section class="app-view" data-panel="applications" hidden>
+      <section class="app-view" data-panel="pressure" data-report-only="power" hidden>
+        <div class="view-heading"><div><h1>功耗压力分析</h1><p>解释电流和功率为什么随任务负载、调度、频率与系统设置变化。</p></div><span class="source-tag counter">时间相关性，不是独立电源轨</span></div>
+        <section class="analysis-section"><h2>内存频率压力</h2>@@MEMORY_PRESSURE_SUMMARY@@</section>
+        <section class="analysis-section"><h2>资源压力驱动</h2><div class="data-table-wrap"><table><thead><tr><th>资源</th><th>功率相关系数</th><th>方向</th><th>样本数</th><th>解释</th></tr></thead><tbody>@@POWER_PRESSURE_DRIVER_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>任务负载压力</h2><div class="data-table-wrap"><table><thead><tr><th>任务</th><th>平均 CPU</th><th>峰值 CPU</th><th>可见时相对功率</th><th>功率相关性</th><th>快照数</th></tr></thead><tbody>@@POWER_PRESSURE_TASK_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>系统设置快照</h2><div class="data-table-wrap"><table><thead><tr><th>设置</th><th>开始</th><th>结束</th><th>变化</th><th>续航影响</th></tr></thead><tbody>@@RUNTIME_SETTING_ROWS@@</tbody></table></div></section>
+      </section>
+
+      <section class="app-view" data-panel="pipeline" data-report-only="performance" hidden>
+        <div class="view-heading"><div><h1>渲染链路与帧延迟</h1><p>从 VSync 起步、UI/RenderThread、GPU 等待到 BufferQueue / SurfaceFlinger 合成，定位慢帧形成阶段。</p></div><span class="source-tag counter">Android framestats / 线程快照</span></div>
+        <section class="analysis-section"><h2>阶段耗时分布</h2><div class="data-table-wrap"><table><thead><tr><th>阶段</th><th>帧数</th><th>平均</th><th>P95</th><th>P99</th><th>峰值</th></tr></thead><tbody>@@RENDER_PIPELINE_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>慢帧明细</h2><div class="data-table-wrap"><table><thead><tr><th>帧 ID</th><th>总耗时</th><th>超截止时间</th><th>最大阶段</th><th>阶段耗时</th></tr></thead><tbody>@@SLOW_FRAME_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>渲染与合成热点线程</h2><div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th><th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>@@RENDER_THREAD_ROWS@@</tbody></table></div></section>
+        @@PERFORMANCE_POWER_RECORDING@@
+      </section>
+
+      <section class="app-view" data-panel="applications" data-report-only="power" hidden>
         <div class="view-heading"><div><h1>前台应用</h1><p>按采样到的前台包名分配电池侧整机实测能量。</p></div><span class="source-tag counter">上下文覆盖率 @@APP_COVERAGE@@%</span></div>
         <section class="analysis-section"><h2>应用能耗</h2><div class="data-table-wrap"><table><thead><tr><th>包名</th><th>持续时间</th><th>时间占比</th><th>能量</th><th>平均功率</th><th>进入次数</th><th>置信度</th></tr></thead><tbody>@@APPLICATION_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>前台应用切换</h2><div class="data-table-wrap"><table><thead><tr><th>已运行时间</th><th>包名</th><th>Activity</th></tr></thead><tbody>@@TRANSITION_ROWS@@</tbody></table></div></section>
@@ -1458,20 +1863,22 @@ REPORT_FRAGMENT = r"""
           <div class="chart-surface"><svg id="cpu-chart" role="img" aria-label="CPU cluster frequency impact timeline"></svg></div>
         </section>
         <section class="analysis-section"><div class="chart-toolbar"><div><h2>频率驻留</h2><p class="section-copy">按负载加权的低、中、高频使用比例。</p></div><div class="legend-row"><span><i class="legend-swatch band-low"></i>低频</span><span><i class="legend-swatch band-balanced"></i>中频</span><span><i class="legend-swatch band-high"></i>高频</span></div></div><div class="residency-list">@@RESIDENCY_ROWS@@</div></section>
-        <section class="analysis-section"><h2>集群汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="power"><h2>集群功耗压力汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="performance"><h2>CPU 调度资源汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>平均负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th></tr></thead><tbody>@@PERFORMANCE_CPU_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>进程 CPU 快照</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>总占用</th><th>用户态</th><th>内核态</th></tr></thead><tbody>@@PROCESS_ROWS@@</tbody></table></div></section>
       </section>
 
-      <section class="app-view" data-panel="system" hidden>
-        <div class="view-heading"><div><h1>性能与功耗上下文</h1><p>刷新率、平台帧节奏、触控交互和关键运行上下文优先展示；系统活动与热状态仅保留异常证据。</p></div><span class="source-tag counter">平台实测计数器</span></div>
+      <section class="app-view" data-panel="system" data-report-only="performance" hidden>
+        <div class="view-heading"><div><h1>性能资源与调度上下文</h1><p>帧表现结合 CPU/GPU、内存频率、cpuset、ADPF、热点进程和热限制解释；不进行进程功耗归因。</p></div><span class="source-tag counter">平台实测计数器</span></div>
         <div class="metric-grid">@@PERFORMANCE_CARDS@@</div>
         <div class="split-layout">
           <section class="analysis-section"><h2>刷新档位驻留</h2><div class="residency-list">@@REFRESH_RESIDENCY_ROWS@@</div></section>
           <section class="analysis-section"><h2>关键上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
         </div>
-        <section class="analysis-section">@@PRIORITY_STATUS@@</section>
-        <section class="analysis-section"><h2>当前 CPU 热点（前 5 项）</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th><th>进入 Top 时平均</th><th>峰值</th><th>可见时功率 / 相对基线</th><th>功率相关性</th><th>相对功耗分数 平均 / 峰值</th><th>快照数</th></tr></thead><tbody>@@SYSTEM_PROCESS_ROWS@@</tbody></table></div></section>
-        <div class="availability-note"><strong>解读边界</strong><span>帧率与帧耗时来自平台公开的合成器或前台窗口统计，不等于应用内部渲染线程或最终可见 FPS；触摸次数来自已分发事件，不能代表面板硬件触控采样率。完整热控、调度和系统快照仍保留在原始 JSONL 中。</span></div>
+        <section class="analysis-section">@@PERFORMANCE_INTERFERENCE_STATUS@@</section>
+        <section class="analysis-section"><h2>进程调度热点</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th><th>进入 Top 时平均</th><th>峰值</th><th>快照数</th></tr></thead><tbody>@@PERFORMANCE_PROCESS_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><h2>RenderThread / SurfaceFlinger / Composer</h2><div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th><th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>@@RENDER_THREAD_ROWS@@</tbody></table></div></section>
+        <div class="availability-note"><strong>解读边界</strong><span>帧率与帧耗时来自平台公开的合成器或前台窗口统计；详细 Android framestats 用于定位 UI / RenderThread 到 BufferQueue 的阶段耗时。插帧仅在读取到显式厂商开关时判定。整机功耗仅作为同期记录，不拆分到进程、UID 或组件。</span></div>
       </section>
 
       <section class="app-view" data-panel="gpu" hidden>
@@ -1479,11 +1886,12 @@ REPORT_FRAGMENT = r"""
         <section class="analysis-section"><div class="status-line">@@GPU_STATUS@@</div></section>
         <div>@@GPU_METRIC@@</div>
         <section class="analysis-section"><div class="chart-surface" id="gpu-chart-surface"><svg id="gpu-chart" role="img" aria-label="GPU telemetry timeline"></svg></div></section>
-        <section class="analysis-section"><h2>按 UID 的 GPU 工作</h2><div class="data-table-wrap"><table><thead><tr><th>包名 / UID</th><th>活跃时长</th><th>运行占比</th><th>来源</th></tr></thead><tbody>@@GPU_UID_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>GPU 进程内存快照</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>PID</th><th>内存</th><th>占 GPU 总量</th></tr></thead><tbody>@@GPU_MEMORY_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="power"><h2>按 UID 的 GPU 工作</h2><div class="data-table-wrap"><table><thead><tr><th>包名 / UID</th><th>活跃时长</th><th>运行占比</th><th>来源</th></tr></thead><tbody>@@GPU_UID_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section" data-report-only="power"><h2>GPU 进程内存快照</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>PID</th><th>内存</th><th>占 GPU 总量</th></tr></thead><tbody>@@GPU_MEMORY_ROWS@@</tbody></table></div></section>
+        <div data-report-only="performance">@@PERFORMANCE_POWER_RECORDING@@</div>
       </section>
 
-      <section class="app-view" data-panel="attribution" hidden>
+      <section class="app-view" data-panel="attribution" data-report-only="power" hidden>
         <div class="view-heading"><div><h1>功耗归因</h1><p>@@ATTRIBUTION_COPY@@</p></div><span class="source-tag @@ATTRIBUTION_TAG_KIND@@">@@ATTRIBUTION_TAG@@</span></div>
         @@ATTRIBUTION_NOTE@@
         <section class="analysis-section"><h2>模型贡献项</h2><div class="contributor-list">@@COMPONENT_ROWS@@</div></section>
@@ -1493,6 +1901,7 @@ REPORT_FRAGMENT = r"""
 
       <section class="app-view" data-panel="data" hidden>
         <div class="view-heading"><div><h1>数据质量</h1><p>查看本次测试的实测、计数器与模型数据来源。</p></div></div>
+        <section class="analysis-section"><h2>采集项与干扰控制</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>数据来源</h2><div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div></section>
         @@WARNING_SECTION@@
         <section class="analysis-section"><h2>会话元数据</h2><pre class="metadata-block">@@METADATA@@</pre></section>
@@ -1502,7 +1911,7 @@ REPORT_FRAGMENT = r"""
 </div>
 <script>
 (() => {
-  const root = document.getElementById("mobile-power-profiler");
+  const root = document.getElementById("mobile-profiler");
   const bundle = @@DATA@@;
   const samples = bundle.samples || [];
   const contexts = (bundle.contexts || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
@@ -1510,10 +1919,12 @@ REPORT_FRAGMENT = r"""
   const analysis = bundle.analysis || {};
   const cpu = analysis.cpu || { clusters: [], timeline: [] };
   const gpu = analysis.gpu || {};
+  const testMode = root.dataset.testMode || "power";
+  const frameTimeline = (((analysis.performance || {}).frame_rate_timeline) || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
   const testItems = analysis.test_items || { rows: [], spans: [], instant_events: [] };
   const colors = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)", "var(--series-6)"];
   let selectedIndex = 0;
-  let overviewMetric = "power_mw";
+  let overviewMetric = testMode === "performance" ? "frame_rate_fps" : "power_mw";
   let selectedCluster = cpu.clusters.length ? cpu.clusters[0].name : null;
   let testRange = null;
 
@@ -1521,6 +1932,8 @@ REPORT_FRAGMENT = r"""
     power_mw: { label: "功率", unit: "mW", color: colors[0], value: sample => sample.power_mw },
     current_ma: { label: "放电电流幅值", unit: "mA", color: colors[1], value: sample => sample.current_ma },
     cpu_pct: { label: "CPU", unit: "%", color: colors[2], value: sample => sample.cpu_pct },
+    frame_rate_fps: { label: "帧率", unit: "FPS", color: colors[0], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_rate_fps },
+    frame_time_ms: { label: "帧耗时 P99", unit: "ms", color: colors[3], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_time_p99_ms || (frameForUptime(sample.uptime_s) || {}).frame_time_p95_ms },
     voltage_mv: { label: "电压", unit: "mV", color: colors[4], value: sample => sample.voltage_mv },
     gpu_frequency_mhz: { label: "GPU 频率", unit: "MHz", color: colors[5], value: sample => sample.gpu_frequency_mhz },
     gpu_load_pct: { label: "GPU 负载", unit: "%", color: colors[5], value: sample => sample.gpu_load_pct }
@@ -1561,6 +1974,14 @@ REPORT_FRAGMENT = r"""
     for (const context of contexts) {
       if (Number(context.uptime_s) > Number(uptime)) break;
       selected = context;
+    }
+    return selected;
+  }
+  function frameForUptime(uptime) {
+    let selected = null;
+    for (const frame of frameTimeline) {
+      if (Number(frame.uptime_s) > Number(uptime)) break;
+      selected = frame;
     }
     return selected;
   }
@@ -1667,19 +2088,28 @@ REPORT_FRAGMENT = r"""
   }
 
   function timelineLanes() {
-    const lanes = [
-      { label: "功率", unit: "mW", color: colors[0], value: sample => sample.power_mw },
-      { label: "电流", unit: "mA", color: colors[1], value: sample => sample.current_ma },
-      { label: "CPU 总负载", unit: "%", color: colors[2], value: sample => sample.cpu_pct }
-    ];
+    const lanes = testMode === "performance"
+      ? [
+          { label: "帧率", unit: "FPS", color: colors[0], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_rate_fps },
+          { label: "P99 帧耗时", unit: "ms", color: colors[3], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_time_p99_ms || (frameForUptime(sample.uptime_s) || {}).frame_time_p95_ms },
+          { label: "CPU 总负载", unit: "%", color: colors[2], value: sample => sample.cpu_pct }
+        ]
+      : [
+          { label: "功率", unit: "mW", color: colors[0], value: sample => sample.power_mw },
+          { label: "电流", unit: "mA", color: colors[1], value: sample => sample.current_ma },
+          { label: "CPU 总负载", unit: "%", color: colors[2], value: sample => sample.cpu_pct }
+        ];
     cpu.clusters.forEach((cluster, index) => lanes.push({ label: `${clusterLabel(cluster)}频率`, unit: "MHz", color: colors[(index + 3) % colors.length], value: sample => (sample.frequencies_mhz || {})[cluster.name] }));
     if (gpu.frequency_available) lanes.push({ label: "GPU 频率", unit: "MHz", color: colors[5], value: sample => sample.gpu_frequency_mhz });
     if (gpu.load_available) lanes.push({ label: "GPU 负载", unit: "%", color: colors[1], value: sample => sample.gpu_load_pct });
+    if (samples.some(sample => finite(sample.memory_frequency_mhz))) lanes.push({ label: "内存频率", unit: "MHz", color: colors[4], value: sample => sample.memory_frequency_mhz });
+    if (testMode === "performance") lanes.push({ label: "整机功耗记录", unit: "mW", color: colors[5], value: sample => sample.power_mw });
     return lanes;
   }
   function renderTimeline() { renderLanes(root.querySelector("#timeline-chart"), timelineLanes()); }
 
   function renderFlow() {
+    if (testMode !== "power") return;
     const svg = root.querySelector("#flow-chart");
     if (!svg || !samples.length) return;
     const width = chartWidth(svg), height = 320;
@@ -1772,8 +2202,8 @@ REPORT_FRAGMENT = r"""
     const plotWidth = width - left - right;
     const x = time => left + (Math.max(rangeStart, Math.min(safeEnd, Number(time))) - rangeStart) / (safeEnd - rangeStart) * plotWidth;
     const visibleSamples = samples.filter(sample => Number(sample.elapsed_s) >= rangeStart && Number(sample.elapsed_s) <= safeEnd);
-    const powerValues = visibleSamples.map(sample => sample.power_mw);
-    const [minimum, maximum] = domain(powerValues);
+    const primaryValues = visibleSamples.map(sample => testMode === "performance" ? (frameForUptime(sample.uptime_s) || {}).frame_rate_fps : sample.power_mw);
+    const [minimum, maximum] = domain(primaryValues);
     const y = value => powerTop + (maximum - value) / (maximum - minimum) * (powerBottom - powerTop);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.style.minHeight = `${height}px`;
@@ -1785,17 +2215,19 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: powerTop, y2: laneStart + laneHeight * laneNames.length, class: "grid" }));
       svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": "middle", class: "axis-text" }, formatTime(seconds)));
     }
-    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 20, class: "lane-label" }, "整机功率"));
+    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 20, class: "lane-label" }, testMode === "performance" ? "帧率" : "整机功率"));
     const selected = samples[selectedIndex];
-    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 41, class: "lane-value" }, format(selected && selected.power_mw, "mW")));
+    const selectedPrimary = testMode === "performance" ? (frameForUptime(selected && selected.uptime_s) || {}).frame_rate_fps : selected && selected.power_mw;
+    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 41, class: "lane-value" }, format(selectedPrimary, testMode === "performance" ? "FPS" : "mW")));
     laneNames.forEach((name, index) => {
       const top = laneStart + index * laneHeight;
       svg.appendChild(svgNode("text", { x: 12, y: top + 25, class: "lane-label" }, name));
       svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: top + laneHeight - 2, y2: top + laneHeight - 2, class: "grid" }));
     });
     const powerPoints = visibleSamples
-      .filter(sample => finite(sample.power_mw))
-      .map(sample => `${x(sample.elapsed_s).toFixed(2)},${y(Number(sample.power_mw)).toFixed(2)}`)
+      .map(sample => ({ sample, value: testMode === "performance" ? (frameForUptime(sample.uptime_s) || {}).frame_rate_fps : sample.power_mw }))
+      .filter(item => finite(item.value))
+      .map(item => `${x(item.sample.elapsed_s).toFixed(2)},${y(Number(item.value)).toFixed(2)}`)
       .join(" ");
     svg.appendChild(svgNode("polyline", { points: powerPoints, fill: "none", stroke: colors[0], "stroke-width": 2 }));
 
@@ -1898,12 +2330,17 @@ REPORT_FRAGMENT = r"""
     const cluster = cpu.clusters.find(item => item.name === selectedCluster);
     if (!svg || !cluster) return;
     const timeline = cpu.timeline || [];
-    renderLanes(svg, [
+    const lanes = [
       { label: `${clusterLabel(cluster)}频率`, unit: "MHz", color: colors[0], value: sample => (sample.frequencies_mhz || {})[cluster.name] },
-      { label: `${clusterLabel(cluster)}负载`, unit: "%", color: colors[1], value: sample => (sample.cluster_cpu_pct || {})[cluster.name] },
-      { label: "CPU 模型功率", unit: "mW", color: colors[2], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).modeled_power_mw },
-      { label: "高频增量", unit: "mW", color: colors[3], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).frequency_premium_mw }
-    ]);
+      { label: `${clusterLabel(cluster)}负载`, unit: "%", color: colors[1], value: sample => (sample.cluster_cpu_pct || {})[cluster.name] }
+    ];
+    if (testMode === "power") {
+      lanes.push(
+        { label: "CPU 模型功率", unit: "mW", color: colors[2], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).modeled_power_mw },
+        { label: "高频增量", unit: "mW", color: colors[3], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).frequency_premium_mw }
+      );
+    }
+    renderLanes(svg, lanes);
   }
 
   function renderGpu() {
@@ -1925,7 +2362,10 @@ REPORT_FRAGMENT = r"""
     if (slider) slider.value = String(selectedIndex);
     const context = contextForUptime(sample.uptime_s);
     const packageName = context && context.foreground_package ? context.foreground_package : "未知";
-    detail.innerHTML = `<span><strong>${formatTime(sample.elapsed_s)}</strong></span><span>功率 <strong>${format(sample.power_mw, "mW")}</strong></span><span>电流 <strong>${format(sample.current_ma, "mA")}</strong></span><span>CPU <strong>${format(sample.cpu_pct, "%")}</strong></span><span>应用 <strong>${packageName}</strong></span>`;
+    const frame = frameForUptime(sample.uptime_s) || {};
+    detail.innerHTML = testMode === "performance"
+      ? `<span><strong>${formatTime(sample.elapsed_s)}</strong></span><span>帧率 <strong>${format(frame.frame_rate_fps, "FPS")}</strong></span><span>P99 <strong>${format(frame.frame_time_p99_ms || frame.frame_time_p95_ms, "ms")}</strong></span><span>CPU <strong>${format(sample.cpu_pct, "%")}</strong></span><span>整机功耗 <strong>${format(sample.power_mw, "mW")}</strong></span>`
+      : `<span><strong>${formatTime(sample.elapsed_s)}</strong></span><span>功率 <strong>${format(sample.power_mw, "mW")}</strong></span><span>电流 <strong>${format(sample.current_ma, "mA")}</strong></span><span>CPU <strong>${format(sample.cpu_pct, "%")}</strong></span><span>应用 <strong>${packageName}</strong></span>`;
   }
   function selectSample(index) {
     selectedIndex = Math.max(0, Math.min(samples.length - 1, Number(index)));
@@ -1956,6 +2396,9 @@ REPORT_FRAGMENT = r"""
     root.querySelectorAll("[data-overview-metric]").forEach(peer => peer.classList.toggle("active", peer === button));
     renderOverview();
   }));
+  root.querySelectorAll("[data-overview-metric]").forEach(button => {
+    button.classList.toggle("active", button.dataset.overviewMetric === overviewMetric);
+  });
   root.querySelectorAll("[data-cpu-cluster]").forEach(button => button.addEventListener("click", () => {
     selectedCluster = button.dataset.cpuCluster;
     root.querySelectorAll("[data-cpu-cluster]").forEach(peer => peer.classList.toggle("active", peer === button));
@@ -1982,9 +2425,9 @@ REPORT_FRAGMENT = r"""
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => selectSample(selectedIndex), 100);
   });
-  selectSample(0);
+  selectSample(testMode === "performance" ? Math.max(0, samples.length - 1) : 0);
   const initialView = new URLSearchParams(window.location.search).get("view") || window.location.hash.slice(1);
-  const initialTab = initialView ? Array.from(root.querySelectorAll("[data-view]")).find(tab => tab.dataset.view === initialView) : null;
+  const initialTab = initialView ? Array.from(root.querySelectorAll("[data-view]")).find(tab => tab.dataset.view === initialView && window.getComputedStyle(tab).display !== "none") : null;
   if (initialTab && initialView !== "overview") initialTab.click();
 })();
 </script>
@@ -2156,6 +2599,63 @@ def _report_platform_profile(
     }
 
 
+def _report_mode_profile(
+    profile: Dict[str, str],
+    metadata: Dict[str, object],
+) -> Dict[str, str]:
+    test_mode = str(metadata.get("test_mode") or "power").strip().lower()
+    result = dict(profile)
+    if test_mode == "performance":
+        result.update(
+            {
+                "report_subtitle": "游戏帧表现、渲染链路与资源调度分析",
+                "overview_title": "性能测试概览",
+                "overview_tag": "帧计数器 + 整机功耗记录",
+                "overview_copy": (
+                    "帧表现使用前台窗口 / 合成器计数器；CPU、GPU、内存频率与整机功耗统一使用设备 uptime 对齐。"
+                ),
+                "timeline_copy": (
+                    "帧率窗口、CPU/GPU/内存资源、调度与整机功耗记录位于同一设备时间轴。"
+                ),
+                "cpu_title": "CPU 调度与频率上下文",
+                "cpu_copy": (
+                    "展示各集群负载、频率驻留与可用核心分配，用于判断主线程 / RenderThread 是否受到调度竞争或频率上限影响。"
+                ),
+                "cpu_tag_kind": "counter",
+                "cpu_tag": "资源计数器，不换算 CPU 电源轨",
+                "cpu_timeline_copy": "频率与利用率用于解释帧延迟，不进行 CPU 功耗归因。",
+                "gpu_copy": (
+                    "展示可读的 GPU 频率与负载，用于判断 GPU 饱和、渲染分辨率和带宽压力；不展示 UID 工作时长或进程功耗归因。"
+                ),
+                "test_item_copy": (
+                    "按导入测试阶段或前台 Activity 聚合平均 FPS、1% Low、P95/P99、异常帧、渲染阶段、资源调度与热状态。"
+                ),
+                "test_item_timeline_copy": (
+                    "帧表现、前台窗口、测试项、CPU/GPU/内存资源、热状态和调度证据共享同一时间轴。"
+                ),
+                "test_item_boundary": (
+                    "详细 framestats 可用时用于阶段和慢帧分析；否则使用周期帧计数窗口给出保守指标。"
+                    "整机功耗仅记录测试窗口均值，不拆分到进程、UID、Wakelock 或硬件组件。"
+                ),
+            }
+        )
+    else:
+        result.update(
+            {
+                "report_subtitle": "续航功耗、任务压力与系统设置分析",
+                "overview_title": "功耗测试概览",
+                "overview_tag": "电池侧整机实测",
+                "overview_copy": (
+                    "电流、电压、任务负载、CPU/GPU/内存频率和设置上下文统一使用设备 uptime 时间轴。"
+                ),
+                "timeline_copy": (
+                    "整机电流功率、任务负载、CPU/GPU/内存频率与系统活动位于同一时间轴。"
+                ),
+            }
+        )
+    return result
+
+
 def build_report_fragment(bundle: Dict[str, object]) -> str:
     bundle = _report_bundle(bundle)
     metadata = bundle.get("metadata", {})
@@ -2163,8 +2663,12 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
     samples = bundle.get("samples", [])
     summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
     device = metadata.get("device", {}) if isinstance(metadata, dict) else {}
-    profile = _report_platform_profile(metadata, device)
+    profile = _report_mode_profile(_report_platform_profile(metadata, device), metadata)
     platform = profile["platform"]
+    analysis_mode = analysis.get("test_mode") if isinstance(analysis, dict) else None
+    test_mode = str(analysis_mode or metadata.get("test_mode") or "power").strip().lower()
+    if test_mode not in {"power", "performance"}:
+        test_mode = "power"
     target = metadata.get("target_package")
     if not target:
         target = "多应用会话" if metadata.get("session_mode") else metadata.get("foreground_package") or "未指定目标"
@@ -2222,6 +2726,12 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "events": bundle.get("events", []),
     }
     replacements = {
+        "@@TEST_MODE@@": _escape(test_mode),
+        "@@REPORT_SUBTITLE@@": _escape(profile["report_subtitle"]),
+        "@@OVERVIEW_TITLE@@": _escape(profile["overview_title"]),
+        "@@OVERVIEW_TAG@@": _escape(profile["overview_tag"]),
+        "@@OVERVIEW_COPY@@": _escape(profile["overview_copy"]),
+        "@@TIMELINE_COPY@@": _escape(profile["timeline_copy"]),
         "@@TITLE@@": _escape(metadata.get("title") or APP_NAME),
         "@@TARGET@@": _escape(target),
         "@@DURATION@@": _number(summary.get("duration_s"), 1, "0"),
@@ -2235,9 +2745,20 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@PERFORMANCE_CARDS@@": _performance_cards(analysis),
         "@@REFRESH_RESIDENCY_ROWS@@": _refresh_residency_rows(analysis),
         "@@PERFORMANCE_CONTEXT_ROWS@@": _performance_context_rows(analysis),
+        "@@PERFORMANCE_POWER_RECORDING@@": _performance_power_recording(analysis),
+        "@@POWER_PRESSURE_DRIVER_ROWS@@": _power_pressure_driver_rows(analysis),
+        "@@POWER_PRESSURE_TASK_ROWS@@": _power_pressure_task_rows(analysis),
+        "@@RUNTIME_SETTING_ROWS@@": _runtime_setting_rows(analysis),
+        "@@MEMORY_PRESSURE_SUMMARY@@": _memory_pressure_summary(analysis),
+        "@@RENDER_PIPELINE_ROWS@@": _render_pipeline_rows(analysis),
+        "@@SLOW_FRAME_ROWS@@": _slow_frame_rows(analysis),
+        "@@RENDER_THREAD_ROWS@@": _render_thread_rows(analysis),
+        "@@PERFORMANCE_PROCESS_ROWS@@": _performance_process_rows(analysis),
+        "@@PERFORMANCE_INTERFERENCE_STATUS@@": _performance_interference_status(analysis),
         "@@GPU_METRIC_BUTTON@@": gpu_button,
         "@@SLIDER_MAX@@": str(max(0, len(samples) - 1)),
         "@@CPU_ROWS@@": cpu_rows,
+        "@@PERFORMANCE_CPU_ROWS@@": _performance_cpu_rows(analysis),
         "@@CPU_TITLE@@": _escape(profile["cpu_title"]),
         "@@CPU_COPY@@": _escape(profile["cpu_copy"]),
         "@@CPU_TAG_KIND@@": _escape(profile["cpu_tag_kind"]),
@@ -2287,6 +2808,8 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@CAPTURE_START_NOTE@@": capture_start_note,
         "@@TEST_ITEM_ROWS@@": _test_item_rows(analysis),
         "@@TEST_ITEM_SPAN_ROWS@@": _test_item_span_rows(analysis),
+        "@@PERFORMANCE_TEST_ITEM_ROWS@@": _performance_test_item_rows(analysis),
+        "@@PERFORMANCE_TEST_ITEM_SPAN_ROWS@@": _performance_test_item_span_rows(analysis),
         "@@APP_COVERAGE@@": _number(
             analysis.get("applications", {}).get("coverage_pct")
             if isinstance(analysis.get("applications"), dict)
@@ -2295,6 +2818,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
             "0",
         ),
         "@@SOURCE_ROWS@@": _source_rows(analysis),
+        "@@CAPTURE_CONFIGURATION_ROWS@@": _capture_configuration_rows(metadata),
         "@@WARNING_SECTION@@": warning_section,
         "@@METADATA@@": _escape(json.dumps(metadata, ensure_ascii=False, indent=2)),
         "@@DATA@@": _json_for_script(payload),

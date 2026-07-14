@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-SCHEMA_VERSION = 5
-APP_NAME = "Mobile Power Profiler"
+SCHEMA_VERSION = 8
+APP_NAME = "Mobile Profiler"
 DEFAULT_ADB = os.environ.get("ADB", "adb")
 DEFAULT_DURATION_S = 60
 DEFAULT_INTERVAL_S = 1.0
@@ -52,6 +52,16 @@ class GpuSource:
 
 
 @dataclass
+class MemorySource:
+    name: str
+    frequency_path: str
+    minimum_mhz: Optional[float] = None
+    maximum_mhz: Optional[float] = None
+    available_frequencies_mhz: List[float] = field(default_factory=list)
+    source_type: str = "devfreq"
+
+
+@dataclass
 class CpuTimes:
     user: float = 0.0
     nice: float = 0.0
@@ -94,6 +104,7 @@ class RawSample:
     frequencies_khz: Dict[str, float] = field(default_factory=dict)
     gpu_frequency_raw: Optional[float] = None
     gpu_load_raw: Optional[float] = None
+    memory_frequency_raw: Optional[float] = None
 
 
 @dataclass
@@ -112,6 +123,7 @@ class Sample:
     frequencies_mhz: Dict[str, float] = field(default_factory=dict)
     gpu_frequency_mhz: Optional[float] = None
     gpu_load_pct: Optional[float] = None
+    memory_frequency_mhz: Optional[float] = None
     battery_temperature_c: Optional[float] = None
     power_source: str = "battery_current_voltage"
     power_sample_age_s: Optional[float] = None

@@ -20,23 +20,35 @@ from .storage import RunJournal
 
 DEFAULT_IOS_PYTHON = os.environ.get("IOS_PYTHON", sys.executable)
 IOS_DEVICE_PREFIX = "ios:"
-LEGACY_IOS_STATE_DIR = Path(
+LEGACY_ANDROID_IOS_STATE_DIR = Path(
     os.environ.get(
         "ANDROID_POWER_PROFILER_STATE_DIR",
         Path.home() / ".android-power-profiler",
     )
 ).expanduser()
-IOS_STATE_DIR = Path(
+LEGACY_MOBILE_POWER_IOS_STATE_DIR = Path(
     os.environ.get(
         "MOBILE_POWER_PROFILER_STATE_DIR",
+        Path.home() / ".mobile-power-profiler",
+    )
+).expanduser()
+IOS_STATE_DIR = Path(
+    os.environ.get(
+        "MOBILE_PROFILER_STATE_DIR",
         os.environ.get(
-            "ANDROID_POWER_PROFILER_STATE_DIR",
-            Path.home() / ".mobile-power-profiler",
+            "MOBILE_POWER_PROFILER_STATE_DIR",
+            os.environ.get(
+                "ANDROID_POWER_PROFILER_STATE_DIR",
+                Path.home() / ".mobile-profiler",
+            ),
         ),
     )
 ).expanduser()
 IOS_ENDPOINTS_PATH = IOS_STATE_DIR / "ios-devices.json"
-LEGACY_IOS_ENDPOINTS_PATH = LEGACY_IOS_STATE_DIR / "ios-devices.json"
+LEGACY_ANDROID_IOS_ENDPOINTS_PATH = LEGACY_ANDROID_IOS_STATE_DIR / "ios-devices.json"
+LEGACY_MOBILE_POWER_IOS_ENDPOINTS_PATH = LEGACY_MOBILE_POWER_IOS_STATE_DIR / "ios-devices.json"
+# Compatibility alias retained for callers that used the original constant.
+LEGACY_IOS_ENDPOINTS_PATH = LEGACY_ANDROID_IOS_ENDPOINTS_PATH
 
 
 @dataclass
@@ -130,7 +142,13 @@ def _read_endpoints(path: Path) -> Dict[str, Dict[str, object]]:
 
 def _load_endpoints() -> Dict[str, Dict[str, object]]:
     endpoints: Dict[str, Dict[str, object]] = {}
-    for path in dict.fromkeys((LEGACY_IOS_ENDPOINTS_PATH, IOS_ENDPOINTS_PATH)):
+    for path in dict.fromkeys(
+        (
+            LEGACY_IOS_ENDPOINTS_PATH,
+            LEGACY_MOBILE_POWER_IOS_ENDPOINTS_PATH,
+            IOS_ENDPOINTS_PATH,
+        )
+    ):
         endpoints.update(_read_endpoints(path))
     return endpoints
 

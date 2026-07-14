@@ -6,5 +6,6 @@ dist/
 build/
 *.egg-info/
 power-runs/
+profiler-runs/
 .tmp-*
 .coverage

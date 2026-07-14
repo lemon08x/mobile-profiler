@@ -1027,7 +1027,7 @@ async def record_device(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="iOS sidecar for Mobile Power Profiler")
+    parser = argparse.ArgumentParser(description="iOS sidecar for Mobile Profiler")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("list")
 
