@@ -106,7 +106,7 @@ def create_evidence_archive(
                 }
             )
         manifest: Dict[str, object] = {
-            "format": "mobile-power-profiler-evidence-v1",
+            "format": "mobile-profiler-evidence-v1",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "run_name": run_dir.name,
             "source_directory": str(run_dir),

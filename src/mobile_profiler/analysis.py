@@ -3366,6 +3366,11 @@ def analyze_performance_contexts(
         return probe.get(key) if value in (None, "", [], {}) else value
 
     platform = str(metadata.get("platform") or latest.get("platform") or "").lower()
+    if not platform:
+        if "refresh_rate_counts" in latest or latest.get("smartperf_source"):
+            platform = "harmony"
+        elif "frame_counter_total" in latest or latest.get("surface_frame_source"):
+            platform = "android"
     is_android = platform == "android"
 
     refresh_values = [
@@ -3498,8 +3503,24 @@ def analyze_performance_contexts(
     surface_frame_rows = [
         item for item in all_frame_rows if bool(item.get("surface_frame_source"))
     ]
+    smartperf_frame_rows = [
+        item for item in all_frame_rows if bool(item.get("smartperf_source"))
+    ]
+    render_service_frame_rows = [
+        item
+        for item in all_frame_rows
+        if not bool(item.get("smartperf_source"))
+        and not bool(item.get("surface_frame_source"))
+    ]
     using_surface_frames = is_android and bool(surface_frame_rows)
-    frame_rows = surface_frame_rows if using_surface_frames else all_frame_rows
+    using_smartperf_frames = platform == "harmony" and bool(smartperf_frame_rows)
+    frame_rows = (
+        surface_frame_rows
+        if using_surface_frames
+        else smartperf_frame_rows
+        if using_smartperf_frames
+        else all_frame_rows
+    )
     frame_sample_count = sum(int(item.get("frame_sample_count") or 0) for item in frame_rows)
     presented_intervals = [
         float(value)
@@ -3647,14 +3668,47 @@ def analyze_performance_contexts(
         else None
     )
 
-    def weighted_frame_value(key: str) -> Optional[float]:
+    def weighted_source_value(
+        rows: Sequence[Dict[str, object]],
+        key: str,
+    ) -> Optional[float]:
         values = [
             (float(item[key]), int(item.get("frame_sample_count") or 0))
-            for item in frame_rows
+            for item in rows
             if isinstance(item.get(key), (int, float))
         ]
         weight = sum(item[1] for item in values)
         return sum(value * count for value, count in values) / weight if weight > 0 else None
+
+    def weighted_frame_value(key: str) -> Optional[float]:
+        return weighted_source_value(frame_rows, key)
+
+    def source_frame_rate(rows: Sequence[Dict[str, object]]) -> Optional[float]:
+        intervals = [
+            float(value)
+            for item in rows
+            for value in (
+                item.get("frame_intervals_ms", [])
+                if isinstance(item.get("frame_intervals_ms"), list)
+                else item.get("frame_interval_values_ms", [])
+                if isinstance(item.get("frame_interval_values_ms"), list)
+                else []
+            )
+            if isinstance(value, (int, float)) and float(value) > 0
+        ]
+        if intervals:
+            average_interval = statistics.fmean(intervals)
+            return 1000.0 / average_interval if average_interval > 0 else None
+        return weighted_source_value(rows, "compositor_fps")
+
+    surface_present_fps = source_frame_rate(surface_frame_rows)
+    smartperf_app_fps = source_frame_rate(smartperf_frame_rows)
+    render_service_compositor_fps = source_frame_rate(render_service_frame_rows)
+    gfxinfo_submission_fps = (
+        counter_frame_count / counter_frame_duration_s
+        if counter_pair_count > 0 and counter_frame_duration_s > 0
+        else None
+    )
 
     fps_values = [
         float(item["compositor_fps"])
@@ -3710,7 +3764,11 @@ def analyze_performance_contexts(
         missed_intervals / frame_sample_count * 100.0 if frame_sample_count > 0 else None
     )
 
-    using_gfxinfo_counters = counter_pair_count > 0 and not using_surface_frames
+    using_gfxinfo_counters = (
+        counter_pair_count > 0
+        and counter_frame_count > 0
+        and not using_surface_frames
+    )
     if using_gfxinfo_counters:
         sampled_frame_rate = (
             counter_frame_count / counter_frame_duration_s
@@ -3999,6 +4057,335 @@ def analyze_performance_contexts(
             )
         ]
 
+    def flow_metric(
+        label: str,
+        value: object,
+        unit: str = "",
+        digits: int = 1,
+    ) -> Optional[Dict[str, object]]:
+        if not isinstance(value, (int, float)):
+            return None
+        return {
+            "label": label,
+            "value": float(value),
+            "unit": unit,
+            "digits": digits,
+        }
+
+    def flow_stage(
+        key: str,
+        phase: str,
+        label: str,
+        status: str,
+        *,
+        value: object = None,
+        unit: str = "",
+        value_label: str = "",
+        source: str = "",
+        detail: str = "",
+        sample_count: object = None,
+        confidence: str = "",
+        metrics: Sequence[Optional[Dict[str, object]]] = (),
+    ) -> Dict[str, object]:
+        return {
+            "key": key,
+            "phase": phase,
+            "label": label,
+            "status": status,
+            "value": float(value) if isinstance(value, (int, float)) else None,
+            "unit": unit,
+            "value_label": value_label,
+            "source": source,
+            "detail": detail,
+            "sample_count": (
+                int(sample_count) if isinstance(sample_count, (int, float)) else None
+            ),
+            "confidence": confidence,
+            "metrics": [item for item in metrics if isinstance(item, dict)],
+        }
+
+    latest_screen_state = str(
+        (latest_context.screen_state if latest_context is not None else "") or ""
+    ).strip().lower()
+    screen_active = not latest_screen_state or latest_screen_state in {"awake", "on"}
+    unavailable_reason = str(latest_value("frame_unavailable_reason") or "").strip()
+    frame_flow_stages: List[Dict[str, object]] = []
+    primary_flow_key: Optional[str] = None
+
+    if is_android:
+        if using_gfxinfo_counters:
+            app_status = "primary"
+            primary_flow_key = "app_submission"
+            app_detail = (
+                "前台窗口 gfxinfo 累计帧计数存在连续正向增量；当前作为应用提交速率主数据。"
+            )
+        elif counter_pair_count > 0 and counter_frame_count > 0:
+            app_status = "reference"
+            app_detail = (
+                "该值只代表应用 UI 窗口提交；游戏 SurfaceView/BLAST 的真实呈现节奏以 "
+                "SurfaceFlinger 时间戳为准。"
+            )
+        elif len(counter_frame_contexts) >= 2:
+            app_status = "invalid"
+            app_detail = unavailable_reason or (
+                "gfxinfo 累计计数没有产生可用增量，可能是静态 UI、窗口切换或原生游戏渲染面未计入。"
+            )
+        else:
+            app_status = "unavailable"
+            app_detail = unavailable_reason or "前台窗口未公开连续 gfxinfo 帧计数。"
+        frame_flow_stages.append(
+            flow_stage(
+                "app_submission",
+                "APP",
+                "应用 / UI 帧提交",
+                app_status,
+                value=gfxinfo_submission_fps,
+                unit="帧/s",
+                value_label="提交速率",
+                source="Android gfxinfo cumulative frame counter delta",
+                detail=app_detail,
+                sample_count=counter_frame_count,
+                confidence="high" if using_gfxinfo_counters else "low",
+                metrics=(
+                    flow_metric("1% Low", counter_one_percent_low_fps, "FPS", 1),
+                    flow_metric("超时", counter_deadline_missed, "帧", 0),
+                ),
+            )
+        )
+
+        pipeline_available = bool(render_pipeline.get("available"))
+        frame_flow_stages.append(
+            flow_stage(
+                "render_queue",
+                "RENDER",
+                "RenderThread / BufferQueue",
+                "valid" if pipeline_available else "unavailable",
+                value=render_pipeline.get("p95_total_ms"),
+                unit="ms",
+                value_label="端到端 P95",
+                source="Android gfxinfo framestats timestamps",
+                detail=(
+                    "逐帧时间戳用于拆分 UI、RenderThread、GPU 与 BufferQueue 等待；"
+                    "它提供阶段延迟，不是独立 FPS 计数。"
+                    if pipeline_available
+                    else (
+                        "当前前台窗口未产生新增且可解析的 gfxinfo framestats；"
+                        "原生游戏 SurfaceView 通常不会在此公开独立 RenderThread 阶段。"
+                    )
+                ),
+                sample_count=render_pipeline.get("frame_count"),
+                confidence="high" if int(render_pipeline.get("frame_count") or 0) >= 100 else "medium",
+                metrics=(
+                    flow_metric(
+                        "截止超时",
+                        render_pipeline.get("deadline_missed_pct"),
+                        "%",
+                        1,
+                    ),
+                ),
+            )
+        )
+
+        untargeted_compositor_fps = source_frame_rate(render_service_frame_rows)
+        if using_surface_frames:
+            surface_status = "primary"
+            primary_flow_key = "surface_present"
+            surface_detail = (
+                "前台 SurfaceView/BLAST 层实际 present 时间戳；用于游戏呈现 FPS、帧间隔和 1% Low。"
+            )
+        elif isinstance(untargeted_compositor_fps, (int, float)):
+            surface_status = "invalid"
+            surface_detail = (
+                "检测到合成器窗口采样，但未绑定到当前应用 SurfaceView/BLAST 层，不能作为游戏呈现 FPS。"
+            )
+        else:
+            surface_status = "unavailable"
+            surface_detail = unavailable_reason or (
+                "当前应用未暴露可持续读取的 SurfaceFlinger 图层 present 时间戳。"
+            )
+        frame_flow_stages.append(
+            flow_stage(
+                "surface_present",
+                "COMPOSITOR",
+                "SurfaceFlinger 应用层呈现",
+                surface_status,
+                value=(
+                    surface_present_fps
+                    if using_surface_frames
+                    else untargeted_compositor_fps
+                ),
+                unit="FPS",
+                value_label="呈现帧率",
+                source=(
+                    "Android SurfaceFlinger BLAST layer present timestamps"
+                    if using_surface_frames
+                    else "Android compositor sample without target-layer binding"
+                ),
+                detail=surface_detail,
+                sample_count=sum(
+                    int(item.get("frame_sample_count") or 0)
+                    for item in surface_frame_rows
+                ),
+                confidence="high" if using_surface_frames else "low",
+                metrics=(
+                    flow_metric("1% Low", compositor_one_percent_low_fps, "FPS", 1),
+                    flow_metric("P95 间隔", compositor_frame_p95_ms, "ms", 2),
+                ),
+            )
+        )
+
+        display_detail = (
+            "屏幕刷新率描述扫描节奏，不等于应用唯一帧数；公开接口未提供可与目标应用逐帧对齐的 HWC present 计数。"
+        )
+        if interpolation_status in {"detected", "disabled"}:
+            display_detail += f" {interpolation_label}。"
+        frame_flow_stages.append(
+            flow_stage(
+                "display_scanout",
+                "DISPLAY",
+                "HWC / 屏幕扫描输出",
+                "reference" if isinstance(current_refresh, (int, float)) and screen_active else "invalid" if isinstance(current_refresh, (int, float)) else "unavailable",
+                value=current_refresh,
+                unit="Hz",
+                value_label="刷新率",
+                source=residency_source or "Android active display mode",
+                detail=(
+                    display_detail
+                    if screen_active
+                    else f"屏幕状态为 {latest_screen_state or 'unknown'}；当前刷新率不能代表有效显示输出。"
+                ),
+                confidence="high" if residency_source else "medium",
+                metrics=(
+                    flow_metric("显示/应用倍率", display_to_frame_ratio, "×", 2),
+                ),
+            )
+        )
+    elif platform == "harmony":
+        smartperf_p95 = weighted_source_value(
+            smartperf_frame_rows,
+            "frame_interval_p95_ms",
+        )
+        smartperf_sample_count = sum(
+            int(item.get("frame_sample_count") or 0) for item in smartperf_frame_rows
+        )
+        if isinstance(smartperf_app_fps, (int, float)):
+            app_status = "primary"
+            primary_flow_key = "app_submission"
+            app_detail = "SmartPerf SP_daemon 绑定目标进程输出的应用 FPS。"
+        else:
+            app_status = "unavailable"
+            app_detail = "未启用 SmartPerf，或 SP_daemon 未返回目标应用 FPS。"
+        frame_flow_stages.append(
+            flow_stage(
+                "app_submission",
+                "APP",
+                "应用产帧 / SmartPerf",
+                app_status,
+                value=smartperf_app_fps,
+                unit="FPS",
+                value_label="应用 FPS",
+                source="HarmonyOS SmartPerf SP_daemon app FPS",
+                detail=app_detail,
+                sample_count=smartperf_sample_count,
+                confidence="high" if app_status == "primary" else "low",
+                metrics=(
+                    flow_metric("P95 抖动", smartperf_p95, "ms", 2),
+                ),
+            )
+        )
+        frame_flow_stages.append(
+            flow_stage(
+                "render_queue",
+                "RENDER",
+                "应用渲染 / 帧抖动",
+                "valid" if isinstance(smartperf_p95, (int, float)) else "unavailable",
+                value=smartperf_p95,
+                unit="ms",
+                value_label="帧间隔 P95",
+                source="HarmonyOS SmartPerf fpsJitters",
+                detail=(
+                    "帧抖动反映应用提交间隔，但量产接口不拆分 RenderThread、BufferQueue 与 GPU 内部阶段。"
+                    if isinstance(smartperf_p95, (int, float))
+                    else "未获得 SmartPerf 帧抖动数组，无法拆分应用渲染阶段。"
+                ),
+                sample_count=smartperf_sample_count,
+                confidence="high" if isinstance(smartperf_p95, (int, float)) else "low",
+            )
+        )
+        if isinstance(render_service_compositor_fps, (int, float)):
+            composer_status = "valid" if primary_flow_key else "primary"
+            if primary_flow_key is None:
+                primary_flow_key = "surface_present"
+            composer_detail = (
+                "RenderService 最近合成提交时间戳窗口；可反映合成节奏，但不保证只包含目标应用。"
+            )
+        else:
+            composer_status = "unavailable"
+            composer_detail = "RenderService 未返回足够的合成时间戳。"
+        frame_flow_stages.append(
+            flow_stage(
+                "surface_present",
+                "COMPOSITOR",
+                "RenderService 合成提交",
+                composer_status,
+                value=render_service_compositor_fps,
+                unit="FPS",
+                value_label="合成器 FPS",
+                source="HarmonyOS RenderService composer fps sampled windows",
+                detail=composer_detail,
+                sample_count=sum(
+                    int(item.get("frame_sample_count") or 0)
+                    for item in render_service_frame_rows
+                ),
+                confidence="medium" if composer_status != "unavailable" else "low",
+            )
+        )
+        frame_flow_stages.append(
+            flow_stage(
+                "display_scanout",
+                "DISPLAY",
+                "RenderService / 屏幕刷新",
+                "reference" if isinstance(current_refresh, (int, float)) and screen_active else "invalid" if isinstance(current_refresh, (int, float)) else "unavailable",
+                value=current_refresh,
+                unit="Hz",
+                value_label="刷新率",
+                source=residency_source or "HarmonyOS RenderService current refresh rate",
+                detail=(
+                    "fpsCount 与当前刷新率描述显示档位驻留，不是目标应用 FPS；HWC 最终 present 计数未公开。"
+                    if screen_active
+                    else f"屏幕状态为 {latest_screen_state or 'unknown'}；刷新率仅保留为无效上下文。"
+                ),
+                confidence="high" if residency_source else "medium",
+                metrics=(
+                    flow_metric("显示/应用倍率", display_to_frame_ratio, "×", 2),
+                ),
+            )
+        )
+
+    frame_flow = {
+        "available": any(
+            item.get("status") != "unavailable" for item in frame_flow_stages
+        ),
+        "platform": platform,
+        "primary_key": primary_flow_key,
+        "valid_count": sum(
+            1
+            for item in frame_flow_stages
+            if item.get("status") in {"primary", "valid"}
+        ),
+        "reference_count": sum(
+            1 for item in frame_flow_stages if item.get("status") == "reference"
+        ),
+        "invalid_count": sum(
+            1 for item in frame_flow_stages if item.get("status") == "invalid"
+        ),
+        "stages": frame_flow_stages,
+        "note": (
+            "不同阶段的数值语义不同：应用提交速率、合成器呈现 FPS 与屏幕刷新率不能直接互换。"
+            "主数据只选择与当前目标应用绑定且能连续产生有效增量的来源。"
+        ),
+    }
+
     gpu_probe = metadata.get("gpu_probe", {})
     gpu_probe = gpu_probe if isinstance(gpu_probe, dict) else {}
     touch_devices = touch_probe.get("devices", [])
@@ -4045,6 +4432,11 @@ def analyze_performance_contexts(
         "one_percent_low_source": one_percent_low_source,
         "one_percent_low_confidence": one_percent_low_confidence,
         "frame_rate_timeline": frame_rate_timeline,
+        "frame_flow": frame_flow,
+        "gfxinfo_submission_fps": gfxinfo_submission_fps,
+        "surface_present_fps": surface_present_fps,
+        "smartperf_app_fps": smartperf_app_fps,
+        "render_service_compositor_fps": render_service_compositor_fps,
         "render_pipeline": render_pipeline,
         "frame_issue_count": frame_issue_count,
         "frame_issue_pct": frame_issue_pct,

@@ -573,6 +573,8 @@ def parse_harmony_compositor_fps(
     )
     return {
         "compositor_fps": 1000.0 / average_ms if average_ms > 0 else None,
+        "render_service_compositor_source": True,
+        "frame_counter_source": "HarmonyOS RenderService composer fps sampled windows",
         "frame_interval_average_ms": average_ms,
         "frame_interval_p95_ms": _percentile_value(intervals_ms, 0.95),
         "frame_interval_maximum_ms": max(intervals_ms),

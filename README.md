@@ -75,8 +75,7 @@ python -m pip install -e .
 mobile-profiler --help
 ```
 
-`mobile-profiler` is the primary command. The former `mobile-power-profiler`
-entry remains available as a compatibility alias for existing scripts.
+`mobile-profiler` is the project command.
 
 The Android/HarmonyOS core profiler has no Python runtime dependency outside
 the standard library. iOS uses a separate Python environment described below.
@@ -301,9 +300,7 @@ mobile-profiler --ios-python $iosPython record `
 ```
 
 The RemotePairing record is stored by `pymobiledevice3`; the last working
-host/port is cached under `~/.mobile-profiler/ios-devices.json`. Existing
-`.mobile-power-profiler` and `.android-power-profiler` caches are read during
-migration. iOS
+host/port is cached under `~/.mobile-profiler/ios-devices.json`. iOS
 physical power commonly refreshes only about every 20 seconds even though DVT
 CPU/GPU/process counters update at 0.5-1 second cadence. The report retains
 `power_sample_age_s` and `collector_cpu_pct`, and never converts DVT
@@ -413,7 +410,7 @@ Useful recording options:
 - `--harmony-high-performance`: temporarily apply HarmonyOS
   `power-shell setmode 602`; valid only in HarmonyOS Performance mode.
 - `--package PACKAGE`: retain a named target app for BatteryStats/UID analysis.
-- `--session-mode`: do not default to the starting foreground package.
+- `--session-mode`: power mode only; do not default to the starting foreground package.
 - `--interval 1`: current, CPU, and frequency sampling interval.
 - `--checkpoint-interval 30`: journal and clock-sync cadence.
 - `--reconnect-timeout 120`: maximum device-transport outage before finalizing partial data.

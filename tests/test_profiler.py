@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from mobile_power_profiler.analysis import (
+from mobile_profiler.analysis import (
     analyze_android_frame_pipeline,
     analyze_memory_frequency,
     analyze_performance_contexts,
@@ -22,7 +22,7 @@ from mobile_power_profiler.analysis import (
     analyze_thermal_history,
     convert_samples,
 )
-from mobile_power_profiler.collector import (
+from mobile_profiler.collector import (
     adb_connection_type,
     android_surface_frame_metrics,
     build_sampler_script,
@@ -43,17 +43,17 @@ from mobile_power_profiler.collector import (
     parse_sampler_line,
     parse_normalized_samples,
 )
-from mobile_power_profiler.cli import filter_events_by_metadata, run_harmony_record
-from mobile_power_profiler.comparison import build_comparison_html, build_run_comparison
-from mobile_power_profiler.evidence import create_evidence_archive
-from mobile_power_profiler.features import resolve_capture_configuration
-from mobile_power_profiler.ios import (
+from mobile_profiler.cli import filter_events_by_metadata, run_harmony_record
+from mobile_profiler.comparison import build_comparison_html, build_run_comparison
+from mobile_profiler.evidence import create_evidence_archive
+from mobile_profiler.features import resolve_capture_configuration
+from mobile_profiler.ios import (
     _load_endpoints,
     collect_ios_session,
     list_ios_devices,
     select_ios_device,
 )
-from mobile_power_profiler.harmony import (
+from mobile_profiler.harmony import (
     build_harmony_smartperf_context,
     build_harmony_smartperf_sample,
     build_harmony_sample,
@@ -76,11 +76,11 @@ from mobile_power_profiler.harmony import (
     read_harmony_power_mode,
     set_harmony_power_mode,
 )
-from mobile_power_profiler.log_import import (
+from mobile_profiler.log_import import (
     host_epoch_to_device_uptime,
     import_timestamped_log,
 )
-from mobile_power_profiler.models import (
+from mobile_profiler.models import (
     ClockSyncPoint,
     CommandResult,
     ContextSample,
@@ -95,7 +95,7 @@ from mobile_power_profiler.models import (
     SystemSnapshot,
     ThermalSnapshot,
 )
-from mobile_power_profiler.parsers import (
+from mobile_profiler.parsers import (
     parse_activity_processes,
     parse_cpuset_policy_state,
     parse_gpu_dump,
@@ -106,8 +106,8 @@ from mobile_power_profiler.parsers import (
     parse_top_processes,
     parse_top_threads,
 )
-from mobile_power_profiler.report import _report_bundle, build_report_fragment
-from mobile_power_profiler.storage import (
+from mobile_profiler.report import _report_bundle, build_report_fragment
+from mobile_profiler.storage import (
     RunJournal,
     load_contexts,
     load_scheduler_snapshots,
@@ -1251,19 +1251,19 @@ class StreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with RunJournal(root) as journal, patch(
-                "mobile_power_profiler.collector._wait_for_device",
+                "mobile_profiler.collector._wait_for_device",
                 side_effect=[True, True, False],
             ), patch(
-                "mobile_power_profiler.collector.collect_clock_sync",
+                "mobile_profiler.collector.collect_clock_sync",
                 return_value=None,
             ), patch(
-                "mobile_power_profiler.collector._device_ready",
+                "mobile_profiler.collector._device_ready",
                 return_value=False,
             ), patch(
-                "mobile_power_profiler.collector.subprocess.Popen",
+                "mobile_profiler.collector.subprocess.Popen",
                 side_effect=processes,
             ), patch(
-                "mobile_power_profiler.collector.time.sleep",
+                "mobile_profiler.collector.time.sleep",
                 return_value=None,
             ):
                 result = collect_streaming_session(
@@ -1451,6 +1451,11 @@ class HarmonyAdapterTests(unittest.TestCase):
         residency = {row["refresh_rate_hz"]: row for row in result["refresh_residency"]}
         self.assertAlmostEqual(residency[60.0]["share_pct"], 66.666, places=2)
         self.assertEqual(result["gpu_renderer"], "Maleoon 920C")
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(flow["app_submission"]["status"], "unavailable")
+        self.assertEqual(flow["surface_present"]["status"], "primary")
+        self.assertAlmostEqual(flow["surface_present"]["value"], 88.9, places=1)
+        self.assertEqual(flow["display_scanout"]["status"], "reference")
 
     def test_android_performance_context_analysis_uses_counter_deltas(self) -> None:
         contexts = [
@@ -1513,6 +1518,12 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertIsNone(result["render_height_px"])
         self.assertFalse(result["render_resolution_available"])
         self.assertFalse(result["render_resolution_estimated"])
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(result["frame_flow"]["primary_key"], "app_submission")
+        self.assertEqual(flow["app_submission"]["status"], "primary")
+        self.assertAlmostEqual(flow["app_submission"]["value"], 6.0)
+        self.assertEqual(flow["surface_present"]["status"], "unavailable")
+        self.assertEqual(flow["display_scanout"]["status"], "reference")
 
     def test_android_surface_frames_override_static_gfxinfo_counter(self) -> None:
         contexts = [
@@ -1561,6 +1572,12 @@ class HarmonyAdapterTests(unittest.TestCase):
             "Android SurfaceFlinger BLAST layer present timestamps",
         )
         self.assertEqual(len(result["frame_rate_timeline"]), 1)
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(result["frame_flow"]["primary_key"], "surface_present")
+        self.assertEqual(flow["app_submission"]["status"], "invalid")
+        self.assertEqual(flow["app_submission"]["value"], 0.0)
+        self.assertEqual(flow["surface_present"]["status"], "primary")
+        self.assertAlmostEqual(flow["surface_present"]["value"], 60.07)
 
     def test_android_frame_pipeline_and_performance_test_items_follow_slow_frame_path(self) -> None:
         def frame_record(frame_id: int, base: int, completed_ms: int) -> dict[str, int]:
@@ -1912,7 +1929,7 @@ command exec finished!
             "Set Mode Failed, current mode is: 600\n"
         )
         with patch(
-            "mobile_power_profiler.harmony.hdc_shell",
+            "mobile_profiler.harmony.hdc_shell",
             return_value=CommandResult([], 0, help_output, "", 0.01),
         ):
             state = read_harmony_power_mode("hdc", "device")
@@ -1920,7 +1937,7 @@ command exec finished!
         self.assertEqual(state["current_mode"], 600)
 
         with patch(
-            "mobile_power_profiler.harmony.hdc_shell",
+            "mobile_profiler.harmony.hdc_shell",
             side_effect=[
                 CommandResult([], 0, "Set Mode Success!", "", 0.01),
                 CommandResult(
@@ -2011,16 +2028,16 @@ command exec finished!
 
             with (
                 patch(
-                    "mobile_power_profiler.cli.select_harmony_device",
+                    "mobile_profiler.cli.select_harmony_device",
                     return_value={
                         "serial": "harmony:USB123",
                         "hdc_target": "USB123",
                         "connection_type": "usb",
                     },
                 ),
-                patch("mobile_power_profiler.cli.probe_harmony_device", return_value=probe),
+                patch("mobile_profiler.cli.probe_harmony_device", return_value=probe),
                 patch(
-                    "mobile_power_profiler.cli.read_harmony_power_mode",
+                    "mobile_profiler.cli.read_harmony_power_mode",
                     return_value={
                         "supported": True,
                         "current_mode": 600,
@@ -2028,19 +2045,19 @@ command exec finished!
                     },
                 ),
                 patch(
-                    "mobile_power_profiler.cli.set_harmony_power_mode",
+                    "mobile_profiler.cli.set_harmony_power_mode",
                     side_effect=change_mode,
                 ) as set_mode,
                 patch(
-                    "mobile_power_profiler.cli.collect_harmony_session",
+                    "mobile_profiler.cli.collect_harmony_session",
                     side_effect=RuntimeError("collector failed"),
                 ),
                 patch(
-                    "mobile_power_profiler.cli.finalize_run",
+                    "mobile_profiler.cli.finalize_run",
                     side_effect=finalize_after_restore,
                 ),
-                patch("mobile_power_profiler.cli.print_run_summary"),
-                patch("mobile_power_profiler.cli.sys.stderr", new=io.StringIO()),
+                patch("mobile_profiler.cli.print_run_summary"),
+                patch("mobile_profiler.cli.sys.stderr", new=io.StringIO()),
             ):
                 result = run_harmony_record(args)
 
@@ -2053,25 +2070,16 @@ command exec finished!
 
 
 class IosAdapterTests(unittest.TestCase):
-    def test_legacy_project_cache_is_loaded_after_rename(self) -> None:
+    def test_project_cache_is_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            android_legacy = root / ".android-power-profiler" / "ios-devices.json"
-            mobile_power_legacy = root / ".mobile-power-profiler" / "ios-devices.json"
             current = root / ".mobile-profiler" / "ios-devices.json"
-            android_legacy.parent.mkdir(parents=True)
-            android_legacy.write_text(
+            current.parent.mkdir(parents=True)
+            current.write_text(
                 json.dumps({"00008150-TEST": {"host": "192.0.2.10", "port": 49152}}),
                 encoding="utf-8",
             )
-            with (
-                patch("mobile_power_profiler.ios.LEGACY_IOS_ENDPOINTS_PATH", android_legacy),
-                patch(
-                    "mobile_power_profiler.ios.LEGACY_MOBILE_POWER_IOS_ENDPOINTS_PATH",
-                    mobile_power_legacy,
-                ),
-                patch("mobile_power_profiler.ios.IOS_ENDPOINTS_PATH", current),
-            ):
+            with patch("mobile_profiler.ios.IOS_ENDPOINTS_PATH", current):
                 endpoints = _load_endpoints()
 
         self.assertEqual(endpoints["00008150-TEST"]["host"], "192.0.2.10")
@@ -2079,7 +2087,7 @@ class IosAdapterTests(unittest.TestCase):
     def test_usb_transport_is_visible_even_when_cached_wireless_endpoint_is_ready(self) -> None:
         with (
             patch(
-                "mobile_power_profiler.ios._run_bridge_json",
+                "mobile_profiler.ios._run_bridge_json",
                 return_value={
                     "devices": [
                         {
@@ -2094,13 +2102,13 @@ class IosAdapterTests(unittest.TestCase):
                 },
             ),
             patch(
-                "mobile_power_profiler.ios._load_endpoints",
+                "mobile_profiler.ios._load_endpoints",
                 return_value={
                     "00008150-TEST": {"host": "192.0.2.10", "port": 49152}
                 },
             ),
-            patch("mobile_power_profiler.ios._save_endpoint"),
-            patch("mobile_power_profiler.ios._endpoint_reachable", return_value=True),
+            patch("mobile_profiler.ios._save_endpoint"),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=True),
         ):
             devices, error = list_ios_devices("ios-python")
 
@@ -2121,11 +2129,11 @@ class IosAdapterTests(unittest.TestCase):
         }
         with (
             patch(
-                "mobile_power_profiler.ios._run_bridge_json",
+                "mobile_profiler.ios._run_bridge_json",
                 side_effect=RuntimeError("Bonjour unavailable"),
             ),
-            patch("mobile_power_profiler.ios._load_endpoints", return_value=cached),
-            patch("mobile_power_profiler.ios._endpoint_reachable", return_value=True),
+            patch("mobile_profiler.ios._load_endpoints", return_value=cached),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=True),
         ):
             devices, error = list_ios_devices("ios-python")
             selected = select_ios_device("ios:00008150-TEST", "ios-python")
@@ -2196,7 +2204,7 @@ class IosAdapterTests(unittest.TestCase):
             root = Path(directory)
             with (
                 RunJournal(root) as journal,
-                patch("mobile_power_profiler.ios.subprocess.Popen", return_value=FakeProcess()),
+                patch("mobile_profiler.ios.subprocess.Popen", return_value=FakeProcess()),
             ):
                 result = collect_ios_session(
                     "ios-python",
@@ -2388,12 +2396,12 @@ class ReportTests(unittest.TestCase):
             }
         )
         self.assertIn('id="mobile-profiler"', power_fragment)
-        self.assertNotIn('id="mobile-power-profiler"', power_fragment)
         self.assertIn('data-test-mode="power"', power_fragment)
         self.assertIn("功耗压力分析", power_fragment)
         self.assertIn("系统设置变化", power_fragment)
         self.assertIn('data-test-mode="performance"', performance_fragment)
-        self.assertIn("渲染链路与帧延迟", performance_fragment)
+        self.assertIn("帧率数据流与渲染链路", performance_fragment)
+        self.assertIn("逐阶段帧数据", performance_fragment)
         self.assertIn("性能测试项矩阵", performance_fragment)
         self.assertIn("性能模式不继续拆分组件、UID、Wakelock", performance_fragment)
         self.assertNotIn("<td><strong>渲染分辨率</strong></td>", performance_fragment)

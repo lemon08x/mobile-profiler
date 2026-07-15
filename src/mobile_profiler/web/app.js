@@ -133,6 +133,7 @@
       value: point => finite(point.power_mw) ? Number(point.power_mw) / 1000 : null,
       unit: "W",
       digits: 3,
+      axis: { fixedMin: 0, minSpan: .5, padding: .08, tickDigits: 2 },
     },
     current_ma: {
       title: "放电电流",
@@ -141,6 +142,7 @@
       value: point => finite(point.current_ma) ? Number(point.current_ma) : null,
       unit: "mA",
       digits: 0,
+      axis: { fixedMin: 0, minSpan: 200, padding: .08, tickDigits: 0 },
     },
     cpu_pct: {
       title: "CPU 总负载",
@@ -149,6 +151,7 @@
       value: point => finite(point.cpu_pct) ? Number(point.cpu_pct) : null,
       unit: "%",
       digits: 1,
+      axis: { fixedMin: 0, fixedMax: 100, tickStep: 25, tickDigits: 0 },
     },
     memory_frequency_mhz: {
       title: "内存 / DMC 频率",
@@ -157,6 +160,7 @@
       value: point => finite(point.memory_frequency_mhz) ? Number(point.memory_frequency_mhz) : null,
       unit: "MHz",
       digits: 0,
+      axis: { fixedMin: 0, minSpan: 400, padding: .08, tickDigits: 0 },
     },
     temperature_c: {
       title: "电池温度",
@@ -165,6 +169,7 @@
       value: point => finite(point.temperature_c) ? Number(point.temperature_c) : null,
       unit: "°C",
       digits: 1,
+      axis: { minSpan: 6, padding: .04, tickDigits: 1 },
     },
     voltage_mv: {
       title: "电池电压",
@@ -173,6 +178,7 @@
       value: point => finite(point.voltage_mv) ? Number(point.voltage_mv) / 1000 : null,
       unit: "V",
       digits: 3,
+      axis: { minSpan: .3, padding: .04, tickDigits: 2 },
     },
     frame_rate_fps: {
       title: "实时帧率",
@@ -184,6 +190,13 @@
       series: "performance",
       secondaryLabel: "1% LOW",
       secondaryQuantile: .01,
+      axis: { fixedMin: 0, minSpan: 30, padding: .08, tickDigits: 0 },
+      reference: active => {
+        const refreshRate = Number(active?.performance?.current_refresh_rate_hz);
+        return finite(refreshRate)
+          ? { value: refreshRate, label: `刷新率 ${formatAxisNumber(refreshRate, 0)} Hz` }
+          : null;
+      },
     },
     frame_time_ms: {
       title: "帧耗时 P95",
@@ -195,6 +208,16 @@
       series: "performance",
       secondaryLabel: "P99",
       secondaryQuantile: .99,
+      axis: { fixedMin: 0, minSpan: 10, padding: .08, tickDigits: 1 },
+      reference: active => {
+        const refreshRate = Number(active?.performance?.current_refresh_rate_hz);
+        return finite(refreshRate) && refreshRate > 0
+          ? {
+            value: 1000 / refreshRate,
+            label: `帧预算 ${formatAxisNumber(1000 / refreshRate, 2)} ms`,
+          }
+          : null;
+      },
     },
     gpu_load_pct: {
       title: "GPU 负载",
@@ -203,6 +226,7 @@
       value: point => finite(point.gpu_load_pct) ? Number(point.gpu_load_pct) : null,
       unit: "%",
       digits: 1,
+      axis: { fixedMin: 0, fixedMax: 100, tickStep: 25, tickDigits: 0 },
     },
     gpu_frequency_mhz: {
       title: "GPU 频率",
@@ -211,6 +235,7 @@
       value: point => finite(point.gpu_frequency_mhz) ? Number(point.gpu_frequency_mhz) : null,
       unit: "MHz",
       digits: 0,
+      axis: { fixedMin: 0, minSpan: 400, padding: .08, tickDigits: 0 },
     },
   };
 
@@ -258,6 +283,102 @@
 
   function clamp(value, minimum, maximum) {
     return Math.max(minimum, Math.min(maximum, value));
+  }
+
+  function formatAxisNumber(value, maximumDigits = 0) {
+    const threshold = 10 ** -(maximumDigits + 1);
+    const normalized = Math.abs(Number(value)) < threshold ? 0 : Number(value);
+    return normalized.toLocaleString("zh-CN", {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: maximumDigits,
+      useGrouping: Math.abs(normalized) >= 1000,
+    });
+  }
+
+  function niceChartStep(rawStep) {
+    if (!finite(rawStep) || Number(rawStep) <= 0) return 1;
+    const exponent = Math.floor(Math.log10(Number(rawStep)));
+    const magnitude = 10 ** exponent;
+    const normalized = Number(rawStep) / magnitude;
+    const factor = normalized <= 1.5
+      ? 1
+      : normalized <= 2.25
+        ? 2
+        : normalized <= 3.5
+          ? 2.5
+          : normalized <= 7.5
+            ? 5
+            : 10;
+    return factor * magnitude;
+  }
+
+  function buildChartScale(values, definition) {
+    const axis = definition.axis || {};
+    const observedMin = Math.min(...values);
+    const observedMax = Math.max(...values);
+    let minimum = finite(axis.fixedMin) ? Number(axis.fixedMin) : observedMin;
+    let maximum = finite(axis.fixedMax) ? Number(axis.fixedMax) : observedMax;
+
+    const minimumSpan = Math.max(0, Number(axis.minSpan || 0));
+    if (maximum - minimum < minimumSpan) {
+      if (finite(axis.fixedMin) && !finite(axis.fixedMax)) {
+        maximum = minimum + minimumSpan;
+      } else if (finite(axis.fixedMax) && !finite(axis.fixedMin)) {
+        minimum = maximum - minimumSpan;
+      } else {
+        const midpoint = (minimum + maximum) / 2;
+        minimum = midpoint - minimumSpan / 2;
+        maximum = midpoint + minimumSpan / 2;
+      }
+    }
+
+    const padding = Math.max(0, Number(axis.padding ?? .08));
+    const span = Math.max(Number.EPSILON, maximum - minimum);
+    if (!finite(axis.fixedMin)) minimum -= span * padding;
+    if (!finite(axis.fixedMax)) maximum += span * padding;
+
+    const targetIntervals = Math.max(3, Number(axis.targetIntervals || 4));
+    const tickStep = finite(axis.tickStep)
+      ? Number(axis.tickStep)
+      : niceChartStep((maximum - minimum) / targetIntervals);
+    const scaleMin = finite(axis.fixedMin)
+      ? Number(axis.fixedMin)
+      : Math.floor((minimum + tickStep * 1e-9) / tickStep) * tickStep;
+    let scaleMax = finite(axis.fixedMax)
+      ? Number(axis.fixedMax)
+      : Math.ceil((maximum - tickStep * 1e-9) / tickStep) * tickStep;
+    if (scaleMax <= scaleMin) scaleMax = scaleMin + tickStep;
+
+    const ticks = [];
+    const tickCount = Math.round((scaleMax - scaleMin) / tickStep);
+    for (let index = 0; index <= tickCount; index += 1) {
+      ticks.push(scaleMin + index * tickStep);
+    }
+    return {
+      minimum: scaleMin,
+      maximum: scaleMax,
+      tickDigits: Math.max(0, Number(axis.tickDigits ?? definition.digits ?? 0)),
+      ticks,
+    };
+  }
+
+  function buildTimeTicks(minimum, maximum, targetIntervals) {
+    const span = Math.max(.001, maximum - minimum);
+    const candidates = [
+      1, 2, 5, 10, 15, 30,
+      60, 120, 300, 600, 900, 1800,
+      3600, 7200, 14400, 28800, 43200,
+    ];
+    const rawStep = span / Math.max(2, targetIntervals);
+    const step = candidates.find(candidate => candidate >= rawStep)
+      || niceChartStep(rawStep);
+    const ticks = [minimum];
+    const firstInner = Math.ceil((minimum + step * .2) / step) * step;
+    for (let value = firstInner; value < maximum - step * .2; value += step) {
+      ticks.push(value);
+    }
+    if (maximum - ticks.at(-1) > .001) ticks.push(maximum);
+    return ticks;
   }
 
   function escapeHtml(value) {
@@ -1424,8 +1545,11 @@
 
   function renderRenderPipeline(active) {
     const platform = activePlatform(active);
+    const performance = active?.performance || {};
+    const frameFlow = performance.frame_flow || {};
+    const flowStages = Array.isArray(frameFlow.stages) ? frameFlow.stages : [];
     const render = active?.render_performance || {};
-    const pipeline = render.pipeline || active?.performance?.render_pipeline || {};
+    const pipeline = render.pipeline || performance.render_pipeline || {};
     const dominant = render.dominant_stage || pipeline.dominant_stage || {};
     const stages = Array.isArray(pipeline.stages) ? pipeline.stages : [];
     const monitorThreads = Array.isArray(active?.system_monitor?.threads) ? active.system_monitor.threads : [];
@@ -1433,15 +1557,56 @@
       ? render.render_threads
       : monitorThreads.filter(item => /renderthread|surfaceflinger|renderengine|composer|hwc|gpu|main/i.test(`${item.name || ""} ${item.process || ""}`)).slice(0, 10);
     const power = render.power_recording || {};
+    const statusLabels = {
+      primary: "主数据",
+      valid: "有效",
+      reference: "仅参考",
+      invalid: "无效",
+      unavailable: "无数据",
+    };
+    const allowedStatuses = new Set(Object.keys(statusLabels));
+    const primaryStage = flowStages.find(item => item?.key === frameFlow.primary_key)
+      || flowStages.find(item => item?.status === "primary");
+    $("#render-pipeline-source").textContent = primaryStage
+      ? `主数据 · ${primaryStage.phase || primaryStage.label || "FPS"}`
+      : pipeline.available
+        ? `${Number(pipeline.frame_count || 0)} detailed frames`
+        : "未找到有效主帧率";
+    const summaryParts = [];
+    if (primaryStage) summaryParts.push(`主数据：${primaryStage.label || primaryStage.phase}`);
+    if (Number(frameFlow.valid_count || 0)) summaryParts.push(`有效阶段 ${Number(frameFlow.valid_count)} 个`);
+    if (Number(frameFlow.reference_count || 0)) summaryParts.push(`参考 ${Number(frameFlow.reference_count)} 个`);
+    if (Number(frameFlow.invalid_count || 0)) summaryParts.push(`无效 ${Number(frameFlow.invalid_count)} 个`);
+    $("#frame-flow-summary").textContent = summaryParts.length
+      ? summaryParts.join(" · ")
+      : "当前会话尚未形成可判定的帧率数据流。";
+    $("#frame-flow-note").innerHTML = `<strong>判定边界：</strong>${escapeHtml(frameFlow.note || "应用提交速率、合成器呈现 FPS 与屏幕刷新率不能直接互换；无效来源保留展示但不会参与主 FPS 和 1% Low。")}`;
+    $("#frame-flow-list").innerHTML = flowStages.length ? flowStages.map((item, index) => {
+      const status = allowedStatuses.has(String(item.status)) ? String(item.status) : "unavailable";
+      const valueDigits = item.unit === "Hz" ? 0 : item.unit === "ms" ? 2 : 1;
+      const value = finite(item.value) ? Number(item.value).toFixed(valueDigits) : "--";
+      const metrics = Array.isArray(item.metrics) ? item.metrics.filter(metric => finite(metric?.value)) : [];
+      const metricHtml = metrics.length ? `<div class="frame-flow-metrics">${metrics.slice(0, 3).map(metric => `<span><small>${escapeHtml(metric.label || "指标")}</small><b>${Number(metric.value).toFixed(Number(metric.digits ?? 1))}${metric.unit ? ` ${escapeHtml(metric.unit)}` : ""}</b></span>`).join("")}</div>` : "";
+      const sampleText = finite(item.sample_count) && Number(item.sample_count) > 0
+        ? `${Number(item.sample_count)} samples`
+        : item.confidence ? `${escapeHtml(item.confidence)} confidence` : "";
+      return `<article class="frame-flow-stage ${status}">
+        <header><span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.phase || "STAGE")}</span><i>${statusLabels[status]}</i></header>
+        <h4>${escapeHtml(item.label || item.key || "帧阶段")}</h4>
+        <div class="frame-flow-value"><strong>${value}</strong><small>${escapeHtml(item.unit || "")}</small></div>
+        <span class="frame-flow-value-label">${escapeHtml(item.value_label || "当前阶段")}</span>
+        ${metricHtml}
+        <p class="frame-flow-source" title="${escapeHtml(item.source || "")}">${escapeHtml(item.source || "未记录来源")}</p>
+        <p class="frame-flow-detail">${escapeHtml(item.detail || "暂无判定说明")}</p>
+        ${sampleText ? `<footer>${sampleText}</footer>` : ""}
+      </article>`;
+    }).join("") : '<div class="empty-row">等待应用、渲染、合成与显示阶段帧数据</div>';
     $("#render-pipeline-dominant").textContent = dominant.label || "--";
     $("#render-pipeline-dominant-detail").textContent = finite(dominant.p95_ms)
       ? `P95 ${Number(dominant.p95_ms).toFixed(2)} ms · P99 ${formatNumber(dominant.p99_ms, 2)} ms`
       : pipeline.limitations || (platform === "harmony"
         ? "HarmonyOS 量产接口提供帧抖动与合成节奏，不提供 Android framestats 阶段时间戳"
         : "等待详细帧时间戳");
-    $("#render-pipeline-source").textContent = pipeline.available
-      ? `${Number(pipeline.frame_count || 0)} detailed frames`
-      : platform === "harmony" ? "SmartPerf frame jitter / RenderService" : "gfxinfo framestats";
     const averageWholePower = finite(power.average_power_mw) ? power.average_power_mw : active?.summary?.average_power_mw;
     $("#performance-whole-power").textContent = finite(averageWholePower)
       ? `${(Number(averageWholePower) / 1000).toFixed(3)} W`
@@ -1805,6 +1970,7 @@
       empty.classList.remove("hidden");
       $("#chart-average").textContent = "--";
       $("#chart-p95").textContent = "--";
+      $("#chart-range").textContent = "--";
       app.chartGeometry = null;
       return;
     }
@@ -1815,46 +1981,138 @@
     $("#chart-average").textContent = `${average.toFixed(definition.digits)} ${definition.unit}`;
     $("#chart-p95").textContent = p95 === null ? "--" : `${p95.toFixed(definition.digits)} ${definition.unit}`;
 
-    const width = 1000;
-    const height = 320;
-    const margins = { left: 58, right: 22, top: 18, bottom: 36 };
+    const width = Math.max(320, Math.round(svg.clientWidth || 1000));
+    const height = Math.max(240, Math.round(svg.clientHeight || 320));
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    const compact = width < 520;
+    const margins = {
+      left: compact ? 52 : 64,
+      right: compact ? 12 : 20,
+      top: 28,
+      bottom: compact ? 38 : 40,
+    };
     const plotWidth = width - margins.left - margins.right;
     const plotHeight = height - margins.top - margins.bottom;
     const minTime = Math.min(...points.map(point => point.elapsed));
     const maxTime = Math.max(...points.map(point => point.elapsed));
-    let minValue = Math.min(...values);
-    let maxValue = Math.max(...values);
-    if (minValue === maxValue) {
-      minValue -= Math.max(1, Math.abs(minValue) * .05);
-      maxValue += Math.max(1, Math.abs(maxValue) * .05);
-    } else {
-      const padding = (maxValue - minValue) * .12;
-      minValue -= padding;
-      maxValue += padding;
-    }
-    if (app.metric === "cpu_pct" || app.metric === "gpu_load_pct") {
-      minValue = Math.max(0, minValue);
-      maxValue = Math.min(100, Math.max(10, maxValue));
-    }
+    const scale = buildChartScale(values, definition);
+    const minValue = scale.minimum;
+    const maxValue = scale.maximum;
+    const rangeMinimum = formatAxisNumber(minValue, scale.tickDigits);
+    const rangeMaximum = formatAxisNumber(maxValue, scale.tickDigits);
+    $("#chart-range").textContent = `${rangeMinimum}–${rangeMaximum} ${definition.unit}`;
+    svg.setAttribute(
+      "aria-label",
+      `${definition.title}，坐标范围 ${rangeMinimum} 到 ${rangeMaximum} ${definition.unit}`,
+    );
     const xFor = elapsed => margins.left + ((elapsed - minTime) / Math.max(.001, maxTime - minTime)) * plotWidth;
     const yFor = value => margins.top + (1 - (value - minValue) / Math.max(.001, maxValue - minValue)) * plotHeight;
 
     const grid = svgNode("g", { class: "chart-grid" });
-    for (let index = 0; index <= 4; index += 1) {
-      const ratio = index / 4;
-      const y = margins.top + ratio * plotHeight;
-      const value = maxValue - ratio * (maxValue - minValue);
-      grid.appendChild(svgNode("line", { x1: margins.left, y1: y, x2: width - margins.right, y2: y, class: "grid-line" }));
-      grid.appendChild(svgNode("text", { x: margins.left - 9, y: y + 3, "text-anchor": "end", class: "axis-label" }, `${value.toFixed(definition.digits)} ${definition.unit}`));
-    }
-    for (let index = 0; index <= 5; index += 1) {
-      const ratio = index / 5;
-      const x = margins.left + ratio * plotWidth;
-      const elapsed = minTime + ratio * (maxTime - minTime);
-      grid.appendChild(svgNode("line", { x1: x, y1: margins.top, x2: x, y2: height - margins.bottom, class: "grid-line" }));
-      grid.appendChild(svgNode("text", { x, y: height - 13, "text-anchor": index === 0 ? "start" : index === 5 ? "end" : "middle", class: "axis-label" }, formatDuration(elapsed)));
-    }
+    grid.appendChild(svgNode("text", {
+      x: margins.left,
+      y: 15,
+      class: "axis-unit",
+    }, definition.unit));
+    scale.ticks.forEach(value => {
+      const y = yFor(value);
+      const isBoundary = Math.abs(value - minValue) < 1e-9 || Math.abs(value - maxValue) < 1e-9;
+      grid.appendChild(svgNode("line", {
+        x1: margins.left,
+        y1: y,
+        x2: width - margins.right,
+        y2: y,
+        class: `grid-line grid-line-y${isBoundary ? " grid-line-boundary" : ""}`,
+      }));
+      grid.appendChild(svgNode("line", {
+        x1: margins.left - 4,
+        y1: y,
+        x2: margins.left,
+        y2: y,
+        class: "axis-tick",
+      }));
+      grid.appendChild(svgNode("text", {
+        x: margins.left - 9,
+        y,
+        "text-anchor": "end",
+        "dominant-baseline": "middle",
+        class: "axis-label axis-label-y",
+      }, formatAxisNumber(value, scale.tickDigits)));
+    });
+    const timeTicks = buildTimeTicks(minTime, maxTime, compact ? 3 : width < 760 ? 4 : 5);
+    timeTicks.forEach((elapsed, index) => {
+      const x = xFor(elapsed);
+      grid.appendChild(svgNode("line", {
+        x1: x,
+        y1: margins.top,
+        x2: x,
+        y2: height - margins.bottom,
+        class: "grid-line grid-line-x",
+      }));
+      grid.appendChild(svgNode("line", {
+        x1: x,
+        y1: height - margins.bottom,
+        x2: x,
+        y2: height - margins.bottom + 4,
+        class: "axis-tick",
+      }));
+      grid.appendChild(svgNode("text", {
+        x,
+        y: height - 14,
+        "text-anchor": index === 0 ? "start" : index === timeTicks.length - 1 ? "end" : "middle",
+        class: "axis-label axis-label-x",
+      }, formatDuration(elapsed)));
+    });
+    grid.appendChild(svgNode("line", {
+      x1: margins.left,
+      y1: margins.top,
+      x2: margins.left,
+      y2: height - margins.bottom,
+      class: "axis-line",
+    }));
+    grid.appendChild(svgNode("line", {
+      x1: margins.left,
+      y1: height - margins.bottom,
+      x2: width - margins.right,
+      y2: height - margins.bottom,
+      class: "axis-line",
+    }));
     svg.appendChild(grid);
+
+    const reference = typeof definition.reference === "function"
+      ? definition.reference(active)
+      : null;
+    let referenceLabel = null;
+    if (reference && finite(reference.value) && reference.value >= minValue && reference.value <= maxValue) {
+      const referenceY = yFor(Number(reference.value));
+      const referenceLabelY = referenceY <= margins.top + 14 ? referenceY + 15 : referenceY - 6;
+      svg.appendChild(svgNode("line", {
+        x1: margins.left,
+        y1: referenceY,
+        x2: width - margins.right,
+        y2: referenceY,
+        class: "reference-line",
+      }));
+      const referenceLabelWidth = Math.min(
+        compact ? 116 : 150,
+        Math.max(76, String(reference.label).length * (compact ? 5.8 : 6.4) + 12),
+      );
+      referenceLabel = svgNode("g", { class: "reference-label-group" });
+      referenceLabel.appendChild(svgNode("rect", {
+        x: width - margins.right - referenceLabelWidth,
+        y: referenceLabelY - 11,
+        width: referenceLabelWidth,
+        height: 16,
+        rx: 4,
+        class: "reference-label-bg",
+      }));
+      referenceLabel.appendChild(svgNode("text", {
+        x: width - margins.right - 5,
+        y: referenceLabelY,
+        "text-anchor": "end",
+        class: "reference-label",
+      }, reference.label));
+    }
 
     const coordinates = points.map(point => ({ ...point, x: xFor(point.elapsed), y: yFor(Number(point.value)) }));
     const linePath = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
@@ -1865,6 +2123,7 @@
     svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 4, class: "latest-marker" }));
     const hoverLine = svgNode("line", { x1: last.x, y1: margins.top, x2: last.x, y2: height - margins.bottom, class: "hover-line", opacity: 0 });
     svg.appendChild(hoverLine);
+    if (referenceLabel) svg.appendChild(referenceLabel);
     app.chartGeometry = { coordinates, width, height, margins, hoverLine, definition };
   }
 
@@ -2278,7 +2537,7 @@
       package: $("#package-input").value.trim(),
       start_context: $("#start-context-input").value,
       start_note: $("#start-note-input").value.trim(),
-      session_mode: $("#session-mode-input").checked,
+      session_mode: app.testMode === "power" && $("#session-mode-input").checked,
       require_unplugged: $("#unplugged-input").checked,
       checkpoint_interval: Number($("#checkpoint-input").value),
       reconnect_timeout: Number($("#reconnect-input").value),

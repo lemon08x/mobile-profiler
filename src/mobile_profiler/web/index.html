@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-6">
-  <script src="/app.js?v=platform-ui-6" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-12">
+  <script src="/app.js?v=platform-ui-12" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -203,13 +203,13 @@
                 </div>
 
                 <div class="switch-stack">
-                  <label class="switch-row">
+                  <label class="switch-row" data-mode-only="power">
                     <span><strong>多应用会话模式</strong><small>跟踪前台应用切换，适合 BTR2</small></span>
                     <input id="session-mode-input" name="session_mode" type="checkbox" checked><i aria-hidden="true"></i>
                   </label>
                   <label class="switch-row emphasis">
                     <span><strong>要求断开外部供电</strong><small>检测到 AC / USB / 无线充电时拒绝采集</small></span>
-                    <input id="unplugged-input" name="require_unplugged" type="checkbox" checked><i aria-hidden="true"></i>
+                    <input id="unplugged-input" name="require_unplugged" type="checkbox"><i aria-hidden="true"></i>
                   </label>
                   <label class="switch-row">
                     <span><strong>性能干扰监控</strong><small>低频采集进程与温度，仅在发现后台或热异常时提示</small></span>
@@ -356,7 +356,7 @@
                     <button type="button" data-metric="gpu_frequency_mhz" data-mode-only="performance" data-platforms="android harmony">GPU 频率</button>
                   </div>
                 </div>
-                <div class="chart-meta"><span><i class="legend-line"></i><b id="chart-legend">Power</b></span><span id="chart-average-label">AVG <b id="chart-average">--</b></span><span><em id="chart-secondary-label">P95</em> <b id="chart-p95">--</b></span></div>
+                <div class="chart-meta"><span><i class="legend-line"></i><b id="chart-legend">Power</b></span><span id="chart-average-label">AVG <b id="chart-average">--</b></span><span><em id="chart-secondary-label">P95</em> <b id="chart-p95">--</b></span><span><em>RANGE</em> <b id="chart-range">--</b></span></div>
                 <div class="chart-wrap" id="chart-wrap">
                   <svg id="live-chart" viewBox="0 0 1000 320" preserveAspectRatio="none" role="img" aria-label="实时遥测曲线"></svg>
                   <div class="chart-empty" id="chart-empty"><span class="empty-wave" aria-hidden="true"></span><strong>等待遥测数据</strong><small>开始采集后，曲线将在这里实时更新</small></div>
@@ -427,7 +427,13 @@
               </section>
 
               <section class="panel render-pipeline-panel" data-mode-only="performance" data-platforms="android harmony">
-                <div class="panel-heading"><div><small>FRAME PIPELINE</small><h2>渲染链路延迟</h2></div><span class="data-source" id="render-pipeline-source">gfxinfo framestats</span></div>
+                <div class="panel-heading"><div><small>FRAME PIPELINE</small><h2>帧率数据流与渲染链路</h2></div><span class="data-source" id="render-pipeline-source">等待帧数据</span></div>
+                <div class="frame-flow-heading">
+                  <div><h3>逐阶段帧数据</h3><p id="frame-flow-summary">区分应用提交、合成呈现和屏幕刷新，避免把不同语义的数据混为一个 FPS。</p></div>
+                  <div class="frame-flow-legend" aria-label="帧数据有效性图例"><span class="primary">主数据</span><span class="valid">有效</span><span class="reference">仅参考</span><span class="invalid">无效</span><span class="unavailable">无数据</span></div>
+                </div>
+                <div class="frame-flow-list" id="frame-flow-list"><div class="empty-row">等待应用、合成器与显示阶段帧数据</div></div>
+                <p class="observability-note frame-flow-note" id="frame-flow-note"><strong>判定边界：</strong>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率的语义不同，只有绑定当前目标应用且持续产生有效增量的来源会标记为主数据。</p>
                 <div class="pipeline-summary"><div><small>主要延迟阶段</small><strong id="render-pipeline-dominant">--</strong><span id="render-pipeline-dominant-detail">等待详细帧时间戳</span></div><div><small>整机功耗</small><strong id="performance-whole-power">--</strong><span>只记录，不做来源归因</span></div></div>
                 <div class="pipeline-grid">
                   <div><h3>阶段 P95</h3><div class="pipeline-list" id="render-pipeline-stage-list"><div class="empty-row">等待详细 framestats</div></div></div>

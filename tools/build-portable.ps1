@@ -50,7 +50,7 @@ try {
     Expand-Archive -LiteralPath $embedZip -DestinationPath $runtime -Force
 
     Write-Host "Copying Mobile Profiler into the portable site-packages..."
-    Copy-Item -LiteralPath (Join-Path $repoRoot "src\mobile_power_profiler") -Destination (Join-Path $sitePackages "mobile_power_profiler") -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $repoRoot "src\mobile_profiler") -Destination (Join-Path $sitePackages "mobile_profiler") -Recurse -Force
 
     $pth = Get-ChildItem -LiteralPath $runtime -Filter "python*._pth" | Select-Object -First 1
     if (-not $pth) {
@@ -101,7 +101,7 @@ try {
 setlocal
 set "ROOT=%~dp0"
 if exist "%ROOT%platform-tools\adb.exe" set "PATH=%ROOT%platform-tools;%PATH%"
-"%ROOT%python-runtime\python.exe" -m mobile_power_profiler %*
+"%ROOT%python-runtime\python.exe" -m mobile_profiler %*
 endlocal
 '@
     Set-Content -LiteralPath (Join-Path $stage "profiler.cmd") -Value $launcher -Encoding ascii
@@ -113,7 +113,7 @@ set "ROOT=%~dp0"
 cd /d "%ROOT%"
 if exist "%ROOT%platform-tools\adb.exe" set "PATH=%ROOT%platform-tools;%PATH%"
 if not exist "%ROOT%profiler-runs" mkdir "%ROOT%profiler-runs"
-"%ROOT%python-runtime\python.exe" -m mobile_power_profiler ui --output-root "%ROOT%profiler-runs" %*
+"%ROOT%python-runtime\python.exe" -m mobile_profiler ui --output-root "%ROOT%profiler-runs" %*
 endlocal
 '@
     Set-Content -LiteralPath (Join-Path $stage "start-ui.bat") -Value $uiLauncher -Encoding ascii
@@ -144,7 +144,7 @@ portable ZIP.
     New-Item -ItemType Directory -Force -Path (Join-Path $stage "profiler-runs") | Out-Null
 
     Write-Host "Validating portable runtime..."
-    & (Join-Path $runtime "python.exe") -m mobile_power_profiler --help | Out-Null
+    & (Join-Path $runtime "python.exe") -m mobile_profiler --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Portable runtime validation failed."
     }

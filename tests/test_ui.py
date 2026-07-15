@@ -10,13 +10,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
-from mobile_power_profiler.cli import (
+from mobile_profiler.cli import (
     apply_record_interval_defaults,
     build_parser,
     install_console_interrupt_handlers,
     requested_platform,
 )
-from mobile_power_profiler.ui import (
+from mobile_profiler.ui import (
     DashboardHTTPServer,
     DashboardManager,
     LiveTelemetryReader,
@@ -237,11 +237,11 @@ class UiServerTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=([{"serial": "ANDROID", "state": "device"}], None),
                 ),
                 patch(
-                    "mobile_power_profiler.ui.adb_shell",
+                    "mobile_profiler.ui.adb_shell",
                     side_effect=[third_party, launcher],
                 ) as shell,
             ):
@@ -260,11 +260,11 @@ class UiServerTests(unittest.TestCase):
             manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
             with (
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=([{"serial": "ANDROID", "state": "device"}], None),
                 ),
                 patch(
-                    "mobile_power_profiler.ui.list_ios_devices",
+                    "mobile_profiler.ui.list_ios_devices",
                     return_value=(
                         [
                             {
@@ -279,7 +279,7 @@ class UiServerTests(unittest.TestCase):
                     ),
                 ),
                 patch(
-                    "mobile_power_profiler.ui.list_harmony_devices",
+                    "mobile_profiler.ui.list_harmony_devices",
                     return_value=(
                         [
                             {
@@ -310,10 +310,10 @@ class UiServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
             with (
-                patch("mobile_power_profiler.ui.list_adb_devices") as android,
-                patch("mobile_power_profiler.ui.list_harmony_devices") as harmony,
+                patch("mobile_profiler.ui.list_adb_devices") as android,
+                patch("mobile_profiler.ui.list_harmony_devices") as harmony,
                 patch(
-                    "mobile_power_profiler.ui.list_ios_devices",
+                    "mobile_profiler.ui.list_ios_devices",
                     return_value=([], None),
                 ) as ios,
             ):
@@ -367,7 +367,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("32 分钟", html)
             self.assertIn("资源调度分配", html)
             self.assertIn("功耗压力解释", html)
-            self.assertIn("渲染链路延迟", html)
+            self.assertIn("帧率数据流与渲染链路", html)
             self.assertIn("内存频率", html)
             self.assertIn("FRAME RATE", html)
             self.assertIn("硬件采样率未公开", html)
@@ -378,6 +378,14 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("portable_build_available", state["tooling"])
             self.assertEqual(len(state["active"]["series"]), 240)
             self.assertEqual(state["active"]["performance"]["current_refresh_rate_hz"], 120.0)
+            self.assertEqual(
+                state["active"]["performance"]["frame_flow"]["primary_key"],
+                "surface_present",
+            )
+            self.assertEqual(
+                len(state["active"]["performance"]["frame_flow"]["stages"]),
+                4,
+            )
             self.assertEqual(
                 state["active"]["system_monitor"]["active_priority"][0]["watch_name"],
                 "dex2oat",
@@ -491,11 +499,11 @@ class UiServerTests(unittest.TestCase):
             fake_active.snapshot.return_value = {"running": True, "status": "starting"}
             with (
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=([{"serial": "SERIAL", "state": "device"}], None),
                 ),
-                patch("mobile_power_profiler.ui.subprocess.Popen", return_value=object()) as popen,
-                patch("mobile_power_profiler.ui.ActiveRun", return_value=fake_active),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
             ):
                 result = manager.start_record(
                     {
@@ -515,12 +523,12 @@ class UiServerTests(unittest.TestCase):
             self.assertEqual(command[:5], [
                 sys.executable,
                 "-m",
-                "mobile_power_profiler",
+                "mobile_profiler",
                 "--adb",
                 "custom-adb",
             ])
             self.assertIn("record", command)
-            self.assertIn("--session-mode", command)
+            self.assertNotIn("--session-mode", command)
             self.assertIn("--require-unplugged", command)
             self.assertIn("--test-mode", command)
             self.assertEqual(command[command.index("--test-mode") + 1], "performance")
@@ -538,11 +546,44 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(any(Path(value).name == "UI-smoke" for value in command))
             self.assertEqual(result["status"], "starting")
 
+    def test_ui_defaults_optional_power_disconnect_off_in_both_modes(self) -> None:
+        cases = (
+            ("power", "", True),
+            ("performance", "com.example.game", False),
+        )
+        for test_mode, package, expects_session_mode in cases:
+            with self.subTest(test_mode=test_mode), tempfile.TemporaryDirectory() as directory:
+                manager = DashboardManager("custom-adb", Path(directory))
+                fake_active = Mock()
+                fake_active.running = True
+                fake_active.snapshot.return_value = {"running": True, "status": "starting"}
+                with (
+                    patch(
+                        "mobile_profiler.ui.list_adb_devices",
+                        return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                    ),
+                    patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                    patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
+                ):
+                    manager.start_record(
+                        {
+                            "device": "SERIAL",
+                            "platform": "android",
+                            "run_name": f"{test_mode} defaults",
+                            "test_mode": test_mode,
+                            "package": package,
+                        }
+                    )
+
+                command = popen.call_args.args[0]
+                self.assertEqual("--session-mode" in command, expects_session_mode)
+                self.assertNotIn("--require-unplugged", command)
+
     def test_performance_ui_requires_target_application(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory))
             with patch(
-                "mobile_power_profiler.ui.list_adb_devices",
+                "mobile_profiler.ui.list_adb_devices",
                 return_value=([{"serial": "SERIAL", "state": "device"}], None),
             ):
                 with self.assertRaisesRegex(ValueError, "target game or application"):
@@ -562,9 +603,9 @@ class UiServerTests(unittest.TestCase):
             fake_active.running = True
             fake_active.snapshot.return_value = {"running": True, "status": "starting"}
             with (
-                patch("mobile_power_profiler.ui.list_adb_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.list_adb_devices", return_value=([], None)),
                 patch(
-                    "mobile_power_profiler.ui.list_harmony_devices",
+                    "mobile_profiler.ui.list_harmony_devices",
                     return_value=(
                         [
                             {
@@ -578,9 +619,9 @@ class UiServerTests(unittest.TestCase):
                         None,
                     ),
                 ),
-                patch("mobile_power_profiler.ui.list_ios_devices", return_value=([], None)),
-                patch("mobile_power_profiler.ui.subprocess.Popen", return_value=object()) as popen,
-                patch("mobile_power_profiler.ui.ActiveRun", return_value=fake_active),
+                patch("mobile_profiler.ui.list_ios_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
             ):
                 manager.start_record(
                     {
@@ -619,10 +660,10 @@ class UiServerTests(unittest.TestCase):
             fake_active.running = True
             fake_active.snapshot.return_value = {"running": True, "status": "starting"}
             with (
-                patch("mobile_power_profiler.ui.list_adb_devices", return_value=([], None)),
-                patch("mobile_power_profiler.ui.list_harmony_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.list_adb_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.list_harmony_devices", return_value=([], None)),
                 patch(
-                    "mobile_power_profiler.ui.list_ios_devices",
+                    "mobile_profiler.ui.list_ios_devices",
                     return_value=(
                         [
                             {
@@ -636,8 +677,8 @@ class UiServerTests(unittest.TestCase):
                         None,
                     ),
                 ),
-                patch("mobile_power_profiler.ui.subprocess.Popen", return_value=object()) as popen,
-                patch("mobile_power_profiler.ui.ActiveRun", return_value=fake_active),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
             ):
                 manager.start_record(
                     {
@@ -667,7 +708,7 @@ class UiServerTests(unittest.TestCase):
             manager = DashboardManager("custom-adb", Path(directory))
             with (
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=(
                         [
                             {
@@ -680,8 +721,8 @@ class UiServerTests(unittest.TestCase):
                         None,
                     ),
                 ),
-                patch("mobile_power_profiler.ui.list_harmony_devices", return_value=([], None)),
-                patch("mobile_power_profiler.ui.list_ios_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.list_harmony_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.list_ios_devices", return_value=([], None)),
             ):
                 with self.assertRaisesRegex(ValueError, "does not match"):
                     manager.start_record(
@@ -697,9 +738,9 @@ class UiServerTests(unittest.TestCase):
             manager = DashboardManager("custom-adb", Path(directory))
             completed = Mock(returncode=0, stdout="connected to 192.168.1.20:5555\n", stderr="")
             with (
-                patch("mobile_power_profiler.ui.subprocess.run", return_value=completed) as run,
+                patch("mobile_profiler.ui.subprocess.run", return_value=completed) as run,
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=([{"serial": "192.168.1.20:5555", "state": "device"}], None),
                 ),
             ):
@@ -716,7 +757,7 @@ class UiServerTests(unittest.TestCase):
                 stderr="",
             )
             with (
-                patch("mobile_power_profiler.ui.subprocess.run", return_value=completed) as run,
+                patch("mobile_profiler.ui.subprocess.run", return_value=completed) as run,
                 patch.object(manager, "devices", return_value=([], None)),
             ):
                 result = manager.disconnect_device({"address": "192.168.1.20:5555"})
@@ -762,13 +803,13 @@ class UiServerTests(unittest.TestCase):
             }
             with (
                 patch(
-                    "mobile_power_profiler.ui.list_adb_devices",
+                    "mobile_profiler.ui.list_adb_devices",
                     return_value=([{"serial": "USB123", "state": "device"}], None),
                 ),
-                patch("mobile_power_profiler.ui.adb_shell", return_value=ip_result) as shell,
-                patch("mobile_power_profiler.ui.subprocess.run", return_value=tcpip_result) as run,
+                patch("mobile_profiler.ui.adb_shell", return_value=ip_result) as shell,
+                patch("mobile_profiler.ui.subprocess.run", return_value=tcpip_result) as run,
                 patch.object(manager, "connect_device", return_value=connected) as connect,
-                patch("mobile_power_profiler.ui.time.sleep", return_value=None),
+                patch("mobile_profiler.ui.time.sleep", return_value=None),
             ):
                 result = manager.enable_tcpip(
                     {"device": "USB123", "port": 5555, "auto_connect": True}
@@ -808,7 +849,7 @@ class UiServerTests(unittest.TestCase):
                 }
             ]
             with (
-                patch("mobile_power_profiler.ui.enable_harmony_tcp", return_value=enabled) as enable,
+                patch("mobile_profiler.ui.enable_harmony_tcp", return_value=enabled) as enable,
                 patch.object(manager, "devices", return_value=(refreshed, None)) as devices,
             ):
                 result = manager.enable_harmony_tcpip(
@@ -862,7 +903,7 @@ class UiServerTests(unittest.TestCase):
             rules_path.write_text("[]", encoding="utf-8")
             manager = DashboardManager("custom-adb", root)
             completed = Mock(returncode=0, stdout="ok\n", stderr="")
-            with patch("mobile_power_profiler.ui.subprocess.run", return_value=completed) as run:
+            with patch("mobile_profiler.ui.subprocess.run", return_value=completed) as run:
                 report = manager.regenerate_run({"run_name": "phone-a"})
                 recovered = manager.recover_run({"run_name": "phone-a"})
                 imported = manager.import_run_log(
@@ -913,7 +954,7 @@ class UiServerTests(unittest.TestCase):
                 (run_dir / "metadata.json").write_text("{}", encoding="utf-8")
             manager = DashboardManager("adb", root)
             completed = Mock(returncode=0, stdout="comparison ready\n", stderr="")
-            with patch("mobile_power_profiler.ui.subprocess.run", return_value=completed) as run:
+            with patch("mobile_profiler.ui.subprocess.run", return_value=completed) as run:
                 result = manager.compare_history_runs(
                     {
                         "run_a": "phone-a",
@@ -949,7 +990,7 @@ class UiServerTests(unittest.TestCase):
                 return "built"
 
             with (
-                patch("mobile_power_profiler.ui.shutil.which", return_value="powershell.exe"),
+                patch("mobile_profiler.ui.shutil.which", return_value="powershell.exe"),
                 patch.object(manager, "_run_command", side_effect=fake_build) as build,
             ):
                 result = manager.build_portable_bundle(
@@ -969,9 +1010,9 @@ class UiServerTests(unittest.TestCase):
 class UiConfigurationTests(unittest.TestCase):
     def test_windows_ctrl_break_is_converted_to_keyboard_interrupt(self) -> None:
         with (
-            patch("mobile_power_profiler.cli.sys.platform", "win32"),
-            patch("mobile_power_profiler.cli.signal.SIGBREAK", 21, create=True),
-            patch("mobile_power_profiler.cli.signal.signal") as register,
+            patch("mobile_profiler.cli.sys.platform", "win32"),
+            patch("mobile_profiler.cli.signal.SIGBREAK", 21, create=True),
+            patch("mobile_profiler.cli.signal.signal") as register,
         ):
             install_console_interrupt_handlers()
 
@@ -1041,6 +1082,17 @@ class UiConfigurationTests(unittest.TestCase):
         self.assertEqual(performance.thread_interval, 5.0)
         self.assertEqual(performance.thermal_interval, 5.0)
         self.assertEqual(performance.scheduler_interval, 5.0)
+
+    def test_cli_rejects_multi_app_session_in_performance_mode(self) -> None:
+        args = build_parser().parse_args(
+            ["record", "--test-mode", "performance", "--session-mode"]
+        )
+
+        with patch("builtins.print") as print_mock:
+            result = args.handler(args)
+
+        self.assertEqual(result, 2)
+        self.assertIn("power test mode", print_mock.call_args.args[0])
 
     def test_cli_parser_exposes_ios_sidecar_workflow(self) -> None:
         record = build_parser().parse_args(

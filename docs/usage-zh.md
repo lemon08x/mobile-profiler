@@ -99,8 +99,7 @@ python -m pip install -e .
 mobile-profiler --help
 ```
 
-`mobile-profiler` 是新的主命令；为兼容已有脚本，旧命令
-`mobile-power-profiler` 仍作为别名保留。
+项目命令统一为 `mobile-profiler`。
 
 如果 PowerShell 阻止激活脚本：
 
@@ -112,7 +111,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 也可以不激活环境，直接执行：
 
 ```powershell
-.\.venv\Scripts\python.exe -m mobile_power_profiler --help
+.\.venv\Scripts\python.exe -m mobile_profiler --help
 ```
 
 项目运行时只依赖 Python 标准库，没有第三方 Python 运行时依赖。
@@ -156,7 +155,7 @@ dist\mobile-profiler-portable.zip
 ZIP 中包含：
 
 - 官方 Embedded Python。
-- 当前源码中的 `mobile_power_profiler` 包和 Web UI。
+- 当前源码中的 `mobile_profiler` 包和 Web UI。
 - 中文指南、示例规则和启动脚本。
 - 构建电脑能找到 ADB 时所需的 `adb.exe` 和 DLL。
 
@@ -402,6 +401,19 @@ KGSL 实时频率/负载由 SELinux 限制并正确降级。
   RenderThread 提交、GPU 等待、BufferQueue、SurfaceFlinger/HWC 背压，以及调度和热限制。
   功耗只记录整机曲线、平均/P95/峰值和能量，不执行组件、UID、Wakelock、前台应用能量或
   第三方任务功耗归因。
+
+性能模式的 **帧率数据流与渲染链路** 按应用产帧、渲染/队列、系统合成、屏幕扫描顺序
+展示所有已检测来源。每个阶段会标记为 **主数据、有效、仅参考、无效或无数据**：
+
+- Android 原生游戏优先把目标 SurfaceView/BLAST 层的 SurfaceFlinger present 时间戳标为
+  主 FPS；`gfxinfo` UI 提交速率仍保留，但不会冒充游戏呈现帧率。
+- HarmonyOS 优先使用绑定目标进程的 SmartPerf 应用 FPS；RenderService 合成窗口作为
+  合成阶段数据或回退主数据。
+- 屏幕刷新率和 `fpsCount` 只代表显示扫描/档位驻留，始终标为参考数据；未绑定目标图层的
+  全局合成器采样、静止不增长的累计计数会明确标为无效，并显示不能采用的原因。
+- `gfxinfo framestats` 或 SmartPerf 抖动可提供渲染阶段延迟，即使没有独立 FPS 也会沿链路
+  展示，避免为了填充阶段而推算不存在的帧率。
+
 - **报告标题**：便于阅读，例如“Phone A 一小时 BTR2 续航”。
 - **运行目录名**：建议包含设备、版本和轮次，例如
   `phone-a-build-123-round-01`。
@@ -413,10 +425,12 @@ KGSL 实时频率/负载由 SELinux 限制并正确降级。
 - **目标游戏 / 应用**：性能测试必填。Android 先选择设备，再点击 **扫描手机应用**；
   列表优先展示带桌面启动入口的第三方应用，可按包名或 Activity 搜索。若旧系统不支持
   启动入口查询，界面会回退到第三方包列表；扫描失败时仍可手工输入。功耗测试中的目标
-  包名仍为可选，多应用 BTR2 流程可留空并启用 session mode。
+  包名仍为可选，多应用 BTR2 流程可留空并启用 session mode；性能模式不提供多应用
+  会话，始终围绕已选择的具体游戏或应用采集和分析。
 - **开始场景**：通常选择“桌面”。
 - **开始说明**：例如“功耗先启动，BTR2 预计 2 分钟后开始”。
-- **仅允许未供电设备**：正式测试建议保持启用。
+- **要求断开外部供电**：功耗和性能模式均默认关闭；需要严格拒绝 USB、AC 或无线充电
+  状态下启动测试时再手动开启。正式续航结论仍应使用已断开外部供电的设备。
 - **性能干扰监控**：建议保持启用；进程和温度只在出现异常时形成主要提示。
 
 采集预设和逐项开关用于控制测试工具自身的干扰，和“功耗 / 性能”分析模式是两个
@@ -640,7 +654,7 @@ profiler-runs\comparisons\对比名称\
 
 ```text
 pyproject.toml
-src\mobile_power_profiler\
+src\mobile_profiler\
 tests\
 tools\build-portable.ps1
 build-portable.bat
@@ -655,7 +669,7 @@ build-portable.bat
 
 ```text
 pyproject.toml                         [project].version
-src\mobile_power_profiler\__init__.py  __version__
+src\mobile_profiler\__init__.py  __version__
 ```
 
 仅在本地调试小改动时可以暂不改版本，但正式分发建议更新。
@@ -672,7 +686,7 @@ python -m unittest discover -s tests -v
 如果修改了 Web UI，并且电脑安装了 Node.js，再补充：
 
 ```powershell
-node --check src\mobile_power_profiler\web\app.js
+node --check src\mobile_profiler\web\app.js
 ```
 
 用 Demo 做一次不连接手机的界面检查：
@@ -1060,9 +1074,6 @@ mobile-profiler --ios-python $iosPython ios-pair --json
 ```text
 ~/.mobile-profiler/ios-devices.json
 ```
-
-升级时仍会读取旧的 `~/.mobile-power-profiler` 与
-`~/.android-power-profiler` 缓存，新的配对端点统一写入上述目录。
 
 UI 中也可以选择 USB iPhone 后点击顶部 **iOS 无线** 完成同一操作。
 

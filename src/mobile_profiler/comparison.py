@@ -250,7 +250,7 @@ def build_run_comparison(
         warnings.append(f"有 {len(duration_mismatch)} 个配对测试项时长差超过 5%，优先比较 mWh/min 和平均功率。")
 
     return {
-        "schema": "mobile-power-profiler-comparison-v1",
+        "schema": "mobile-profiler-comparison-v1",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": title,
         "labels": {"a": label_a, "b": label_b},

@@ -585,6 +585,54 @@ def _render_pipeline_rows(analysis: Dict[str, object]) -> str:
     return "".join(rows) or '<tr><td colspan="6" class="empty-cell">当前平台没有恢复到可用的详细 framestats 阶段时间戳。</td></tr>'
 
 
+def _frame_flow_rows(analysis: Dict[str, object]) -> str:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    frame_flow = performance.get("frame_flow", {})
+    frame_flow = frame_flow if isinstance(frame_flow, dict) else {}
+    stages = frame_flow.get("stages", [])
+    stages = stages if isinstance(stages, list) else []
+    status_labels = {
+        "primary": "主数据",
+        "valid": "有效",
+        "reference": "仅参考",
+        "invalid": "无效",
+        "unavailable": "无数据",
+    }
+    status_classes = {
+        "primary": "measured",
+        "valid": "counter",
+        "reference": "medium",
+        "invalid": "high",
+        "unavailable": "low",
+    }
+    rows = []
+    for index, item in enumerate(stages, start=1):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "unavailable")
+        unit = str(item.get("unit") or "")
+        digits = 0 if unit == "Hz" else 2 if unit == "ms" else 1
+        value = (
+            f'{_number(item.get("value"), digits)} {_escape(unit)}'
+            if isinstance(item.get("value"), (int, float))
+            else "—"
+        )
+        rows.append(
+            "<tr>"
+            f'<td><strong>{index:02d} · {_escape(item.get("phase") or "STAGE")}</strong>'
+            f'<span class="cell-sub">{_escape(item.get("label") or item.get("key"))}</span></td>'
+            f'<td><span class="source-tag {status_classes.get(status, "low")}">'
+            f'{_escape(status_labels.get(status, status))}</span></td>'
+            f'<td><strong>{value}</strong><span class="cell-sub">{_escape(item.get("value_label"))}</span></td>'
+            f'<td>{_escape(item.get("source") or "未记录来源")}</td>'
+            f'<td>{int(item.get("sample_count") or 0) if isinstance(item.get("sample_count"), (int, float)) else "—"}</td>'
+            f'<td>{_escape(item.get("detail") or "暂无判定说明")}</td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="6" class="empty-cell">本次没有形成可判定的帧率数据流。</td></tr>'
+
+
 def _slow_frame_rows(analysis: Dict[str, object]) -> str:
     render = analysis.get("render_performance", {})
     render = render if isinstance(render, dict) else {}
@@ -1952,7 +2000,8 @@ REPORT_FRAGMENT = r"""
       </section>
 
       <section class="app-view" data-panel="pipeline" data-report-only="performance" hidden>
-        <div class="view-heading"><div><h1>渲染链路与帧延迟</h1><p>从 VSync 起步、UI/RenderThread、GPU 等待到 BufferQueue / SurfaceFlinger 合成，定位慢帧形成阶段。</p></div><span class="source-tag counter">Android framestats / 线程快照</span></div>
+        <div class="view-heading"><div><h1>帧率数据流与渲染链路</h1><p>区分应用提交、渲染阶段、系统合成和屏幕刷新；保留无效来源及弃用原因，再定位慢帧形成阶段。</p></div><span class="source-tag counter">多源有效性 / 阶段时延</span></div>
+        <section class="analysis-section"><h2>逐阶段帧数据</h2><div class="data-table-wrap"><table><thead><tr><th>渲染阶段</th><th>状态</th><th>速率 / 耗时</th><th>数据来源</th><th>样本数</th><th>判定说明</th></tr></thead><tbody>@@FRAME_FLOW_ROWS@@</tbody></table></div><div class="availability-note"><strong>解读边界</strong><span>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率不能直接互换；只有绑定当前目标应用并持续产生有效增量的来源才作为主 FPS。</span></div></section>
         <section class="analysis-section"><h2>阶段耗时分布</h2><div class="data-table-wrap"><table><thead><tr><th>阶段</th><th>帧数</th><th>平均</th><th>P95</th><th>P99</th><th>峰值</th></tr></thead><tbody>@@RENDER_PIPELINE_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>慢帧明细</h2><div class="data-table-wrap"><table><thead><tr><th>帧 ID</th><th>总耗时</th><th>超截止时间</th><th>最大阶段</th><th>阶段耗时</th></tr></thead><tbody>@@SLOW_FRAME_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>渲染与合成热点线程</h2><div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th><th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>@@RENDER_THREAD_ROWS@@</tbody></table></div></section>
@@ -2860,6 +2909,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@POWER_PRESSURE_TASK_ROWS@@": _power_pressure_task_rows(analysis),
         "@@RUNTIME_SETTING_ROWS@@": _runtime_setting_rows(analysis),
         "@@MEMORY_PRESSURE_SUMMARY@@": _memory_pressure_summary(analysis),
+        "@@FRAME_FLOW_ROWS@@": _frame_flow_rows(analysis),
         "@@RENDER_PIPELINE_ROWS@@": _render_pipeline_rows(analysis),
         "@@SLOW_FRAME_ROWS@@": _slow_frame_rows(analysis),
         "@@RENDER_THREAD_ROWS@@": _render_thread_rows(analysis),

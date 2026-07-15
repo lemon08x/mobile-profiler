@@ -1074,7 +1074,7 @@ class DashboardManager:
         return [
             sys.executable,
             "-m",
-            "mobile_power_profiler",
+            "mobile_profiler",
             "--adb",
             self.adb,
             "--hdc",
@@ -1098,8 +1098,8 @@ class DashboardManager:
             if (
                 (resolved / "pyproject.toml").is_file()
                 and (resolved / "tools" / "build-portable.ps1").is_file()
-                and (resolved / "src" / "mobile_power_profiler").is_dir()
-                and (resolved / "src" / "mobile_power_profiler").resolve() == package_dir
+                and (resolved / "src" / "mobile_profiler").is_dir()
+                and (resolved / "src" / "mobile_profiler").resolve() == package_dir
             ):
                 return resolved
         return None
@@ -1922,8 +1922,8 @@ class DashboardManager:
             raise ValueError("start context must be desktop, app, other, or unknown")
         start_note = str(payload.get("start_note") or "").strip()[:500]
         gpu_path = str(payload.get("gpu_frequency_path") or "").strip()[:500]
-        session_mode = bool(payload.get("session_mode", True))
-        require_unplugged = bool(payload.get("require_unplugged", True))
+        session_mode = test_mode == "power" and bool(payload.get("session_mode", True))
+        require_unplugged = bool(payload.get("require_unplugged", False))
         no_reset = bool(payload.get("no_reset", False))
         full_history = bool(payload.get("full_history", False))
         system_monitor = bool(payload.get("system_monitor", True))
@@ -2600,7 +2600,100 @@ class DashboardManager:
                 "frame_metric_p99_ms": 28.4,
                 "frame_issue_pct": 0.84,
                 "frame_issue_label": "超出帧截止时间",
-                "frame_source": "Android gfxinfo frame counter delta",
+                "frame_source": "Android SurfaceFlinger BLAST layer present timestamps",
+                "frame_flow": {
+                    "available": True,
+                    "platform": "android",
+                    "primary_key": "surface_present",
+                    "valid_count": 2,
+                    "reference_count": 1,
+                    "invalid_count": 1,
+                    "note": (
+                        "不同阶段的数值语义不同：应用提交速率、合成器呈现 FPS 与屏幕刷新率"
+                        "不能直接互换。主数据只选择与当前目标应用绑定且持续产生有效增量的来源。"
+                    ),
+                    "stages": [
+                        {
+                            "key": "app_submission",
+                            "phase": "APP",
+                            "label": "应用 / UI 帧提交",
+                            "status": "invalid",
+                            "value": 0.0,
+                            "unit": "帧/s",
+                            "value_label": "提交速率",
+                            "source": "Android gfxinfo cumulative frame counter delta",
+                            "detail": "gfxinfo 累计计数没有增长；原生游戏渲染面未计入该 UI 窗口，不能作为游戏 FPS。",
+                            "sample_count": 0,
+                            "confidence": "low",
+                            "metrics": [],
+                        },
+                        {
+                            "key": "render_queue",
+                            "phase": "RENDER",
+                            "label": "RenderThread / BufferQueue",
+                            "status": "valid",
+                            "value": 16.72,
+                            "unit": "ms",
+                            "value_label": "端到端 P95",
+                            "source": "Android gfxinfo framestats timestamps",
+                            "detail": "提供 UI、RenderThread、GPU 和 BufferQueue 阶段延迟，不作为独立 FPS。",
+                            "sample_count": 864,
+                            "confidence": "high",
+                            "metrics": [{"label": "截止超时", "value": 0.84, "unit": "%", "digits": 2}],
+                        },
+                        {
+                            "key": "surface_present",
+                            "phase": "COMPOSITOR",
+                            "label": "SurfaceFlinger 应用层呈现",
+                            "status": "primary",
+                            "value": 117.8,
+                            "unit": "FPS",
+                            "value_label": "呈现帧率",
+                            "source": "Android SurfaceFlinger BLAST layer present timestamps",
+                            "detail": "目标应用 BLAST 层实际 present 时间戳，是当前主 FPS 与 1% Low 数据源。",
+                            "sample_count": 2140,
+                            "confidence": "high",
+                            "metrics": [
+                                {"label": "1% Low", "value": 88.6, "unit": "FPS", "digits": 1},
+                                {"label": "P95 间隔", "value": 16.72, "unit": "ms", "digits": 2},
+                            ],
+                        },
+                        {
+                            "key": "display_scanout",
+                            "phase": "DISPLAY",
+                            "label": "HWC / 屏幕扫描输出",
+                            "status": "reference",
+                            "value": 120.0,
+                            "unit": "Hz",
+                            "value_label": "刷新率",
+                            "source": "Android SurfaceFlinger refresh-rate duration delta",
+                            "detail": "刷新率是屏幕扫描节奏，不等于应用唯一帧；HWC 逐帧 present 计数未公开。",
+                            "sample_count": None,
+                            "confidence": "high",
+                            "metrics": [{"label": "显示/应用倍率", "value": 1.02, "unit": "×", "digits": 2}],
+                        },
+                    ],
+                },
+                "render_pipeline": {
+                    "available": True,
+                    "frame_count": 864,
+                    "p95_total_ms": 16.72,
+                    "p99_total_ms": 28.4,
+                    "deadline_missed_pct": 0.84,
+                    "dominant_stage": {
+                        "key": "post_swap_ms",
+                        "label": "BufferQueue / 合成等待",
+                        "sample_count": 864,
+                        "p95_ms": 7.8,
+                        "p99_ms": 13.4,
+                    },
+                    "stages": [
+                        {"key": "post_swap_ms", "label": "BufferQueue / 合成等待", "sample_count": 864, "p95_ms": 7.8, "p99_ms": 13.4},
+                        {"key": "gpu_wait_ms", "label": "GPU 完成等待", "sample_count": 864, "p95_ms": 5.6, "p99_ms": 9.2},
+                        {"key": "command_ms", "label": "渲染命令提交", "sample_count": 864, "p95_ms": 2.7, "p99_ms": 4.1},
+                    ],
+                    "limitations": "演示数据用于预览渲染链路界面。",
+                },
                 "frame_interval_average_ms": 8.49,
                 "frame_interval_p95_ms": 16.72,
                 "frame_sample_count": 2140,
@@ -2772,7 +2865,7 @@ class DashboardManager:
 
 
 def _asset_bytes(name: str) -> bytes:
-    return files("mobile_power_profiler").joinpath("web", name).read_bytes()
+    return files("mobile_profiler").joinpath("web", name).read_bytes()
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):

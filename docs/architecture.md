@@ -18,7 +18,7 @@ mobile-profiler/
 |-- tests/
 |   |-- test_profiler.py
 |   `-- test_ui.py
-`-- src/mobile_power_profiler/
+`-- src/mobile_profiler/
     |-- __init__.py
     |-- __main__.py
     |-- models.py
@@ -107,6 +107,10 @@ share the same contracts as iOS and future adapters.
    its SurfaceFlinger present-timestamp ring is sampled every 0.5 seconds and summarized
    into FPS, 1% Low, and frame-interval windows. SurfaceFlinger refresh-duration counters
    and GLES renderer identity are sampled every 30 seconds and once more during finalization.
+   Analysis retains each source separately instead of collapsing them immediately: UI-submit
+   counters, detailed RenderThread/BufferQueue timestamps, target-layer present FPS, compositor
+   fallback samples, and display refresh are assigned explicit primary/valid/reference/invalid/
+   unavailable status along the rendering flow.
 5. Start an independent low-frequency system-monitor worker. It captures
    processes every 10 seconds, hot threads every 30 seconds, ThermalService
    every 10 seconds, and cpuset/ActivityManager/ADPF state every 30 seconds.
@@ -154,9 +158,7 @@ device.
 
 1. A trusted USB connection creates a persistent RemotePairing record.
 2. The parent caches the validated Wi-Fi host/port under
-   `~/.mobile-profiler/ios-devices.json`, while reading the former
-   `.mobile-power-profiler` and `.android-power-profiler` locations as migration
-   fallbacks.
+   `~/.mobile-profiler/ios-devices.json`.
 3. Probe opens a userspace RSD tunnel, reads DiagnosticsService battery data,
    inspects DVT sysmon capabilities, and samples DVT Graphics availability.
 4. Record starts concurrent DVT sysmontap, Graphics, and application-state
@@ -185,7 +187,7 @@ from the UI launches the installed module's existing `record` command in a
 child process and tails the append-only sampler journal for live presentation.
 
 ```text
-Browser <-- local JSON/HTML --> ui.py --> python -m mobile_power_profiler record
+Browser <-- local JSON/HTML --> ui.py --> python -m mobile_profiler record
                                       |--> report / recover / import-log
                                       |--> compare
                                       |--> evidence archive
@@ -211,7 +213,7 @@ rejects mobile-data `rmnet` addresses for automatic connection, executes
 `adb -s SERIAL tcpip 5555`, and then reuses the normal `/api/connect` logic.
 
 Source-project detection requires all of `pyproject.toml`,
-`tools/build-portable.ps1`, and `src/mobile_power_profiler`. Therefore a
+`tools/build-portable.ps1`, and `src/mobile_profiler`. Therefore a
 portable installation can perform capture and data workflows but cannot
 present itself as a build checkout. Build output from the UI is constrained to
 the source checkout's `dist/` tree because the PowerShell builder intentionally

@@ -727,9 +727,7 @@ def run_ios_record(args: argparse.Namespace) -> int:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": args.title
         or (
-            "Multi-app iOS performance session"
-            if args.test_mode == "performance" and args.session_mode and not target_package
-            else f"{target_package} performance test"
+            f"{target_package} performance test"
             if args.test_mode == "performance" and target_package
             else "iOS performance test"
             if args.test_mode == "performance"
@@ -976,9 +974,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": args.title
         or (
-            "Multi-app HarmonyOS performance session"
-            if args.test_mode == "performance" and args.session_mode and not target_package
-            else f"{target_package} performance test"
+            f"{target_package} performance test"
             if args.test_mode == "performance" and target_package
             else "HarmonyOS performance test"
             if args.test_mode == "performance"
@@ -1326,6 +1322,13 @@ def run_harmony_record(args: argparse.Namespace) -> int:
 def run_record(args: argparse.Namespace) -> int:
     apply_record_interval_defaults(args)
 
+    if str(args.test_mode) == "performance" and bool(args.session_mode):
+        print(
+            "ERROR: --session-mode is available only in power test mode",
+            file=sys.stderr,
+        )
+        return 2
+
     platform = requested_platform(args)
     try:
         apply_capture_configuration(args, platform)
@@ -1484,9 +1487,7 @@ def run_record(args: argparse.Namespace) -> int:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": args.title
         or (
-            "Multi-app Android performance session"
-            if args.test_mode == "performance" and args.session_mode and not target_package
-            else f"{target_package} performance test"
+            f"{target_package} performance test"
             if args.test_mode == "performance" and target_package
             else "Android performance test"
             if args.test_mode == "performance"
@@ -2437,7 +2438,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--session-mode",
         action="store_true",
-        help="track foreground app changes instead of assuming one target app",
+        help="power mode only: track foreground app changes instead of assuming one target app",
     )
     record.add_argument("--output", type=Path, help="output directory")
     record.add_argument("--title", help="report title")

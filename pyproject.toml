@@ -11,8 +11,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-mobile-profiler = "mobile_power_profiler.cli:main"
-mobile-power-profiler = "mobile_power_profiler.cli:main"
+mobile-profiler = "mobile_profiler.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -21,4 +20,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-mobile_power_profiler = ["web/*.html", "web/*.css", "web/*.js"]
+mobile_profiler = ["web/*.html", "web/*.css", "web/*.js"]
