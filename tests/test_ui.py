@@ -161,6 +161,20 @@ class LiveTelemetryTests(unittest.TestCase):
                         "host_epoch_s": 1000.0,
                         "status": 0,
                         "temperatures": [{"name": "CPU", "value_c": 40.0}],
+                        "cooling_devices": [{"name": "lcd-backlight", "value": 1.0}],
+                        "display_brightness": {
+                            "available": True,
+                            "screen_state": "ON",
+                            "setting_raw": 204.0,
+                            "setting_float": 0.8,
+                            "current_screen_brightness": 0.8,
+                            "screen_brightness": 0.5,
+                            "adjusted_brightness": 0.5,
+                            "thermal_cap": 0.5,
+                            "thermal_applied": True,
+                            "thermal_status": 3,
+                            "brightness_max_reason": 1,
+                        },
                     }
                 )
                 + "\n",
@@ -245,6 +259,12 @@ class LiveTelemetryTests(unittest.TestCase):
             self.assertIn("power_pressure", snapshot)
             self.assertIn("render_performance", snapshot)
             self.assertTrue(snapshot["runtime_settings"]["available"] is False)
+            self.assertEqual(snapshot["brightness_throttling"]["point_count"], 1)
+            self.assertTrue(snapshot["brightness_throttling"]["current_active"])
+            self.assertEqual(
+                snapshot["brightness_throttling"]["current_state"]["status"],
+                "confirmed",
+            )
 
 
 class UiServerTests(unittest.TestCase):
@@ -560,9 +580,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-13", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-14", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-13", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-14", timeout=5) as response:
                     javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -589,12 +609,15 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn("platform-ui-13", html)
+            self.assertIn("platform-ui-14", html)
+            self.assertIn("屏幕热降亮监控", html)
             self.assertNotIn('<details class="advanced-settings" open', html)
             self.assertIn(".capture-feature-card input", css)
             self.assertIn("pointer-events: auto", css)
             self.assertIn("captureFeaturesOverridden", javascript)
             self.assertIn('api("/api/brightness"', javascript)
+            self.assertIn("renderBrightnessThrottling", javascript)
+            self.assertIn("brightness-dim-marker", css)
             self.assertIn("扫描手机应用", html)
             self.assertIn("32 分钟", html)
             self.assertIn("资源调度分配", html)

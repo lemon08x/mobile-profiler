@@ -33,6 +33,7 @@ from .parsers import (
     parse_performance_hint,
     parse_power_scheduler_state,
     parse_ps_processes,
+    parse_display_brightness_state,
     parse_thermalservice,
     parse_top_processes,
     parse_top_threads,
@@ -1862,6 +1863,9 @@ _ANDROID_SURFACE_MARKER = "__APP_ANDROID_SURFACE__"
 _ANDROID_LAYER_MARKER = "__APP_ANDROID_LAYER__"
 _ANDROID_WINDOW_MARKER = "__APP_ANDROID_WINDOW__"
 _ANDROID_GFXINFO_MARKER = "__APP_ANDROID_GFXINFO__"
+_BRIGHTNESS_SETTING_MARKER = "__APP_BRIGHTNESS_SETTING__|"
+_BRIGHTNESS_FLOAT_MARKER = "__APP_BRIGHTNESS_FLOAT__|"
+_BRIGHTNESS_DISPLAY_MARKER = "__APP_BRIGHTNESS_DISPLAY__"
 
 
 def _timed_shell_output(
@@ -2332,6 +2336,7 @@ def collect_system_snapshot(
 def collect_thermal_snapshot(
     adb: str,
     device: str,
+    include_display_brightness: bool = True,
 ) -> Tuple[Optional[ThermalSnapshot], Optional[str]]:
     uptime_s, host_epoch_s, output, collection_ms, error = _timed_shell_output(
         adb,
@@ -2342,6 +2347,56 @@ def collect_thermal_snapshot(
     if uptime_s is None:
         return None, error
     parsed = parse_thermalservice(output)
+    brightness_cooling_active = any(
+        isinstance(item, dict)
+        and re.search(r"lcd|backlight|display|screen", str(item.get("name") or ""), re.I)
+        and float(item.get("value") or 0.0) > 0
+        for item in parsed.get("cooling_devices", [])
+        if isinstance(parsed.get("cooling_devices"), list)
+    )
+    display_brightness: Dict[str, object] = {}
+    display_elapsed_ms = 0.0
+    if include_display_brightness or brightness_cooling_active:
+        display_script = (
+            f"printf '{_BRIGHTNESS_SETTING_MARKER}'; "
+            "settings get system screen_brightness 2>/dev/null; "
+            f"printf '{_BRIGHTNESS_FLOAT_MARKER}'; "
+            "settings get system screen_brightness_float 2>/dev/null; "
+            f"printf '{_BRIGHTNESS_DISPLAY_MARKER}\\n'; "
+            "dumpsys display 2>/dev/null"
+        )
+        display_result = adb_shell(adb, device, display_script, timeout_s=15.0)
+        display_elapsed_ms = display_result.elapsed_s * 1000.0
+        setting_text = ""
+        setting_float_text = ""
+        display_lines: List[str] = []
+        in_display = False
+        for line in display_result.stdout.splitlines():
+            if line.startswith(_BRIGHTNESS_SETTING_MARKER):
+                setting_text = line[len(_BRIGHTNESS_SETTING_MARKER) :]
+            elif line.startswith(_BRIGHTNESS_FLOAT_MARKER):
+                setting_float_text = line[len(_BRIGHTNESS_FLOAT_MARKER) :]
+            elif line.strip() == _BRIGHTNESS_DISPLAY_MARKER:
+                in_display = True
+            elif in_display:
+                display_lines.append(line)
+        if display_result.ok:
+            display_brightness = parse_display_brightness_state(
+                "\n".join(display_lines),
+                setting_text,
+                setting_float_text,
+            )
+            display_brightness["probe_elapsed_ms"] = display_elapsed_ms
+        else:
+            display_brightness = {
+                "available": False,
+                "error": (
+                    display_result.stderr.strip()
+                    or display_result.stdout.strip()
+                    or "dumpsys display brightness probe failed"
+                ),
+                "probe_elapsed_ms": display_elapsed_ms,
+            }
     return (
         ThermalSnapshot(
             uptime_s=uptime_s,
@@ -2352,7 +2407,8 @@ def collect_thermal_snapshot(
             cooling_devices=list(parsed.get("cooling_devices", [])),
             thresholds=list(parsed.get("thresholds", [])),
             headroom_thresholds=list(parsed.get("headroom_thresholds", [])),
-            collection_ms=collection_ms,
+            display_brightness=display_brightness,
+            collection_ms=collection_ms + display_elapsed_ms,
         ),
         error,
     )
@@ -2773,6 +2829,8 @@ class SystemMonitorWorker:
         next_process = now if self.process_enabled else math.inf
         next_thread = now if self.thread_enabled else math.inf
         next_thermal = now if self.thermal_enabled else math.inf
+        next_brightness_probe = now if self.thermal_enabled else math.inf
+        brightness_tracking_active = False
         next_scheduler = now if self.scheduler_enabled else math.inf
         while not self._stop_event.is_set():
             now = time.monotonic()
@@ -2809,10 +2867,40 @@ class SystemMonitorWorker:
                     and now >= next_thermal
                     and not self._stop_event.is_set()
                 ):
-                    snapshot, error = collect_thermal_snapshot(self.adb, self.device)
+                    include_brightness = brightness_tracking_active or now >= next_brightness_probe
+                    snapshot, error = collect_thermal_snapshot(
+                        self.adb,
+                        self.device,
+                        include_display_brightness=include_brightness,
+                    )
                     if snapshot is not None:
                         self.journal.append_thermal_snapshot(snapshot)
                         self.thermal_snapshot_count += 1
+                        relevant_cooling = any(
+                            re.search(
+                                r"lcd|backlight|display|screen",
+                                str(item.get("name") or ""),
+                                re.I,
+                            )
+                            and float(item.get("value") or 0.0) > 0
+                            for item in snapshot.cooling_devices
+                            if isinstance(item, dict)
+                        )
+                        brightness = snapshot.display_brightness
+                        framework_clamp = bool(brightness.get("thermal_applied")) or (
+                            isinstance(brightness.get("thermal_cap"), (int, float))
+                            and float(brightness["thermal_cap"]) < 0.999
+                            and int(brightness.get("thermal_status") or 0) > 0
+                        )
+                        was_tracking = brightness_tracking_active
+                        brightness_tracking_active = relevant_cooling or framework_clamp
+                        if brightness_tracking_active or was_tracking:
+                            next_brightness_probe = time.monotonic() + self.thermal_interval_s
+                        elif snapshot.display_brightness:
+                            next_brightness_probe = time.monotonic() + max(
+                                30.0,
+                                self.thermal_interval_s * 3.0,
+                            )
                     if error:
                         self._warn_once("thermal", f"热状态监控：{error}")
                     next_thermal = self._advance_due(

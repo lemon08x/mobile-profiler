@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from .analysis import (
+    analyze_brightness_throttling,
     analyze_memory_frequency,
     analyze_performance_contexts,
     analyze_runtime_settings,
@@ -778,6 +779,18 @@ class LiveTelemetryReader:
             else []
         )
         performance = analyze_performance_contexts(contexts, self.metadata)
+        brightness_throttling = (
+            analyze_brightness_throttling(samples, contexts, self.thermal_snapshots)
+            if str(self.metadata.get("platform") or "android").lower() == "android"
+            else {
+                "available": False,
+                "timeline": [],
+                "points": [],
+                "events": [],
+                "point_count": 0,
+                "event_count": 0,
+            }
+        )
         session_start_uptime = samples[0].uptime_s if samples else None
         performance_timeline = performance.get("frame_rate_timeline", [])
         performance_series = [
@@ -1050,6 +1063,7 @@ class LiveTelemetryReader:
             "clusters": clusters,
             "context": asdict(latest_context) if latest_context is not None else None,
             "performance": performance,
+            "brightness_throttling": brightness_throttling,
             "memory": memory_analysis,
             "runtime_settings": settings_analysis,
             "power_pressure": power_pressure,

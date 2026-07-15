@@ -2209,6 +2209,30 @@ body[data-test-mode="performance"] .test-mode-switch button.active > i {
   vector-effect: non-scaling-stroke;
 }
 
+#live-chart .brightness-dim-marker {
+  stroke: var(--warning);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+  opacity: .9;
+  vector-effect: non-scaling-stroke;
+}
+
+#live-chart .brightness-dim-marker.confirmed {
+  stroke: var(--danger);
+  stroke-width: 2;
+}
+
+#live-chart .brightness-dim-dot {
+  fill: var(--warning);
+  stroke: var(--bg-soft);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+#live-chart .brightness-dim-dot.confirmed {
+  fill: var(--danger);
+}
+
 .chart-empty {
   position: absolute;
   inset: 0;
@@ -2217,6 +2241,110 @@ body[data-test-mode="performance"] .test-mode-switch button.active > i {
   justify-items: center;
   color: var(--muted);
   text-align: center;
+}
+
+.brightness-dim-panel {
+  overflow: hidden;
+  border-color: rgb(246 199 96 / 25%);
+  background: linear-gradient(120deg, rgb(246 199 96 / 6%), transparent 48%), var(--surface);
+}
+
+.brightness-dim-panel.active {
+  border-color: rgb(255 101 125 / 44%);
+  box-shadow: inset 3px 0 0 var(--danger), var(--shadow-soft);
+}
+
+.brightness-dim-panel.suspected:not(.active) {
+  box-shadow: inset 3px 0 0 var(--warning), var(--shadow-soft);
+}
+
+.brightness-dim-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 15px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.brightness-dim-indicator {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--good);
+  border-radius: 50%;
+  box-shadow: 0 0 0 5px rgb(53 212 154 / 8%);
+}
+
+.brightness-dim-panel.suspected .brightness-dim-indicator {
+  border-color: var(--warning);
+  box-shadow: 0 0 0 5px rgb(246 199 96 / 9%);
+}
+
+.brightness-dim-panel.active .brightness-dim-indicator {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 5px rgb(255 101 125 / 10%);
+  animation: priority-pulse 1.8s ease-in-out infinite;
+}
+
+.brightness-dim-summary strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.brightness-dim-summary p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.brightness-dim-summary em {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: .08em;
+}
+
+.brightness-dim-panel.suspected .brightness-dim-summary em {
+  border-color: rgb(246 199 96 / 35%);
+  color: var(--warning);
+}
+
+.brightness-dim-panel.active .brightness-dim-summary em {
+  border-color: rgb(255 101 125 / 38%);
+  color: var(--danger);
+}
+
+.brightness-dim-points {
+  display: flex;
+  gap: 6px;
+  padding: 0 15px 13px;
+  overflow-x: auto;
+  color: var(--muted-2);
+  font-size: 8px;
+}
+
+.brightness-dim-points span {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-deep);
+}
+
+.brightness-dim-points span.suspected {
+  border-color: rgb(246 199 96 / 30%);
+  color: var(--warning);
+}
+
+.brightness-dim-points span.confirmed {
+  border-color: rgb(255 101 125 / 34%);
+  color: var(--danger);
 }
 
 .chart-empty strong {

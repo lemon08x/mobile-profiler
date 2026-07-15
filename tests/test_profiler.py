@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from mobile_profiler.analysis import (
     analyze_android_frame_pipeline,
+    analyze_brightness_throttling,
     analyze_memory_frequency,
     analyze_performance_contexts,
     analyze_performance_test_items,
@@ -99,6 +100,7 @@ from mobile_profiler.models import (
 from mobile_profiler.parsers import (
     parse_activity_processes,
     parse_cpuset_policy_state,
+    parse_display_brightness_state,
     parse_gpu_dump,
     parse_gpu_work,
     parse_performance_hint,
@@ -537,6 +539,44 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(hint["sessions"][0]["tids"], [2717, 2718])
         self.assertTrue(hint["sessions"][0]["graphics_pipeline"])
 
+    def test_display_brightness_parser_separates_requested_and_thermal_cap(self) -> None:
+        parsed = parse_display_brightness_state(
+            """Display Power Controller Thread State:
+  mScreenState=ON
+  mScreenBrightness=0.2800000
+  mSdrScreenBrightness=0.2800000
+DisplayBrightnessController:
+  mCurrentScreenBrightness=0.3954986
+  mLastUserSetScreenBrightness=0.3954986
+mCachedBrightnessInfo.brightness=0.2800000
+mCachedBrightnessInfo.adjustedBrightness=0.2800000
+mCachedBrightnessInfo.brightnessMin=0.0
+mCachedBrightnessInfo.brightnessMax=0.2800000
+mCachedBrightnessInfo.brightnessMaxReason=1
+BrightnessThermalClamper:
+  mThrottlingStatus=3
+  mBrightnessCap=0.2800000
+  mApplied=true
+HighBrightnessModeController:
+  mBrightness=0.2800000
+  mUnthrottledBrightness=0.3954986
+  mThrottlingReason=thermal
+  mCurrentMax=0.2800000
+""",
+            "101\n",
+            "0.3954986\n",
+        )
+
+        self.assertTrue(parsed["available"])
+        self.assertEqual(parsed["screen_state"], "ON")
+        self.assertEqual(parsed["setting_raw"], 101.0)
+        self.assertAlmostEqual(parsed["current_screen_brightness"], 0.3954986)
+        self.assertAlmostEqual(parsed["screen_brightness"], 0.28)
+        self.assertAlmostEqual(parsed["thermal_cap"], 0.28)
+        self.assertTrue(parsed["thermal_applied"])
+        self.assertEqual(parsed["brightness_max_reason"], 1)
+        self.assertEqual(parsed["hbm_throttling_reason"], "thermal")
+
     def test_activity_manager_process_state_parser(self) -> None:
         parsed = parse_activity_processes(
             "  *APP* UID 10287 ProcessRecord{abc 13646:tv.danmaku.bili/u0a287}\n"
@@ -938,6 +978,69 @@ class SystemAnalysisTests(unittest.TestCase):
         self.assertEqual(scheduler_result["timeline"][0]["cpuset_cpu_count"], 4)
         self.assertEqual(scheduler_result["timeline"][0]["top_app_process_count"], 0)
         self.assertEqual(scheduler_result["timeline"][0]["frozen_process_count"], 0)
+
+    def test_brightness_throttling_groups_confirmed_points_and_recovery(self) -> None:
+        samples = self._samples()
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example.game",
+                foreground_activity=".GameActivity",
+                screen_state="Awake",
+            )
+        ]
+
+        def snapshot(
+            uptime_s: float,
+            effective: float,
+            cap: float,
+            applied: bool,
+            cooling: float,
+            maximum_reason: int,
+        ) -> ThermalSnapshot:
+            return ThermalSnapshot(
+                uptime_s=uptime_s,
+                host_epoch_s=1000.0 + uptime_s,
+                status=2 if applied else 0,
+                temperatures=[{"name": "skin", "value_c": 44.0 if applied else 38.0}],
+                cooling_devices=[{"name": "lcd-backlight", "value": cooling}],
+                display_brightness={
+                    "available": True,
+                    "screen_state": "ON",
+                    "setting_raw": 204.0,
+                    "setting_float": 0.8,
+                    "current_screen_brightness": 0.8,
+                    "last_user_set_brightness": 0.8,
+                    "screen_brightness": effective,
+                    "adjusted_brightness": effective,
+                    "thermal_cap": cap,
+                    "thermal_applied": applied,
+                    "thermal_status": 3 if applied else 0,
+                    "brightness_max_reason": maximum_reason,
+                },
+            )
+
+        result = analyze_brightness_throttling(
+            samples,
+            contexts,
+            [
+                snapshot(100.0, 0.8, 1.0, False, 0.0, 0),
+                snapshot(110.0, 0.58, 0.58, True, 1.0, 1),
+                snapshot(120.0, 0.48, 0.48, True, 2.0, 1),
+                snapshot(130.0, 0.8, 1.0, False, 0.0, 0),
+            ],
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["point_count"], 2)
+        self.assertEqual(result["confirmed_point_count"], 2)
+        self.assertEqual(result["event_count"], 1)
+        self.assertEqual(result["events"][0]["point_count"], 2)
+        self.assertTrue(result["events"][0]["setting_unchanged"])
+        self.assertAlmostEqual(result["events"][0]["minimum_effective_raw_estimate"], 122.4)
+        self.assertFalse(result["current_active"])
+        self.assertEqual(result["current_state"]["status"], "none")
+        self.assertEqual(result["points"][0]["foreground_package"], "com.example.game")
 
     def test_bcl_vbat_status_does_not_trigger_thermal_shutdown(self) -> None:
         result = analyze_thermal_history(
@@ -2348,6 +2451,103 @@ class IosAdapterTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_lists_and_marks_each_brightness_throttling_point(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index * 10),
+                uptime_s=100.0 + index * 10,
+                current_ma=300.0,
+                signed_current_ma=-300.0,
+                voltage_mv=3800.0,
+                power_mw=1140.0,
+                direction="discharging",
+                cpu_pct=45.0,
+            )
+            for index in range(4)
+        ]
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example.game",
+                foreground_activity=".GameActivity",
+                screen_state="Awake",
+                refresh_rate_hz=60.0,
+            )
+        ]
+        thermal_snapshots = [
+            ThermalSnapshot(
+                uptime_s=uptime_s,
+                host_epoch_s=1000.0 + uptime_s,
+                status=2 if applied else 0,
+                temperatures=[{"name": "skin", "value_c": temperature}],
+                cooling_devices=[{"name": "lcd-backlight", "value": cooling}],
+                display_brightness={
+                    "available": True,
+                    "screen_state": "ON",
+                    "setting_raw": 204.0,
+                    "setting_float": 0.8,
+                    "current_screen_brightness": 0.8,
+                    "screen_brightness": effective,
+                    "adjusted_brightness": effective,
+                    "thermal_cap": cap,
+                    "thermal_applied": applied,
+                    "thermal_status": 3 if applied else 0,
+                    "brightness_max_reason": 1 if applied else 0,
+                },
+            )
+            for uptime_s, effective, cap, applied, cooling, temperature in (
+                (100.0, 0.8, 1.0, False, 0.0, 38.0),
+                (110.0, 0.8, 1.0, False, 1.0, 43.0),
+                (120.0, 0.48, 0.48, True, 2.0, 45.0),
+                (130.0, 0.8, 1.0, False, 0.0, 40.0),
+            )
+        ]
+        metadata = {
+            "platform": "android",
+            "test_mode": "performance",
+            "title": "Brightness throttle markers",
+            "sample_interval_s": 10.0,
+            "cpu_policies": [],
+            "gpu_source": None,
+            "battery_start": {"level_pct": 80, "temperature_c": 32.0},
+            "battery_end": {"level_pct": 80, "temperature_c": 33.0},
+            "device": {"brand": "Test", "model": "Phone", "android": "16"},
+            "system_monitor": {"enabled": True},
+            "capture_configuration": resolve_capture_configuration(
+                "performance",
+                "android",
+                "performance-standard",
+            ),
+        }
+
+        analysis = analyze_run(
+            samples,
+            metadata,
+            {},
+            [],
+            contexts=contexts,
+            thermal_snapshots=thermal_snapshots,
+        )
+        fragment = build_report_fragment(
+            {
+                "metadata": metadata,
+                "analysis": analysis,
+                "samples": [item.__dict__ for item in samples],
+                "contexts": [item.__dict__ for item in contexts],
+            }
+        )
+
+        self.assertEqual(analysis["brightness_throttling"]["point_count"], 2)
+        self.assertIn("疑似降亮度点", fragment)
+        self.assertEqual(fragment.count('class="brightness-point-row"'), 2)
+        self.assertIn('data-brightness-time="10.000"', fragment)
+        self.assertIn('data-brightness-time="20.000"', fragment)
+        self.assertIn('source-tag medium">疑似', fragment)
+        self.assertIn('source-tag high">确认', fragment)
+        self.assertIn("系统设定亮度和显示侧有效亮度分开记录", fragment)
+        self.assertIn("appendBrightnessMarkers", fragment)
+
     def test_power_and_performance_modes_separate_analysis_and_report_focus(self) -> None:
         samples = [
             Sample(

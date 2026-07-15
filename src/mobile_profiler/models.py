@@ -184,6 +184,7 @@ class ThermalSnapshot:
     cooling_devices: List[Dict[str, object]] = field(default_factory=list)
     thresholds: List[Dict[str, object]] = field(default_factory=list)
     headroom_thresholds: List[Optional[float]] = field(default_factory=list)
+    display_brightness: Dict[str, object] = field(default_factory=dict)
     collection_ms: Optional[float] = None
 
 

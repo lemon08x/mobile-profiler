@@ -99,6 +99,7 @@ METRIC_LABELS = {
     "Render and compositor thread activity": "渲染与合成线程活动",
     "Scheduler and thermal context": "调度与热状态上下文",
     "Whole-device power recording": "整机功耗记录",
+    "Brightness thermal limiting": "屏幕热降亮",
 }
 SOURCE_LABELS = {
     "iOS DiagnosticsService PowerTelemetryData.SystemLoad": "iOS DiagnosticsService · PowerTelemetryData.SystemLoad",
@@ -135,6 +136,7 @@ SOURCE_LABELS = {
     "Platform utilization, cpufreq and readable devfreq counters": "平台利用率、cpufreq 与可读 devfreq 计数器",
     "Periodic toybox top/ps thread snapshots": "周期性 toybox top / ps 线程快照",
     "Battery current and voltage telemetry": "电池电流与电压遥测",
+    "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight": "DisplayManager 热亮度限制 + Thermal HAL lcd-backlight",
 }
 COMPONENT_LABELS = {
     "screen": "屏幕",
@@ -1797,6 +1799,83 @@ def _cooling_rows(analysis: Dict[str, object]) -> str:
     return "".join(rows) or '<tr><td colspan="3" class="empty-cell">系统未暴露冷却设备活动。</td></tr>'
 
 
+def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
+    brightness = analysis.get("brightness_throttling", {})
+    brightness = brightness if isinstance(brightness, dict) else {}
+    if not brightness.get("available"):
+        return ""
+    points = brightness.get("points", [])
+    points = points if isinstance(points, list) else []
+    if not points:
+        return (
+            '<section class="analysis-section brightness-dim-section">'
+            '<div class="priority-callout"><span class="status-dot good"></span><div>'
+            '<strong>未观察到疑似屏幕热降亮</strong>'
+            '<span>系统亮度、DisplayManager 热亮度上限和 lcd-backlight 冷却档位未形成降亮证据。</span>'
+            '</div></div></section>'
+        )
+    rows = []
+    for item in points:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "suspected")
+        tag = "high" if status == "confirmed" else "medium"
+        label = "确认" if status == "confirmed" else "疑似"
+        requested = item.get("requested_brightness")
+        effective = item.get("effective_brightness")
+        cap = item.get("thermal_cap")
+        effective_raw = item.get("effective_raw_estimate")
+        display_text = (
+            f'请求 {_number(float(requested) * 100.0, 1)}% → '
+            f'有效 {_number(float(effective) * 100.0, 1)}%'
+            if isinstance(requested, (int, float)) and isinstance(effective, (int, float))
+            else "有效亮度不可直接读取"
+        )
+        if isinstance(effective_raw, (int, float)):
+            display_text += f'<span class="cell-sub">折算档位约 {_number(effective_raw, 0)}</span>'
+        cap_text = (
+            f'{_number(float(cap) * 100.0, 1)}%'
+            if isinstance(cap, (int, float))
+            else "—"
+        )
+        temperature = item.get("skin_temperature_c")
+        rows.append(
+            f'<tr class="brightness-point-row" data-brightness-time="{_number(item.get("elapsed_s"), 3, "0")}">'
+            f'<td>{_number(item.get("elapsed_s"), 1)} s</td>'
+            f'<td><span class="source-tag {tag}">{label}</span></td>'
+            f'<td>{_number(item.get("setting_raw"), 0)}'
+            f'<span class="cell-sub">{"设定未变" if item.get("setting_unchanged") else "设定可能变化"}</span></td>'
+            f'<td>{display_text}</td>'
+            f'<td>{cap_text}</td>'
+            f'<td>{_number(item.get("lcd_backlight_cooling"), 0)}</td>'
+            f'<td>{_number(temperature, 1)} °C</td>'
+            f'<td>{_escape(item.get("foreground_package") or "—")}</td>'
+            f'<td>{_escape(item.get("reason") or "—")}</td>'
+            '</tr>'
+        )
+    confirmed = int(brightness.get("confirmed_point_count") or 0)
+    title = "检测到屏幕热降亮" if confirmed else "检测到疑似屏幕热降亮"
+    return (
+        '<section class="analysis-section brightness-dim-section">'
+        '<div class="chart-toolbar"><div><h2>疑似降亮度点</h2>'
+        '<p class="section-copy">时间线中的橙色/红色竖线与下表逐点对应；系统设定亮度和显示侧有效亮度分开记录。</p></div>'
+        f'<span class="source-tag {"high" if confirmed else "medium"}">'
+        f'{int(brightness.get("point_count") or 0)} 点 / {int(brightness.get("event_count") or 0)} 段</span></div>'
+        '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
+        f'<strong>{_escape(title)}</strong>'
+        '<span>DisplayManager 热亮度上限、有效亮度和 Thermal HAL lcd-backlight 冷却状态已联合判定。</span>'
+        '</div></div>'
+        '<div class="data-table-wrap"><table><thead><tr>'
+        '<th>时间</th><th>判定</th><th>系统设定</th><th>显示侧亮度</th><th>热上限</th>'
+        '<th>LCD 冷却档</th><th>SKIN</th><th>前台应用</th><th>证据</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        '<div class="availability-note"><strong>测量边界</strong><span>'
+        '这里能确认 Android Framework / Thermal HAL 侧的限亮并估算有效档位；厂商若在面板底层执行不可见策略，'
+        'ADB 无法给出绝对物理亮度，精确 nits 仍需外部亮度计。</span></div>'
+        '</section>'
+    )
+
+
 def _cpuset_rows(analysis: Dict[str, object]) -> str:
     scheduler = analysis.get("scheduler", {})
     rows = []
@@ -2052,6 +2131,8 @@ def _source_rows(analysis: Dict[str, object]) -> str:
     scheduler = scheduler if isinstance(scheduler, dict) else {}
     thermal = analysis.get("thermal", {})
     thermal = thermal if isinstance(thermal, dict) else {}
+    brightness = analysis.get("brightness_throttling", {})
+    brightness = brightness if isinstance(brightness, dict) else {}
     gpu = analysis.get("gpu", {})
     gpu = gpu if isinstance(gpu, dict) else {}
     rows = []
@@ -2083,6 +2164,8 @@ def _source_rows(analysis: Dict[str, object]) -> str:
             or gpu.get("work_by_uid")
             or (isinstance(gpu.get("memory"), dict) and gpu.get("memory", {}).get("available"))
         ):
+            continue
+        if metric == "Brightness thermal limiting" and not brightness.get("available"):
             continue
         rows.append(
             "<tr>"
@@ -2501,6 +2584,10 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .chart-surface .selected-point { fill: var(--app-bg); stroke-width: 2; }
   #mobile-profiler .chart-surface .event-span { fill: var(--series-3); opacity: .12; }
   #mobile-profiler .chart-surface .event-line { stroke: var(--series-3); stroke-width: 1; }
+  #mobile-profiler .chart-surface .brightness-dim-marker { stroke: var(--series-3); stroke-width: 1.4; stroke-dasharray: 4 3; opacity: .85; }
+  #mobile-profiler .chart-surface .brightness-dim-marker.confirmed { stroke: var(--series-4); stroke-width: 1.8; }
+  #mobile-profiler .chart-surface .brightness-dim-dot { fill: var(--series-3); stroke: var(--app-bg); stroke-width: 1.5; }
+  #mobile-profiler .chart-surface .brightness-dim-dot.confirmed { fill: var(--series-4); }
   #mobile-profiler .chart-surface .app-band { opacity: .78; }
   #mobile-profiler .chart-surface .test-band { fill: var(--series-1); opacity: .28; }
   #mobile-profiler .chart-surface .activity-band { opacity: .72; }
@@ -2522,6 +2609,8 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .test-item-row:hover td { background: rgba(79, 195, 215, .055); }
   #mobile-profiler .cell-sub { display: block; margin-top: 2px; }
   #mobile-profiler .empty-cell { color: var(--app-muted); }
+  #mobile-profiler .brightness-point-row td { background: rgba(240, 161, 94, .035); }
+  #mobile-profiler .brightness-point-row:hover td { background: rgba(240, 161, 94, .075); }
   #mobile-profiler .finding-list { display: grid; gap: 0; }
   #mobile-profiler .finding-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--app-border); }
   #mobile-profiler .finding-row strong { font-size: 13px; font-weight: 500; }
@@ -2647,6 +2736,7 @@ REPORT_FRAGMENT = r"""
             </div>
           </div>
         </section>
+        @@BRIGHTNESS_THROTTLING_SECTION@@
         <section class="analysis-section" data-report-only="power"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         <div class="split-layout" data-report-only="performance">
           @@OVERVIEW_PERFORMANCE_CONTEXT_SECTION@@
@@ -2763,6 +2853,8 @@ REPORT_FRAGMENT = r"""
   const analysis = bundle.analysis || {};
   const cpu = analysis.cpu || { clusters: [], timeline: [] };
   const gpu = analysis.gpu || {};
+  const brightnessDim = analysis.brightness_throttling || {};
+  const brightnessDimPoints = (brightnessDim.points || []).slice().sort((a, b) => Number(a.elapsed_s) - Number(b.elapsed_s));
   const testMode = root.dataset.testMode || "power";
   const frameTimeline = (((analysis.performance || {}).frame_rate_timeline) || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
   const testItems = analysis.test_items || { rows: [], spans: [], instant_events: [] };
@@ -2812,6 +2904,29 @@ REPORT_FRAGMENT = r"""
     return Math.max(360, Math.round(svg.getBoundingClientRect().width || 1080));
   }
   function maxTime() { return Math.max(1, ...samples.map(sample => Number(sample.elapsed_s || 0))); }
+  function appendBrightnessMarkers(svg, x, top, bottom, rangeStart = 0, rangeEnd = maxTime()) {
+    brightnessDimPoints.forEach(point => {
+      const elapsed = Number(point.elapsed_s || 0);
+      if (elapsed < rangeStart || elapsed > rangeEnd) return;
+      const status = String(point.status || "suspected");
+      const xPos = x(elapsed);
+      const line = svgNode("line", {
+        x1: xPos,
+        x2: xPos,
+        y1: top,
+        y2: bottom,
+        class: `brightness-dim-marker ${status}`,
+      });
+      line.appendChild(svgNode("title", {}, `${formatTime(elapsed)} · ${status === "confirmed" ? "确认热降亮" : "疑似热降亮"} · ${point.reason || "显示侧热限制"}`));
+      svg.appendChild(line);
+      svg.appendChild(svgNode("circle", {
+        cx: xPos,
+        cy: top + 6,
+        r: status === "confirmed" ? 4.5 : 3.5,
+        class: `brightness-dim-dot ${status}`,
+      }));
+    });
+  }
   function sessionStartUptime() { return samples.length ? Number(samples[0].uptime_s || 0) : 0; }
   function contextForUptime(uptime) {
     let selected = null;
@@ -2901,6 +3016,7 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": "middle", class: "axis-text" }, formatTime(seconds)));
     }
     svg.appendChild(svgNode("polyline", { points: pointString(values, x, y), fill: "none", stroke: metric.color, "stroke-width": 2.2 }));
+    appendBrightnessMarkers(svg, x, margin.top, height - margin.bottom);
     const selected = samples[selectedIndex];
     const selectedValue = metric.value(selected);
     const xPos = x(selected.elapsed_s);
@@ -2940,6 +3056,7 @@ REPORT_FRAGMENT = r"""
       const selectedValue = values[selectedIndex];
       if (finite(selectedValue)) svg.appendChild(svgNode("circle", { cx: x(samples[selectedIndex].elapsed_s), cy: y(Number(selectedValue)), r: 3.5, class: "selected-point", stroke: lane.color }));
     });
+    appendBrightnessMarkers(svg, x, top, height - bottom);
     const selectedX = x(samples[selectedIndex].elapsed_s);
     svg.appendChild(svgNode("line", { x1: selectedX, x2: selectedX, y1: top, y2: height - bottom, class: "crosshair" }));
     attachOverlay(svg, width, height, left, right, top, bottom);
@@ -3730,6 +3847,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         ),
         "@@PERFORMANCE_CONTEXT_SECTIONS@@": _performance_context_sections(analysis),
         "@@PERFORMANCE_POWER_RECORDING@@": _performance_power_recording(analysis),
+        "@@BRIGHTNESS_THROTTLING_SECTION@@": _brightness_throttling_section(analysis),
         "@@POWER_PRESSURE_SECTIONS@@": _power_pressure_sections(analysis),
         "@@POWER_PRESSURE_DRIVER_ROWS@@": _power_pressure_driver_rows(analysis),
         "@@POWER_PRESSURE_TASK_ROWS@@": _power_pressure_task_rows(analysis),

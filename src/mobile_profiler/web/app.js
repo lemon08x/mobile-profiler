@@ -46,6 +46,7 @@
     currentRunName: null,
     chartGeometry: null,
     notifiedWarnings: new Set(),
+    notifiedBrightnessPoints: new Set(),
     scannedApps: [],
     scannedAppsDevice: "",
     scannedAppsSource: "",
@@ -1187,6 +1188,67 @@
     $("#live-detail-count").textContent = cards.length ? `${cards.length} 项有效数据` : "等待数据";
   }
 
+  function renderBrightnessThrottling(active) {
+    const panel = $("#brightness-dim-panel");
+    if (!panel) return;
+    const analysis = active?.brightness_throttling || {};
+    const available = activePlatform(active) === "android" && Boolean(analysis.available);
+    panel.classList.toggle("hidden", !available);
+    if (!available) return;
+    const points = Array.isArray(analysis.points) ? analysis.points : [];
+    const current = analysis.current_state || {};
+    const status = String(current.status || "none");
+    const currentActive = status === "confirmed" || status === "suspected";
+    panel.classList.toggle("active", status === "confirmed");
+    panel.classList.toggle("suspected", status === "suspected");
+    const title = $("#brightness-dim-title");
+    const detail = $("#brightness-dim-detail");
+    const badge = $("#brightness-dim-badge");
+    const source = $("#brightness-dim-source");
+    const pointList = $("#brightness-dim-points");
+    const parts = [];
+    if (finite(current.setting_raw)) parts.push(`系统设定 ${Number(current.setting_raw).toFixed(0)}`);
+    if (finite(current.effective_raw_estimate)) {
+      parts.push(`有效档位约 ${Number(current.effective_raw_estimate).toFixed(0)}`);
+    } else if (finite(current.effective_brightness)) {
+      parts.push(`有效亮度 ${Number(current.effective_brightness * 100).toFixed(1)}%`);
+    }
+    if (finite(current.thermal_cap)) parts.push(`热上限 ${Number(current.thermal_cap * 100).toFixed(1)}%`);
+    if (finite(current.lcd_backlight_cooling) && Number(current.lcd_backlight_cooling) > 0) {
+      parts.push(`LCD 冷却档 ${Number(current.lcd_backlight_cooling).toFixed(0)}`);
+    }
+    if (finite(current.skin_temperature_c)) parts.push(`SKIN ${Number(current.skin_temperature_c).toFixed(1)} °C`);
+    if (currentActive) {
+      title.textContent = status === "confirmed" ? "确认发生屏幕热降亮" : "疑似发生屏幕热降亮";
+      detail.textContent = `${parts.join(" · ") || "显示侧热限制已触发"}；${current.reason || "请查看时间点证据"}`;
+      badge.textContent = status === "confirmed" ? "DIM" : "SUSPECT";
+      if (active?.running) {
+        const key = `${current.uptime_s || current.elapsed_s}:${status}`;
+        if (!app.notifiedBrightnessPoints.has(key)) {
+          app.notifiedBrightnessPoints.add(key);
+          notify(
+            status === "confirmed" ? "检测到屏幕热降亮" : "检测到疑似屏幕热降亮",
+            `${formatDuration(current.elapsed_s)} · ${parts.join(" · ") || current.reason || "显示侧热限制"}`,
+            "error",
+            9000,
+          );
+        }
+      }
+    } else if (points.length) {
+      title.textContent = `当前已恢复，历史标记 ${points.length} 个降亮点`;
+      detail.textContent = parts.length ? parts.join(" · ") : "当前 DisplayManager 和 lcd-backlight 未继续限制亮度。";
+      badge.textContent = "HISTORY";
+    } else {
+      title.textContent = "未检测到屏幕热降亮";
+      detail.textContent = parts.length ? parts.join(" · ") : "系统亮度与显示侧热限制状态正常。";
+      badge.textContent = "CLEAR";
+    }
+    source.textContent = `${points.length} points · DisplayManager / Thermal HAL`;
+    pointList.innerHTML = points.length
+      ? points.slice(-40).map(point => `<span class="${escapeHtml(point.status || "suspected")}" title="${escapeHtml(point.reason || "显示侧热限制")}">${formatDuration(point.elapsed_s)} · ${point.status === "confirmed" ? "确认" : "疑似"}</span>`).join("")
+      : "<span>尚无疑似降亮点</span>";
+  }
+
   function svgNode(name, attributes = {}, text = "") {
     const node = document.createElementNS(svgNs, name);
     Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)));
@@ -1776,9 +1838,16 @@
       ? Number(latest.memory_frequency_mhz).toFixed(0) + " MHz"
       : "--";
     const thermal = monitor.thermal || {};
-    $("#resource-thermal").textContent = finite(thermal.status)
-      ? (thermalStatusDefinitions[Number(thermal.status)] || "状态 " + String(thermal.status))
-      : "--";
+    const brightnessDim = active?.brightness_throttling || {};
+    const brightnessState = brightnessDim.current_state || {};
+    const brightnessStatus = String(brightnessState.status || "none");
+    $("#resource-thermal").textContent = brightnessStatus === "confirmed"
+      ? `热降亮 · 上限 ${finite(brightnessState.thermal_cap) ? Number(brightnessState.thermal_cap * 100).toFixed(1) + "%" : "已限制"}`
+      : brightnessStatus === "suspected"
+        ? "疑似热降亮"
+        : finite(thermal.status)
+          ? (thermalStatusDefinitions[Number(thermal.status)] || "状态 " + String(thermal.status))
+          : "--";
     $("#resource-window").textContent = performance.foreground_window_name || context.foreground_activity || "--";
 
     const cadenceParts = [];
@@ -2161,6 +2230,8 @@
     const processes = Array.isArray(monitor.processes) ? monitor.processes : [];
     const priority = Array.isArray(monitor.active_priority) ? monitor.active_priority : [];
     const thermal = monitor.thermal || {};
+    const brightnessState = active?.brightness_throttling?.current_state || {};
+    const brightnessStatus = String(brightnessState.status || "none");
     const temperatures = Array.isArray(thermal.temperatures) ? thermal.temperatures : [];
     const thermalTemperatures = temperatures.filter(isThermalTemperature);
     const hottest = thermalTemperatures.length ? [...thermalTemperatures].sort((a, b) => Number(b.value_c || 0) - Number(a.value_c || 0))[0] : null;
@@ -2206,8 +2277,11 @@
       ? `${Number(performance.display_width_px).toFixed(0)} × ${Number(performance.display_height_px).toFixed(0)}`
       : "--";
     const brightness = finite(performance.brightness_raw) ? Number(performance.brightness_raw).toFixed(0) : "--";
+    const effectiveBrightness = finite(brightnessState.effective_raw_estimate)
+      ? ` → 有效约 ${Number(brightnessState.effective_raw_estimate).toFixed(0)}`
+      : "";
     $("#performance-window-value").textContent = performance.foreground_window_name ? `${performance.foreground_window_name}${finite(performance.foreground_window_id) ? ` · #${performance.foreground_window_id}` : ""}` : "--";
-    $("#performance-display-value").textContent = `${resolution} / ${brightness}`;
+    $("#performance-display-value").textContent = `${resolution} / ${brightness}${effectiveBrightness}`;
     $("#performance-gpu-value").textContent = performance.gpu_renderer || "--";
     $("#performance-temperature-value").textContent = hottest && finite(hottest.value_c) ? `${Number(hottest.value_c).toFixed(1)} °C · ${hottest.name || "sensor"}` : finite(active?.latest?.temperature_c) ? `${Number(active.latest.temperature_c).toFixed(1)} °C · battery` : "--";
     $("#performance-switch-value").textContent = `${Number(performance.refresh_switch_count || 0)} 次`;
@@ -2217,10 +2291,15 @@
     const missedPct = finite(performance.frame_issue_pct) ? Number(performance.frame_issue_pct) : finite(performance.missed_vsync_interval_pct) ? Number(performance.missed_vsync_interval_pct) : 0;
     const thermalStatus = finite(thermal.status) ? Number(thermal.status) : 0;
     const hasFrameIssue = missedPct >= 2 || Number(performance.severe_frame_interval_count || 0) > 0;
-    const hasIssue = priority.length > 0 || hasFrameIssue || thermalStatus > 0;
+    const brightnessIssue = brightnessStatus === "confirmed" || brightnessStatus === "suspected";
+    const hasIssue = brightnessIssue || priority.length > 0 || hasFrameIssue || thermalStatus > 0;
     banner.classList.toggle("active", hasIssue);
     banner.classList.toggle("idle", !hasIssue);
-    if (priority.length) {
+    if (brightnessIssue) {
+      $("#system-priority-title").textContent = brightnessStatus === "confirmed" ? "检测到屏幕热降亮" : "检测到疑似屏幕热降亮";
+      $("#system-priority-detail").textContent = `${brightnessState.reason || "显示侧热限制已触发"}；系统设定亮度 ${finite(brightnessState.setting_raw) ? Number(brightnessState.setting_raw).toFixed(0) : "未知"}。`;
+      $("#system-priority-badge").textContent = brightnessStatus === "confirmed" ? "DIM" : "SUSPECT";
+    } else if (priority.length) {
       const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
       const names = priority.map(item => item.watch_label || item.watch_name || item.name).filter(Boolean);
       $("#system-priority-title").textContent = `检测到 ${names.join(" / ")}`;
@@ -2551,6 +2630,30 @@
     const areaPath = `${linePath} L${coordinates.at(-1).x.toFixed(2)},${height - margins.bottom} L${coordinates[0].x.toFixed(2)},${height - margins.bottom} Z`;
     svg.appendChild(svgNode("path", { d: areaPath, class: "series-area" }));
     svg.appendChild(svgNode("path", { d: linePath, class: "series-line" }));
+    const dimPoints = Array.isArray(active?.brightness_throttling?.points)
+      ? active.brightness_throttling.points
+      : [];
+    dimPoints.forEach(point => {
+      const elapsed = Number(point.elapsed_s || 0);
+      if (elapsed < minTime || elapsed > maxTime) return;
+      const status = String(point.status || "suspected");
+      const x = xFor(elapsed);
+      const marker = svgNode("line", {
+        x1: x,
+        y1: margins.top,
+        x2: x,
+        y2: height - margins.bottom,
+        class: `brightness-dim-marker ${status}`,
+      });
+      marker.appendChild(svgNode("title", {}, `${formatDuration(elapsed)} · ${status === "confirmed" ? "确认热降亮" : "疑似热降亮"} · ${point.reason || "显示侧热限制"}`));
+      svg.appendChild(marker);
+      svg.appendChild(svgNode("circle", {
+        cx: x,
+        cy: margins.top + 6,
+        r: status === "confirmed" ? 4.5 : 3.5,
+        class: `brightness-dim-dot ${status}`,
+      }));
+    });
     const last = coordinates.at(-1);
     svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 4, class: "latest-marker" }));
     const hoverLine = svgNode("line", { x1: last.x, y1: margins.top, x2: last.x, y2: height - margins.bottom, class: "hover-line", opacity: 0 });
@@ -2565,6 +2668,7 @@
       app.currentRunName = active?.run_name || null;
       app.consoleClearedAt = 0;
       app.notifiedWarnings.clear();
+      app.notifiedBrightnessPoints.clear();
     }
     if (active && (isNewRun || active.running)) {
       if (active.running) {
@@ -2632,6 +2736,7 @@
     }
     renderSession(active);
     renderMetrics(active);
+    renderBrightnessThrottling(active);
     renderPerformanceMetrics(active);
     renderClusters(active);
     renderContext(active);

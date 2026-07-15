@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-13">
-  <script src="/app.js?v=platform-ui-13" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-14">
+  <script src="/app.js?v=platform-ui-14" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -381,6 +381,16 @@
                   <div class="chart-empty" id="chart-empty"><span class="empty-wave" aria-hidden="true"></span><strong>等待遥测数据</strong><small>开始采集后，曲线将在这里实时更新</small></div>
                   <div class="chart-tooltip hidden" id="chart-tooltip"></div>
                 </div>
+              </section>
+
+              <section class="panel brightness-dim-panel hidden" id="brightness-dim-panel" data-platforms="android">
+                <div class="panel-heading"><div><small>DISPLAY THERMAL LIMIT</small><h2>屏幕热降亮监控</h2></div><span class="data-source" id="brightness-dim-source">DisplayManager / Thermal HAL</span></div>
+                <div class="brightness-dim-summary">
+                  <span class="brightness-dim-indicator" aria-hidden="true"></span>
+                  <div><strong id="brightness-dim-title">等待显示热状态</strong><p id="brightness-dim-detail">系统设定亮度与显示侧有效亮度会分开判断。</p></div>
+                  <em id="brightness-dim-badge">WAIT</em>
+                </div>
+                <div class="brightness-dim-points" id="brightness-dim-points"><span>尚无疑似降亮点</span></div>
               </section>
 
               <section class="panel live-detail-panel">

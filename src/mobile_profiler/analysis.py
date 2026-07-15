@@ -1939,6 +1939,334 @@ def analyze_thermal_history(
     }
 
 
+def analyze_brightness_throttling(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    snapshots: Sequence[ThermalSnapshot],
+) -> Dict[str, object]:
+    ordered = sorted(snapshots, key=lambda item: item.uptime_s)
+    if not ordered:
+        return {
+            "available": False,
+            "timeline": [],
+            "points": [],
+            "events": [],
+            "point_count": 0,
+            "event_count": 0,
+        }
+
+    sample_uptimes = [item.uptime_s for item in samples]
+    ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+    context_uptimes = [item.uptime_s for item in ordered_contexts]
+    session_start = (
+        samples[0].uptime_s
+        if samples
+        else ordered_contexts[0].uptime_s
+        if ordered_contexts
+        else ordered[0].uptime_s
+    )
+
+    def context_for(uptime_s: float) -> Optional[ContextSample]:
+        if not ordered_contexts:
+            return None
+        index = bisect.bisect_right(context_uptimes, uptime_s) - 1
+        return ordered_contexts[max(0, index)]
+
+    def normalized(value: object) -> Optional[float]:
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        parsed = float(value)
+        return parsed if 0.0 <= parsed <= 1.001 else None
+
+    def sensor_value(snapshot: ThermalSnapshot, name_pattern: str) -> Optional[float]:
+        values = [
+            float(item["value_c"])
+            for item in snapshot.temperatures
+            if isinstance(item, dict)
+            and re.search(name_pattern, str(item.get("name") or ""), re.I)
+            and isinstance(item.get("value_c"), (int, float))
+        ]
+        return max(values) if values else None
+
+    baseline_setting: Optional[float] = None
+    observations: List[Dict[str, object]] = []
+    cooling_exposed = False
+    display_exposed = False
+    for snapshot in ordered:
+        display = (
+            snapshot.display_brightness
+            if isinstance(snapshot.display_brightness, dict)
+            else {}
+        )
+        display_exposed = display_exposed or bool(display.get("available"))
+        relevant_cooling = [
+            item
+            for item in snapshot.cooling_devices
+            if isinstance(item, dict)
+            and re.search(r"lcd|backlight|display|screen", str(item.get("name") or ""), re.I)
+        ]
+        cooling_exposed = cooling_exposed or bool(relevant_cooling)
+        if not display and not relevant_cooling:
+            continue
+
+        context = context_for(snapshot.uptime_s)
+        setting_raw = display.get("setting_raw")
+        if not isinstance(setting_raw, (int, float)) and context is not None:
+            setting_raw = context.brightness_raw
+        if isinstance(setting_raw, (int, float)) and baseline_setting is None:
+            baseline_setting = float(setting_raw)
+        setting_float = normalized(display.get("setting_float"))
+        requested = next(
+            (
+                value
+                for value in (
+                    normalized(display.get("current_screen_brightness")),
+                    normalized(display.get("last_user_set_brightness")),
+                    setting_float,
+                    normalized(display.get("hbm_unthrottled_brightness")),
+                )
+                if value is not None
+            ),
+            None,
+        )
+        effective, effective_source = next(
+            (
+                (value, source)
+                for value, source in (
+                    (normalized(display.get("screen_brightness")), "Display Power Controller"),
+                    (normalized(display.get("adjusted_brightness")), "BrightnessInfo adjustedBrightness"),
+                    (normalized(display.get("hbm_brightness")), "HighBrightnessModeController"),
+                    (normalized(display.get("cached_brightness")), "BrightnessInfo brightness"),
+                )
+                if value is not None
+            ),
+            (None, None),
+        )
+        thermal_cap = normalized(display.get("thermal_cap"))
+        thermal_applied = display.get("thermal_applied") is True
+        thermal_status = int(display.get("thermal_status") or 0)
+        maximum_reason = (
+            int(display["brightness_max_reason"])
+            if isinstance(display.get("brightness_max_reason"), (int, float))
+            else None
+        )
+        cooling_value = max(
+            (float(item.get("value") or 0.0) for item in relevant_cooling),
+            default=0.0,
+        )
+        if (
+            thermal_cap is not None
+            and requested is not None
+            and thermal_applied
+            and thermal_cap < requested
+            and (effective is None or effective > thermal_cap)
+        ):
+            effective = thermal_cap
+            effective_source = "DisplayManager thermal cap estimate"
+
+        screen_text = str(
+            display.get("screen_state")
+            or (context.screen_state if context is not None else "")
+            or ""
+        ).strip().upper()
+        screen_explicitly_off = bool(
+            screen_text
+            and (screen_text in {"OFF", "ASLEEP"} or screen_text.startswith("DOZE"))
+        )
+        cap_restricts = bool(
+            thermal_cap is not None
+            and requested is not None
+            and thermal_cap < requested - 0.005
+        )
+        effective_drop = (
+            max(0.0, requested - effective)
+            if requested is not None and effective is not None
+            else None
+        )
+        effective_drop_pct = (
+            effective_drop / requested * 100.0
+            if effective_drop is not None and requested and requested > 0
+            else None
+        )
+        thermal_reason = maximum_reason == 1 or str(
+            display.get("hbm_throttling_reason") or ""
+        ).lower() == "thermal"
+        confirmed = bool(
+            not screen_explicitly_off
+            and (
+                (thermal_reason and (cap_restricts or (effective_drop or 0.0) >= 0.005))
+                or (thermal_applied and cap_restricts)
+                or (cooling_value > 0 and (effective_drop or 0.0) >= 0.005)
+            )
+        )
+        suspected = bool(
+            not screen_explicitly_off
+            and not confirmed
+            and (
+                cooling_value > 0
+                or (thermal_applied and cap_restricts)
+                or (thermal_status > 0 and cap_restricts)
+                or (thermal_reason and cap_restricts)
+            )
+        )
+        status = "confirmed" if confirmed else "suspected" if suspected else "none"
+        reasons: List[str] = []
+        if thermal_applied:
+            reasons.append("DisplayManager 已应用热亮度限制")
+        if thermal_reason:
+            reasons.append("显示亮度最大值原因标记为 thermal")
+        if thermal_cap is not None and thermal_cap < 0.999:
+            reasons.append(f"亮度上限 {thermal_cap * 100.0:.1f}%")
+        if cooling_value > 0:
+            reasons.append(f"lcd-backlight 冷却档位 {cooling_value:g}")
+        if thermal_status > 0:
+            reasons.append(f"亮度热限制状态 {thermal_status}")
+        if isinstance(effective_drop_pct, (int, float)) and effective_drop_pct >= 0.5:
+            reasons.append(f"有效亮度较请求值低 {effective_drop_pct:.1f}%")
+
+        effective_raw_estimate = None
+        if (
+            isinstance(setting_raw, (int, float))
+            and setting_float is not None
+            and setting_float > 0
+            and effective is not None
+        ):
+            effective_raw_estimate = float(setting_raw) * effective / setting_float
+        sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        observations.append(
+            {
+                "elapsed_s": max(0.0, snapshot.uptime_s - session_start),
+                "uptime_s": snapshot.uptime_s,
+                "status": status,
+                "confidence": "high" if confirmed else "medium" if suspected else "none",
+                "screen_state": screen_text or None,
+                "setting_raw": float(setting_raw) if isinstance(setting_raw, (int, float)) else None,
+                "setting_unchanged": (
+                    abs(float(setting_raw) - baseline_setting) < 0.5
+                    if isinstance(setting_raw, (int, float)) and baseline_setting is not None
+                    else None
+                ),
+                "requested_brightness": requested,
+                "effective_brightness": effective,
+                "effective_brightness_source": effective_source,
+                "effective_raw_estimate": effective_raw_estimate,
+                "effective_drop_pct": effective_drop_pct,
+                "thermal_cap": thermal_cap,
+                "thermal_applied": thermal_applied,
+                "thermal_status": thermal_status,
+                "brightness_max_reason": maximum_reason,
+                "lcd_backlight_cooling": cooling_value,
+                "skin_temperature_c": sensor_value(snapshot, r"^skin$"),
+                "battery_temperature_c": sensor_value(snapshot, r"battery"),
+                "foreground_package": context.foreground_package if context is not None else None,
+                "power_mw": sample.power_mw if sample is not None else None,
+                "reason": "；".join(reasons) if reasons else "未观察到热降亮证据",
+                "probe_elapsed_ms": display.get("probe_elapsed_ms"),
+            }
+        )
+
+    available = display_exposed or cooling_exposed
+    points = [item for item in observations if item.get("status") in {"suspected", "confirmed"}]
+    events: List[Dict[str, object]] = []
+    current_event: List[Dict[str, object]] = []
+
+    def finish_event() -> None:
+        nonlocal current_event
+        if not current_event:
+            return
+        confirmed_event = any(item.get("status") == "confirmed" for item in current_event)
+        settings = [
+            float(item["setting_raw"])
+            for item in current_event
+            if isinstance(item.get("setting_raw"), (int, float))
+        ]
+        effective_values = [
+            float(item["effective_brightness"])
+            for item in current_event
+            if isinstance(item.get("effective_brightness"), (int, float))
+        ]
+        raw_estimates = [
+            float(item["effective_raw_estimate"])
+            for item in current_event
+            if isinstance(item.get("effective_raw_estimate"), (int, float))
+        ]
+        caps = [
+            float(item["thermal_cap"])
+            for item in current_event
+            if isinstance(item.get("thermal_cap"), (int, float))
+        ]
+        skin_values = [
+            float(item["skin_temperature_c"])
+            for item in current_event
+            if isinstance(item.get("skin_temperature_c"), (int, float))
+        ]
+        events.append(
+            {
+                "index": len(events) + 1,
+                "status": "confirmed" if confirmed_event else "suspected",
+                "confidence": "high" if confirmed_event else "medium",
+                "start_elapsed_s": current_event[0]["elapsed_s"],
+                "end_elapsed_s": current_event[-1]["elapsed_s"],
+                "duration_s": max(
+                    0.0,
+                    float(current_event[-1]["elapsed_s"])
+                    - float(current_event[0]["elapsed_s"]),
+                ),
+                "point_count": len(current_event),
+                "setting_raw": settings[0] if settings else None,
+                "setting_unchanged": bool(settings) and max(settings) - min(settings) < 0.5,
+                "minimum_effective_brightness": min(effective_values) if effective_values else None,
+                "minimum_effective_raw_estimate": min(raw_estimates) if raw_estimates else None,
+                "minimum_thermal_cap": min(caps) if caps else None,
+                "maximum_lcd_backlight_cooling": max(
+                    float(item.get("lcd_backlight_cooling") or 0.0)
+                    for item in current_event
+                ),
+                "maximum_skin_temperature_c": max(skin_values) if skin_values else None,
+                "foreground_packages": list(
+                    dict.fromkeys(
+                        str(item.get("foreground_package"))
+                        for item in current_event
+                        if item.get("foreground_package")
+                    )
+                ),
+                "reason": current_event[0].get("reason"),
+            }
+        )
+        current_event = []
+
+    for observation in observations:
+        if observation.get("status") in {"suspected", "confirmed"}:
+            current_event.append(observation)
+        else:
+            finish_event()
+    finish_event()
+    current_state = observations[-1] if observations else None
+    latest_flagged = points[-1] if points else None
+    return {
+        "available": available,
+        "source": "Android DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
+        "timeline": observations,
+        "points": points,
+        "events": events,
+        "point_count": len(points),
+        "confirmed_point_count": sum(1 for item in points if item.get("status") == "confirmed"),
+        "suspected_point_count": sum(1 for item in points if item.get("status") == "suspected"),
+        "event_count": len(events),
+        "current_active": bool(
+            current_state and current_state.get("status") in {"suspected", "confirmed"}
+        ),
+        "current_state": current_state,
+        "latest_flagged_point": latest_flagged,
+        "setting_baseline_raw": baseline_setting,
+        "limitations": (
+            "ADB can identify framework or Thermal HAL brightness limiting and estimate the effective normalized "
+            "brightness. It cannot guarantee physical panel luminance in nits when an OEM applies an opaque "
+            "panel-side policy; exact luminance still requires an external photometer."
+        ),
+    }
+
+
 def _cpuset_cpu_count(value: object) -> Optional[int]:
     text = str(value or "").strip()
     if not text or text.lower() in {"none", "unavailable", "unknown", "-"}:
@@ -4911,6 +5239,8 @@ def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, st
     performance = performance if isinstance(performance, dict) else {}
     render = analysis.get("render_performance", {})
     render = render if isinstance(render, dict) else {}
+    brightness = analysis.get("brightness_throttling", {})
+    brightness = brightness if isinstance(brightness, dict) else {}
     findings: List[Dict[str, str]] = []
     fps = performance.get("sampled_frame_rate_fps")
     one_low = performance.get("one_percent_low_fps")
@@ -4938,6 +5268,26 @@ def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, st
                 "level": str(item.get("severity") or "counter"),
                 "title": f"可能的帧延迟来源：{item.get('stage') or '渲染链路'}",
                 "detail": str(item.get("detail") or ""),
+            }
+        )
+    if int(brightness.get("point_count") or 0) > 0:
+        events = brightness.get("events", [])
+        events = events if isinstance(events, list) else []
+        leading = events[0] if events and isinstance(events[0], dict) else {}
+        findings.append(
+            {
+                "level": "high" if int(brightness.get("confirmed_point_count") or 0) else "medium",
+                "title": "检测到疑似屏幕热降亮",
+                "detail": (
+                    f"共标记 {int(brightness.get('point_count') or 0)} 个采样点、"
+                    f"{int(brightness.get('event_count') or 0)} 段事件；"
+                    f"首次发生在 {float(leading.get('start_elapsed_s') or 0.0):.1f} s。"
+                    + (
+                        "系统亮度设定在事件内保持不变，显示侧有效亮度发生下降。"
+                        if leading.get("setting_unchanged")
+                        else "请结合事件表中的设置值和有效亮度判断。"
+                    )
+                ),
             }
         )
     power = render.get("power_recording", {})
@@ -4968,6 +5318,8 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
     thermal = analysis.get("thermal", {})
     system = analysis.get("system", {})
     scheduler = analysis.get("scheduler", {})
+    brightness = analysis.get("brightness_throttling", {})
+    brightness = brightness if isinstance(brightness, dict) else {}
     target = analysis.get("target_app")
     findings: List[Dict[str, str]] = [
         {
@@ -5236,6 +5588,26 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
             }
         )
     thermal_status = None
+    if int(brightness.get("point_count") or 0) > 0:
+        events = brightness.get("events", [])
+        events = events if isinstance(events, list) else []
+        leading = events[0] if events and isinstance(events[0], dict) else {}
+        findings.append(
+            {
+                "level": "high" if int(brightness.get("confirmed_point_count") or 0) else "medium",
+                "title": "检测到疑似屏幕热降亮",
+                "detail": (
+                    f"共标记 {int(brightness.get('point_count') or 0)} 个采样点、"
+                    f"{int(brightness.get('event_count') or 0)} 段事件；"
+                    f"首次发生在 {float(leading.get('start_elapsed_s') or 0.0):.1f} s。"
+                    + (
+                        "系统亮度设定保持不变，因此屏幕变暗不能用设置值下降解释。"
+                        if leading.get("setting_unchanged")
+                        else "设置值同期也有变化，报告会分别展示设置与显示侧限制。"
+                    )
+                ),
+            }
+        )
     if isinstance(thermal, dict):
         thermal_status = thermal.get("maximum_status")
         if thermal_status is None:
@@ -5312,7 +5684,7 @@ def _analysis_data_sources(
             if platform == "harmony"
             else "cgroup files + ActivityManager + performance_hint"
         )
-        return [
+        sources = [
             {
                 "metric": "Frame rate, 1% Low and frame latency",
                 "source": platform_frame_source,
@@ -5344,6 +5716,15 @@ def _analysis_data_sources(
                 "kind": "measured",
             },
         ]
+        if platform == "android":
+            sources.append(
+                {
+                    "metric": "Brightness thermal limiting",
+                    "source": "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
+                    "kind": "measured counters",
+                }
+            )
+        return sources
     if platform == "ios":
         return [
             {
@@ -5537,6 +5918,11 @@ def _analysis_data_sources(
         {
             "metric": "Thermal severity, sensors and cooling devices",
             "source": "Android ThermalService / thermal HAL",
+            "kind": "measured counters",
+        },
+        {
+            "metric": "Brightness thermal limiting",
+            "source": "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
             "kind": "measured counters",
         },
         {
@@ -5909,6 +6295,27 @@ def analyze_run(
         }
     else:
         thermal = {**thermal_post_run, **thermal_history, "post_run": thermal_post_run}
+    brightness_throttling = (
+        analyze_brightness_throttling(samples, contexts, thermal_snapshots)
+        if platform == "android" and feature("thermal")
+        else {
+            "available": False,
+            "analysis_disabled": platform != "android" or not feature("thermal"),
+            "reason": (
+                "当前平台未提供 Android DisplayManager 热亮度限制语义。"
+                if platform != "android"
+                else "温度与热限制采集已关闭。"
+            ),
+            "timeline": [],
+            "points": [],
+            "events": [],
+            "point_count": 0,
+            "event_count": 0,
+        }
+    )
+    thermal["brightness_throttling"] = brightness_throttling
+    if isinstance(display, dict):
+        display["brightness_throttling"] = brightness_throttling
     scheduler_analysis = analyze_scheduler_history(samples, scheduler_snapshots)
     if not feature("thermal"):
         thermal = {
@@ -6119,6 +6526,7 @@ def analyze_run(
         "power_pressure": power_pressure,
         "render_performance": render_performance,
         "thermal": thermal,
+        "brightness_throttling": brightness_throttling,
         "scheduler": scheduler_analysis,
         "applications": application_analysis,
         "external_events": event_analysis,

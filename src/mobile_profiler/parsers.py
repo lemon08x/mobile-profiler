@@ -1087,6 +1087,122 @@ def parse_thermal(text: str) -> Dict[str, object]:
     }
 
 
+def parse_display_brightness_state(
+    text: str,
+    setting_text: str = "",
+    setting_float_text: str = "",
+) -> Dict[str, object]:
+    lines = text.splitlines()
+
+    def last_match(pattern: str) -> Optional[str]:
+        matches = re.findall(pattern, text, re.M)
+        return matches[-1].strip() if matches else None
+
+    def section_values(heading: str, names: Set[str], limit: int = 36) -> Dict[str, str]:
+        values: Dict[str, str] = {}
+        start = next(
+            (index for index, line in enumerate(lines) if line.strip() == heading),
+            None,
+        )
+        if start is None:
+            return values
+        for line in lines[start + 1 : start + 1 + limit]:
+            stripped = line.strip()
+            match = re.match(r"(m[A-Za-z0-9_.]+)\s*[:=]\s*(.+)$", stripped)
+            if not match:
+                continue
+            name, value = match.groups()
+            if name in names and name not in values:
+                values[name] = value.strip()
+            if names.issubset(values):
+                break
+        return values
+
+    thread = section_values(
+        "Display Power Controller Thread State:",
+        {"mScreenState", "mScreenBrightness", "mSdrScreenBrightness"},
+    )
+    controller = section_values(
+        "DisplayBrightnessController:",
+        {"mCurrentScreenBrightness", "mLastUserSetScreenBrightness"},
+    )
+    thermal = section_values(
+        "BrightnessThermalClamper:",
+        {"mThrottlingStatus", "mBrightnessCap", "mApplied"},
+        limit=20,
+    )
+    hbm = section_values(
+        "HighBrightnessModeController:",
+        {"mBrightness", "mUnthrottledBrightness", "mThrottlingReason", "mCurrentMax"},
+        limit=30,
+    )
+
+    cached_brightness = last_match(
+        r"^\s*mCachedBrightnessInfo\.brightness\s*=\s*([^\s]+)"
+    )
+    cached_adjusted = last_match(
+        r"^\s*mCachedBrightnessInfo\.adjustedBrightness\s*=\s*([^\s]+)"
+    )
+    cached_minimum = last_match(
+        r"^\s*mCachedBrightnessInfo\.brightnessMin\s*=\s*([^\s]+)"
+    )
+    cached_maximum = last_match(
+        r"^\s*mCachedBrightnessInfo\.brightnessMax\s*=\s*([^\s]+)"
+    )
+    maximum_reason = last_match(
+        r"^\s*mCachedBrightnessInfo\.brightnessMaxReason\s*=\s*([^\s]+)"
+    )
+
+    def number(value: Optional[str]) -> Optional[float]:
+        return first_number(value)
+
+    applied_text = str(thermal.get("mApplied") or "").strip().lower()
+    screen_state = str(thread.get("mScreenState") or "").strip().upper() or None
+    setting_raw = number(setting_text)
+    setting_float = number(setting_float_text)
+    parsed: Dict[str, object] = {
+        "available": False,
+        "source": "Android DisplayManager + settings",
+        "screen_state": screen_state,
+        "setting_raw": setting_raw,
+        "setting_float": setting_float,
+        "screen_brightness": number(thread.get("mScreenBrightness")),
+        "sdr_screen_brightness": number(thread.get("mSdrScreenBrightness")),
+        "current_screen_brightness": number(controller.get("mCurrentScreenBrightness")),
+        "last_user_set_brightness": number(controller.get("mLastUserSetScreenBrightness")),
+        "cached_brightness": number(cached_brightness),
+        "adjusted_brightness": number(cached_adjusted),
+        "brightness_minimum": number(cached_minimum),
+        "brightness_maximum": number(cached_maximum),
+        "brightness_max_reason": (
+            int(float(maximum_reason))
+            if maximum_reason is not None and number(maximum_reason) is not None
+            else None
+        ),
+        "thermal_status": (
+            int(float(thermal["mThrottlingStatus"]))
+            if number(thermal.get("mThrottlingStatus")) is not None
+            else None
+        ),
+        "thermal_cap": number(thermal.get("mBrightnessCap")),
+        "thermal_applied": (
+            applied_text == "true"
+            if applied_text in {"true", "false"}
+            else None
+        ),
+        "hbm_brightness": number(hbm.get("mBrightness")),
+        "hbm_unthrottled_brightness": number(hbm.get("mUnthrottledBrightness")),
+        "hbm_current_maximum": number(hbm.get("mCurrentMax")),
+        "hbm_throttling_reason": str(hbm.get("mThrottlingReason") or "").strip() or None,
+    }
+    parsed["available"] = any(
+        value is not None
+        for key, value in parsed.items()
+        if key not in {"available", "source", "screen_state", "hbm_throttling_reason"}
+    ) or bool(screen_state)
+    return parsed
+
+
 def parse_display(text: str, brightness_text: str, peak_refresh_text: str) -> Dict[str, object]:
     active_match = re.search(r"mActiveRenderFrameRate=([-+\d.]+)", text)
     active_refresh = first_number(active_match.group(1) if active_match else None)
