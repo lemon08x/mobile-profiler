@@ -29,6 +29,7 @@ from mobile_profiler.ui import (
     parse_device_ipv4_addresses,
     sanitize_run_name,
 )
+from mobile_profiler import __version__
 
 
 class LiveTelemetryTests(unittest.TestCase):
@@ -283,6 +284,23 @@ class UiServerTests(unittest.TestCase):
         self.assertAlmostEqual(capability["normalized_step"], 1 / 255)
         self.assertFalse(capability["automatic"])
 
+        oem_raw = _parse_android_brightness_capability(
+            "2119\n",
+            "null\n",
+            "0\n",
+            "mScreenBrightnessMinimum=0.016\nmScreenBrightnessMaximum=1.0\n",
+            "2119.0\n",
+            0,
+            "mScreenBrightnessRangeMinimum=2.0\n"
+            "mScreenBrightnessRangeMaximum=4675.0\n"
+            "mScreenBrightnessNormalMaximum=4095.0\n",
+        )
+        self.assertEqual(oem_raw["minimum"], 2)
+        self.assertEqual(oem_raw["maximum"], 4095)
+        self.assertEqual(oem_raw["display_id"], 0)
+        self.assertEqual(oem_raw["display_value_format"], "raw")
+        self.assertIn("raw brightness range", oem_raw["range_source"])
+
         automatic = _parse_android_brightness_capability(
             "0\n",
             "null\n",
@@ -360,6 +378,55 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(applied["applied"])
             self.assertTrue(applied["manual_mode_changed"])
             self.assertEqual(applied["previous_mode"], 1)
+
+    def test_android_brightness_uses_raw_display_value_for_oem_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            ready_devices = ([{
+                "serial": "ROOTED",
+                "state": "device",
+                "platform": "android",
+            }], None)
+            before = {
+                "current": 2119,
+                "minimum": 66,
+                "maximum": 4095,
+                "normalized_minimum": 0.016,
+                "normalized_maximum": 1.0,
+                "normalized_step": 0.984 / 4029,
+                "display_current": 2119.0,
+                "display_value_format": "raw",
+                "mode": 0,
+            }
+            after = {**before, "current": 2000, "display_current": 2000.0}
+            command_result = Mock(ok=True, stdout="", stderr="")
+            with (
+                patch.object(manager, "devices", return_value=ready_devices),
+                patch.object(
+                    manager,
+                    "_android_brightness_capability",
+                    side_effect=[before, after],
+                ),
+                patch("mobile_profiler.ui.adb_shell", return_value=command_result) as shell,
+                patch("mobile_profiler.ui.time.sleep"),
+            ):
+                applied = manager.brightness({
+                    "device": "ROOTED",
+                    "platform": "android",
+                    "action": "set",
+                    "value": 2000,
+                })
+
+            commands = [call.args[2] for call in shell.call_args_list]
+            self.assertEqual(
+                commands,
+                [
+                    ["settings", "put", "system", "screen_brightness", "2000"],
+                    ["cmd", "display", "set-brightness", "2000"],
+                ],
+            )
+            self.assertTrue(applied["display_applied"])
+            self.assertTrue(applied["applied"])
 
     def test_android_brightness_rejects_invalid_values_and_active_recording(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -580,9 +647,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-14", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-15", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-14", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-15", timeout=5) as response:
                     javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -593,6 +660,9 @@ class UiServerTests(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertIn("Mobile Profiler", html)
+            self.assertIn("v0.7.1", html)
+            self.assertIn('class="app-version-badge"', html)
+            self.assertEqual(state["version"], __version__)
             self.assertIn("TEST PLATFORM", html)
             self.assertIn("ADB / gfxinfo", html)
             self.assertIn("DVT / RemoteXPC", html)
@@ -609,7 +679,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn("platform-ui-14", html)
+            self.assertIn("platform-ui-15", html)
             self.assertIn("屏幕热降亮监控", html)
             self.assertNotIn('<details class="advanced-settings" open', html)
             self.assertIn(".capture-feature-card input", css)
@@ -619,6 +689,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("renderBrightnessThrottling", javascript)
             self.assertIn("brightness-dim-marker", css)
             self.assertIn("扫描手机应用", html)
+            self.assertIn('title="${escapeHtml(packageName)}"', javascript)
+            self.assertIn("overflow-wrap: anywhere", css)
             self.assertIn("32 分钟", html)
             self.assertIn("资源调度分配", html)
             self.assertIn("功耗压力解释", html)
@@ -800,6 +872,100 @@ class UiServerTests(unittest.TestCase):
             self.assertEqual(command[duration_index + 1], "1920")
             self.assertTrue(any(Path(value).name == "UI-smoke" for value in command))
             self.assertEqual(result["status"], "starting")
+
+    def test_repeated_start_reserves_unique_run_directories_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = DashboardManager("custom-adb", root)
+            created_runs = []
+
+            def create_active(process, output_dir, config, command):
+                active = Mock()
+                active.running = False
+                active.output_dir = output_dir
+                active.snapshot.return_value = {
+                    "running": False,
+                    "status": "finished",
+                    "run_name": output_dir.name,
+                }
+                created_runs.append((output_dir, config, command))
+                return active
+
+            payload = {
+                "device": "SERIAL",
+                "platform": "android",
+                "run_name": "repeatable run",
+                "test_mode": "power",
+            }
+            with (
+                patch(
+                    "mobile_profiler.ui.list_adb_devices",
+                    return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                ),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()),
+                patch("mobile_profiler.ui.ActiveRun", side_effect=create_active),
+            ):
+                manager.start_record(payload)
+                first_data = root / "repeatable-run" / "samples.csv"
+                first_data.write_text("first run\n", encoding="utf-8")
+
+                manager.start_record(payload)
+                second_data = root / "repeatable-run-2" / "samples.csv"
+                second_data.write_text("second run\n", encoding="utf-8")
+
+                manager.start_record(payload)
+
+            self.assertEqual(
+                [output_dir.name for output_dir, _, _ in created_runs],
+                ["repeatable-run", "repeatable-run-2", "repeatable-run-3"],
+            )
+            self.assertEqual(
+                [config["run_name"] for _, config, _ in created_runs],
+                ["repeatable-run", "repeatable-run-2", "repeatable-run-3"],
+            )
+            self.assertEqual(first_data.read_text(encoding="utf-8"), "first run\n")
+            self.assertEqual(second_data.read_text(encoding="utf-8"), "second run\n")
+            self.assertTrue((root / "repeatable-run-3").is_dir())
+            for output_dir, _, command in created_runs:
+                output_index = command.index("--output")
+                self.assertEqual(Path(command[output_index + 1]), output_dir)
+
+    def test_start_failure_releases_reserved_run_directory_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = DashboardManager("custom-adb", root)
+            fake_active = Mock()
+            fake_active.running = False
+            fake_active.output_dir = root / "retry-run"
+            fake_active.snapshot.return_value = {
+                "running": False,
+                "status": "finished",
+                "run_name": "retry-run",
+            }
+            payload = {
+                "device": "SERIAL",
+                "platform": "android",
+                "run_name": "retry run",
+            }
+            with (
+                patch(
+                    "mobile_profiler.ui.list_adb_devices",
+                    return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                ),
+                patch(
+                    "mobile_profiler.ui.subprocess.Popen",
+                    side_effect=[OSError("unable to launch"), object()],
+                ),
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active) as active_run,
+            ):
+                with self.assertRaisesRegex(OSError, "unable to launch"):
+                    manager.start_record(payload)
+                self.assertFalse((root / "retry-run").exists())
+
+                manager.start_record(payload)
+
+            self.assertEqual(active_run.call_args.args[1], root / "retry-run")
+            self.assertTrue((root / "retry-run").is_dir())
 
     def test_ui_defaults_optional_power_disconnect_off_in_both_modes(self) -> None:
         cases = (
@@ -1236,7 +1402,7 @@ class UiServerTests(unittest.TestCase):
             output_dir = source / "dist" / "portable-test"
             self.assertEqual(
                 manager.tooling_state()["portable_output_default"],
-                str(source / "dist" / "mobile-profiler-portable"),
+                str(source / "dist" / f"mobile-profiler-v{__version__}-portable"),
             )
 
             def fake_build(command, operation, **kwargs):
@@ -1255,6 +1421,7 @@ class UiServerTests(unittest.TestCase):
             command = build.call_args.args[0]
             self.assertIn("-SkipAdb", command)
             self.assertIn("-PythonVersion", command)
+            self.assertEqual(result["version"], __version__)
             self.assertEqual(result["zip_path"], f"{output_dir}.zip")
             with self.assertRaises(ValueError):
                 manager.build_portable_bundle(

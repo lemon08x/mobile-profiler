@@ -186,6 +186,12 @@ def list_ios_devices(
         bridge_error = str(exc)
     raw_devices = payload.get("devices")
     raw_devices = raw_devices if isinstance(raw_devices, list) else []
+    raw_warnings = payload.get("warnings")
+    discovery_warnings = (
+        [str(value) for value in raw_warnings if str(value).strip()]
+        if isinstance(raw_warnings, list)
+        else []
+    )
     endpoints = _load_endpoints()
     devices: Dict[str, Dict[str, str]] = {}
     unavailable_wireless: Dict[str, str] = {}
@@ -272,6 +278,12 @@ def list_ios_devices(
         )
         bridge_error = " | ".join(
             value for value in (bridge_error, unavailable_error) if value
+        )
+    if not devices and discovery_warnings:
+        bridge_error = " | ".join(
+            value
+            for value in (bridge_error, "; ".join(discovery_warnings))
+            if value
         )
     return list(devices.values()), bridge_error
 

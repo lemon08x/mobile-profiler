@@ -9,8 +9,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$projectText = Get-Content -LiteralPath (Join-Path $repoRoot "pyproject.toml") -Raw
+$versionMatch = [regex]::Match($projectText, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+if (-not $versionMatch.Success) {
+    throw "Unable to read the Mobile Profiler version from pyproject.toml."
+}
+$ProjectVersion = $versionMatch.Groups[1].Value
+if ($ProjectVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
+    throw "The Mobile Profiler version contains unsupported filename characters."
+}
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $repoRoot "dist\mobile-profiler-portable"
+    $OutputDirectory = Join-Path $repoRoot "dist\mobile-profiler-v$ProjectVersion-portable"
 }
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
 $repoPath = [System.IO.Path]::GetFullPath($repoRoot)
@@ -106,21 +115,24 @@ endlocal
 '@
     Set-Content -LiteralPath (Join-Path $stage "profiler.cmd") -Value $launcher -Encoding ascii
 
-    $uiLauncher = @'
+    $uiLauncher = @"
 @echo off
 setlocal
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 if exist "%ROOT%platform-tools\adb.exe" set "PATH=%ROOT%platform-tools;%PATH%"
 if not exist "%ROOT%profiler-runs" mkdir "%ROOT%profiler-runs"
+echo Mobile Profiler v$ProjectVersion
 "%ROOT%python-runtime\python.exe" -m mobile_profiler ui --output-root "%ROOT%profiler-runs" %*
 endlocal
-'@
+"@
     Set-Content -LiteralPath (Join-Path $stage "start-ui.bat") -Value $uiLauncher -Encoding ascii
 
-    $portableReadme = @'
-Mobile Profiler Portable Bundle
-===============================
+    $portableReadme = @"
+Mobile Profiler Portable Bundle v$ProjectVersion
+===============================================
+
+Version: $ProjectVersion
 
 1. Extract the complete directory. Do not copy start-ui.bat by itself.
 2. Double-click start-ui.bat to launch the local dashboard.
@@ -139,8 +151,9 @@ Software rebuilding is intentionally disabled in a portable installation.
 Make code changes in the complete source project, run its tests, and execute
 build-portable.bat (or use the source UI Tools & Delivery page) to create a new
 portable ZIP.
-'@
+"@
     Set-Content -LiteralPath (Join-Path $stage "README-PORTABLE.txt") -Value $portableReadme -Encoding utf8
+    Set-Content -LiteralPath (Join-Path $stage "VERSION.txt") -Value $ProjectVersion -Encoding ascii
     New-Item -ItemType Directory -Force -Path (Join-Path $stage "profiler-runs") | Out-Null
 
     Write-Host "Validating portable runtime..."
@@ -162,6 +175,7 @@ portable ZIP.
     Compress-Archive -LiteralPath $outputPath -DestinationPath $zipPath -CompressionLevel Optimal
     Write-Host "Portable directory: $outputPath"
     Write-Host "Portable ZIP:       $zipPath"
+    Write-Host "Mobile Profiler:    v$ProjectVersion"
 }
 finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

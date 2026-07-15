@@ -17,16 +17,32 @@ import plistlib
 import socket
 import sys
 import time
+import warnings
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 
-IMPORT_ERROR: Optional[BaseException] = None
+def _configure_windows_event_loop() -> None:
+    if sys.platform != "win32":
+        return
+    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_factory is None:
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        asyncio.set_event_loop_policy(policy_factory())
+
+
+_configure_windows_event_loop()
+
+
+DISCOVERY_IMPORT_ERROR: Optional[BaseException] = None
+PAIRING_IMPORT_ERROR: Optional[BaseException] = None
+COLLECTION_IMPORT_ERROR: Optional[BaseException] = None
+ApplicationListing = None
 try:
     from pymobiledevice3 import usbmux
-    from pymobiledevice3.bonjour import browse_remotepairing
-    from pymobiledevice3.exceptions import RemotePairingCompletedError
     from pymobiledevice3.lockdown import (
         create_using_tcp,
         create_using_usbmux,
@@ -40,12 +56,22 @@ try:
     except ImportError:
         get_mobdev2_lockdowns = None
     from pymobiledevice3.pair_records import get_remote_pairing_record_filename
+except BaseException as exc:  # pragma: no cover - exercised through the parent runtime check
+    DISCOVERY_IMPORT_ERROR = exc
+
+try:
+    from pymobiledevice3.bonjour import browse_remotepairing
+    from pymobiledevice3.exceptions import RemotePairingCompletedError
     from pymobiledevice3.remote import userspace_tunnel
     from pymobiledevice3.remote.tunnel_service import (
         CoreDeviceTunnelProxy,
         RemotePairingLockdownService,
         create_core_device_tunnel_service_using_remotepairing,
     )
+except BaseException as exc:  # pragma: no cover - exercised through pairing/probe checks
+    PAIRING_IMPORT_ERROR = exc
+
+try:
     from pymobiledevice3.services.diagnostics import DiagnosticsService
     try:
         from pymobiledevice3.services.dvt.instruments.application_listing import ApplicationListing
@@ -56,8 +82,8 @@ try:
     from pymobiledevice3.services.dvt.instruments.graphics import Graphics
     from pymobiledevice3.services.dvt.instruments.notifications import Notifications
     from pymobiledevice3.services.dvt.instruments.sysmontap import Sysmontap
-except BaseException as exc:  # pragma: no cover - exercised through the parent runtime check
-    IMPORT_ERROR = exc
+except BaseException as exc:  # pragma: no cover - exercised through probe/record checks
+    COLLECTION_IMPORT_ERROR = exc
 
 
 DEFAULT_REMOTE_PORT = 49152
@@ -86,11 +112,29 @@ def _emit(event_type: str, **payload: object) -> None:
     _print_json({"type": event_type, **payload})
 
 
-def _require_runtime() -> None:
-    if IMPORT_ERROR is not None:
+def _require_discovery_runtime() -> None:
+    if DISCOVERY_IMPORT_ERROR is not None:
         raise RuntimeError(
-            "pymobiledevice3 is unavailable in the selected iOS Python runtime: "
-            f"{IMPORT_ERROR}"
+            "pymobiledevice3 device discovery is unavailable in the selected iOS "
+            f"Python runtime: {DISCOVERY_IMPORT_ERROR}"
+        )
+
+
+def _require_pairing_runtime() -> None:
+    _require_discovery_runtime()
+    if PAIRING_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "pymobiledevice3 RemotePairing support is unavailable in the selected "
+            f"iOS Python runtime: {PAIRING_IMPORT_ERROR}"
+        )
+
+
+def _require_collection_runtime() -> None:
+    _require_pairing_runtime()
+    if COLLECTION_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "pymobiledevice3 DVT collection support is unavailable in the selected "
+            f"iOS Python runtime: {COLLECTION_IMPORT_ERROR}"
         )
 
 
@@ -206,19 +250,16 @@ def _private_ipv4(address: object) -> bool:
 async def _network_devices() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     clients: list[tuple[Optional[str], object]] = []
-    try:
-        if get_mobdev2_devices is not None:
-            clients = [(None, client) for client in list(await get_mobdev2_devices())]
-        elif get_mobdev2_lockdowns is not None:
-            clients = [
-                (host, client)
-                async for host, client in get_mobdev2_lockdowns(
-                    only_paired=False,
-                    timeout=2.0,
-                )
-            ]
-    except Exception:
-        return rows
+    if get_mobdev2_devices is not None:
+        clients = [(None, client) for client in list(await get_mobdev2_devices())]
+    elif get_mobdev2_lockdowns is not None:
+        clients = [
+            (host, client)
+            async for host, client in get_mobdev2_lockdowns(
+                only_paired=False,
+                timeout=2.0,
+            )
+        ]
     for discovered_host, client in clients:
         try:
             values = dict(getattr(client, "all_values", {}) or {})
@@ -253,9 +294,15 @@ async def _network_devices() -> list[dict[str, object]]:
 
 
 async def list_devices() -> dict[str, object]:
-    _require_runtime()
+    _require_discovery_runtime()
     rows: dict[str, dict[str, object]] = {}
-    for device in await _usb_devices():
+    discovery_warnings: list[str] = []
+    try:
+        usb_devices = await _usb_devices()
+    except Exception as exc:
+        usb_devices = []
+        discovery_warnings.append(f"USB discovery unavailable: {exc}")
+    for device in usb_devices:
         udid = str(device.serial)
         item: dict[str, object] = {
             "udid": udid,
@@ -287,7 +334,12 @@ async def list_devices() -> dict[str, object]:
             await client.close()
         rows[udid] = item
 
-    for item in await _network_devices():
+    try:
+        network_devices = await _network_devices()
+    except Exception as exc:
+        network_devices = []
+        discovery_warnings.append(f"network discovery unavailable: {exc}")
+    for item in network_devices:
         udid = str(item["udid"])
         existing = rows.get(udid)
         if existing is None or existing.get("state") != "device":
@@ -297,7 +349,7 @@ async def list_devices() -> dict[str, object]:
             existing["wireless_port"] = item.get("port")
             existing["remote_paired"] = item.get("remote_paired")
 
-    return {"devices": list(rows.values())}
+    return {"devices": list(rows.values()), "warnings": discovery_warnings}
 
 
 async def _find_remote_endpoint(udid: str, timeout: float) -> Optional[dict[str, object]]:
@@ -334,7 +386,7 @@ async def _find_remote_endpoint(udid: str, timeout: float) -> Optional[dict[str,
 
 
 async def pair_device(udid: Optional[str], timeout: float) -> dict[str, object]:
-    _require_runtime()
+    _require_pairing_runtime()
     devices = await _usb_devices()
     if udid:
         devices = [device for device in devices if str(device.serial) == udid]
@@ -520,7 +572,7 @@ async def probe_device(
     host: Optional[str],
     port: Optional[int],
 ) -> dict[str, object]:
-    _require_runtime()
+    _require_collection_runtime()
     device = await _device_values(udid, host)
     async with _open_rsd(udid, host, port) as rsd:
         async with DiagnosticsService(rsd) as diagnostics:
@@ -678,7 +730,7 @@ def _process_snapshot(
 
 
 async def record_device(args: argparse.Namespace) -> None:
-    _require_runtime()
+    _require_collection_runtime()
     udid = str(args.udid)
     host = str(args.host) if args.host else None
     port = int(args.port) if args.port else None

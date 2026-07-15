@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
+from . import __version__ as APP_VERSION
 from .analysis import (
     analyze_brightness_throttling,
     analyze_memory_frequency,
@@ -129,6 +130,9 @@ def _parse_android_brightness_capability(
     float_text: str,
     mode_text: str,
     power_text: str,
+    display_text: str = "",
+    display_id: Optional[int] = None,
+    display_dump_text: str = "",
 ) -> Dict[str, object]:
     current_number = _optional_float(current_text)
     if current_number is None or current_number < 0:
@@ -177,8 +181,40 @@ def _parse_android_brightness_capability(
             max(current, ANDROID_BRIGHTNESS_SCALES[-1]),
         )
 
-    minimum = max(0, int(round(normalized_minimum * integer_scale)))
-    maximum = max(minimum + 1, int(round(normalized_maximum * integer_scale)), current)
+    raw_minimum_match = re.search(
+        r"mScreenBrightnessRangeMinimum\s*=\s*([-+]?\d+(?:\.\d+)?)",
+        display_dump_text or "",
+    )
+    raw_normal_maximum_match = re.search(
+        r"mScreenBrightnessNormalMaximum\s*=\s*([-+]?\d+(?:\.\d+)?)",
+        display_dump_text or "",
+    )
+    raw_maximum_match = re.search(
+        r"mScreenBrightnessRangeMaximum\s*=\s*([-+]?\d+(?:\.\d+)?)",
+        display_dump_text or "",
+    )
+    raw_minimum = (
+        float(raw_minimum_match.group(1)) if raw_minimum_match else None
+    )
+    raw_maximum = (
+        float(raw_normal_maximum_match.group(1))
+        if raw_normal_maximum_match
+        else float(raw_maximum_match.group(1))
+        if raw_maximum_match
+        else None
+    )
+    raw_range_available = (
+        raw_minimum is not None
+        and raw_maximum is not None
+        and raw_maximum > max(1.0, raw_minimum)
+    )
+    if raw_range_available:
+        minimum = max(0, int(round(raw_minimum)))
+        maximum = max(minimum + 1, int(round(raw_maximum)), current)
+        integer_scale = maximum
+    else:
+        minimum = max(0, int(round(normalized_minimum * integer_scale)))
+        maximum = max(minimum + 1, int(round(normalized_maximum * integer_scale)), current)
     step = 1
     mode_number = _optional_float(mode_text)
     mode = int(round(mode_number)) if mode_number is not None else None
@@ -189,6 +225,14 @@ def _parse_android_brightness_capability(
         else normalized_minimum
         + (current - minimum) / max(1, maximum - minimum)
         * (normalized_maximum - normalized_minimum)
+    )
+    display_current = _optional_float(display_text)
+    display_value_format = (
+        "raw"
+        if display_current is not None and display_current > normalized_maximum + 1e-6
+        else "normalized"
+        if display_current is not None
+        else None
     )
     return {
         "supported": True,
@@ -205,8 +249,13 @@ def _parse_android_brightness_capability(
         "normalized_step": normalized_step,
         "mode": mode,
         "automatic": mode == 1,
+        "display_id": display_id,
+        "display_current": display_current,
+        "display_value_format": display_value_format,
         "range_source": (
-            "dumpsys power + screen_brightness_float"
+            "dumpsys display raw brightness range"
+            if raw_range_available
+            else "dumpsys power + screen_brightness_float"
             if current_float is not None
             else "dumpsys power + Android integer fallback"
         ),
@@ -255,6 +304,20 @@ def sanitize_run_name(value: object) -> str:
     if not result or result in {".", ".."}:
         return datetime.now().strftime("mobile-profile-%Y%m%d-%H%M%S")
     return result[:96]
+
+
+def _reserve_unique_run_directory(output_root: Path, run_name: str) -> Path:
+    sequence = 1
+    while True:
+        suffix = "" if sequence == 1 else f"-{sequence}"
+        stem = run_name[: max(1, 96 - len(suffix))].rstrip("-. ")
+        candidate = output_root / f"{stem}{suffix}"
+        try:
+            candidate.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            sequence += 1
+            continue
+        return candidate
 
 
 def parse_device_ipv4_addresses(text: str) -> List[Dict[str, object]]:
@@ -1799,11 +1862,44 @@ class DashboardManager:
             ["dumpsys", "power"],
             timeout_s=20,
         )
+        display_id: Optional[int] = None
+        display_text = ""
+        display_ids_result = adb_shell(
+            self.adb,
+            device,
+            ["cmd", "display", "get-displays", "-i"],
+            timeout_s=10,
+        )
+        display_dump_result = adb_shell(
+            self.adb,
+            device,
+            ["dumpsys", "display"],
+            timeout_s=20,
+        )
+        display_ids = (
+            [int(value) for value in re.findall(r"(?m)^\s*(\d+)\s*$", display_ids_result.stdout)]
+            if display_ids_result.ok
+            else []
+        )
+        for candidate_id in list(dict.fromkeys([*display_ids, 0])):
+            display_result = adb_shell(
+                self.adb,
+                device,
+                ["cmd", "display", "get-brightness", str(candidate_id)],
+                timeout_s=10,
+            )
+            if display_result.ok and _optional_float(display_result.stdout) is not None:
+                display_id = candidate_id
+                display_text = display_result.stdout
+                break
         capability = _parse_android_brightness_capability(
             current_result.stdout,
             float_result.stdout if float_result.ok else "",
             mode_result.stdout if mode_result.ok else "",
             power_result.stdout if power_result.ok else "",
+            display_text,
+            display_id,
+            display_dump_result.stdout if display_dump_result.ok else "",
         )
         capability["device"] = device
         capability["platform"] = "android"
@@ -1912,10 +2008,14 @@ class DashboardManager:
             (value - minimum) / max(1, maximum - minimum)
             * (normalized_maximum - normalized_minimum)
         )
+        display_value_format = str(
+            capability.get("display_value_format") or "normalized"
+        )
+        display_value = str(value) if display_value_format == "raw" else f"{normalized:.7f}"
         display_result = adb_shell(
             self.adb,
             device,
-            ["cmd", "display", "set-brightness", f"{normalized:.7f}"],
+            ["cmd", "display", "set-brightness", display_value],
             timeout_s=10,
         )
         time.sleep(0.1)
@@ -1927,10 +2027,25 @@ class DashboardManager:
                 or display_result.stdout.strip()
                 or "The persistent value was written, but DisplayManager did not apply it immediately"
             )
+        setting_applied = _integer(refreshed.get("current"), -1) == value
+        display_current = _optional_float(refreshed.get("display_current"))
+        display_applied: Optional[bool] = None
+        if display_current is not None:
+            if display_value_format == "raw":
+                display_applied = abs(display_current - value) <= 0.5
+            else:
+                display_applied = abs(display_current - normalized) <= max(
+                    1e-4,
+                    float(capability.get("normalized_step") or 0.0) * 1.5,
+                )
         refreshed.update(
             {
                 "requested": value,
-                "applied": _integer(refreshed.get("current"), -1) == value,
+                "display_requested": (
+                    float(value) if display_value_format == "raw" else normalized
+                ),
+                "display_applied": display_applied,
+                "applied": setting_applied and display_applied is not False,
                 "previous_mode": previous_mode,
                 "manual_mode_changed": mode_changed,
                 "warnings": warnings,
@@ -2343,14 +2458,12 @@ class DashboardManager:
         if current_unit not in {"auto", "ma", "ua"}:
             raise ValueError("current unit must be auto, ma, or ua")
 
-        run_name = sanitize_run_name(payload.get("run_name"))
-        output_dir = (self.output_root / run_name).resolve()
+        requested_run_name = sanitize_run_name(payload.get("run_name"))
+        requested_output_dir = (self.output_root / requested_run_name).resolve()
         try:
-            output_dir.relative_to(self.output_root)
+            requested_output_dir.relative_to(self.output_root)
         except ValueError as exc:
             raise ValueError("Output directory must stay inside the configured run root") from exc
-        if output_dir.exists() and any(output_dir.iterdir()):
-            raise RuntimeError(f"Output directory is not empty: {output_dir}")
 
         title = str(payload.get("title") or "").strip()[:200]
         package = str(payload.get("package") or "").strip()[:200]
@@ -2368,6 +2481,12 @@ class DashboardManager:
         no_reset = bool(payload.get("no_reset", False))
         full_history = bool(payload.get("full_history", False))
         system_monitor = bool(payload.get("system_monitor", True))
+
+        output_dir = _reserve_unique_run_directory(
+            self.output_root,
+            requested_run_name,
+        )
+        run_name = output_dir.name
 
         config: Dict[str, object] = {
             "device": device,
@@ -2464,17 +2583,24 @@ class DashboardManager:
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
         environment["PYTHONIOENCODING"] = "utf-8"
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=environment,
-            creationflags=creationflags,
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=environment,
+                creationflags=creationflags,
+            )
+        except Exception:
+            try:
+                output_dir.rmdir()
+            except OSError:
+                pass
+            raise
         active = ActiveRun(process, output_dir, config, command)
         with self._lock:
             self.active = active
@@ -2728,7 +2854,10 @@ class DashboardManager:
         output_dir = (
             Path(raw_output).expanduser().resolve()
             if raw_output and Path(raw_output).expanduser().is_absolute()
-            else (self.source_root / (raw_output or "dist/mobile-profiler-portable")).resolve()
+            else (
+                self.source_root
+                / (raw_output or f"dist/mobile-profiler-v{APP_VERSION}-portable")
+            ).resolve()
         )
         try:
             output_dir.relative_to(dist_root)
@@ -2770,6 +2899,7 @@ class DashboardManager:
         if not output_dir.is_dir() or not zip_path.is_file():
             raise RuntimeError("Portable build finished without the expected directory and ZIP")
         return {
+            "version": APP_VERSION,
             "bundle_dir": str(output_dir),
             "zip_path": str(zip_path),
             "include_adb": include_adb,
@@ -2808,7 +2938,7 @@ class DashboardManager:
 
     def tooling_state(self) -> Dict[str, object]:
         default_output = (
-            self.source_root / "dist" / "mobile-profiler-portable"
+            self.source_root / "dist" / f"mobile-profiler-v{APP_VERSION}-portable"
             if self.source_root is not None
             else None
         )
@@ -2883,6 +3013,7 @@ class DashboardManager:
         with self._lock:
             probes = dict(self.probe_cache)
         return {
+            "version": APP_VERSION,
             "server_time": time.time(),
             "adb": self.adb,
             "hdc": self.hdc,

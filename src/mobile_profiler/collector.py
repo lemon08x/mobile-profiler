@@ -366,6 +366,50 @@ def _readable_number(
     return None, reason[-1] if reason else "unavailable"
 
 
+def _root_shell(
+    adb: str,
+    device: str,
+    command: Sequence[str] | str,
+    timeout_s: float = 30.0,
+) -> CommandResult:
+    command_text = (
+        command
+        if isinstance(command, str)
+        else " ".join(shlex.quote(str(part)) for part in command)
+    )
+    return adb_shell(
+        adb,
+        device,
+        f"su -c {shlex.quote(command_text)}",
+        timeout_s=timeout_s,
+    )
+
+
+def _has_su_access(adb: str, device: str) -> bool:
+    result = _root_shell(adb, device, ["id", "-u"], timeout_s=3)
+    return result.ok and first_number(result.stdout) == 0
+
+
+def _readable_number_with_root(
+    adb: str,
+    device: str,
+    path: str,
+    *,
+    allow_root: bool,
+) -> Tuple[Optional[float], str, bool]:
+    value, status = _readable_number(adb, device, path)
+    if value is not None or not allow_root:
+        return value, status, False
+    root_result = _root_shell(adb, device, ["cat", path], timeout_s=10)
+    root_value = first_number(root_result.stdout)
+    if root_result.ok and root_value is not None:
+        return root_value, "readable via su", True
+    root_reason = (root_result.stderr or root_result.stdout).strip().splitlines()
+    if root_reason:
+        status = f"{status}; root: {root_reason[-1]}"
+    return None, status, False
+
+
 def gpu_load_from_text(text: str, load_format: str) -> Optional[float]:
     values = [float(item) for item in re.findall(r"[-+]?\d+(?:\.\d+)?", text or "")]
     if not values:
@@ -389,6 +433,70 @@ def _readable_gpu_load(
         return value, "readable"
     reason = (result.stderr or result.stdout).strip().splitlines()
     return None, reason[-1] if reason else "unavailable"
+
+
+def _readable_gpu_load_with_root(
+    adb: str,
+    device: str,
+    path: str,
+    load_format: str,
+    *,
+    allow_root: bool,
+) -> Tuple[Optional[float], str, bool]:
+    value, status = _readable_gpu_load(adb, device, path, load_format)
+    if value is not None or not allow_root:
+        return value, status, False
+    root_result = _root_shell(adb, device, ["cat", path], timeout_s=10)
+    root_value = gpu_load_from_text(root_result.stdout, load_format)
+    if root_result.ok and root_value is not None:
+        return root_value, "readable via su", True
+    root_reason = (root_result.stderr or root_result.stdout).strip().splitlines()
+    if root_reason:
+        status = f"{status}; root: {root_reason[-1]}"
+    return None, status, False
+
+
+def _read_number_with_access(
+    adb: str,
+    device: str,
+    path: str,
+    *,
+    requires_root: bool,
+) -> Optional[float]:
+    if not requires_root:
+        return _read_number(adb, device, path)
+    result = _root_shell(adb, device, ["cat", path], timeout_s=10)
+    return first_number(result.stdout) if result.ok else None
+
+
+def _read_numbers_with_access(
+    adb: str,
+    device: str,
+    path: str,
+    *,
+    requires_root: bool,
+) -> List[float]:
+    if not requires_root:
+        return _read_numbers(adb, device, path)
+    result = _root_shell(adb, device, ["cat", path], timeout_s=10)
+    if not result.ok:
+        return []
+    return [float(item) for item in re.findall(r"[-+]?\d+(?:\.\d+)?", result.stdout)]
+
+
+def _read_text_with_root(
+    adb: str,
+    device: str,
+    path: str,
+    *,
+    allow_root: bool,
+) -> Tuple[Optional[str], bool]:
+    value = _read_text(adb, device, path)
+    if value is not None or not allow_root:
+        return value, False
+    result = _root_shell(adb, device, ["cat", path], timeout_s=10)
+    root_value = result.stdout.strip()
+    return (root_value, True) if result.ok and root_value else (None, False)
 
 
 def is_gpu_core_devfreq(identity: str) -> bool:
@@ -512,7 +620,13 @@ def detect_gpu_source(
     is_qualcomm = any(
         token in platform_identity for token in ("qti", "qualcomm", "qcom")
     )
-    kgsl_model = _read_text(adb, device, "/sys/class/kgsl/kgsl-3d0/gpu_model")
+    su_available = _has_su_access(adb, device)
+    kgsl_model, model_requires_root = _read_text_with_root(
+        adb,
+        device,
+        "/sys/class/kgsl/kgsl-3d0/gpu_model",
+        allow_root=su_available,
+    )
     provider = "qualcomm_kgsl" if is_qualcomm or kgsl_model else "generic_sysfs"
     profiler_support = get_prop(adb, device, "graphics.gpu.profiler.support")
     producer_help = adb_shell(adb, device, ["gpu_counter_producer", "-h"], timeout_s=10)
@@ -570,17 +684,25 @@ def detect_gpu_source(
     attempts: List[Dict[str, str]] = []
     frequency_path: Optional[str] = None
     initial_raw: Optional[float] = None
+    frequency_requires_root = False
     for path in candidates:
-        value, status = _readable_number(adb, device, path)
+        value, status, requires_root = _readable_number_with_root(
+            adb,
+            device,
+            path,
+            allow_root=su_available,
+        )
         attempts.append({"path": path, "status": status})
         if value is not None:
             frequency_path = path
             initial_raw = value
+            frequency_requires_root = requires_root
             break
 
     load_path: Optional[str] = None
     load_format = "percentage"
     initial_load_pct: Optional[float] = None
+    load_requires_root = False
     load_attempts: List[Dict[str, str]] = []
     load_candidates = [
         ("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", "percentage"),
@@ -588,13 +710,22 @@ def detect_gpu_source(
         ("/sys/kernel/ged/hal/gpu_utilization", "percentage"),
     ]
     for path, candidate_format in load_candidates:
-        value, status = _readable_gpu_load(adb, device, path, candidate_format)
+        value, status, requires_root = _readable_gpu_load_with_root(
+            adb,
+            device,
+            path,
+            candidate_format,
+            allow_root=su_available,
+        )
         load_attempts.append({"path": path, "format": candidate_format, "status": status})
         if value is not None:
             load_path = path
             load_format = candidate_format
             initial_load_pct = value
+            load_requires_root = requires_root
             break
+
+    requires_root = model_requires_root or frequency_requires_root or load_requires_root
 
     probe: Dict[str, object] = {
         "provider": provider,
@@ -613,6 +744,8 @@ def detect_gpu_source(
         "perfetto_gpu_sources": perfetto_gpu_sources,
         "perfetto_hardware_counter_source_available": bool(hardware_counter_sources),
         "perfetto_query_available": perfetto_state.ok,
+        "root_access_used": requires_root,
+        "su_available": su_available,
     }
     if frequency_path is None and load_path is None:
         platform_note = (
@@ -630,17 +763,59 @@ def detect_gpu_source(
         return None, probe
 
     parent = frequency_path.rsplit("/", 1)[0] if frequency_path else ""
-    min_raw = _read_number(adb, device, f"{parent}/min_freq") if parent else None
-    max_raw = _read_number(adb, device, f"{parent}/max_freq") if parent else None
-    available_raw = _read_numbers(adb, device, f"{parent}/available_frequencies") if parent else []
+    min_raw = (
+        _read_number_with_access(
+            adb,
+            device,
+            f"{parent}/min_freq",
+            requires_root=requires_root,
+        )
+        if parent
+        else None
+    )
+    max_raw = (
+        _read_number_with_access(
+            adb,
+            device,
+            f"{parent}/max_freq",
+            requires_root=requires_root,
+        )
+        if parent
+        else None
+    )
+    available_raw = (
+        _read_numbers_with_access(
+            adb,
+            device,
+            f"{parent}/available_frequencies",
+            requires_root=requires_root,
+        )
+        if parent
+        else []
+    )
     if is_qualcomm or kgsl_model:
         kgsl_root = "/sys/class/kgsl/kgsl-3d0"
         if min_raw is None:
-            min_raw = _read_number(adb, device, f"{kgsl_root}/min_gpuclk")
+            min_raw = _read_number_with_access(
+                adb,
+                device,
+                f"{kgsl_root}/min_gpuclk",
+                requires_root=requires_root,
+            )
         if max_raw is None:
-            max_raw = _read_number(adb, device, f"{kgsl_root}/max_gpuclk")
+            max_raw = _read_number_with_access(
+                adb,
+                device,
+                f"{kgsl_root}/max_gpuclk",
+                requires_root=requires_root,
+            )
         if not available_raw:
-            available_raw = _read_numbers(adb, device, f"{kgsl_root}/gpu_available_frequencies")
+            available_raw = _read_numbers_with_access(
+                adb,
+                device,
+                f"{kgsl_root}/gpu_available_frequencies",
+                requires_root=requires_root,
+            )
     name = kgsl_model or (_read_text(adb, device, f"{parent}/name") if parent else None) or "GPU"
     source = GpuSource(
         name=name,
@@ -651,6 +826,7 @@ def detect_gpu_source(
         maximum_mhz=frequency_to_mhz(max_raw) if max_raw is not None else None,
         available_frequencies_mhz=[frequency_to_mhz(value) for value in available_raw],
         source_type=provider,
+        requires_root=requires_root,
     )
     probe.update(
         {
@@ -1443,6 +1619,12 @@ def build_sampler_script(
     refresh_period_s: float = 30.0,
     emit_context_samples: bool = True,
 ) -> str:
+    def cat_command(path: str, *, requires_root: bool = False) -> str:
+        quoted_path = shlex.quote(path)
+        if requires_root:
+            return f"su -c {shlex.quote(f'cat {quoted_path}')}"
+        return f"cat {quoted_path}"
+
     core_ids = sorted({core for policy in policies for core in policy.cores})
     voltage_every = max(1, int(math.ceil(voltage_period_s / interval_s)))
     temperature_every = max(1, int(math.ceil(context_period_s / interval_s)))
@@ -1516,7 +1698,7 @@ def build_sampler_script(
         if gpu_source.frequency_path:
             body.extend(
                 [
-                    f"gpu_f=$(cat {gpu_source.frequency_path} 2>/dev/null)",
+                    f"gpu_f=$({cat_command(gpu_source.frequency_path, requires_root=gpu_source.requires_root)} 2>/dev/null)",
                     "set -- $gpu_f; gpu_f=$1; [ -n \"$gpu_f\" ] || gpu_f=-1",
                 ]
             )
@@ -1526,14 +1708,14 @@ def build_sampler_script(
             if gpu_source.load_format == "busy_total":
                 body.extend(
                     [
-                        f"gpu_l=$(cat {gpu_source.load_path} 2>/dev/null | awk '{{ if ($2 > 0) printf \"%.3f\", 100 * $1 / $2; else print -1 }}')",
+                        f"gpu_l=$({cat_command(gpu_source.load_path, requires_root=gpu_source.requires_root)} 2>/dev/null | awk '{{ if ($2 > 0) printf \"%.3f\", 100 * $1 / $2; else print -1 }}')",
                         "set -- $gpu_l; gpu_l=$1; [ -n \"$gpu_l\" ] || gpu_l=-1",
                     ]
                 )
             else:
                 body.extend(
                     [
-                        f"gpu_l=$(cat {gpu_source.load_path} 2>/dev/null)",
+                        f"gpu_l=$({cat_command(gpu_source.load_path, requires_root=gpu_source.requires_root)} 2>/dev/null)",
                         "set -- $gpu_l; gpu_l=$1; gpu_l=$(echo \"$gpu_l\" | tr -d '%'); [ -n \"$gpu_l\" ] || gpu_l=-1",
                     ]
                 )

@@ -442,7 +442,7 @@ Python installation or relocatable virtual environment.
 The source UI calls this same script and passes the running interpreter's full
 patch version explicitly. This avoids relying on an unrelated `python` command
 on `PATH`. The default output is
-`dist/mobile-profiler-portable(.zip)`. A portable bundle intentionally
+`dist/mobile-profiler-v<version>-portable(.zip)`. A portable bundle intentionally
 contains documentation and examples but omits the source/build structure, so
 future software changes must be rebuilt from the source computer.
 

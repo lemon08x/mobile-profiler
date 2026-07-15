@@ -1413,9 +1413,9 @@
       const icon = typeof item.icon_data_uri === "string" && item.icon_data_uri.startsWith("data:image/")
         ? `<img src="${escapeHtml(item.icon_data_uri)}" alt="" loading="lazy">`
         : escapeHtml(initials);
-      return `<button type="button" class="app-option ${packageName === packageValue ? "selected" : ""}" data-app-package="${escapeHtml(packageName)}" role="option" aria-selected="${packageName === packageValue ? "true" : "false"}">
+      return `<button type="button" class="app-option ${packageName === packageValue ? "selected" : ""}" data-app-package="${escapeHtml(packageName)}" role="option" aria-selected="${packageName === packageValue ? "true" : "false"}" title="${escapeHtml(packageName)}">
         <span class="app-thumb">${icon}</span>
-        <span class="app-option-copy"><strong>${escapeHtml(activity)}</strong><small>${escapeHtml(packageName)}</small></span>
+        <span class="app-option-copy"><strong>${escapeHtml(activity)}</strong><small title="${escapeHtml(packageName)}">${escapeHtml(packageName)}</small></span>
         <span class="app-option-badge">${item.user_app ? "USER" : "SYSTEM"}</span>
       </button>`;
     }).join("") : '<div class="empty-row">没有匹配的应用</div>';
@@ -3022,6 +3022,12 @@
 
   function render(state) {
     app.state = state;
+    const version = String(state?.version || "").trim().replace(/^v/i, "");
+    const versionBadge = $("#app-version-badge");
+    if (version && versionBadge) {
+      versionBadge.textContent = `v${version}`;
+      versionBadge.title = `Mobile Profiler ${version}`;
+    }
     setServerState(true, state.demo_mode ? "Demo preview enabled" : "Local dashboard");
     if (state.active?.running) {
       setPlatform(state.active.platform || state.active.metadata?.platform || selectedPlatform(), {
@@ -3657,7 +3663,8 @@
     $("#portable-build-form").addEventListener("submit", async event => {
       event.preventDefault();
       const outputDirectory = $("#portable-output-directory").value.trim();
-      if (!confirm(`确认重新构建便携包？\n\n输出目录：${outputDirectory || "dist\\mobile-profiler-portable"}\n已有同名目录和 ZIP 会被替换。`)) return;
+      const defaultPortable = `dist\\mobile-profiler-v${String(app.state?.version || "X.Y.Z").replace(/^v/i, "")}-portable`;
+      if (!confirm(`确认重新构建便携包？\n\n输出目录：${outputDirectory || defaultPortable}\n已有同名目录和 ZIP 会被替换。`)) return;
       localStorage.setItem("mobile-profiler-portable-output", outputDirectory);
       await runToolOperation(
         "/api/build-portable",

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import json
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from mobile_profiler.analysis import (
     analyze_android_frame_pipeline,
@@ -28,6 +29,7 @@ from mobile_profiler.collector import (
     android_surface_frame_metrics,
     build_sampler_script,
     collect_streaming_session,
+    detect_gpu_source,
     gpu_load_from_text,
     is_gpu_core_devfreq,
     is_memory_devfreq,
@@ -55,6 +57,7 @@ from mobile_profiler.ios import (
     pair_ios_device,
     select_ios_device,
 )
+from mobile_profiler import ios_bridge
 from mobile_profiler.harmony import (
     build_harmony_smartperf_context,
     build_harmony_smartperf_sample,
@@ -247,6 +250,44 @@ class ParserTests(unittest.TestCase):
         script = build_sampler_script(5, 1.0, [], source)
         self.assertIn("100 * $1 / $2", script)
         self.assertIn("gpu_f=-1", script)
+
+    def test_root_gpu_sysfs_is_detected_and_sampled_via_su(self) -> None:
+        frequency_path = "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq"
+
+        def fake_shell(adb, device, command, timeout_s=30):
+            command_text = command if isinstance(command, str) else " ".join(command)
+            if command == ["cat", "/sys/class/kgsl/kgsl-3d0/gpu_model"]:
+                return CommandResult([], 1, "", "Permission denied", 0.01)
+            if command == ["cat", frequency_path]:
+                return CommandResult([], 1, "", "Permission denied", 0.01)
+            if isinstance(command, str) and command.startswith("su -c"):
+                if "id -u" in command_text:
+                    return CommandResult([], 0, "0\n", "", 0.01)
+                if "gpu_model" in command_text:
+                    return CommandResult([], 0, "Adreno 830\n", "", 0.01)
+                if frequency_path in command_text:
+                    return CommandResult([], 0, "710000000\n", "", 0.01)
+                return CommandResult([], 1, "", "No such file", 0.01)
+            return CommandResult([], 0, "", "", 0.01)
+
+        with (
+            patch(
+                "mobile_profiler.collector.get_prop",
+                side_effect=["Qualcomm", "qcom", "sm8750", "false"],
+            ),
+            patch("mobile_profiler.collector.adb_shell", side_effect=fake_shell),
+        ):
+            source, probe = detect_gpu_source("adb", "ROOTED")
+
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.frequency_path, frequency_path)
+        self.assertTrue(source.requires_root)
+        self.assertTrue(probe["root_access_used"])
+        self.assertEqual(probe["initial_frequency_mhz"], 710.0)
+        script = build_sampler_script(5, 1.0, [], source)
+        self.assertIn("su -c", script)
+        self.assertIn(frequency_path, script)
 
     def test_sampler_context_line(self) -> None:
         parsed = parse_sampler_line(
@@ -2178,6 +2219,65 @@ command exec finished!
 
 
 class IosAdapterTests(unittest.TestCase):
+    def test_ios_sidecar_uses_windows_selector_event_loop_policy(self) -> None:
+        policy = object()
+        with (
+            patch.object(ios_bridge.sys, "platform", "win32"),
+            patch.object(
+                ios_bridge.asyncio,
+                "WindowsSelectorEventLoopPolicy",
+                return_value=policy,
+                create=True,
+            ) as policy_factory,
+            patch.object(ios_bridge.asyncio, "set_event_loop_policy") as set_policy,
+        ):
+            ios_bridge._configure_windows_event_loop()
+
+        policy_factory.assert_called_once_with()
+        set_policy.assert_called_once_with(policy)
+
+    def test_ios_list_keeps_usb_devices_when_collection_or_network_is_unavailable(self) -> None:
+        device = type("MuxDevice", (), {"serial": "00008150-TEST"})()
+        client = type(
+            "Lockdown",
+            (),
+            {
+                "all_values": {
+                    "DeviceName": "Test iPhone",
+                    "ProductType": "iPhone18,2",
+                    "ProductVersion": "19.0",
+                    "BuildVersion": "23A000",
+                },
+                "close": AsyncMock(),
+            },
+        )()
+        with (
+            patch.object(ios_bridge, "DISCOVERY_IMPORT_ERROR", None),
+            patch.object(
+                ios_bridge,
+                "COLLECTION_IMPORT_ERROR",
+                RuntimeError("Graphics API changed"),
+            ),
+            patch.object(ios_bridge, "_usb_devices", AsyncMock(return_value=[device])),
+            patch.object(
+                ios_bridge,
+                "_open_usb_lockdown",
+                AsyncMock(return_value=client),
+            ),
+            patch.object(
+                ios_bridge,
+                "_network_devices",
+                AsyncMock(side_effect=OSError("Bonjour socket failed")),
+            ),
+            patch.object(ios_bridge, "_remote_pair_record_path") as pair_path,
+        ):
+            pair_path.return_value.is_file.return_value = False
+            payload = asyncio.run(ios_bridge.list_devices())
+
+        self.assertEqual(payload["devices"][0]["udid"], "00008150-TEST")
+        self.assertEqual(payload["devices"][0]["state"], "device")
+        self.assertIn("Bonjour socket failed", payload["warnings"][0])
+
     def test_project_cache_is_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

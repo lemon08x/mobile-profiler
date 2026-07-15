@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-14">
-  <script src="/app.js?v=platform-ui-14" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-15">
+  <script src="/app.js?v=platform-ui-15" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -48,7 +48,7 @@
     <section class="workspace">
       <header class="topbar">
         <div class="page-title">
-          <p>MOBILE PROFILING LAB</p>
+          <p>MOBILE PROFILING LAB <span class="app-version-badge" id="app-version-badge" title="Mobile Profiler 0.7.1">v0.7.1</span></p>
           <h1 id="page-heading">实时监控</h1>
         </div>
         <div class="topbar-actions">
@@ -686,7 +686,7 @@
               <form class="tool-form portable-form" id="portable-build-form">
                 <div class="form-field tool-field portable-output-field">
                   <label for="portable-output-directory"><span>输出目录（必须位于源码工程 dist 下）</span></label>
-                  <input id="portable-output-directory" type="text" autocomplete="off" placeholder="dist\mobile-profiler-portable">
+                  <input id="portable-output-directory" type="text" autocomplete="off" placeholder="dist\mobile-profiler-vX.Y.Z-portable">
                 </div>
                 <label class="compact-check tool-check"><input id="portable-include-adb" type="checkbox" checked><span>把本机可用的 ADB Platform Tools 一并打包</span></label>
                 <button class="button primary tool-submit" id="portable-build-button" type="submit">生成新版便携包</button>

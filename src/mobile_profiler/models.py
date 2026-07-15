@@ -49,6 +49,7 @@ class GpuSource:
     maximum_mhz: Optional[float] = None
     available_frequencies_mhz: List[float] = field(default_factory=list)
     source_type: str = "sysfs"
+    requires_root: bool = False
 
 
 @dataclass

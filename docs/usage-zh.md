@@ -28,7 +28,7 @@ mobile-profiler ui
 
 ### 1.2 在便携包电脑启动
 
-完整解压 `mobile-profiler-portable.zip`，然后双击解压目录中的：
+完整解压 `mobile-profiler-v0.7.1-portable.zip`，然后双击解压目录中的：
 
 ```text
 start-ui.bat
@@ -125,7 +125,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 1. 确认当前没有手机采集正在运行。
 2. 保持默认输出目录
-   `dist\mobile-profiler-portable`。
+   `dist\mobile-profiler-v0.7.1-portable`。
 3. 根据目标电脑需要，选择是否包含本机 ADB Platform Tools。
 4. 点击 **生成新版便携包**。
 
@@ -148,8 +148,8 @@ build-portable.bat
 输出为：
 
 ```text
-dist\mobile-profiler-portable\
-dist\mobile-profiler-portable.zip
+dist\mobile-profiler-v0.7.1-portable\
+dist\mobile-profiler-v0.7.1-portable.zip
 ```
 
 ZIP 中包含：
@@ -745,8 +745,8 @@ UI：
 构建脚本会替换源码工程中默认的：
 
 ```text
-dist\mobile-profiler-portable\
-dist\mobile-profiler-portable.zip
+dist\mobile-profiler-v0.7.1-portable\
+dist\mobile-profiler-v0.7.1-portable.zip
 ```
 
 不会删除 `profiler-runs`、`build` 或源码目录。
@@ -754,20 +754,20 @@ dist\mobile-profiler-portable.zip
 ### 10.5 验证新包
 
 ```powershell
-.\dist\mobile-profiler-portable\profiler.cmd --help
-.\dist\mobile-profiler-portable\start-ui.bat --demo
+.\dist\mobile-profiler-v0.7.1-portable\profiler.cmd --help
+.\dist\mobile-profiler-v0.7.1-portable\start-ui.bat --demo
 ```
 
 如果需要包内 ADB，再检查：
 
 ```powershell
-Test-Path .\dist\mobile-profiler-portable\platform-tools\adb.exe
+Test-Path .\dist\mobile-profiler-v0.7.1-portable\platform-tools\adb.exe
 ```
 
 确认后分发：
 
 ```text
-dist\mobile-profiler-portable.zip
+dist\mobile-profiler-v0.7.1-portable.zip
 ```
 
 ### 10.6 升级目标电脑
