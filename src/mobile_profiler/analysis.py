@@ -1939,6 +1939,26 @@ def analyze_thermal_history(
     }
 
 
+def _cpuset_cpu_count(value: object) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "unavailable", "unknown", "-"}:
+        return None
+    cores = set()
+    for token in re.split(r"[\s,]+", text):
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            if left.isdigit() and right.isdigit():
+                start, end = int(left), int(right)
+                if 0 <= start <= end <= 4096:
+                    cores.update(range(start, end + 1))
+            continue
+        if token.isdigit():
+            cores.add(int(token))
+    return len(cores) if cores else None
+
+
 def analyze_scheduler_history(
     samples: Sequence[Sample],
     snapshots: Sequence[SchedulerSnapshot],
@@ -2012,15 +2032,41 @@ def analyze_scheduler_history(
             row["snapshot_count"] = int(row["snapshot_count"]) + 1
             row.update(process)
         sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        cpuset_name = (
+            "top-app"
+            if snapshot.cpusets.get("top-app")
+            else "foreground"
+            if snapshot.cpusets.get("foreground")
+            else next(iter(snapshot.cpusets), "")
+        )
+        cpuset_value = snapshot.cpusets.get(cpuset_name) if cpuset_name else None
         timeline.append(
             {
                 "elapsed_s": snapshot.uptime_s - samples[0].uptime_s,
+                "cpuset_name": cpuset_name or None,
+                "cpuset_cpus": cpuset_value,
+                "cpuset_cpu_count": _cpuset_cpu_count(cpuset_value),
                 "hint_session_count": len(snapshot.hint_sessions),
                 "graphics_session_count": sum(
                     1 for item in snapshot.hint_sessions if item.get("graphics_pipeline")
                 ),
                 "power_efficient_session_count": sum(
                     1 for item in snapshot.hint_sessions if item.get("power_efficient")
+                ),
+                "top_app_process_count": sum(
+                    1
+                    for item in snapshot.watched_processes
+                    if item.get("current_sched_group") == 3
+                    or str(item.get("adj_type") or "") == "top-activity"
+                ),
+                "foreground_process_count": sum(
+                    1
+                    for item in snapshot.watched_processes
+                    if isinstance(item.get("current_sched_group"), (int, float))
+                    and int(item.get("current_sched_group") or 0) >= 2
+                ),
+                "frozen_process_count": sum(
+                    1 for item in snapshot.watched_processes if item.get("frozen")
                 ),
                 "power_mw": sample.power_mw if sample else None,
                 "collection_ms": snapshot.collection_ms,

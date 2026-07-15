@@ -50,6 +50,12 @@
     scannedAppsDevice: "",
     scannedAppsSource: "",
     selectedScannedPackage: "",
+    brightnessDevice: "",
+    brightnessInfo: null,
+    brightnessError: "",
+    brightnessLoading: false,
+    brightnessRequestId: 0,
+    captureFeaturesOverridden: false,
   };
 
   const platformProfiles = {
@@ -540,6 +546,13 @@
     }
     const previousPlatform = app.platform;
     app.platform = nextPlatform;
+    if (previousPlatform !== nextPlatform) {
+      app.brightnessRequestId += 1;
+      app.brightnessDevice = "";
+      app.brightnessInfo = null;
+      app.brightnessError = "";
+      app.brightnessLoading = false;
+    }
     if (!fromRun) localStorage.setItem("mobile-profiler-platform", nextPlatform);
     $$(".platform-switch [data-platform]").forEach(button => {
       const selected = button.dataset.platform === nextPlatform;
@@ -570,6 +583,7 @@
       renderPerformanceMetrics(app.state.active);
       renderPerformanceResources(app.state.active);
       renderSystem(app.state.active);
+      renderSchedulerHistory(app.state.active);
       renderChart();
     }
   }
@@ -663,6 +677,158 @@
     return (app.state?.devices || []).find(device => device.serial === selectedDevice()) || null;
   }
 
+  function androidBrightnessDevice(device = selectedDeviceInfo()) {
+    return selectedPlatform() === "android"
+      && devicePlatform(device) === "android"
+      && device?.state === "device"
+      ? device
+      : null;
+  }
+
+  function renderBrightnessControl(device = selectedDeviceInfo()) {
+    const input = $("#brightness-input");
+    const refreshButton = $("#brightness-refresh");
+    const applyButton = $("#brightness-apply");
+    const badge = $("#brightness-current-badge");
+    const hint = $("#brightness-hint");
+    if (!input || !refreshButton || !applyButton || !badge || !hint) return;
+    const readyDevice = androidBrightnessDevice(device);
+    const recording = Boolean(app.state?.active?.running);
+    const disabled = !readyDevice || recording || app.brightnessLoading;
+    input.disabled = disabled;
+    refreshButton.disabled = disabled;
+    applyButton.disabled = disabled;
+    if (!readyDevice) {
+      badge.textContent = "等待设备";
+      badge.classList.remove("ready");
+      input.value = "";
+      hint.textContent = "选择在线 Android 设备后读取最小值、最大值和最小调整间隔；应用时会切换为手动亮度。";
+      return;
+    }
+    if (recording) {
+      badge.textContent = "采集中锁定";
+      badge.classList.remove("ready");
+      hint.textContent = "为避免改变本轮测试条件，采集期间不能修改亮度。";
+      return;
+    }
+    if (app.brightnessLoading) {
+      badge.textContent = "读取中";
+      badge.classList.remove("ready");
+      hint.textContent = "正在读取 Android 亮度当前值和设备范围…";
+      return;
+    }
+    const info = app.brightnessDevice === readyDevice.serial ? app.brightnessInfo : null;
+    if (!info) {
+      badge.textContent = app.brightnessError ? "读取失败" : "等待读取";
+      badge.classList.remove("ready");
+      hint.textContent = app.brightnessError
+        ? `${app.brightnessError}；可点击“读取范围”重试。`
+        : "点击“读取范围”获取最小值、最大值和最小调整间隔。";
+      return;
+    }
+    input.min = String(info.minimum);
+    input.max = String(info.maximum);
+    input.step = String(info.step || 1);
+    if (document.activeElement !== input || !input.value) input.value = String(info.current);
+    badge.textContent = `当前 ${info.current}`;
+    badge.classList.add("ready");
+    const normalizedStep = finite(info.normalized_step)
+      ? Number(info.normalized_step).toFixed(5).replace(/0+$/, "").replace(/\.$/, "")
+      : "--";
+    hint.textContent = `最小值 ${info.minimum} · 最大值 ${info.maximum} · 最小调整间隔 ${info.step || 1} 级（归一化约 ${normalizedStep}） · ${info.automatic ? "当前为自动亮度，应用时会切换手动" : "当前为手动亮度"}`;
+  }
+
+  async function refreshBrightnessCapability({ force = false, notifyFailure = false } = {}) {
+    const device = androidBrightnessDevice();
+    if (!device) {
+      renderBrightnessControl();
+      return null;
+    }
+    if (!force && app.brightnessDevice === device.serial && (app.brightnessInfo || app.brightnessError)) {
+      renderBrightnessControl(device);
+      return app.brightnessInfo;
+    }
+    const requestId = ++app.brightnessRequestId;
+    app.brightnessDevice = device.serial;
+    app.brightnessInfo = null;
+    app.brightnessError = "";
+    app.brightnessLoading = true;
+    renderBrightnessControl(device);
+    try {
+      const info = await api("/api/brightness", {
+        method: "POST",
+        body: JSON.stringify({ device: device.serial, platform: "android", action: "read" }),
+      });
+      if (requestId !== app.brightnessRequestId || selectedDevice() !== device.serial) return null;
+      app.brightnessInfo = info;
+      return info;
+    } catch (error) {
+      if (requestId !== app.brightnessRequestId) return null;
+      app.brightnessError = error.message || "无法读取设备亮度";
+      if (notifyFailure) notify("亮度范围读取失败", app.brightnessError, "error", 7000);
+      return null;
+    } finally {
+      if (requestId === app.brightnessRequestId) {
+        app.brightnessLoading = false;
+        renderBrightnessControl();
+      }
+    }
+  }
+
+  async function applyBrightnessValue() {
+    const device = androidBrightnessDevice();
+    const input = $("#brightness-input");
+    const info = app.brightnessInfo;
+    if (!device || !input || !info) {
+      notify("无法设置亮度", "请先选择在线 Android 设备并读取亮度范围。", "error");
+      return;
+    }
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < Number(info.minimum) || value > Number(info.maximum)) {
+      notify(
+        "亮度数值无效",
+        `请输入 ${info.minimum}–${info.maximum} 之间的整数，最小调整间隔为 ${info.step || 1}。`,
+        "error",
+      );
+      return;
+    }
+    const requestId = ++app.brightnessRequestId;
+    app.brightnessLoading = true;
+    app.brightnessError = "";
+    renderBrightnessControl(device);
+    try {
+      const result = await api("/api/brightness", {
+        method: "POST",
+        body: JSON.stringify({
+          device: device.serial,
+          platform: "android",
+          action: "set",
+          value,
+        }),
+      });
+      if (requestId !== app.brightnessRequestId) return;
+      app.brightnessInfo = result;
+      const detail = `当前 ${result.current} · 最小 ${result.minimum} · 最大 ${result.maximum} · 间隔 ${result.step}`;
+      notify(
+        result.applied ? "亮度已应用" : "亮度值已写入",
+        `${detail}${result.manual_mode_changed ? " · 已切换为手动亮度" : ""}`,
+        result.applied ? "success" : "error",
+        6000,
+      );
+      const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+      if (warnings.length) notify("亮度应用提示", warnings.join("；"), "error", 8000);
+    } catch (error) {
+      if (requestId !== app.brightnessRequestId) return;
+      app.brightnessError = error.message || "无法修改设备亮度";
+      notify("亮度修改失败", app.brightnessError, "error", 8000);
+    } finally {
+      if (requestId === app.brightnessRequestId) {
+        app.brightnessLoading = false;
+        renderBrightnessControl();
+      }
+    }
+  }
+
   function effectiveCapturePreset() {
     const requested = $("#capture-preset-input")?.value || "auto";
     if (requested !== "auto") return requested;
@@ -682,10 +848,12 @@
     $$('[data-capture-feature]').forEach(input => {
       input.checked = enabled.has(input.dataset.captureFeature);
     });
-    updateCaptureFeatureControls();
+    updateCaptureFeatureControls({ overridden: false });
   }
 
-  function updateCaptureFeatureControls({ overridden = false } = {}) {
+  function updateCaptureFeatureControls({ overridden } = {}) {
+    if (typeof overridden === "boolean") app.captureFeaturesOverridden = overridden;
+    const customized = app.captureFeaturesOverridden;
     const platform = selectedPlatform();
     const performance = app.testMode === "performance";
     const smartPerfOption = $("#capture-preset-input")?.querySelector('option[value="harmony-smartperf"]');
@@ -748,7 +916,13 @@
       "process_snapshots", "hot_threads", "thermal", "scheduler",
     ].some(name => Boolean($(`[data-capture-feature="${name}"]`)?.checked));
     const presetLabel = $("#capture-preset-input")?.selectedOptions?.[0]?.textContent || "采集预设";
-    $("#capture-preset-hint").textContent = overridden
+    const advancedBadge = $("#advanced-setting-count");
+    if (advancedBadge) {
+      advancedBadge.textContent = customized
+        ? "已自定义"
+        : $("#capture-preset-input")?.value === "auto" ? "默认已配置" : "预设已应用";
+    }
+    $("#capture-preset-hint").textContent = customized
       ? `${presetLabel} · 已逐项覆盖；基础电流、电压和时间戳仍保留。`
       : `${presetLabel} · 可继续逐项关闭以降低测试干扰。`;
     $("#capture-feature-note").textContent = showHighPerformance
@@ -805,7 +979,7 @@
     $("#test-mode-description").textContent = performance ? profile.performanceDescription : profile.powerDescription;
     $("#capture-config-title").textContent = performance ? "性能采集配置" : "功耗采集配置";
     $("#capture-mode-badge").lastChild.textContent = performance ? " PERFORMANCE" : " POWER";
-    $("#advanced-setting-count").textContent = performance ? "采集项可裁剪" : "采集项可裁剪";
+    $("#advanced-setting-count").textContent = "默认已配置";
     $("#control-note").textContent = performance ? profile.performanceNote : profile.powerNote;
     updatePlatformPresentation();
     syncDurationPreset();
@@ -863,6 +1037,102 @@
     return input ? Boolean(input.checked) : true;
   }
 
+  function powerFlowPresentation(active) {
+    const latest = active?.latest || {};
+    const rawDirection = String(
+      latest.direction
+      || active?.summary?.direction
+      || active?.battery?.status
+      || active?.metadata?.battery_start?.status
+      || "unknown"
+    ).toLowerCase();
+    const charging = rawDirection === "charging" || (
+      rawDirection === "unknown"
+      && finite(latest.signed_current_ma)
+      && Number(latest.signed_current_ma) > 0
+    );
+    const discharging = rawDirection === "discharging" || (
+      rawDirection === "unknown"
+      && finite(latest.signed_current_ma)
+      && Number(latest.signed_current_ma) < 0
+    );
+    if (charging) {
+      return {
+        direction: "charging",
+        powerLabel: "电池充入功率",
+        powerTag: "CHARGE",
+        currentLabel: "充电电流",
+        currentTag: "INPUT",
+        energyLabel: "累计充入能量",
+        chartPowerTitle: "电池充入功率",
+        chartPowerLegend: "Battery charge power",
+        chartCurrentTitle: "充电电流",
+        chartCurrentLegend: "Battery charge current",
+      };
+    }
+    if (discharging) {
+      return {
+        direction: "discharging",
+        powerLabel: "电池放电功率",
+        powerTag: "BATTERY",
+        currentLabel: "放电电流",
+        currentTag: "CURRENT",
+        energyLabel: "累计放电能量",
+        chartPowerTitle: "电池放电功率",
+        chartPowerLegend: "Battery discharge power",
+        chartCurrentTitle: "放电电流",
+        chartCurrentLegend: "Battery discharge current",
+      };
+    }
+    return {
+      direction: "unknown",
+      powerLabel: "电池侧功率",
+      powerTag: "BATTERY",
+      currentLabel: "电池电流",
+      currentTag: "CURRENT",
+      energyLabel: "累计电池侧能量",
+      chartPowerTitle: "电池侧功率",
+      chartPowerLegend: "Battery-side power",
+      chartCurrentTitle: "电池电流幅值",
+      chartCurrentLegend: "Battery current magnitude",
+    };
+  }
+
+  function gpuTelemetryAvailable(active) {
+    if (!active) return true;
+    if (!captureFeatureEnabled(active, "gpu_metrics")) return false;
+    const latest = active.latest || {};
+    if (finite(latest.gpu_load_pct) || finite(latest.gpu_frequency_mhz)) return true;
+    const series = Array.isArray(active.series) ? active.series : [];
+    if (series.some(item => finite(item.gpu_load_pct) || finite(item.gpu_frequency_mhz))) return true;
+    // A detected sysfs/DVT candidate is only a capability hint. Keep the controls
+    // while the first sample is pending, then hide them unless telemetry actually
+    // arrived; this avoids displaying permanently empty GPU rows on restricted OEMs.
+    return Boolean(active.running) && Number(active.sample_count || 0) === 0;
+  }
+
+  function updateGpuVisibility(active) {
+    const available = gpuTelemetryAvailable(active);
+    $$('[data-metric="gpu_load_pct"], [data-metric="gpu_frequency_mhz"]').forEach(button => {
+      button.classList.toggle("hidden", !available);
+    });
+    $("#resource-gpu-row")?.classList.toggle("hidden", !available);
+    $("#performance-gpu-row")?.classList.toggle("hidden", !available);
+    const iosPerformance = (active?.test_mode || app.testMode) === "performance"
+      && activePlatform(active) === "ios";
+    $("#metric-one-low-card")?.classList.toggle("hidden", iosPerformance && !available);
+    $("#performance-fps-stat")?.classList.toggle("hidden", iosPerformance && !available);
+    if (!available && ["gpu_load_pct", "gpu_frequency_mhz"].includes(app.metric)) {
+      app.metric = app.testMode === "performance" && activePlatform(active) !== "ios"
+        ? "frame_rate_fps"
+        : "cpu_pct";
+      $$('[data-metric]').forEach(button => {
+        button.classList.toggle("active", button.dataset.metric === app.metric);
+      });
+    }
+    return available;
+  }
+
   function sparklineMarkup(values) {
     const selected = values.slice(-60).filter(finite).map(Number);
     if (selected.length < 2) return '<svg class="live-sparkline" viewBox="0 0 86 42" aria-hidden="true"><line x1="2" y1="21" x2="84" y2="21"></line></svg>';
@@ -900,8 +1170,14 @@
       const current = values.at(-1);
       const average = values.reduce((sum, value) => sum + value, 0) / values.length;
       const secondary = percentile(values, definition.secondaryQuantile ?? .95);
+      const powerFlow = powerFlowPresentation(active);
+      const title = key === "power_mw"
+        ? powerFlow.chartPowerTitle
+        : key === "current_ma"
+          ? powerFlow.chartCurrentTitle
+          : definition.title;
       cards.push(`<button type="button" class="live-detail-card" data-live-metric="${escapeHtml(key)}" style="--detail-color:${escapeHtml(definition.color)}">
-        <span class="live-detail-copy"><small>${escapeHtml(definition.title)}</small><strong>${current.toFixed(definition.digits)} ${escapeHtml(definition.unit)}</strong><span>AVG ${average.toFixed(definition.digits)} · ${escapeHtml(definition.secondaryLabel || "P95")} ${secondary === null ? "--" : secondary.toFixed(definition.digits)}</span></span>
+        <span class="live-detail-copy"><small>${escapeHtml(title)}</small><strong>${current.toFixed(definition.digits)} ${escapeHtml(definition.unit)}</strong><span>AVG ${average.toFixed(definition.digits)} · ${escapeHtml(definition.secondaryLabel || "P95")} ${secondary === null ? "--" : secondary.toFixed(definition.digits)}</span></span>
         ${sparklineMarkup(values)}
       </button>`);
     });
@@ -1161,6 +1437,11 @@
   function renderDevices(state) {
     const select = $("#device-select");
     const platform = selectedPlatform();
+    const platformError = platform === "ios"
+      ? state.ios_error
+      : platform === "harmony"
+        ? state.harmony_error
+        : state.device_error;
     const allDevices = Array.isArray(state.devices) ? state.devices : [];
     const currentValue = select.value || "";
     const currentMatchesPlatform = allDevices.some(
@@ -1176,7 +1457,7 @@
     if (!devices.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = state.device_error ? `${platformLabel(platform)} 运行时不可用` : `未发现 ${platformLabel(platform)} 设备`;
+      option.textContent = platformError ? `${platformLabel(platform)} 连接不可用` : `未发现 ${platformLabel(platform)} 设备`;
       select.appendChild(option);
     } else {
       [
@@ -1207,7 +1488,7 @@
       : "";
     const preferred = activeSerial || previous;
     const preferredDevice = devices.find(device => device.serial === preferred);
-    if (preferredDevice && (preferredDevice.state === "device" || deviceConnectionType(preferredDevice) === "wireless")) {
+    if (preferredDevice?.state === "device") {
       select.value = preferred;
     } else if (ready.length) {
       select.value = ready[0].serial;
@@ -1218,21 +1499,32 @@
     const chosenPlatform = chosen ? devicePlatform(chosen) : platform;
     const deviceState = $("#device-state");
     deviceState.classList.toggle("online", Boolean(chosen?.state === "device"));
-    deviceState.classList.toggle("error", Boolean(state.device_error || (chosen && chosen.state !== "device")));
-    deviceState.querySelector("span").textContent = chosen?.state === "device" ? `${platformLabel(chosenPlatform)} · ${deviceConnectionLabel(chosen)}在线` : state.device_error ? "设备运行时异常" : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
+    deviceState.classList.toggle("error", Boolean(platformError || (chosen && chosen.state !== "device")));
+    deviceState.title = platformError || "";
+    deviceState.querySelector("span").textContent = chosen?.state === "device" ? `${platformLabel(chosenPlatform)} · ${deviceConnectionLabel(chosen)}在线` : platformError ? `${platformLabel(platform)} 连接异常` : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
     $("#start-record").disabled = !chosen || chosen.state !== "device" || Boolean(state.active?.running);
     $("#enable-tcpip").disabled = !chosen || chosenPlatform !== "android" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#enable-harmony-tcpip").disabled = !chosen || chosenPlatform !== "harmony" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
-    $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || Boolean(state.active?.running);
+    $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#disconnect-wireless").disabled = !chosen || chosenPlatform !== "android" || chosenType !== "wireless" || Boolean(state.active?.running);
     updateAppScannerAvailability(chosen);
     updateCaptureFeatureControls();
+    renderBrightnessControl(chosen);
+    if (
+      androidBrightnessDevice(chosen)
+      && !state.active?.running
+      && app.brightnessDevice !== chosen.serial
+    ) {
+      void refreshBrightnessCapability();
+    }
   }
 
   function renderMetrics(active) {
     const latest = active?.latest || {};
     const summary = active?.summary || {};
     const isIos = activePlatform(active) === "ios";
+    const powerFlow = powerFlowPresentation(active);
+    updateGpuVisibility(active);
     const memoryEnabled = captureFeatureEnabled(active, "memory_frequency");
     const memoryAvailable = isIos || (
       memoryEnabled
@@ -1246,6 +1538,16 @@
       app.metric = app.testMode === "performance" ? "frame_rate_fps" : "power_mw";
       $$('[data-metric]').forEach(item => item.classList.toggle("active", item.dataset.metric === app.metric));
     }
+    $("#metric-power-label").textContent = powerFlow.powerLabel;
+    $("#metric-power-tag").textContent = powerFlow.powerTag;
+    $("#metric-current-label").textContent = powerFlow.currentLabel;
+    $("#metric-current-tag").textContent = powerFlow.currentTag;
+    $("#metric-energy-label").textContent = powerFlow.energyLabel;
+    $("#metric-energy-tag").textContent = powerFlow.direction === "charging" ? "CHARGE" : "ENERGY";
+    const powerTab = $('[data-metric="power_mw"][data-mode-only="power"]');
+    const currentTab = $('[data-metric="current_ma"][data-mode-only="power"]');
+    if (powerTab) powerTab.textContent = powerFlow.direction === "charging" ? "充入功率" : "放电功率";
+    if (currentTab) currentTab.textContent = powerFlow.direction === "charging" ? "充电电流" : "放电电流";
     $("#metric-power").textContent = finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--";
     $("#metric-current").textContent = formatMetric(latest.current_ma, "mA", 0);
     $("#metric-cpu").textContent = formatMetric(latest.cpu_pct, "%", 1);
@@ -1255,10 +1557,14 @@
     $("#metric-temp").textContent = formatMetric(latest.temperature_c, "°C", 1);
     $("#metric-energy").textContent = formatMetric(summary.energy_mwh, "mWh", 2);
     const averagePower = finite(summary.average_power_mw) ? `AVG ${(Number(summary.average_power_mw) / 1000).toFixed(3)} W` : "整机电池侧";
-    $("#metric-power-sub").textContent = isIos && finite(latest.power_sample_age_s)
-      ? `${averagePower} · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
-      : averagePower;
-    $("#metric-current-sub").textContent = finite(summary.average_current_ma) ? `AVG ${Number(summary.average_current_ma).toFixed(0)} mA` : "正幅值";
+    $("#metric-power-sub").textContent = powerFlow.direction === "charging"
+      ? `${averagePower} · 电池吸收功率，不代表设备自身功耗`
+      : isIos && finite(latest.power_sample_age_s)
+        ? `${averagePower} · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
+        : averagePower;
+    $("#metric-current-sub").textContent = finite(summary.average_current_ma)
+      ? `AVG ${Number(summary.average_current_ma).toFixed(0)} mA${powerFlow.direction === "charging" ? " · 流入电池" : ""}`
+      : powerFlow.direction === "charging" ? "流入电池的正幅值" : "正幅值";
     const averageCpu = finite(summary.average_cpu_pct) ? `AVG ${Number(summary.average_cpu_pct).toFixed(1)}%` : "全核心";
     $("#metric-cpu-sub").textContent = isIos && finite(summary.average_collector_cpu_pct)
       ? `${averageCpu} · collector ${Number(summary.average_collector_cpu_pct).toFixed(1)}%`
@@ -1272,7 +1578,21 @@
         ? `P95 ${Number(memory.p95_frequency_mhz).toFixed(0)} MHz · 高频 ${formatNumber(memory.high_frequency_share_pct, 1)}%`
         : memory.limitations || "DRAM / DMC / MIF";
     $("#metric-temp-sub").textContent = finite(latest.voltage_mv) ? `${(Number(latest.voltage_mv) / 1000).toFixed(3)} V` : isIos ? "DiagnosticsService" : "BatteryService";
-    $("#metric-energy-sub").textContent = active?.sample_count ? `${active.sample_count} samples` : "有效区间积分";
+    $("#metric-energy-sub").textContent = active?.sample_count
+      ? `${active.sample_count} samples · ${powerFlow.direction === "charging" ? "充入能量积分" : "有效区间积分"}`
+      : powerFlow.direction === "charging" ? "充入能量积分" : "有效区间积分";
+    const chargingNotice = $("#charging-power-notice");
+    const showChargingNotice = powerFlow.direction === "charging" && finite(latest.power_mw);
+    chargingNotice?.classList.toggle("hidden", !showChargingNotice);
+    if (showChargingNotice) {
+      const watts = Number(latest.power_mw) / 1000;
+      const amps = finite(latest.current_ma) ? Number(latest.current_ma) / 1000 : null;
+      const volts = finite(latest.voltage_mv) ? Number(latest.voltage_mv) / 1000 : null;
+      $("#charging-power-title").textContent = `当前为充电状态：电池充入 ${watts.toFixed(2)} W`;
+      $("#charging-power-detail").textContent = amps !== null && volts !== null
+        ? `${amps.toFixed(2)} A × ${volts.toFixed(2)} V。黑屏只降低设备负载，不会让快充输入归零；续航测试请断开外部供电。`
+        : "该数值是电池吸收的充电功率，不等于黑屏待机功耗；续航测试请断开外部供电。";
+    }
   }
 
   function renderPerformanceMetrics(active) {
@@ -1520,6 +1840,12 @@
     const settings = pressure.settings || active?.runtime_settings || {};
     const settingRows = Array.isArray(settings.rows) ? settings.rows : [];
     const platform = activePlatform(active);
+    const powerFlow = powerFlowPresentation(active);
+    $("#power-pressure-note").innerHTML = powerFlow.direction === "charging"
+      ? "<strong>当前为充电状态：</strong>资源变化与这里显示的电池充入功率相关，不等于续航功耗，也不应用于组件或任务耗电归因；请断开外部供电后进行功耗测试。"
+      : platform === "harmony"
+        ? "<strong>边界：</strong>BatteryService 电流是整机电池侧数据；CPU/GPU/DDR 与进程相关性用于解释趋势，不等于独立电源轨或 Android BatteryStats 归因。"
+        : "<strong>边界：</strong>相关系数用于解释电流 / 功率和资源压力是否同步变化，不代表独立硬件电源轨，也不能把多个压力项直接相加。";
     $("#power-pressure-driver-list").innerHTML = drivers.length ? drivers.slice(0, 7).map(item => {
       const correlation = finite(item.correlation) ? Number(item.correlation) : null;
       const width = correlation === null ? 0 : clamp(Math.abs(correlation) * 100, 0, 100);
@@ -1777,7 +2103,7 @@
       { label: "CPU", value: latest.cpu_pct, unit: "%", scale: 100 },
       { label: "GPU", value: latest.gpu_load_pct, unit: "%", scale: 100 },
       { label: "Observer", value: latest.collector_cpu_pct, unit: "%", scale: 25 },
-    ];
+    ].filter(item => item.label !== "GPU" || finite(item.value));
     $("#performance-residency-source").textContent = "DVT / PowerTelemetry";
     $("#performance-residency-list").innerHTML = resourceRows.map(item => {
       const value = finite(item.value) ? Number(item.value) : null;
@@ -1929,6 +2255,106 @@
     </tr>`).join("") : '<tr><td colspan="4" class="table-empty">暂无进程快照；只在这里显示当前前 5 项。</td></tr>';
   }
 
+  function renderSchedulerHistory(active) {
+    const panel = $("#scheduler-history-panel");
+    const svg = $("#scheduler-history-chart");
+    const empty = $("#scheduler-history-empty");
+    if (!panel || !svg || !empty) return;
+    const platform = activePlatform(active);
+    const enabled = platform !== "ios" && captureFeatureEnabled(active, "scheduler");
+    panel.classList.toggle("hidden", !enabled);
+    if (!enabled) return;
+    const series = Array.isArray(active?.scheduler_series)
+      ? active.scheduler_series.filter(item => finite(item.elapsed_s))
+      : [];
+    const latest = series.at(-1) || {};
+    $("#scheduler-history-source").textContent = series.length
+      ? `${series.length} 个调度快照`
+      : active?.running ? "等待调度快照" : "没有调度历史";
+    $("#scheduler-cpuset-value").textContent = finite(latest.cpuset_cpu_count)
+      ? `${Number(latest.cpuset_cpu_count).toFixed(0)} 核`
+      : "--";
+    $("#scheduler-cpuset-label").textContent = [latest.cpuset_name, latest.cpuset_cpus].filter(Boolean).join(" · ") || "top-app / foreground";
+    const groupLabels = { 0: "默认 / 后台", 1: "受限", 2: "前台", 3: "Top-app" };
+    $("#scheduler-group-value").textContent = finite(latest.foreground_sched_group)
+      ? `组 ${Number(latest.foreground_sched_group).toFixed(0)}`
+      : "--";
+    $("#scheduler-group-label").textContent = finite(latest.foreground_sched_group)
+      ? `${groupLabels[Number(latest.foreground_sched_group)] || "调度组"}${latest.foreground_process ? ` · ${latest.foreground_process}` : ""}`
+      : latest.foreground_process || "目标进程";
+    $("#scheduler-hint-value").textContent = finite(latest.hint_session_count)
+      ? `${Number(latest.hint_session_count).toFixed(0)} 个`
+      : "--";
+    $("#scheduler-hint-label").textContent = finite(latest.graphics_session_count)
+      ? `${Number(latest.graphics_session_count).toFixed(0)} 个图形管线`
+      : "活动 / 图形管线";
+
+    svg.replaceChildren();
+    const laneDefinitions = [
+      { key: "cpuset_cpu_count", label: "可调度 CPU", unit: "核", className: "cpuset", minimum: 0 },
+      { key: "foreground_sched_group", label: "前台调度组", unit: "组", className: "group", minimum: 0, maximum: 3 },
+      { key: "hint_session_count", label: "ADPF 会话", unit: "个", className: "hint", minimum: 0 },
+    ].filter(lane => series.some(item => finite(item[lane.key])));
+    if (series.length < 2 || !laneDefinitions.length) {
+      empty.classList.remove("hidden");
+      return;
+    }
+    empty.classList.add("hidden");
+    const width = Math.max(420, Math.round(svg.clientWidth || 1000));
+    const compact = width < 650;
+    const left = compact ? 112 : 148;
+    const right = compact ? 22 : 42;
+    const top = 18;
+    const bottom = 34;
+    const laneHeight = compact ? 72 : 78;
+    const height = top + bottom + laneDefinitions.length * laneHeight;
+    const minimumTime = Math.min(...series.map(item => Number(item.elapsed_s)));
+    const maximumTime = Math.max(...series.map(item => Number(item.elapsed_s)));
+    const safeMaximumTime = Math.max(minimumTime + 1, maximumTime);
+    const x = value => left + (Number(value) - minimumTime) / (safeMaximumTime - minimumTime) * (width - left - right);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("aria-label", `CPU 调度历史趋势，共 ${series.length} 个快照`);
+    const ticks = buildTimeTicks(minimumTime, safeMaximumTime, compact ? 3 : 5);
+    ticks.forEach((value, index) => {
+      const position = x(value);
+      svg.appendChild(svgNode("line", { x1: position, x2: position, y1: top, y2: height - bottom, class: "scheduler-grid" }));
+      svg.appendChild(svgNode("text", {
+        x: position,
+        y: height - 12,
+        "text-anchor": index === 0 ? "start" : index === ticks.length - 1 ? "end" : "middle",
+        class: "scheduler-axis",
+      }, formatDuration(value)));
+    });
+    laneDefinitions.forEach((lane, laneIndex) => {
+      const laneTop = top + laneIndex * laneHeight;
+      const laneBottom = laneTop + laneHeight - 12;
+      const values = series.map(item => finite(item[lane.key]) ? Number(item[lane.key]) : null);
+      const valid = values.filter(finite).map(Number);
+      const minimum = Number(lane.minimum ?? Math.min(...valid));
+      const maximum = Math.max(Number(lane.maximum ?? 0), ...valid, minimum + 1);
+      const y = value => laneTop + 10 + (maximum - Number(value)) / Math.max(1, maximum - minimum) * (laneBottom - laneTop - 20);
+      const latestValue = [...values].reverse().find(finite);
+      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 25, class: "scheduler-label" }, lane.label));
+      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 43, class: "scheduler-value" }, finite(latestValue) ? `${Number(latestValue).toFixed(0)} ${lane.unit}` : "--"));
+      svg.appendChild(svgNode("text", { x: width - 8, y: laneTop + 15, "text-anchor": "end", class: "scheduler-axis" }, `${maximum.toFixed(0)} ${lane.unit}`));
+      svg.appendChild(svgNode("text", { x: width - 8, y: laneBottom, "text-anchor": "end", class: "scheduler-axis" }, `${minimum.toFixed(0)} ${lane.unit}`));
+      svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: laneBottom + 5, y2: laneBottom + 5, class: "scheduler-separator" }));
+      const coordinates = series
+        .map((item, index) => finite(values[index]) ? { x: x(item.elapsed_s), y: y(values[index]) } : null)
+        .filter(Boolean);
+      if (!coordinates.length) return;
+      let path = `M${coordinates[0].x.toFixed(2)},${coordinates[0].y.toFixed(2)}`;
+      for (let index = 1; index < coordinates.length; index += 1) {
+        const previous = coordinates[index - 1];
+        const current = coordinates[index];
+        path += ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+      }
+      svg.appendChild(svgNode("path", { d: path, class: `scheduler-line ${lane.className}` }));
+      const last = coordinates.at(-1);
+      svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 3.5, class: `scheduler-dot ${lane.className}` }));
+    });
+  }
+
   function renderConsole(active) {
     const container = $("#console-output");
     let logs = Array.isArray(active?.logs) ? active.logs : [];
@@ -1952,7 +2378,13 @@
     const svg = $("#live-chart");
     const empty = $("#chart-empty");
     const active = app.state?.active;
-    const definition = metricDefinitions[app.metric];
+    const baseDefinition = metricDefinitions[app.metric];
+    const powerFlow = powerFlowPresentation(active);
+    const definition = app.metric === "power_mw"
+      ? { ...baseDefinition, title: powerFlow.chartPowerTitle, legend: powerFlow.chartPowerLegend }
+      : app.metric === "current_ma"
+        ? { ...baseDefinition, title: powerFlow.chartCurrentTitle, legend: powerFlow.chartCurrentLegend }
+        : baseDefinition;
     const sourceSeries = definition.series === "performance"
       ? active?.performance_series
       : active?.series;
@@ -2195,7 +2627,7 @@
           }
         });
         $("#harmony-high-performance-input").checked = Boolean(active.config.harmony_high_performance);
-        updateCaptureFeatureControls();
+        updateCaptureFeatureControls({ overridden: false });
       }
     }
     renderSession(active);
@@ -2207,6 +2639,7 @@
     renderPowerPressure(active);
     renderRenderPipeline(active);
     renderSystem(active);
+    renderSchedulerHistory(active);
     renderConsole(active);
     renderLiveDetails(active);
     renderChart();
@@ -2563,11 +2996,19 @@
       setTestMode(button.dataset.testMode);
     }));
     window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
-    window.addEventListener("resize", () => requestAnimationFrame(renderChart));
+    window.addEventListener("resize", () => requestAnimationFrame(() => {
+      renderChart();
+      renderSchedulerHistory(app.state?.active);
+    }));
     document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshState(); });
 
     $("#device-select").addEventListener("change", event => {
       localStorage.setItem(`mobile-profiler-device-${selectedPlatform()}`, event.target.value);
+      app.brightnessRequestId += 1;
+      app.brightnessDevice = "";
+      app.brightnessInfo = null;
+      app.brightnessError = "";
+      app.brightnessLoading = false;
       if (app.scannedAppsDevice && app.scannedAppsDevice !== event.target.value) {
         resetAppScanner({ clearPackage: true });
       }
@@ -2576,28 +3017,60 @@
       updateCaptureFeatureControls();
     });
 
+    $("#brightness-refresh").addEventListener("click", () => {
+      void refreshBrightnessCapability({ force: true, notifyFailure: true });
+    });
+    $("#brightness-apply").addEventListener("click", () => {
+      void applyBrightnessValue();
+    });
+    $("#brightness-input").addEventListener("keydown", event => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      void applyBrightnessValue();
+    });
+
     $("#capture-preset-input").addEventListener("change", () => applyCapturePreset());
-    $$('[data-capture-feature]').forEach(input => input.addEventListener("change", () => {
-      if (input.dataset.captureFeature === "frame_rate" && !input.checked) {
-        $('[data-capture-feature="frame_details"]').checked = false;
-      }
-      if (input.dataset.captureFeature === "frame_details" && input.checked) {
-        $('[data-capture-feature="frame_rate"]').checked = true;
-      }
-      if (input.dataset.captureFeature === "foreground_window" && !input.checked) {
-        $('[data-capture-feature="harmony_hitches"]').checked = false;
-      }
-      if (input.dataset.captureFeature === "harmony_hitches" && input.checked) {
-        $('[data-capture-feature="foreground_window"]').checked = true;
-      }
-      if (input.dataset.captureFeature === "hot_threads" && input.checked) {
-        $('[data-capture-feature="process_snapshots"]').checked = true;
-      }
-      if (input.dataset.captureFeature === "process_snapshots" && !input.checked) {
-        $('[data-capture-feature="hot_threads"]').checked = false;
-      }
-      updateCaptureFeatureControls({ overridden: true });
-    }));
+    $$('[data-capture-feature]').forEach(input => {
+      const card = input.closest(".capture-feature-card");
+      let pointerChecked = null;
+      card?.addEventListener("pointerdown", event => {
+        if (event.button !== 0 || input.disabled) return;
+        pointerChecked = input.checked;
+      });
+      card?.addEventListener("pointercancel", () => { pointerChecked = null; });
+      card?.addEventListener("click", event => {
+        if (pointerChecked === null) return;
+        const requested = !pointerChecked;
+        pointerChecked = null;
+        event.preventDefault();
+        setTimeout(() => {
+          if (input.disabled) return;
+          input.checked = requested;
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        }, 0);
+      });
+      input.addEventListener("change", () => {
+        if (input.dataset.captureFeature === "frame_rate" && !input.checked) {
+          $('[data-capture-feature="frame_details"]').checked = false;
+        }
+        if (input.dataset.captureFeature === "frame_details" && input.checked) {
+          $('[data-capture-feature="frame_rate"]').checked = true;
+        }
+        if (input.dataset.captureFeature === "foreground_window" && !input.checked) {
+          $('[data-capture-feature="harmony_hitches"]').checked = false;
+        }
+        if (input.dataset.captureFeature === "harmony_hitches" && input.checked) {
+          $('[data-capture-feature="foreground_window"]').checked = true;
+        }
+        if (input.dataset.captureFeature === "hot_threads" && input.checked) {
+          $('[data-capture-feature="process_snapshots"]').checked = true;
+        }
+        if (input.dataset.captureFeature === "process_snapshots" && !input.checked) {
+          $('[data-capture-feature="hot_threads"]').checked = false;
+        }
+        updateCaptureFeatureControls({ overridden: true });
+      });
+    });
     $("#system-monitor-input").addEventListener("change", event => {
       ["process_snapshots", "hot_threads", "thermal", "scheduler"].forEach(name => {
         const input = $(`[data-capture-feature="${name}"]`);
@@ -2715,8 +3188,8 @@
     $("#pair-ios").addEventListener("click", async () => {
       const device = selectedDevice();
       const selected = (app.state?.devices || []).find(item => item.serial === device);
-      if (!device || devicePlatform(selected) !== "ios") {
-        notify("请选择 iPhone", "需要一台已通过 USB 信任的 iPhone。", "error");
+      if (!device || devicePlatform(selected) !== "ios" || deviceConnectionType(selected) !== "usb") {
+        notify("请选择 USB iPhone", "创建或修复无线连接时，iPhone 必须通过 USB 连接并保持解锁。", "error");
         return;
       }
       if (!confirm("将为当前 iPhone 创建 RemotePairing 并缓存 Wi-Fi 端点。配对完成后可拔掉 USB，是否继续？")) return;
@@ -2727,15 +3200,19 @@
           body: JSON.stringify({ device }),
         });
         const endpoint = result.endpoint || {};
+        if (!result.connected || !endpoint.host || !endpoint.port) {
+          throw new Error(result.connection_error || "RemotePairing 未返回可用的 Wi-Fi 端点");
+        }
         notify(
           "iOS 无线配对完成",
-          endpoint.host && endpoint.port ? `${endpoint.host}:${endpoint.port}，现在可以拔掉 USB。` : "配对已写入，请保持解锁后刷新设备。",
+          `${endpoint.host}:${endpoint.port} 已验证，现在可以拔掉 USB。`,
           "success",
           10000,
         );
         await refreshState();
       } catch (error) {
-        notify("iOS 无线配对失败", error.message, "error", 10000);
+        const reason = String(error?.message || "未知连接错误").replace(/^ERROR:\s*/i, "");
+        notify("iOS 无线配对失败", reason, "error", 0);
       } finally {
         setBusy(false);
       }
@@ -2769,15 +3246,24 @@
 
     $("#refresh-devices").addEventListener("click", async () => {
       const button = $("#refresh-devices");
+      const platform = selectedPlatform();
       button.classList.add("loading");
       try {
-        await api("/api/devices/refresh", {
+        const result = await api("/api/devices/refresh", {
           method: "POST",
-          body: JSON.stringify({ platform: selectedPlatform() }),
+          body: JSON.stringify({ platform }),
         });
         await refreshState();
+        const platformError = platform === "ios"
+          ? app.state?.ios_error
+          : platform === "harmony"
+            ? app.state?.harmony_error
+            : result.error || app.state?.device_error;
+        if (platformError) {
+          notify(`${platformLabel(platform)} 连接检查失败`, platformError, "error", 0);
+        }
       } catch (error) {
-        notify("设备刷新失败", error.message, "error");
+        notify("设备刷新失败", error.message, "error", 0);
       } finally {
         button.classList.remove("loading");
       }

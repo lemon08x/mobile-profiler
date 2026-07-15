@@ -20,6 +20,7 @@ from mobile_profiler.ui import (
     DashboardHTTPServer,
     DashboardManager,
     LiveTelemetryReader,
+    _parse_android_brightness_capability,
     android_icon_data_uri,
     parse_android_apk_icon_candidates,
     parse_android_launcher_activities,
@@ -31,6 +32,33 @@ from mobile_profiler.ui import (
 
 
 class LiveTelemetryTests(unittest.TestCase):
+    def test_reader_keeps_charging_direction_before_samples_arrive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {
+                            "voltage_mv": 3640.0,
+                            "status": "charging",
+                            "powered": ["AC"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "raw" / "sampler-stream.txt").write_text("", encoding="utf-8")
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            self.assertEqual(snapshot["sample_count"], 0)
+            self.assertIsNone(snapshot["latest"])
+            self.assertEqual(snapshot["summary"]["direction"], "charging")
+            self.assertEqual(snapshot["battery"]["powered"], ["AC"])
+
     def test_reader_converts_append_only_sampler_stream(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -139,13 +167,46 @@ class LiveTelemetryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "scheduler-snapshots.jsonl").write_text(
-                json.dumps(
-                    {
-                        "uptime_s": 101.0,
-                        "host_epoch_s": 1000.0,
-                        "cpusets": {"background": "0-3"},
-                        "hint_sessions": [{"uid": 1000, "pid": 123, "tids": [124]}],
-                    }
+                "\n".join(
+                    json.dumps(item)
+                    for item in [
+                        {
+                            "uptime_s": 100.5,
+                            "host_epoch_s": 999.5,
+                            "cpusets": {"foreground": "0-5", "background": "0-3"},
+                            "hint_sessions": [],
+                            "watched_processes": [
+                                {
+                                    "pid": 123,
+                                    "name": "com.example.app",
+                                    "current_sched_group": 2,
+                                    "current_proc_state": 5,
+                                }
+                            ],
+                        },
+                        {
+                            "uptime_s": 101.0,
+                            "host_epoch_s": 1000.0,
+                            "cpusets": {"foreground": "0-7", "background": "0-3"},
+                            "hint_sessions": [
+                                {
+                                    "uid": 1000,
+                                    "pid": 123,
+                                    "tids": [124],
+                                    "graphics_pipeline": True,
+                                }
+                            ],
+                            "watched_processes": [
+                                {
+                                    "pid": 123,
+                                    "name": "com.example.app",
+                                    "current_sched_group": 3,
+                                    "current_proc_state": 2,
+                                    "adj_type": "top-activity",
+                                }
+                            ],
+                        },
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
@@ -156,6 +217,7 @@ class LiveTelemetryTests(unittest.TestCase):
             self.assertEqual(snapshot["sample_count"], 2)
             self.assertAlmostEqual(snapshot["latest"]["current_ma"], 320.0)
             self.assertAlmostEqual(snapshot["latest"]["power_mw"], 1215.36)
+            self.assertEqual(snapshot["latest"]["direction"], "discharging")
             self.assertAlmostEqual(snapshot["latest"]["cpu_pct"], 66.6666666, places=4)
             self.assertEqual(snapshot["context"]["foreground_package"], "com.example.app")
             self.assertGreater(snapshot["summary"]["energy_mwh"], 0.3)
@@ -169,6 +231,10 @@ class LiveTelemetryTests(unittest.TestCase):
                 snapshot["system_monitor"]["scheduler"]["cpusets"]["background"],
                 "0-3",
             )
+            self.assertEqual(len(snapshot["scheduler_series"]), 2)
+            self.assertEqual(snapshot["scheduler_series"][-1]["cpuset_cpu_count"], 8)
+            self.assertEqual(snapshot["scheduler_series"][-1]["foreground_sched_group"], 3)
+            self.assertEqual(snapshot["scheduler_series"][-1]["graphics_session_count"], 1)
             self.assertEqual(snapshot["test_mode"], "performance")
             self.assertEqual(len(snapshot["performance_series"]), 1)
             self.assertAlmostEqual(
@@ -182,6 +248,129 @@ class LiveTelemetryTests(unittest.TestCase):
 
 
 class UiServerTests(unittest.TestCase):
+    def test_android_brightness_capability_reports_range_and_step(self) -> None:
+        capability = _parse_android_brightness_capability(
+            "101\n",
+            "0.3954986\n",
+            "0\n",
+            "mScreenBrightnessMinimum=0.0\nmScreenBrightnessMaximum=1.0\n",
+        )
+
+        self.assertEqual(capability["current"], 101)
+        self.assertEqual(capability["minimum"], 0)
+        self.assertEqual(capability["maximum"], 255)
+        self.assertEqual(capability["step"], 1)
+        self.assertAlmostEqual(capability["normalized_step"], 1 / 255)
+        self.assertFalse(capability["automatic"])
+
+        automatic = _parse_android_brightness_capability(
+            "0\n",
+            "null\n",
+            "1\n",
+            "mScreenBrightnessMinimum=0.0\nmScreenBrightnessMaximum=1.0\n",
+        )
+        self.assertEqual(automatic["maximum"], 255)
+        self.assertTrue(automatic["automatic"])
+        self.assertIn("fallback", automatic["range_source"])
+
+    def test_android_brightness_read_and_numeric_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            ready_devices = ([{
+                "serial": "ANDROID",
+                "state": "device",
+                "platform": "android",
+            }], None)
+            before = {
+                "supported": True,
+                "device": "ANDROID",
+                "platform": "android",
+                "writable": True,
+                "current": 101,
+                "minimum": 0,
+                "maximum": 255,
+                "step": 1,
+                "normalized_minimum": 0.0,
+                "normalized_maximum": 1.0,
+                "normalized_step": 1 / 255,
+                "mode": 1,
+                "automatic": True,
+            }
+            after = {**before, "current": 100, "mode": 0, "automatic": False}
+
+            with (
+                patch.object(manager, "devices", return_value=ready_devices),
+                patch.object(manager, "_android_brightness_capability", return_value=before),
+            ):
+                read = manager.brightness({
+                    "device": "ANDROID",
+                    "platform": "android",
+                    "action": "read",
+                })
+            self.assertEqual(read["current"], 101)
+            self.assertEqual(read["maximum"], 255)
+
+            command_result = Mock(ok=True, stdout="", stderr="")
+            with (
+                patch.object(manager, "devices", return_value=ready_devices),
+                patch.object(
+                    manager,
+                    "_android_brightness_capability",
+                    side_effect=[before, after],
+                ),
+                patch("mobile_profiler.ui.adb_shell", return_value=command_result) as shell,
+                patch("mobile_profiler.ui.time.sleep"),
+            ):
+                applied = manager.brightness({
+                    "device": "ANDROID",
+                    "platform": "android",
+                    "action": "set",
+                    "value": 100,
+                })
+
+            commands = [call.args[2] for call in shell.call_args_list]
+            self.assertEqual(
+                commands,
+                [
+                    ["settings", "put", "system", "screen_brightness_mode", "0"],
+                    ["settings", "put", "system", "screen_brightness", "100"],
+                    ["cmd", "display", "set-brightness", "0.3921569"],
+                ],
+            )
+            self.assertTrue(applied["applied"])
+            self.assertTrue(applied["manual_mode_changed"])
+            self.assertEqual(applied["previous_mode"], 1)
+
+    def test_android_brightness_rejects_invalid_values_and_active_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            ready_devices = ([{
+                "serial": "ANDROID",
+                "state": "device",
+                "platform": "android",
+            }], None)
+            capability = {
+                "current": 101,
+                "minimum": 0,
+                "maximum": 255,
+                "normalized_minimum": 0.0,
+                "normalized_maximum": 1.0,
+                "mode": 0,
+            }
+            with (
+                patch.object(manager, "devices", return_value=ready_devices),
+                patch.object(manager, "_android_brightness_capability", return_value=capability),
+                patch("mobile_profiler.ui.adb_shell") as shell,
+            ):
+                with self.assertRaisesRegex(ValueError, "must be an integer"):
+                    manager.brightness({"device": "ANDROID", "action": "set", "value": 12.5})
+                with self.assertRaisesRegex(ValueError, "between 0 and 255"):
+                    manager.brightness({"device": "ANDROID", "action": "set", "value": 256})
+                manager.active = Mock(running=True)
+                with self.assertRaisesRegex(RuntimeError, "Stop the active recording"):
+                    manager.brightness({"device": "ANDROID", "action": "set", "value": 100})
+            shell.assert_not_called()
+
     def test_android_application_parsers_prioritize_launchable_user_apps(self) -> None:
         third_party = parse_android_package_list(
             "package:com.example.game\npackage:com.example.reader\ninvalid\n"
@@ -328,6 +517,35 @@ class UiServerTests(unittest.TestCase):
         harmony.assert_not_called()
         ios.assert_called_once_with("ios-python")
 
+    def test_ios_pair_requires_a_usb_device_and_preserves_failure_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            wireless = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "wireless",
+            }
+            with patch(
+                "mobile_profiler.ui.list_ios_devices",
+                return_value=([wireless], None),
+            ), patch("mobile_profiler.ui.pair_ios_device") as pair:
+                with self.assertRaisesRegex(ValueError, "USB-connected iPhone"):
+                    manager.pair_ios({"device": "ios:IPHONE"})
+            pair.assert_not_called()
+
+            usb = {**wireless, "connection_type": "usb"}
+            with patch(
+                "mobile_profiler.ui.list_ios_devices",
+                return_value=([usb], None),
+            ), patch(
+                "mobile_profiler.ui.pair_ios_device",
+                side_effect=RuntimeError("Bonjour endpoint discovery timed out"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Bonjour endpoint discovery timed out"):
+                    manager.pair_ios({"device": "ios:IPHONE"})
+
     def test_demo_server_serves_assets_and_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager(
@@ -342,6 +560,10 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
+                with urlopen(base + "/app.css?v=platform-ui-13", timeout=5) as response:
+                    css = response.read().decode("utf-8")
+                with urlopen(base + "/app.js?v=platform-ui-13", timeout=5) as response:
+                    javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
             finally:
@@ -363,6 +585,16 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("性能上下文", html)
             self.assertIn("功耗测试模式", html)
             self.assertIn("FPS / 1% Low / 调度", html)
+            self.assertIn("必要设置", html)
+            self.assertIn("更多采集设置", html)
+            self.assertIn("设备亮度", html)
+            self.assertIn('id="brightness-input"', html)
+            self.assertIn("platform-ui-13", html)
+            self.assertNotIn('<details class="advanced-settings" open', html)
+            self.assertIn(".capture-feature-card input", css)
+            self.assertIn("pointer-events: auto", css)
+            self.assertIn("captureFeaturesOverridden", javascript)
+            self.assertIn('api("/api/brightness"', javascript)
             self.assertIn("扫描手机应用", html)
             self.assertIn("32 分钟", html)
             self.assertIn("资源调度分配", html)

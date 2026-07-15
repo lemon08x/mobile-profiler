@@ -51,6 +51,7 @@ from mobile_profiler.ios import (
     _load_endpoints,
     collect_ios_session,
     list_ios_devices,
+    pair_ios_device,
     select_ios_device,
 )
 from mobile_profiler.harmony import (
@@ -933,6 +934,10 @@ class SystemAnalysisTests(unittest.TestCase):
         self.assertEqual(scheduler_result["cpusets"][0]["latest_cpus"], "0-3")
         self.assertEqual(scheduler_result["maximum_hint_session_count"], 1)
         self.assertFalse(scheduler_result["cpu_policies"][0]["runtime_controls_visible"])
+        self.assertEqual(scheduler_result["timeline"][0]["cpuset_name"], "background")
+        self.assertEqual(scheduler_result["timeline"][0]["cpuset_cpu_count"], 4)
+        self.assertEqual(scheduler_result["timeline"][0]["top_app_process_count"], 0)
+        self.assertEqual(scheduler_result["timeline"][0]["frozen_process_count"], 0)
 
     def test_bcl_vbat_status_does_not_trigger_thermal_shutdown(self) -> None:
         result = analyze_thermal_history(
@@ -2118,6 +2123,118 @@ class IosAdapterTests(unittest.TestCase):
         self.assertEqual(devices[0]["wireless_ready"], "true")
         self.assertEqual(devices[0]["host"], "192.0.2.10")
 
+    def test_usb_transport_remains_visible_when_cached_wireless_endpoint_is_stale(self) -> None:
+        with (
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={
+                    "devices": [
+                        {
+                            "udid": "00008150-TEST",
+                            "name": "Test iPhone",
+                            "connection_type": "usb",
+                            "state": "device",
+                            "remote_paired": True,
+                        }
+                    ]
+                },
+            ),
+            patch(
+                "mobile_profiler.ios._load_endpoints",
+                return_value={
+                    "00008150-TEST": {"host": "192.0.2.10", "port": 49152}
+                },
+            ),
+            patch("mobile_profiler.ios._save_endpoint"),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=False),
+        ):
+            devices, error = list_ios_devices("ios-python")
+
+        self.assertIsNone(error)
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]["connection_type"], "usb")
+        self.assertEqual(devices[0]["transports"], "usb")
+        self.assertEqual(devices[0]["wireless_ready"], "false")
+
+    def test_unreachable_cached_wireless_endpoint_is_removed_from_device_list(self) -> None:
+        cached = {
+            "00008150-TEST": {
+                "host": "192.0.2.10",
+                "port": 49152,
+                "model": "Test iPhone",
+            }
+        }
+        with (
+            patch("mobile_profiler.ios._run_bridge_json", return_value={"devices": []}),
+            patch("mobile_profiler.ios._load_endpoints", return_value=cached),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=False),
+        ):
+            devices, error = list_ios_devices("ios-python")
+
+        self.assertEqual(devices, [])
+        self.assertIn("no longer reachable", error or "")
+        self.assertIn("192.0.2.10:49152", error or "")
+
+    def test_unreachable_discovered_wireless_endpoint_is_removed_from_device_list(self) -> None:
+        with (
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={
+                    "devices": [
+                        {
+                            "udid": "00008150-TEST",
+                            "name": "Test iPhone",
+                            "connection_type": "wireless",
+                            "state": "device",
+                            "host": "192.0.2.10",
+                            "port": 49152,
+                        }
+                    ]
+                },
+            ),
+            patch("mobile_profiler.ios._load_endpoints", return_value={}),
+            patch("mobile_profiler.ios._save_endpoint"),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=False),
+        ):
+            devices, error = list_ios_devices("ios-python")
+
+        self.assertEqual(devices, [])
+        self.assertIn("no longer reachable", error or "")
+
+    def test_pair_requires_a_reachable_wifi_endpoint_before_reporting_success(self) -> None:
+        with (
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={
+                    "udid": "00008150-TEST",
+                    "endpoint": None,
+                    "device": {"name": "Test iPhone"},
+                },
+            ),
+            patch("mobile_profiler.ios._save_endpoint") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no reachable Wi-Fi endpoint"):
+                pair_ios_device("ios:00008150-TEST", "ios-python", 12.0)
+
+        save.assert_not_called()
+
+    def test_pair_reports_the_unreachable_endpoint_address(self) -> None:
+        with (
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={
+                    "udid": "00008150-TEST",
+                    "endpoint": {"host": "192.0.2.10", "port": 49152},
+                },
+            ),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=False),
+            patch("mobile_profiler.ios._save_endpoint") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "192.0.2.10:49152"):
+                pair_ios_device("ios:00008150-TEST", "ios-python", 12.0)
+
+        save.assert_not_called()
+
     def test_cached_wireless_endpoint_survives_sidecar_discovery_failure(self) -> None:
         cached = {
             "00008150-TEST": {
@@ -2687,6 +2804,207 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(prepared["analysis"]["cpu"]["timeline"]), 1200)
         self.assertEqual(prepared["samples"][0]["elapsed_s"], 0.0)
         self.assertEqual(prepared["samples"][-1]["elapsed_s"], 3599.0)
+
+    def test_report_visualizes_frame_flow_and_omits_unavailable_performance_analysis(self) -> None:
+        bundle = {
+            "metadata": {
+                "title": "performance coverage",
+                "platform": "android",
+                "test_mode": "performance",
+                "device": {},
+                "cpu_policies": [],
+            },
+            "samples": [
+                {"elapsed_s": 0.0, "uptime_s": 10.0, "power_mw": 1000.0},
+                {"elapsed_s": 1.0, "uptime_s": 11.0, "power_mw": 1100.0},
+            ],
+            "analysis": {
+                "test_mode": "performance",
+                "summary": {"duration_s": 1.0, "sample_count": 2},
+                "cpu": {"clusters": [], "timeline": []},
+                "gpu": {
+                    "frequency_available": False,
+                    "load_available": False,
+                    "work_by_uid": [],
+                    "memory": {"available": False},
+                    "unavailable_reason": "GPU counters blocked",
+                },
+                "performance": {
+                    "available": True,
+                    "current_refresh_rate_hz": 60.0,
+                    "sampled_frame_rate_fps": 59.8,
+                    "frame_sample_count": 5,
+                    "frame_issue_pct": 20.0,
+                    "frame_rate_timeline": [
+                        {
+                            "uptime_s": 10.0,
+                            "frame_rate_fps": 59.8,
+                            "frame_intervals_ms": [16.4, 16.6, 16.8, 17.0, 40.0],
+                            "refresh_rate_hz": 60.0,
+                        }
+                    ],
+                    "frame_flow": {
+                        "stages": [
+                            {
+                                "phase": "APP",
+                                "label": "应用提交",
+                                "status": "invalid",
+                                "value": 0.0,
+                                "unit": "帧/s",
+                                "source": "gfxinfo",
+                                "detail": "没有有效增量",
+                            },
+                            {
+                                "phase": "COMPOSITOR",
+                                "label": "合成器呈现",
+                                "status": "primary",
+                                "value": 59.8,
+                                "unit": "FPS",
+                                "source": "SurfaceFlinger",
+                                "sample_count": 5,
+                            },
+                        ]
+                    },
+                },
+                "render_performance": {
+                    "pipeline": {
+                        "available": False,
+                        "stages": [],
+                        "slow_frames": [],
+                    },
+                    "render_threads": [],
+                    "bottlenecks": [],
+                },
+                "system": {"top_processes": [], "priority_activities": {"rows": []}},
+                "thermal": {"sensors": [], "cooling_devices": []},
+                "scheduler": {"cpusets": [], "cpu_policies": [], "hint_sessions": [], "process_states": []},
+                "applications": {},
+                "external_events": {},
+                "warnings": [],
+                "findings": [],
+                "data_sources": [],
+            },
+        }
+        fragment = build_report_fragment(bundle)
+        self.assertIn('class="frame-flow-visual"', fragment)
+        self.assertIn('id="frame-interval-chart"', fragment)
+        self.assertIn("单周期内 / 跨预算异常", fragment)
+        self.assertIn("分析覆盖与省略项", fragment)
+        self.assertIn("GPU 页面已省略", fragment)
+        self.assertNotIn('<h2>阶段耗时分布</h2>', fragment)
+        self.assertNotIn('<h2>慢帧明细</h2>', fragment)
+        self.assertNotIn('<h2>渲染与合成热点线程</h2>', fragment)
+        self.assertNotIn('data-view="gpu"', fragment)
+        self.assertNotIn("GPU 频率/负载数据源不可用", fragment)
+
+        bundle["analysis"]["gpu"].update(
+            {
+                "load_available": True,
+                "average_load_pct": 70.0,
+                "maximum_load_pct": 95.0,
+            }
+        )
+        bundle["analysis"]["render_performance"] = {
+            "pipeline": {
+                "available": True,
+                "stages": [
+                    {
+                        "label": "Draw",
+                        "sample_count": 5,
+                        "average_ms": 4.0,
+                        "p95_ms": 6.0,
+                        "p99_ms": 7.0,
+                        "maximum_ms": 8.0,
+                    }
+                ],
+                "slow_frames": [
+                    {
+                        "frame_id": 5,
+                        "total_ms": 40.0,
+                        "draw_ms": 30.0,
+                        "deadline_missed": True,
+                    }
+                ],
+            },
+            "render_threads": [
+                {
+                    "name": "RenderThread",
+                    "process": "game",
+                    "pid": 1,
+                    "tid": 2,
+                    "average_when_visible_cpu_pct": 30.0,
+                    "maximum_cpu_pct": 50.0,
+                    "seen_snapshots": 3,
+                }
+            ],
+            "bottlenecks": [],
+        }
+        valid_fragment = build_report_fragment(bundle)
+        self.assertIn('<h2>阶段耗时分布</h2>', valid_fragment)
+        self.assertIn('<h2>慢帧明细</h2>', valid_fragment)
+        self.assertIn('<h2>渲染与合成热点线程</h2>', valid_fragment)
+        self.assertIn('data-view="gpu"', valid_fragment)
+
+    def test_power_report_visualizes_resource_correlation_and_hides_empty_gpu_page(self) -> None:
+        fragment = build_report_fragment(
+            {
+                "metadata": {
+                    "title": "power correlation",
+                    "platform": "android",
+                    "test_mode": "power",
+                    "device": {},
+                    "cpu_policies": [],
+                },
+                "samples": [],
+                "analysis": {
+                    "test_mode": "power",
+                    "summary": {"duration_s": 0.0, "sample_count": 0},
+                    "cpu": {"clusters": [], "timeline": []},
+                    "gpu": {
+                        "frequency_available": False,
+                        "load_available": False,
+                        "work_by_uid": [],
+                        "memory": {"available": False},
+                    },
+                    "power_pressure": {
+                        "drivers": [
+                            {
+                                "label": "CPU 总负载",
+                                "correlation": 0.75,
+                                "sample_count": 30,
+                                "detail": "同期变化",
+                            },
+                            {
+                                "label": "电池温度",
+                                "correlation": -0.2,
+                                "sample_count": 30,
+                                "detail": "长期累积",
+                            },
+                        ],
+                        "tasks": [],
+                    },
+                    "memory": {"available": False, "reason": "采集关闭"},
+                    "runtime_settings": {"rows": []},
+                    "system": {"priority_activities": {"rows": []}},
+                    "performance": {},
+                    "render_performance": {},
+                    "thermal": {"sensors": [], "cooling_devices": []},
+                    "scheduler": {"cpusets": [], "cpu_policies": [], "hint_sessions": [], "process_states": []},
+                    "applications": {},
+                    "external_events": {},
+                    "warnings": [],
+                    "findings": [],
+                    "data_sources": [],
+                },
+            }
+        )
+        self.assertIn('class="correlation-chart"', fragment)
+        self.assertIn("+0.75", fragment)
+        self.assertIn("-0.20", fragment)
+        self.assertIn("查看相关性计算证据", fragment)
+        self.assertNotIn('data-view="gpu"', fragment)
+        self.assertIn("资源与整机功率相关性", fragment)
+        self.assertNotIn("GPU 频率/负载数据源不可用", fragment)
 
     def test_report_prioritizes_performance_context_and_keeps_only_compact_interference(self) -> None:
         bundle = {

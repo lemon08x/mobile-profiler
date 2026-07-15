@@ -64,6 +64,7 @@ ANDROID_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 ANDROID_COMPONENT_RE = re.compile(
     r"^(?P<package>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/(?P<activity>\S+)$"
 )
+ANDROID_BRIGHTNESS_SCALES = (255, 1023, 2047, 4095, 8191, 16383, 32767, 65535)
 
 
 def _read_json(path: Path) -> Dict[str, object]:
@@ -89,6 +90,126 @@ def _integer(value: object, default: int = 0) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def _cpu_set_count(value: object) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "unavailable", "unknown", "-"}:
+        return None
+    cores = set()
+    for token in re.split(r"[\s,]+", text):
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            if left.isdigit() and right.isdigit():
+                start, end = int(left), int(right)
+                if 0 <= start <= end <= 4096:
+                    cores.update(range(start, end + 1))
+            continue
+        if token.isdigit():
+            cores.add(int(token))
+    return len(cores) if cores else None
+
+
+def _optional_float(value: object) -> Optional[float]:
+    match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        parsed = float(match.group(0))
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_android_brightness_capability(
+    current_text: str,
+    float_text: str,
+    mode_text: str,
+    power_text: str,
+) -> Dict[str, object]:
+    current_number = _optional_float(current_text)
+    if current_number is None or current_number < 0:
+        raise RuntimeError("Android did not expose a valid screen_brightness value")
+    current = int(round(current_number))
+    current_float = _optional_float(float_text)
+    minimum_match = re.search(
+        r"mScreenBrightnessMinimum\s*=\s*([-+]?\d+(?:\.\d+)?)",
+        power_text or "",
+    )
+    maximum_match = re.search(
+        r"mScreenBrightnessMaximum\s*=\s*([-+]?\d+(?:\.\d+)?)",
+        power_text or "",
+    )
+    normalized_minimum = (
+        float(minimum_match.group(1)) if minimum_match else 0.0
+    )
+    normalized_maximum = (
+        float(maximum_match.group(1)) if maximum_match else 1.0
+    )
+    if not math.isfinite(normalized_minimum):
+        normalized_minimum = 0.0
+    if not math.isfinite(normalized_maximum) or normalized_maximum <= normalized_minimum:
+        normalized_maximum = 1.0
+
+    inferred_ratio: Optional[float] = None
+    if (
+        current_float is not None
+        and current_float > normalized_minimum
+        and current > 0
+    ):
+        inferred_ratio = current / max(1e-9, current_float - normalized_minimum)
+    if inferred_ratio is not None:
+        integer_scale = min(
+            ANDROID_BRIGHTNESS_SCALES,
+            key=lambda candidate: abs(float(candidate) - inferred_ratio),
+        )
+        if abs(float(integer_scale) - inferred_ratio) / integer_scale > 0.12:
+            integer_scale = next(
+                (candidate for candidate in ANDROID_BRIGHTNESS_SCALES if candidate >= current),
+                max(current, ANDROID_BRIGHTNESS_SCALES[-1]),
+            )
+    else:
+        integer_scale = next(
+            (candidate for candidate in ANDROID_BRIGHTNESS_SCALES if candidate >= current),
+            max(current, ANDROID_BRIGHTNESS_SCALES[-1]),
+        )
+
+    minimum = max(0, int(round(normalized_minimum * integer_scale)))
+    maximum = max(minimum + 1, int(round(normalized_maximum * integer_scale)), current)
+    step = 1
+    mode_number = _optional_float(mode_text)
+    mode = int(round(mode_number)) if mode_number is not None else None
+    normalized_step = (normalized_maximum - normalized_minimum) / max(1, maximum - minimum)
+    normalized_current = (
+        current_float
+        if current_float is not None
+        else normalized_minimum
+        + (current - minimum) / max(1, maximum - minimum)
+        * (normalized_maximum - normalized_minimum)
+    )
+    return {
+        "supported": True,
+        "current": current,
+        "current_normalized": max(
+            normalized_minimum,
+            min(normalized_maximum, float(normalized_current)),
+        ),
+        "minimum": minimum,
+        "maximum": maximum,
+        "step": step,
+        "normalized_minimum": normalized_minimum,
+        "normalized_maximum": normalized_maximum,
+        "normalized_step": normalized_step,
+        "mode": mode,
+        "automatic": mode == 1,
+        "range_source": (
+            "dumpsys power + screen_brightness_float"
+            if current_float is not None
+            else "dumpsys power + Android integer fallback"
+        ),
+    }
 
 
 def _bounded_float(
@@ -633,6 +754,8 @@ class LiveTelemetryReader:
                 )
 
         battery = self.metadata.get("battery_start", {})
+        battery = battery if isinstance(battery, dict) else {}
+        battery_status = str(battery.get("status") or "unknown")
         warnings = list(conversion_warnings)
         raw_warnings = self.metadata.get("collection_warnings", [])
         if isinstance(raw_warnings, list):
@@ -670,6 +793,95 @@ class LiveTelemetryReader:
             and session_start_uptime is not None
             and isinstance(item.get("uptime_s"), (int, float))
         ] if isinstance(performance_timeline, list) else []
+
+        target_package = str(
+            self.metadata.get("target_package")
+            or self.metadata.get("foreground_package")
+            or (latest_context.foreground_package if latest_context is not None else "")
+            or ""
+        )
+        scheduler_source = self.scheduler_snapshots
+        if len(scheduler_source) > MAX_LIVE_POINTS:
+            stride = max(1, math.ceil(len(scheduler_source) / MAX_LIVE_POINTS))
+            scheduler_source = scheduler_source[::stride]
+            if scheduler_source[-1] is not self.scheduler_snapshots[-1]:
+                scheduler_source = [*scheduler_source, self.scheduler_snapshots[-1]]
+        scheduler_start_uptime = (
+            session_start_uptime
+            if session_start_uptime is not None
+            else scheduler_source[0].uptime_s if scheduler_source else None
+        )
+        scheduler_series: List[Dict[str, object]] = []
+        for snapshot in scheduler_source:
+            if scheduler_start_uptime is None:
+                continue
+            cpuset_name = (
+                "top-app"
+                if snapshot.cpusets.get("top-app")
+                else "foreground"
+                if snapshot.cpusets.get("foreground")
+                else next(iter(snapshot.cpusets), "")
+            )
+            cpuset_value = snapshot.cpusets.get(cpuset_name) if cpuset_name else None
+            watched = [item for item in snapshot.watched_processes if isinstance(item, dict)]
+            foreground_process = next(
+                (
+                    item
+                    for item in watched
+                    if target_package
+                    and (
+                        str(item.get("name") or "") == target_package
+                        or str(item.get("name") or "").startswith(target_package + ":")
+                    )
+                ),
+                None,
+            )
+            if foreground_process is None:
+                foreground_process = next(
+                    (
+                        item
+                        for item in watched
+                        if str(item.get("adj_type") or "") == "top-activity"
+                        or item.get("current_sched_group") == 3
+                    ),
+                    None,
+                )
+            scheduler_series.append(
+                {
+                    "elapsed_s": max(0.0, snapshot.uptime_s - scheduler_start_uptime),
+                    "uptime_s": snapshot.uptime_s,
+                    "cpuset_name": cpuset_name or None,
+                    "cpuset_cpus": cpuset_value,
+                    "cpuset_cpu_count": _cpu_set_count(cpuset_value),
+                    "hint_session_count": len(snapshot.hint_sessions),
+                    "graphics_session_count": sum(
+                        1 for item in snapshot.hint_sessions if item.get("graphics_pipeline")
+                    ),
+                    "foreground_sched_group": (
+                        foreground_process.get("current_sched_group")
+                        if foreground_process is not None
+                        else None
+                    ),
+                    "foreground_proc_state": (
+                        foreground_process.get("current_proc_state")
+                        if foreground_process is not None
+                        else None
+                    ),
+                    "foreground_process": (
+                        foreground_process.get("name")
+                        if foreground_process is not None
+                        else target_package or None
+                    ),
+                    "top_app_process_count": sum(
+                        1
+                        for item in watched
+                        if item.get("current_sched_group") == 3
+                        or str(item.get("adj_type") or "") == "top-activity"
+                    ),
+                    "frozen_process_count": sum(1 for item in watched if item.get("frozen")),
+                    "collection_ms": snapshot.collection_ms,
+                }
+            )
 
         memory_analysis = analyze_memory_frequency(samples, self.metadata) if samples else {
             "available": False,
@@ -786,6 +998,7 @@ class LiveTelemetryReader:
                     "current_ma": latest.current_ma,
                     "signed_current_ma": latest.signed_current_ma,
                     "power_mw": latest.power_mw,
+                    "direction": latest.direction,
                     "voltage_mv": latest.voltage_mv,
                     "cpu_pct": latest.cpu_pct,
                     "temperature_c": latest.battery_temperature_c,
@@ -803,6 +1016,7 @@ class LiveTelemetryReader:
                 "average_power_mw": statistics.fmean(powers) if powers else None,
                 "p95_power_mw": _percentile(powers, 0.95),
                 "average_current_ma": statistics.fmean(currents) if currents else None,
+                "direction": latest.direction if latest is not None else battery_status,
                 "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
                 "average_collector_cpu_pct": statistics.fmean(
                     [
@@ -819,6 +1033,7 @@ class LiveTelemetryReader:
                 {
                     "elapsed_s": sample.elapsed_s,
                     "power_mw": sample.power_mw,
+                    "direction": sample.direction,
                     "current_ma": sample.current_ma,
                     "voltage_mv": sample.voltage_mv,
                     "cpu_pct": sample.cpu_pct,
@@ -831,6 +1046,7 @@ class LiveTelemetryReader:
                 for sample in displayed
             ],
             "performance_series": performance_series,
+            "scheduler_series": scheduler_series,
             "clusters": clusters,
             "context": asdict(latest_context) if latest_context is not None else None,
             "performance": performance,
@@ -838,7 +1054,7 @@ class LiveTelemetryReader:
             "runtime_settings": settings_analysis,
             "power_pressure": power_pressure,
             "render_performance": render_performance,
-            "battery": battery if isinstance(battery, dict) else {},
+            "battery": battery,
             "warnings": list(dict.fromkeys(warnings)),
             "system_monitor": {
                 "enabled": bool(
@@ -1538,6 +1754,176 @@ class DashboardManager:
             "device_error": refreshed_error,
         }
 
+    def _android_brightness_capability(self, device: str) -> Dict[str, object]:
+        current_result = adb_shell(
+            self.adb,
+            device,
+            ["settings", "get", "system", "screen_brightness"],
+            timeout_s=10,
+        )
+        if not current_result.ok:
+            raise RuntimeError(
+                current_result.stderr.strip()
+                or current_result.stdout.strip()
+                or "Unable to read Android screen brightness"
+            )
+        float_result = adb_shell(
+            self.adb,
+            device,
+            ["settings", "get", "system", "screen_brightness_float"],
+            timeout_s=10,
+        )
+        mode_result = adb_shell(
+            self.adb,
+            device,
+            ["settings", "get", "system", "screen_brightness_mode"],
+            timeout_s=10,
+        )
+        power_result = adb_shell(
+            self.adb,
+            device,
+            ["dumpsys", "power"],
+            timeout_s=20,
+        )
+        capability = _parse_android_brightness_capability(
+            current_result.stdout,
+            float_result.stdout if float_result.ok else "",
+            mode_result.stdout if mode_result.ok else "",
+            power_result.stdout if power_result.ok else "",
+        )
+        capability["device"] = device
+        capability["platform"] = "android"
+        capability["writable"] = True
+        return capability
+
+    def brightness(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        if not device:
+            raise ValueError("Select an Android device before reading brightness")
+        requested_platform = str(payload.get("platform") or "android").strip().lower()
+        if requested_platform != "android":
+            raise ValueError("Numeric brightness control is currently available only for Android")
+        devices, error = self.devices(
+            force=True,
+            refresh_android=True,
+            refresh_ios=False,
+            refresh_harmony=False,
+        )
+        if error:
+            raise RuntimeError(error)
+        selected = next(
+            (
+                item
+                for item in devices
+                if item.get("serial") == device
+                and item.get("state") == "device"
+                and str(item.get("platform") or "android") == "android"
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Android device {device!r} is not ready")
+
+        action = str(payload.get("action") or "read").strip().lower()
+        if action not in {"read", "set"}:
+            raise ValueError("brightness action must be read or set")
+        if action == "set":
+            with self._lock:
+                active = self.active
+            if active is not None and active.running:
+                raise RuntimeError("Stop the active recording before changing device brightness")
+        capability = self._android_brightness_capability(device)
+        if action == "read":
+            return capability
+        raw_value = payload.get("value")
+        try:
+            numeric_value = float(raw_value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("brightness value must be an integer") from exc
+        if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise ValueError("brightness value must be an integer")
+        value = int(numeric_value)
+        minimum = int(capability["minimum"])
+        maximum = int(capability["maximum"])
+        if value < minimum or value > maximum:
+            raise ValueError(
+                f"brightness value must be between {minimum} and {maximum}"
+            )
+
+        previous_mode = capability.get("mode")
+        mode_changed = previous_mode != 0
+        if mode_changed:
+            mode_result = adb_shell(
+                self.adb,
+                device,
+                ["settings", "put", "system", "screen_brightness_mode", "0"],
+                timeout_s=10,
+            )
+            if not mode_result.ok:
+                raise RuntimeError(
+                    mode_result.stderr.strip()
+                    or mode_result.stdout.strip()
+                    or "Unable to switch Android to manual brightness mode"
+                )
+
+        value_result = adb_shell(
+            self.adb,
+            device,
+            ["settings", "put", "system", "screen_brightness", str(value)],
+            timeout_s=10,
+        )
+        if not value_result.ok:
+            if mode_changed and previous_mode is not None:
+                adb_shell(
+                    self.adb,
+                    device,
+                    [
+                        "settings",
+                        "put",
+                        "system",
+                        "screen_brightness_mode",
+                        str(previous_mode),
+                    ],
+                    timeout_s=10,
+                )
+            raise RuntimeError(
+                value_result.stderr.strip()
+                or value_result.stdout.strip()
+                or "Unable to write Android screen brightness"
+            )
+
+        normalized_minimum = float(capability["normalized_minimum"])
+        normalized_maximum = float(capability["normalized_maximum"])
+        normalized = normalized_minimum + (
+            (value - minimum) / max(1, maximum - minimum)
+            * (normalized_maximum - normalized_minimum)
+        )
+        display_result = adb_shell(
+            self.adb,
+            device,
+            ["cmd", "display", "set-brightness", f"{normalized:.7f}"],
+            timeout_s=10,
+        )
+        time.sleep(0.1)
+        refreshed = self._android_brightness_capability(device)
+        warnings: List[str] = []
+        if not display_result.ok:
+            warnings.append(
+                display_result.stderr.strip()
+                or display_result.stdout.strip()
+                or "The persistent value was written, but DisplayManager did not apply it immediately"
+            )
+        refreshed.update(
+            {
+                "requested": value,
+                "applied": _integer(refreshed.get("current"), -1) == value,
+                "previous_mode": previous_mode,
+                "manual_mode_changed": mode_changed,
+                "warnings": warnings,
+            }
+        )
+        return refreshed
+
     def probe(self, payload: Dict[str, object]) -> Dict[str, object]:
         device = str(payload.get("device") or "").strip()
         if not device:
@@ -1768,8 +2154,49 @@ class DashboardManager:
             active = self.active
         if active is not None and active.running:
             raise RuntimeError("Stop the active recording before changing iOS RemotePairing")
+        devices, error = self.devices(
+            force=True,
+            refresh_android=False,
+            refresh_harmony=False,
+            refresh_ios=True,
+        )
+        if device:
+            selected = next(
+                (
+                    item
+                    for item in devices
+                    if item.get("serial") == device and item.get("platform") == "ios"
+                ),
+                None,
+            )
+            if selected is None:
+                raise RuntimeError(error or f"iPhone {device!r} is no longer available")
+            if str(selected.get("connection_type") or "").lower() != "usb":
+                raise ValueError(
+                    "Creating or repairing iOS wireless pairing requires a USB-connected iPhone"
+                )
         result = pair_ios_device(device, self.ios_python, 12.0)
-        self.devices(force=True, refresh_ios=True)
+        refreshed_devices, refreshed_error = self.devices(
+            force=True,
+            refresh_android=False,
+            refresh_harmony=False,
+            refresh_ios=True,
+        )
+        paired = next(
+            (
+                item
+                for item in refreshed_devices
+                if item.get("serial") == result.get("serial")
+            ),
+            None,
+        )
+        if paired is None or str(paired.get("wireless_ready") or "").lower() != "true":
+            raise RuntimeError(
+                refreshed_error
+                or "RemotePairing completed, but the iPhone wireless endpoint failed validation"
+            )
+        result["device"] = paired
+        result["devices"] = refreshed_devices
         return result
 
     def start_record(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -2989,6 +3416,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.enable_tcpip(payload)
             elif path == "/api/harmony/tcpip":
                 result = self.server.manager.enable_harmony_tcpip(payload)
+            elif path == "/api/brightness":
+                result = self.server.manager.brightness(payload)
             elif path == "/api/ios/pair":
                 result = self.server.manager.pair_ios(payload)
             elif path == "/api/record":

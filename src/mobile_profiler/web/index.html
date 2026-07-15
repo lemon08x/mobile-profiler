@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-12">
-  <script src="/app.js?v=platform-ui-12" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-13">
+  <script src="/app.js?v=platform-ui-13" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -135,25 +135,15 @@
                 <span class="safe-badge" id="capture-mode-badge"><i></i>POWER</span>
               </div>
               <form id="record-form">
-                <div class="form-field">
-                  <label for="title-input">会话标题</label>
-                  <input id="title-input" name="title" type="text" maxlength="200" placeholder="例如：BTR2 一小时续航流程">
-                </div>
-                <div class="form-field">
-                  <label for="run-name-input">采集目录名称</label>
-                  <input id="run-name-input" name="run_name" type="text" maxlength="96" placeholder="自动使用时间戳">
-                  <small class="field-hint" id="output-root-hint">保存在 profiler-runs</small>
-                </div>
-                <div class="form-row">
+                <section class="essential-config" aria-labelledby="essential-config-title">
+                  <div class="essential-config-heading">
+                    <div><strong id="essential-config-title">必要设置</strong><small>确认时长和目标应用即可开始</small></div>
+                    <span>其余参数使用模式默认值</span>
+                  </div>
                   <div class="form-field">
                     <label for="duration-input">时长</label>
                     <div class="input-with-unit"><input id="duration-input" name="duration" type="number" min="2" max="604800" step="1" value="3720"><span>秒</span></div>
                   </div>
-                  <div class="form-field">
-                    <label for="interval-input">采样周期</label>
-                    <div class="input-with-unit"><input id="interval-input" name="interval" type="number" min="0.2" max="60" step="0.1" value="1"><span>秒</span></div>
-                  </div>
-                </div>
                 <div class="duration-presets" aria-label="时长快捷选项">
                   <button type="button" data-duration="60">1 分钟</button>
                   <button type="button" data-duration="900">15 分钟</button>
@@ -179,51 +169,75 @@
                   <input id="package-input" name="package" type="text" maxlength="200" placeholder="com.example.app">
                   <small class="field-hint" id="package-input-hint">功耗测试可留空；填写后会保留目标应用的资源与归因上下文。</small>
                 </div>
-                <div class="form-row">
-                  <div class="form-field">
-                    <label for="start-context-input">采集起点</label>
-                    <select id="start-context-input"><option value="desktop" selected>桌面 / Launcher</option><option value="app">应用内</option><option value="other">其他场景</option><option value="unknown">不确定</option></select>
-                  </div>
-                  <div class="form-field">
-                    <label for="start-note-input">起点备注 <span>可选</span></label>
-                    <input id="start-note-input" type="text" maxlength="500" placeholder="例如：先启动采集，30 秒后启动 BTR2">
-                  </div>
-                </div>
-
-                <div class="form-field capture-preset-field">
-                  <label for="capture-preset-input">采集预设</label>
-                  <select id="capture-preset-input">
-                    <option value="auto" selected>跟随测试模式</option>
-                    <option value="power-standard">功耗标准</option>
-                    <option value="performance-standard">性能标准</option>
-                    <option value="low-overhead">低干扰</option>
-                    <option value="harmony-smartperf">Harmony SmartPerf 采集</option>
-                  </select>
-                  <small class="field-hint" id="capture-preset-hint">预设会批量设置下方采集项，之后仍可逐项覆盖。</small>
-                </div>
-
-                <div class="switch-stack">
-                  <label class="switch-row" data-mode-only="power">
-                    <span><strong>多应用会话模式</strong><small>跟踪前台应用切换，适合 BTR2</small></span>
-                    <input id="session-mode-input" name="session_mode" type="checkbox" checked><i aria-hidden="true"></i>
-                  </label>
-                  <label class="switch-row emphasis">
-                    <span><strong>要求断开外部供电</strong><small>检测到 AC / USB / 无线充电时拒绝采集</small></span>
-                    <input id="unplugged-input" name="require_unplugged" type="checkbox"><i aria-hidden="true"></i>
-                  </label>
-                  <label class="switch-row">
-                    <span><strong>性能干扰监控</strong><small>低频采集进程与温度，仅在发现后台或热异常时提示</small></span>
-                    <input id="system-monitor-input" name="system_monitor" type="checkbox" checked><i aria-hidden="true"></i>
-                  </label>
-                  <label class="switch-row emphasis hidden" id="harmony-high-performance-row">
+                  <section class="brightness-setting" id="brightness-setting" data-platforms="android" aria-labelledby="brightness-setting-title">
+                    <div class="brightness-setting-heading">
+                      <span><strong id="brightness-setting-title">设备亮度</strong><small>按 Android 数值档位固定测试亮度</small></span>
+                      <em id="brightness-current-badge">等待读取</em>
+                    </div>
+                    <div class="brightness-setting-controls">
+                      <div class="input-with-unit"><input id="brightness-input" type="number" min="0" max="255" step="1" inputmode="numeric" placeholder="--" aria-label="设备亮度数值"><span>级</span></div>
+                      <button id="brightness-refresh" type="button">读取范围</button>
+                      <button id="brightness-apply" type="button" class="apply">应用亮度</button>
+                    </div>
+                    <small class="field-hint" id="brightness-hint" aria-live="polite">选择在线 Android 设备后读取最小值、最大值和最小调整间隔；应用时会切换为手动亮度。</small>
+                  </section>
+                  <label class="switch-row emphasis essential-option hidden" id="harmony-high-performance-row">
                     <span><strong>设备高性能模式</strong><small>测试期间切换到 power-shell 602，结束或异常退出时恢复原模式</small></span>
                     <input id="harmony-high-performance-input" type="checkbox"><i aria-hidden="true"></i>
                   </label>
-                </div>
+                </section>
 
                 <details class="advanced-settings">
-                  <summary>高级设置 <span id="advanced-setting-count">10 项</span></summary>
+                  <summary><span class="advanced-summary-copy"><strong>更多采集设置</strong><small>命名、采样策略、监控开关与抓取项目</small></span><em id="advanced-setting-count">默认已配置</em></summary>
                   <div class="advanced-body">
+                    <div class="form-field">
+                      <label for="title-input">会话标题 <span>可选</span></label>
+                      <input id="title-input" name="title" type="text" maxlength="200" placeholder="例如：BTR2 一小时续航流程">
+                    </div>
+                    <div class="form-field">
+                      <label for="run-name-input">采集目录名称 <span>可选</span></label>
+                      <input id="run-name-input" name="run_name" type="text" maxlength="96" placeholder="自动使用时间戳">
+                      <small class="field-hint" id="output-root-hint">保存在 profiler-runs</small>
+                    </div>
+                    <div class="form-field">
+                      <label for="interval-input">采样周期</label>
+                      <div class="input-with-unit"><input id="interval-input" name="interval" type="number" min="0.2" max="60" step="0.1" value="1"><span>秒</span></div>
+                    </div>
+                    <div class="form-row">
+                      <div class="form-field">
+                        <label for="start-context-input">采集起点</label>
+                        <select id="start-context-input"><option value="desktop" selected>桌面 / Launcher</option><option value="app">应用内</option><option value="other">其他场景</option><option value="unknown">不确定</option></select>
+                      </div>
+                      <div class="form-field">
+                        <label for="start-note-input">起点备注 <span>可选</span></label>
+                        <input id="start-note-input" type="text" maxlength="500" placeholder="例如：先启动采集，30 秒后启动 BTR2">
+                      </div>
+                    </div>
+                    <div class="form-field capture-preset-field">
+                      <label for="capture-preset-input">采集预设</label>
+                      <select id="capture-preset-input">
+                        <option value="auto" selected>跟随测试模式</option>
+                        <option value="power-standard">功耗标准</option>
+                        <option value="performance-standard">性能标准</option>
+                        <option value="low-overhead">低干扰</option>
+                        <option value="harmony-smartperf">Harmony SmartPerf 采集</option>
+                      </select>
+                      <small class="field-hint" id="capture-preset-hint">预设会批量设置下方采集项，之后仍可逐项覆盖。</small>
+                    </div>
+                    <div class="switch-stack">
+                      <label class="switch-row" data-mode-only="power">
+                        <span><strong>多应用会话模式</strong><small>跟踪前台应用切换，适合 BTR2</small></span>
+                        <input id="session-mode-input" name="session_mode" type="checkbox" checked><i aria-hidden="true"></i>
+                      </label>
+                      <label class="switch-row emphasis">
+                        <span><strong>要求断开外部供电</strong><small>检测到 AC / USB / 无线充电时拒绝采集</small></span>
+                        <input id="unplugged-input" name="require_unplugged" type="checkbox"><i aria-hidden="true"></i>
+                      </label>
+                      <label class="switch-row">
+                        <span><strong>性能干扰监控</strong><small>低频采集进程与温度，仅在发现后台或热异常时提示</small></span>
+                        <input id="system-monitor-input" name="system_monitor" type="checkbox" checked><i aria-hidden="true"></i>
+                      </label>
+                    </div>
                     <div class="form-row">
                       <div class="form-field">
                         <label for="checkpoint-input">检查点</label>
@@ -321,17 +335,22 @@
 
             <div class="monitoring-stack">
               <div class="metric-grid" data-mode-only="power">
-                <article class="metric-card power-card"><div class="metric-top"><span>实时功率</span><i>BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">整机电池侧</small></article>
-                <article class="metric-card"><div class="metric-top"><span>放电电流</span><i>CURRENT</i></div><strong id="metric-current">--</strong><small id="metric-current-sub">正幅值</small></article>
+                <article class="metric-card power-card"><div class="metric-top"><span id="metric-power-label">电池放电功率</span><i id="metric-power-tag">BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">整机电池侧</small></article>
+                <article class="metric-card"><div class="metric-top"><span id="metric-current-label">放电电流</span><i id="metric-current-tag">CURRENT</i></div><strong id="metric-current">--</strong><small id="metric-current-sub">正幅值</small></article>
                 <article class="metric-card"><div class="metric-top"><span>CPU 总负载</span><i>CPU</i></div><strong id="metric-cpu">--</strong><small id="metric-cpu-sub">全核心</small></article>
                 <article class="metric-card" id="metric-memory-card"><div class="metric-top"><span id="metric-memory-label">内存频率</span><i id="metric-memory-tag">DMC</i></div><strong id="metric-memory">--</strong><small id="metric-memory-sub">DRAM / DMC / MIF</small></article>
                 <article class="metric-card"><div class="metric-top"><span>电池温度</span><i>THERMAL</i></div><strong id="metric-temp">--</strong><small id="metric-temp-sub">BatteryService</small></article>
-                <article class="metric-card"><div class="metric-top"><span>累计能量</span><i>ENERGY</i></div><strong id="metric-energy">--</strong><small id="metric-energy-sub">有效区间积分</small></article>
+                <article class="metric-card"><div class="metric-top"><span id="metric-energy-label">累计放电能量</span><i id="metric-energy-tag">ENERGY</i></div><strong id="metric-energy">--</strong><small id="metric-energy-sub">有效区间积分</small></article>
               </div>
+
+              <section class="charging-power-notice hidden" id="charging-power-notice" data-mode-only="power">
+                <strong id="charging-power-title">当前处于充电状态</strong>
+                <span id="charging-power-detail">这里显示的是电池吸收的充电功率，不等于黑屏待机功耗；续航测试请断开外部供电。</span>
+              </section>
 
               <div class="metric-grid performance-metric-grid" data-mode-only="performance">
                 <article class="metric-card performance-card"><div class="metric-top"><span id="metric-fps-label">实时帧率</span><i id="metric-fps-tag">FPS</i></div><strong id="metric-fps">--</strong><small id="metric-fps-sub">等待前台窗口帧计数</small></article>
-                <article class="metric-card"><div class="metric-top"><span id="metric-one-low-label">1% Low</span><i id="metric-one-low-tag">LOW</i></div><strong id="metric-one-low">--</strong><small id="metric-one-low-sub">最慢 1% 帧换算</small></article>
+                <article class="metric-card" id="metric-one-low-card"><div class="metric-top"><span id="metric-one-low-label">1% Low</span><i id="metric-one-low-tag">LOW</i></div><strong id="metric-one-low">--</strong><small id="metric-one-low-sub">最慢 1% 帧换算</small></article>
                 <article class="metric-card"><div class="metric-top"><span id="metric-frame-p99-label">P99 帧耗时</span><i id="metric-frame-p99-tag">FRAME</i></div><strong id="metric-frame-p99">--</strong><small id="metric-frame-p99-sub">应用帧耗时</small></article>
                 <article class="metric-card"><div class="metric-top"><span id="metric-frame-issue-label">异常帧</span><i id="metric-frame-issue-tag">JANK</i></div><strong id="metric-frame-issue">--</strong><small id="metric-frame-issue-sub">截止时间 / VSync</small></article>
                 <article class="metric-card" id="metric-render-resolution-card"><div class="metric-top"><span id="metric-render-resolution-label">渲染分辨率</span><i id="metric-render-resolution-tag">RENDER</i></div><strong id="metric-render-resolution">--</strong><small id="metric-render-resolution-sub">前台窗口边界</small></article>
@@ -395,7 +414,7 @@
                     <div data-platforms="android harmony"><dt>前台进程调度组</dt><dd id="resource-foreground-sched">--</dd></div>
                     <div data-platforms="android harmony"><dt>CPU Governor</dt><dd id="resource-governors">--</dd></div>
                     <div data-platforms="android harmony"><dt>ADPF / 调度会话</dt><dd id="resource-adpf">--</dd></div>
-                    <div><dt>GPU 负载 / 频率</dt><dd id="resource-gpu">--</dd></div>
+                    <div id="resource-gpu-row"><dt>GPU 负载 / 频率</dt><dd id="resource-gpu">--</dd></div>
                     <div data-platforms="android harmony" id="resource-memory-row"><dt>内存 / DMC 频率</dt><dd id="resource-memory">--</dd></div>
                     <div><dt>温控状态</dt><dd id="resource-thermal">--</dd></div>
                     <div><dt id="resource-window-label">前台窗口</dt><dd id="resource-window">--</dd></div>
@@ -457,10 +476,23 @@
 
           <div class="system-stat-grid">
             <article class="panel system-stat"><small id="performance-stat-label-1">REFRESH RATE</small><strong id="performance-refresh-value">--</strong><span id="performance-refresh-label">当前显示档位</span></article>
-            <article class="panel system-stat"><small id="performance-stat-label-2">FRAME RATE</small><strong id="performance-fps-value">--</strong><span id="performance-fps-label">帧率抽样</span></article>
+            <article class="panel system-stat" id="performance-fps-stat"><small id="performance-stat-label-2">FRAME RATE</small><strong id="performance-fps-value">--</strong><span id="performance-fps-label">帧率抽样</span></article>
             <article class="panel system-stat"><small id="performance-stat-label-3">FRAME P95</small><strong id="performance-frame-value">--</strong><span id="performance-frame-label">帧间隔</span></article>
             <article class="panel system-stat accent"><small id="performance-stat-label-4">TOUCHES</small><strong id="performance-touch-value">--</strong><span id="performance-touch-label">硬件采样率未公开</span></article>
           </div>
+
+          <section class="panel scheduler-history-panel" id="scheduler-history-panel" data-platforms="android harmony">
+            <div class="panel-heading"><div><small>CPU SCHEDULING HISTORY</small><h2>CPU 调度历史趋势</h2></div><span class="data-source" id="scheduler-history-source">等待调度快照</span></div>
+            <div class="scheduler-history-stats">
+              <div><span>可调度 CPU</span><strong id="scheduler-cpuset-value">--</strong><small id="scheduler-cpuset-label">top-app / foreground</small></div>
+              <div><span>前台调度组</span><strong id="scheduler-group-value">--</strong><small id="scheduler-group-label">目标进程</small></div>
+              <div><span>ADPF 会话</span><strong id="scheduler-hint-value">--</strong><small id="scheduler-hint-label">活动 / 图形管线</small></div>
+            </div>
+            <div class="scheduler-history-wrap">
+              <svg id="scheduler-history-chart" viewBox="0 0 1000 300" preserveAspectRatio="none" role="img" aria-label="CPU 调度历史趋势"></svg>
+              <div class="chart-empty" id="scheduler-history-empty"><strong>等待调度历史</strong><small>至少采集 2 个调度快照后显示趋势</small></div>
+            </div>
+          </section>
 
           <div class="system-split-grid">
             <section class="panel system-table-panel">
@@ -472,7 +504,7 @@
               <dl class="context-list performance-context-list">
                 <div><dt id="performance-window-label">前台窗口</dt><dd id="performance-window-value">--</dd></div>
                 <div><dt id="performance-display-label">分辨率 / 亮度</dt><dd id="performance-display-value">--</dd></div>
-                <div><dt>GPU</dt><dd id="performance-gpu-value">--</dd></div>
+                <div id="performance-gpu-row"><dt>GPU</dt><dd id="performance-gpu-value">--</dd></div>
                 <div><dt>最高温度</dt><dd id="performance-temperature-value">--</dd></div>
                 <div><dt id="performance-switch-label">刷新切换</dt><dd id="performance-switch-value">0</dd></div>
                 <div><dt id="performance-frame-count-label">采样帧数</dt><dd id="performance-frame-count">0</dd></div>

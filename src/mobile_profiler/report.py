@@ -93,6 +93,12 @@ METRIC_LABELS = {
     "System processes and hot threads": "系统进程与热点线程",
     "Thermal severity, sensors and cooling devices": "热级别、传感器与冷却设备",
     "cpuset, process state and ADPF hints": "cpuset、进程状态与 ADPF Hint",
+    "Frame rate, 1% Low and frame latency": "帧率、1% Low 与帧延迟",
+    "Render pipeline stages": "渲染链路阶段",
+    "CPU, GPU and memory frequency context": "CPU / GPU / 内存频率上下文",
+    "Render and compositor thread activity": "渲染与合成线程活动",
+    "Scheduler and thermal context": "调度与热状态上下文",
+    "Whole-device power recording": "整机功耗记录",
 }
 SOURCE_LABELS = {
     "iOS DiagnosticsService PowerTelemetryData.SystemLoad": "iOS DiagnosticsService · PowerTelemetryData.SystemLoad",
@@ -125,6 +131,10 @@ SOURCE_LABELS = {
     "HarmonyOS ThermalService via hidumper": "HarmonyOS ThermalService · hidumper",
     "HarmonyOS PowerManagerService + cpufreq capability snapshots": "HarmonyOS PowerManagerService + cpufreq 能力快照",
     "Imported timestamped logs aligned to HarmonyOS device realtime": "按 HarmonyOS 设备实时时钟对齐的外部日志",
+    "Android SurfaceFlinger BLAST present timestamps with gfxinfo fallback and detailed framestats": "Android SurfaceFlinger BLAST 呈现时间戳 + gfxinfo / framestats 回退",
+    "Platform utilization, cpufreq and readable devfreq counters": "平台利用率、cpufreq 与可读 devfreq 计数器",
+    "Periodic toybox top/ps thread snapshots": "周期性 toybox top / ps 线程快照",
+    "Battery current and voltage telemetry": "电池电流与电压遥测",
 }
 COMPONENT_LABELS = {
     "screen": "屏幕",
@@ -449,6 +459,41 @@ def _power_pressure_driver_rows(analysis: Dict[str, object]) -> str:
     return "".join(rows) or '<tr><td colspan="5" class="empty-cell">当前样本不足以计算资源压力与整机功率的时间相关性。</td></tr>'
 
 
+def _power_pressure_driver_visual(analysis: Dict[str, object]) -> str:
+    pressure = analysis.get("power_pressure", {})
+    pressure = pressure if isinstance(pressure, dict) else {}
+    drivers = pressure.get("drivers", [])
+    drivers = drivers if isinstance(drivers, list) else []
+    rows = []
+    for item in drivers[:12]:
+        if not isinstance(item, dict):
+            continue
+        correlation = item.get("correlation")
+        if not isinstance(correlation, (int, float)) or isinstance(correlation, bool):
+            continue
+        value = max(-1.0, min(1.0, float(correlation)))
+        width = abs(value) * 50.0
+        direction = "positive" if value >= 0 else "negative"
+        position = f"left:50%;width:{width:.3f}%" if value >= 0 else f"right:50%;width:{width:.3f}%"
+        rows.append(
+            '<div class="correlation-row">'
+            f'<div class="correlation-label"><strong>{_escape(item.get("label"))}</strong>'
+            f'<span>{int(item.get("sample_count") or 0)} 个样本</span></div>'
+            '<div class="correlation-track" aria-hidden="true"><i></i>'
+            f'<span class="correlation-bar {direction}" style="{position}"></span></div>'
+            f'<div class="correlation-value">{value:+.2f}</div>'
+            "</div>"
+        )
+    if not rows:
+        return ""
+    return (
+        '<div class="correlation-chart" role="img" aria-label="资源压力与整机功率相关系数">'
+        '<div class="correlation-scale"><span>-1.0 反向</span><span>0</span><span>+1.0 同向</span></div>'
+        + "".join(rows)
+        + "</div>"
+    )
+
+
 def _power_pressure_task_rows(analysis: Dict[str, object]) -> str:
     pressure = analysis.get("power_pressure", {})
     pressure = pressure if isinstance(pressure, dict) else {}
@@ -533,11 +578,17 @@ def _power_pressure_sections(analysis: Dict[str, object]) -> str:
         )
     if pressure.get("drivers"):
         sections.append(
-            '<section class="analysis-section"><h2>资源压力驱动</h2>'
+            '<section class="analysis-section"><div class="chart-toolbar"><div>'
+            '<h2>资源与整机功率相关性</h2>'
+            '<p class="section-copy">按同一设备时间轴展示相关方向与强度；用于筛选压力线索，不表示因果或独立电源轨功耗。</p>'
+            '</div><div class="legend-row"><span><i class="legend-swatch correlation-positive"></i>同向</span>'
+            '<span><i class="legend-swatch correlation-negative"></i>反向</span></div></div>'
+            + _power_pressure_driver_visual(analysis)
+            + '<details class="evidence-details"><summary>查看相关性计算证据</summary>'
             '<div class="data-table-wrap"><table><thead><tr><th>资源</th><th>功率相关系数</th>'
             '<th>方向</th><th>样本数</th><th>解释</th></tr></thead><tbody>'
             + _power_pressure_driver_rows(analysis)
-            + "</tbody></table></div></section>"
+            + "</tbody></table></div></details></section>"
         )
     if pressure.get("tasks"):
         sections.append(
@@ -560,6 +611,190 @@ def _power_pressure_sections(analysis: Dict[str, object]) -> str:
         '<section class="analysis-section"><div class="availability-note">'
         '<strong>没有额外功耗压力明细</strong><span>本次关闭了相关采集项，或样本不足；'
         '报告仅保留电池侧实测趋势与摘要。</span></div></section>'
+    )
+
+
+def _frame_flow_stages(analysis: Dict[str, object]) -> List[Dict[str, object]]:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    frame_flow = performance.get("frame_flow", {})
+    frame_flow = frame_flow if isinstance(frame_flow, dict) else {}
+    stages = frame_flow.get("stages", [])
+    return [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
+
+
+def _frame_status_label(status: object) -> str:
+    return {
+        "primary": "主数据",
+        "valid": "有效",
+        "reference": "仅参考",
+        "invalid": "无效",
+        "unavailable": "无数据",
+    }.get(str(status or "unavailable"), str(status or "无数据"))
+
+
+def _frame_status_tag_class(status: object) -> str:
+    return {
+        "primary": "measured",
+        "valid": "counter",
+        "reference": "model",
+        "invalid": "high",
+        "unavailable": "low",
+    }.get(str(status or "unavailable"), "low")
+
+
+def _frame_stage_value(item: Dict[str, object]) -> str:
+    unit = str(item.get("unit") or "")
+    digits = 0 if unit == "Hz" else 2 if unit == "ms" else 1
+    if not isinstance(item.get("value"), (int, float)) or isinstance(item.get("value"), bool):
+        return "—"
+    return f'{_number(item.get("value"), digits)} {_escape(unit)}'.strip()
+
+
+def _frame_flow_visual(analysis: Dict[str, object]) -> str:
+    stages = _frame_flow_stages(analysis)
+    if not stages:
+        return (
+            '<div class="availability-note"><strong>没有可判定的帧率数据流</strong>'
+            '<span>本次未恢复到与目标应用绑定且持续产生有效增量的帧计数来源。</span></div>'
+        )
+    cards = []
+    for index, item in enumerate(stages):
+        status = str(item.get("status") or "unavailable")
+        metrics = []
+        metric_items = item.get("metrics", [])
+        metric_items = metric_items if isinstance(metric_items, list) else []
+        for metric in metric_items[:3]:
+            if not isinstance(metric, dict):
+                continue
+            value = metric.get("value")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            digits = int(metric.get("digits") or 0)
+            metrics.append(
+                '<span><small>'
+                + _escape(metric.get("label"))
+                + '</small><strong>'
+                + _number(value, digits)
+                + (' ' + _escape(metric.get("unit")) if metric.get("unit") else '')
+                + '</strong></span>'
+            )
+        cards.append(
+            f'<article class="frame-stage" data-status="{_escape(status)}">'
+            '<div class="frame-stage-top">'
+            f'<span class="frame-stage-index">{index + 1:02d}</span>'
+            f'<span class="source-tag {_frame_status_tag_class(status)}">{_escape(_frame_status_label(status))}</span>'
+            '</div>'
+            f'<div class="frame-stage-phase">{_escape(item.get("phase") or "STAGE")}</div>'
+            f'<h3>{_escape(item.get("label") or item.get("key"))}</h3>'
+            f'<div class="frame-stage-value">{_frame_stage_value(item)}</div>'
+            f'<div class="frame-stage-caption">{_escape(item.get("value_label") or "当前阶段")}</div>'
+            + (f'<div class="frame-stage-metrics">{"".join(metrics)}</div>' if metrics else '')
+            + f'<div class="frame-stage-source">{_escape(item.get("source") or "来源未记录")}</div>'
+            + "</article>"
+        )
+    return '<div class="frame-flow-visual">' + '<span class="frame-flow-arrow" aria-hidden="true">→</span>'.join(cards) + "</div>"
+
+
+def _frame_flow_evidence(analysis: Dict[str, object]) -> str:
+    if not _frame_flow_stages(analysis):
+        return ""
+    return (
+        '<details class="evidence-details"><summary>查看逐阶段数据源与有效性证据</summary>'
+        '<div class="data-table-wrap"><table><thead><tr><th>渲染阶段</th><th>状态</th>'
+        '<th>速率 / 耗时</th><th>数据来源</th><th>样本数</th><th>判定说明</th></tr></thead>'
+        '<tbody>' + _frame_flow_rows(analysis) + "</tbody></table></div></details>"
+    )
+
+
+def _frame_interval_values(analysis: Dict[str, object]) -> List[float]:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    timeline = performance.get("frame_rate_timeline", [])
+    timeline = timeline if isinstance(timeline, list) else []
+    values = []
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        intervals = item.get("frame_intervals_ms", [])
+        intervals = intervals if isinstance(intervals, list) else []
+        for value in intervals:
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and 0 < float(value) < 10_000
+            ):
+                values.append(float(value))
+    return values
+
+
+def _percentile_value(values: List[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = max(0.0, min(1.0, quantile)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _frame_budget_ms(analysis: Dict[str, object]) -> float | None:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    refresh = performance.get("current_refresh_rate_hz")
+    if isinstance(refresh, (int, float)) and not isinstance(refresh, bool) and float(refresh) > 0:
+        return 1000.0 / float(refresh)
+    timeline = performance.get("frame_rate_timeline", [])
+    timeline = timeline if isinstance(timeline, list) else []
+    refresh_values = [
+        float(item.get("refresh_rate_hz"))
+        for item in timeline
+        if isinstance(item, dict)
+        and isinstance(item.get("refresh_rate_hz"), (int, float))
+        and not isinstance(item.get("refresh_rate_hz"), bool)
+        and float(item.get("refresh_rate_hz")) > 0
+    ]
+    refresh_value = _percentile_value(refresh_values, 0.5)
+    return 1000.0 / refresh_value if refresh_value else None
+
+
+def _frame_stability_section(analysis: Dict[str, object]) -> str:
+    values = _frame_interval_values(analysis)
+    if not values:
+        return ""
+    budget = _frame_budget_ms(analysis)
+    within_count = sum(1 for value in values if budget is not None and value <= budget)
+    within_pct = within_count / len(values) * 100.0 if budget is not None else None
+    issue_threshold = budget * 1.5 if budget is not None else None
+    issue_count = sum(
+        1 for value in values
+        if issue_threshold is not None and value > issue_threshold
+    )
+    issue_pct = issue_count / len(values) * 100.0 if issue_threshold is not None else None
+    p99 = _percentile_value(values, 0.99)
+    maximum = max(values)
+    budget_label = f"{budget:.2f} ms" if budget is not None else "不可用"
+    budget_attr = f'{budget:.8f}' if budget is not None else ""
+    issue_attr = f'{issue_threshold:.8f}' if issue_threshold is not None else ""
+    within_label = f"{within_pct:.2f}%" if within_pct is not None else "—"
+    issue_label = f"{issue_pct:.2f}%" if issue_pct is not None else "—"
+    return (
+        '<section class="analysis-section frame-stability-section">'
+        '<div class="chart-toolbar"><div><h2>帧间隔分布</h2>'
+        '<p class="section-copy">按实际呈现帧间隔展示帧预算线和慢帧尾部；预算至 1.5× 预算之间标为边缘抖动，不计入跨预算异常，最后一个柱汇总长尾样本。</p>'
+        '</div><div class="legend-row"><span><i class="legend-swatch histogram-normal"></i>单周期内</span>'
+        '<span><i class="legend-swatch histogram-edge"></i>预算边缘</span>'
+        '<span><i class="legend-swatch histogram-tail"></i>跨预算 / 长尾</span></div></div>'
+        '<div class="stability-metrics">'
+        f'<div><span>帧间隔样本</span><strong>{len(values):,}</strong></div>'
+        f'<div><span>帧预算</span><strong>{_escape(budget_label)}</strong></div>'
+        f'<div><span>单周期内 / 跨预算异常</span><strong>{_escape(within_label)} / {_escape(issue_label)}</strong></div>'
+        f'<div><span>P99 / 最大</span><strong>{_number(p99, 2)} / {_number(maximum, 2)} ms</strong></div>'
+        '</div>'
+        '<div class="chart-surface frame-interval-surface">'
+        f'<svg id="frame-interval-chart" data-budget-ms="{_escape(budget_attr)}" data-issue-ms="{_escape(issue_attr)}" role="img" aria-label="帧间隔直方图"></svg>'
+        '</div></section>'
     )
 
 
@@ -700,16 +935,377 @@ def _performance_process_rows(analysis: Dict[str, object]) -> str:
     return "".join(rows) or '<tr><td colspan="5" class="empty-cell">没有可用的进程调度快照。</td></tr>'
 
 
+def _render_pipeline_data(analysis: Dict[str, object]) -> Dict[str, object]:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    pipeline = render.get("pipeline", {})
+    return pipeline if isinstance(pipeline, dict) else {}
+
+
+def _render_pipeline_section(analysis: Dict[str, object]) -> str:
+    pipeline = _render_pipeline_data(analysis)
+    stages = pipeline.get("stages", [])
+    stages = [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
+    if not stages:
+        return ""
+    return (
+        '<section class="analysis-section"><h2>阶段耗时分布</h2>'
+        '<details class="evidence-details"><summary>查看详细 framestats 阶段统计</summary>'
+        '<div class="data-table-wrap"><table><thead><tr><th>阶段</th><th>帧数</th><th>平均</th>'
+        '<th>P95</th><th>P99</th><th>峰值</th></tr></thead><tbody>'
+        + _render_pipeline_rows(analysis)
+        + "</tbody></table></div></details></section>"
+    )
+
+
+def _slow_frame_section(analysis: Dict[str, object]) -> str:
+    pipeline = _render_pipeline_data(analysis)
+    slow_frames = pipeline.get("slow_frames", [])
+    slow_frames = [item for item in slow_frames if isinstance(item, dict)] if isinstance(slow_frames, list) else []
+    if not slow_frames:
+        return ""
+    return (
+        '<section class="analysis-section"><h2>慢帧明细</h2>'
+        '<details class="evidence-details"><summary>查看最慢 20 帧的阶段证据</summary>'
+        '<div class="data-table-wrap"><table><thead><tr><th>帧 ID</th><th>总耗时</th>'
+        '<th>超截止时间</th><th>最大阶段</th><th>阶段耗时</th></tr></thead><tbody>'
+        + _slow_frame_rows(analysis)
+        + "</tbody></table></div></details></section>"
+    )
+
+
+def _render_thread_section(analysis: Dict[str, object], heading: str = "渲染与合成热点线程") -> str:
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    threads = render.get("render_threads", [])
+    threads = [item for item in threads if isinstance(item, dict)] if isinstance(threads, list) else []
+    if not threads:
+        return ""
+    return (
+        f'<section class="analysis-section"><h2>{_escape(heading)}</h2>'
+        '<details class="evidence-details"><summary>查看线程 CPU 快照</summary>'
+        '<div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th>'
+        '<th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>'
+        + _render_thread_rows(analysis)
+        + "</tbody></table></div></details></section>"
+    )
+
+
+def _performance_process_section(analysis: Dict[str, object]) -> str:
+    system = analysis.get("system", {})
+    system = system if isinstance(system, dict) else {}
+    processes = system.get("top_processes", [])
+    processes = [item for item in processes if isinstance(item, dict)] if isinstance(processes, list) else []
+    if not processes:
+        return ""
+    return (
+        '<section class="analysis-section"><h2>进程调度热点</h2>'
+        '<details class="evidence-details"><summary>查看周期进程 CPU 快照</summary>'
+        '<div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th>'
+        '<th>进入 Top 时平均</th><th>峰值</th><th>快照数</th></tr></thead><tbody>'
+        + _performance_process_rows(analysis)
+        + "</tbody></table></div></details></section>"
+    )
+
+
+def _refresh_residency_available(analysis: Dict[str, object]) -> bool:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    rows = performance.get("refresh_residency", [])
+    rows = rows if isinstance(rows, list) else []
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("refresh_rate_hz"), (int, float))
+        and not isinstance(item.get("refresh_rate_hz"), bool)
+        for item in rows
+    )
+
+
+def _performance_context_available(analysis: Dict[str, object]) -> bool:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    thermal = analysis.get("thermal", {})
+    thermal = thermal if isinstance(thermal, dict) else {}
+    return any(
+        (
+            performance.get("foreground_window_name"),
+            isinstance(performance.get("foreground_window_id"), (int, float)),
+            isinstance(performance.get("display_width_px"), (int, float)),
+            isinstance(performance.get("display_height_px"), (int, float)),
+            bool(performance.get("render_resolution_available")),
+            bool(performance.get("frame_interpolation_available")),
+            bool(performance.get("supported_refresh_rates_hz")),
+            performance.get("gpu_renderer"),
+            bool(thermal.get("hottest_sensor")),
+            bool(performance.get("touch_devices")),
+            isinstance(performance.get("touch_interaction_count"), (int, float)),
+        )
+    )
+
+
+def _performance_context_section(
+    analysis: Dict[str, object],
+    heading: str = "关键上下文",
+) -> str:
+    if not _performance_context_available(analysis):
+        return ""
+    return (
+        f'<section class="analysis-section"><h2>{_escape(heading)}</h2>'
+        '<div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th>'
+        '<th>说明</th></tr></thead><tbody>' + _performance_context_rows(analysis) + "</tbody></table></div></section>"
+    )
+
+
+def _performance_context_sections(analysis: Dict[str, object]) -> str:
+    sections = []
+    if _refresh_residency_available(analysis):
+        sections.append(
+            '<section class="analysis-section"><h2>刷新档位驻留</h2>'
+            '<div class="residency-list">' + _refresh_residency_rows(analysis) + "</div></section>"
+        )
+    context = _performance_context_section(analysis)
+    if context:
+        sections.append(context)
+    if not sections:
+        return ""
+    return '<div class="split-layout">' + "".join(sections) + "</div>" if len(sections) > 1 else sections[0]
+
+
+def _cpu_process_section(analysis: Dict[str, object]) -> str:
+    processes = analysis.get("processes", [])
+    processes = [item for item in processes if isinstance(item, dict)] if isinstance(processes, list) else []
+    if not processes:
+        return ""
+    return (
+        '<section class="analysis-section"><h2>进程 CPU 快照</h2>'
+        '<div class="data-table-wrap"><table><thead><tr><th>进程</th><th>总占用</th>'
+        '<th>用户态</th><th>内核态</th></tr></thead><tbody>'
+        + _process_rows(analysis)
+        + "</tbody></table></div></section>"
+    )
+
+
+def _gpu_live_available(analysis: Dict[str, object]) -> bool:
+    gpu = analysis.get("gpu", {})
+    gpu = gpu if isinstance(gpu, dict) else {}
+    return bool(gpu.get("frequency_available") or gpu.get("load_available"))
+
+
+def _gpu_power_fallback_available(analysis: Dict[str, object]) -> bool:
+    gpu = analysis.get("gpu", {})
+    gpu = gpu if isinstance(gpu, dict) else {}
+    memory = gpu.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    work = gpu.get("work_by_uid", [])
+    return bool((isinstance(work, list) and work) or memory.get("available"))
+
+
+def _gpu_report_available(analysis: Dict[str, object], test_mode: str) -> bool:
+    return _gpu_live_available(analysis) or (
+        test_mode == "power" and _gpu_power_fallback_available(analysis)
+    )
+
+
+def _gpu_unavailable_display_reason(gpu: Dict[str, object]) -> str:
+    reason = str(gpu.get("unavailable_reason") or "").strip()
+    if reason.startswith("No readable GPU frequency/load node"):
+        return "ADB shell 未暴露可读的 GPU 频率或负载节点，Perfetto 也未注册 GPU 硬件计数器数据源。"
+    if reason.startswith("DVT Graphics"):
+        return "iOS DVT Graphics 没有返回可用的 GPU 利用率事件。"
+    return reason or "设备未暴露可读的 GPU 频率或负载计数器。"
+
+
+def _report_warning_items(analysis: Dict[str, object], test_mode: str) -> List[str]:
+    warnings = analysis.get("warnings", [])
+    warnings = warnings if isinstance(warnings, list) else []
+    gpu_available = _gpu_report_available(analysis, test_mode)
+    rows = []
+    for item in warnings:
+        warning = str(item or "").strip()
+        if not warning:
+            continue
+        if not gpu_available and "gpu" in warning.lower() and (
+            "回退证据" in warning
+            or "dumpsys gpu" in warning.lower()
+            or "generic_sysfs" in warning.lower()
+        ):
+            continue
+        rows.append(warning)
+    return rows
+
+
+def _analysis_coverage_section(
+    analysis: Dict[str, object],
+    test_mode: str,
+    gpu_report_available: bool,
+) -> str:
+    rows: List[Tuple[str, str, str, str]] = []
+    gpu = analysis.get("gpu", {})
+    gpu = gpu if isinstance(gpu, dict) else {}
+    if test_mode == "performance":
+        invalid_stages = [
+            item for item in _frame_flow_stages(analysis)
+            if str(item.get("status") or "unavailable") in {"invalid", "unavailable"}
+        ]
+        if invalid_stages:
+            labels = "、".join(str(item.get("phase") or item.get("label") or "阶段") for item in invalid_stages)
+            rows.append((
+                "帧数据源有效性",
+                "部分可用",
+                "无效来源不参与主 FPS",
+                f"{labels} 未形成有效增量；保留在渲染链路证据明细中说明原因。",
+            ))
+        pipeline = _render_pipeline_data(analysis)
+        stages = pipeline.get("stages", [])
+        if not isinstance(stages, list) or not stages:
+            rows.append((
+                "详细渲染阶段 / 慢帧",
+                "未覆盖",
+                "空表已省略",
+                "目标窗口没有产生可解析的 framestats 阶段时间戳，不能定位引擎内部、RenderThread 或 HWC 分段时延。",
+            ))
+        render = analysis.get("render_performance", {})
+        render = render if isinstance(render, dict) else {}
+        if not render.get("render_threads"):
+            rows.append((
+                "渲染 / 合成线程热点",
+                "未覆盖",
+                "空表已省略",
+                "未采集到 RenderThread、SurfaceFlinger、RenderEngine 或 Composer 的周期线程快照。",
+            ))
+        system = analysis.get("system", {})
+        system = system if isinstance(system, dict) else {}
+        if not system.get("top_processes"):
+            rows.append((
+                "进程调度热点",
+                "未覆盖",
+                "空表已省略",
+                "本次没有周期进程快照；不能据此判断后台进程调度竞争。",
+            ))
+        if not _frame_interval_values(analysis):
+            performance = analysis.get("performance", {})
+            performance = performance if isinstance(performance, dict) else {}
+            rows.append((
+                "帧间隔分布",
+                "未覆盖",
+                "图表已省略",
+                str(performance.get("frame_unavailable_reason") or "帧数据源没有返回逐帧间隔样本。"),
+            ))
+        if not _refresh_residency_available(analysis):
+            rows.append((
+                "刷新档位驻留",
+                "未覆盖",
+                "空模块已省略",
+                "平台没有提供会话内可计算的刷新档位计数变化。",
+            ))
+        if not gpu_report_available:
+            rows.append((
+                "GPU 实时遥测",
+                "未覆盖",
+                "GPU 页面已省略",
+                _gpu_unavailable_display_reason(gpu),
+            ))
+    else:
+        pressure = analysis.get("power_pressure", {})
+        pressure = pressure if isinstance(pressure, dict) else {}
+        memory = analysis.get("memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        settings = analysis.get("runtime_settings", {})
+        settings = settings if isinstance(settings, dict) else {}
+        if not pressure.get("drivers"):
+            rows.append(("资源功率相关性", "未覆盖", "图表已省略", "相关采集项已关闭，或有效时间样本不足。"))
+        if not pressure.get("tasks"):
+            rows.append(("任务负载压力", "未覆盖", "空表已省略", "没有可用的周期任务快照。"))
+        if not memory.get("available"):
+            rows.append((
+                "内存频率压力",
+                "未覆盖",
+                "空模块已省略",
+                str(memory.get("reason") or memory.get("limitations") or "设备未暴露可读内存频率节点，或该采集项已关闭。"),
+            ))
+        if not settings.get("rows"):
+            rows.append(("系统设置变化", "未覆盖", "空表已省略", "未恢复到可比较的测试前后系统设置快照。"))
+        if not gpu_report_available:
+            rows.append((
+                "GPU 证据",
+                "未覆盖",
+                "GPU 页面已省略",
+                _gpu_unavailable_display_reason(gpu),
+            ))
+    if not analysis.get("processes"):
+        rows.append(("进程 CPU 快照", "未覆盖", "空表已省略", "采样中没有可用的进程 CPU 明细。"))
+    if not rows:
+        return ""
+    body = "".join(
+        "<tr>"
+        f"<td><strong>{_escape(label)}</strong></td>"
+        f'<td><span class="source-tag {"medium" if status == "部分可用" else "low"}">{_escape(status)}</span></td>'
+        f"<td>{_escape(action)}</td>"
+        f'<td><span class="cell-sub">{_escape(reason)}</span></td>'
+        "</tr>"
+        for label, status, action, reason in rows
+    )
+    return (
+        '<section class="analysis-section"><h2>分析覆盖与省略项</h2>'
+        '<p class="section-copy">没有有效证据的分析不会占用主报告页面；以下项目仅说明采集边界，不形成性能或功耗结论。</p>'
+        '<div class="data-table-wrap"><table><thead><tr><th>分析项</th><th>覆盖状态</th>'
+        '<th>报告处理</th><th>原因</th></tr></thead><tbody>' + body + "</tbody></table></div></section>"
+    )
+
+
 def _performance_interference_status(analysis: Dict[str, object]) -> str:
     render = analysis.get("render_performance", {})
     render = render if isinstance(render, dict) else {}
     bottlenecks = render.get("bottlenecks", [])
     bottlenecks = bottlenecks if isinstance(bottlenecks, list) else []
     if not bottlenecks:
+        performance = analysis.get("performance", {})
+        performance = performance if isinstance(performance, dict) else {}
+        frame_count = performance.get("frame_sample_count")
+        frame_issue_pct = performance.get("frame_issue_pct")
+        if not isinstance(frame_issue_pct, (int, float)):
+            frame_issue_pct = performance.get("missed_vsync_interval_pct")
+        has_frame_evidence = (
+            isinstance(frame_count, (int, float))
+            and not isinstance(frame_count, bool)
+            and float(frame_count) > 0
+        )
+        has_frame_issue = (
+            isinstance(frame_issue_pct, (int, float))
+            and not isinstance(frame_issue_pct, bool)
+            and float(frame_issue_pct) >= 2.0
+        ) or int(performance.get("severe_frame_interval_count") or 0) > 0
+        pipeline = _render_pipeline_data(analysis)
+        pipeline_available = bool(pipeline.get("available") or pipeline.get("stages"))
+        if has_frame_issue:
+            return (
+                '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
+                '<strong>检测到帧节奏异常，但尚未定位到具体渲染阶段</strong>'
+                f'<span>{_number(frame_issue_pct, 2)}% 帧跨越预算或截止时间。'
+                + (
+                    "详细阶段时间戳可用，但尚未形成稳定的主导瓶颈。"
+                    if pipeline_available
+                    else "详细 framestats 未覆盖当前渲染面，不能据此推断引擎、RenderThread 或 HWC 内部耗时。"
+                )
+                + "</span></div></div>"
+            )
+        if has_frame_evidence:
+            return (
+                '<div class="priority-callout"><span class="status-dot good"></span><div>'
+                '<strong>当前呈现帧节奏未触发异常阈值</strong>'
+                f'<span>已覆盖 {int(frame_count)} 个帧间隔样本'
+                + (f"，异常占比 {_number(frame_issue_pct, 2)}%" if isinstance(frame_issue_pct, (int, float)) else "")
+                + (
+                    "；详细阶段证据可继续用于定位内部时延。"
+                    if pipeline_available
+                    else "；详细渲染阶段未公开，因此该结论仅描述最终呈现节奏，不代表内部链路没有等待。"
+                )
+                + "</span></div></div>"
+            )
         return (
-            '<div class="priority-callout"><span class="status-dot good"></span><div>'
-            '<strong>未形成明确的帧延迟瓶颈结论</strong>'
-            '<span>继续结合详细 framestats、RenderThread / SurfaceFlinger 热点、GPU 饱和、调度与热限制检查。</span>'
+            '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
+            '<strong>帧延迟证据不足，未进行瓶颈判定</strong>'
+            '<span>缺少有效帧间隔或截止时间样本；报告不会把“无法采集”解释为“没有性能问题”。</span>'
             '</div></div>'
         )
     leading = bottlenecks[0] if isinstance(bottlenecks[0], dict) else {}
@@ -1446,14 +2042,56 @@ def _finding_rows(analysis: Dict[str, object]) -> str:
 
 
 def _source_rows(analysis: Dict[str, object]) -> str:
-    return "".join(
-        "<tr>"
-        f'<td><strong>{_escape(_display_label(item.get("metric"), METRIC_LABELS))}</strong></td>'
-        f'<td>{_escape(_display_label(item.get("source"), SOURCE_LABELS))}</td>'
-        f'<td><span class="source-tag {_escape(item.get("kind", "context"))}">{_escape(_display_label(item.get("kind"), SOURCE_KIND_LABELS))}</span></td>'
-        "</tr>"
-        for item in analysis.get("data_sources", [])
-    )
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    pipeline = render.get("pipeline", {})
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    scheduler = analysis.get("scheduler", {})
+    scheduler = scheduler if isinstance(scheduler, dict) else {}
+    thermal = analysis.get("thermal", {})
+    thermal = thermal if isinstance(thermal, dict) else {}
+    gpu = analysis.get("gpu", {})
+    gpu = gpu if isinstance(gpu, dict) else {}
+    rows = []
+    data_sources = analysis.get("data_sources", [])
+    data_sources = data_sources if isinstance(data_sources, list) else []
+    for item in data_sources:
+        if not isinstance(item, dict):
+            continue
+        metric = str(item.get("metric") or "")
+        if metric == "Frame rate, 1% Low and frame latency" and not (
+            performance.get("frame_sample_count")
+            or isinstance(performance.get("sampled_frame_rate_fps"), (int, float))
+            or isinstance(performance.get("sampled_compositor_fps"), (int, float))
+        ):
+            continue
+        if metric == "Render pipeline stages" and not pipeline.get("stages"):
+            continue
+        if metric == "Render and compositor thread activity" and not render.get("render_threads"):
+            continue
+        if metric == "Scheduler and thermal context" and not (
+            any(scheduler.get(key) for key in ("cpusets", "cpu_policies", "hint_sessions", "process_states", "timeline"))
+            or any(thermal.get(key) for key in ("sensors", "cooling_devices", "timeline", "hottest_sensor"))
+            or isinstance(thermal.get("maximum_status"), (int, float))
+        ):
+            continue
+        if metric == "GPU activity" and not (
+            gpu.get("frequency_available")
+            or gpu.get("load_available")
+            or gpu.get("work_by_uid")
+            or (isinstance(gpu.get("memory"), dict) and gpu.get("memory", {}).get("available"))
+        ):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td><strong>{_escape(_display_label(item.get("metric"), METRIC_LABELS))}</strong></td>'
+            f'<td>{_escape(_display_label(item.get("source"), SOURCE_LABELS))}</td>'
+            f'<td><span class="source-tag {_escape(item.get("kind", "context"))}">{_escape(_display_label(item.get("kind"), SOURCE_KIND_LABELS))}</span></td>'
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="3" class="empty-cell">本次没有形成可用于分析的数据来源。</td></tr>'
 
 
 def _capture_configuration_rows(metadata: Dict[str, object]) -> str:
@@ -1785,6 +2423,56 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .source-tag.low { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 55%, var(--app-border)); }
   #mobile-profiler .source-tag.high { color: var(--series-4); border-color: color-mix(in srgb, var(--series-4) 70%, var(--app-border)); background: rgba(228, 111, 111, .08); }
   #mobile-profiler .analysis-section { min-width: 0; border-top: 1px solid var(--app-border); padding-top: 16px; }
+  #mobile-profiler .evidence-details { margin-top: 12px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface); }
+  #mobile-profiler .evidence-details summary { cursor: pointer; padding: 10px 12px; color: var(--app-muted); font-size: 12px; list-style-position: inside; }
+  #mobile-profiler .evidence-details[open] summary { border-bottom: 1px solid var(--app-border); color: var(--app-text); }
+  #mobile-profiler .evidence-details .data-table-wrap { padding: 0 10px 8px; }
+  #mobile-profiler .frame-flow-visual { display: flex; align-items: stretch; gap: 8px; overflow-x: auto; padding: 2px 0 8px; }
+  #mobile-profiler .frame-stage { flex: 1 0 190px; min-width: 0; padding: 13px; border: 1px solid var(--app-border); border-top-width: 3px; border-radius: 6px; background: var(--app-surface); }
+  #mobile-profiler .frame-stage[data-status="primary"] { border-top-color: var(--series-2); background: rgba(114, 201, 139, .055); }
+  #mobile-profiler .frame-stage[data-status="valid"] { border-top-color: var(--series-1); }
+  #mobile-profiler .frame-stage[data-status="reference"] { border-top-color: var(--series-3); }
+  #mobile-profiler .frame-stage[data-status="invalid"] { border-top-color: var(--series-4); background: rgba(228, 111, 111, .045); }
+  #mobile-profiler .frame-stage[data-status="unavailable"] { border-top-color: var(--app-border); border-style: dashed; opacity: .78; }
+  #mobile-profiler .frame-stage-top { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  #mobile-profiler .frame-stage-index { color: var(--app-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  #mobile-profiler .frame-stage-phase { margin-top: 16px; color: var(--series-1); font-size: 11px; letter-spacing: .08em; }
+  #mobile-profiler .frame-stage h3 { margin-top: 4px; min-height: 34px; }
+  #mobile-profiler .frame-stage-value { margin-top: 14px; font-size: 22px; font-weight: 550; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #mobile-profiler .frame-stage-caption, #mobile-profiler .frame-stage-source { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .frame-stage-source { margin-top: 12px; overflow-wrap: anywhere; }
+  #mobile-profiler .frame-stage-metrics { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+  #mobile-profiler .frame-stage-metrics span { display: grid; gap: 1px; min-width: 70px; padding: 5px 7px; background: var(--app-surface-2); }
+  #mobile-profiler .frame-stage-metrics small { color: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .frame-stage-metrics strong { font-size: 11px; font-weight: 500; }
+  #mobile-profiler .frame-flow-arrow { display: grid; place-items: center; flex: 0 0 18px; color: var(--app-muted); font-size: 18px; }
+  #mobile-profiler .stability-metrics { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  #mobile-profiler .stability-metrics > div { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid var(--app-border); background: var(--app-surface); }
+  #mobile-profiler .stability-metrics span { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .stability-metrics strong { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  #mobile-profiler .frame-interval-surface svg { min-height: 300px; }
+  #mobile-profiler .chart-surface .histogram-bar { fill: var(--series-1); opacity: .8; }
+  #mobile-profiler .chart-surface .histogram-bar.edge { fill: var(--series-5); opacity: .86; }
+  #mobile-profiler .chart-surface .histogram-bar.tail { fill: var(--series-3); opacity: .9; }
+  #mobile-profiler .chart-surface .budget-line { stroke: var(--series-4); stroke-width: 1.5; stroke-dasharray: 5 4; }
+  #mobile-profiler .chart-surface .budget-label { fill: var(--series-4); font-size: 11px; }
+  #mobile-profiler .histogram-normal { background: var(--series-1); }
+  #mobile-profiler .histogram-edge { background: var(--series-5); }
+  #mobile-profiler .histogram-tail { background: var(--series-3); }
+  #mobile-profiler .correlation-chart { display: grid; gap: 9px; padding: 14px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface); }
+  #mobile-profiler .correlation-scale { display: grid; grid-template-columns: 1fr auto 1fr; margin-left: min(220px, 28%); color: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .correlation-scale span:nth-child(2) { text-align: center; }
+  #mobile-profiler .correlation-scale span:last-child { text-align: right; }
+  #mobile-profiler .correlation-row { display: grid; grid-template-columns: minmax(125px, 220px) minmax(160px, 1fr) 52px; gap: 12px; align-items: center; }
+  #mobile-profiler .correlation-label { display: grid; min-width: 0; }
+  #mobile-profiler .correlation-label strong { font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+  #mobile-profiler .correlation-label span { color: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .correlation-track { position: relative; height: 10px; background: var(--app-surface-2); overflow: hidden; }
+  #mobile-profiler .correlation-track > i { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--app-muted); opacity: .55; z-index: 2; }
+  #mobile-profiler .correlation-bar { position: absolute; top: 1px; bottom: 1px; }
+  #mobile-profiler .correlation-bar.positive, #mobile-profiler .correlation-positive { background: var(--series-1); }
+  #mobile-profiler .correlation-bar.negative, #mobile-profiler .correlation-negative { background: var(--series-3); }
+  #mobile-profiler .correlation-value { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
   #mobile-profiler .chart-toolbar { justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
   #mobile-profiler .segment-control { display: inline-flex; border: 1px solid var(--app-border); border-radius: 5px; overflow: hidden; }
   #mobile-profiler .segment-button {
@@ -1873,6 +2561,7 @@ REPORT_FRAGMENT = r"""
     #mobile-profiler .split-layout { grid-template-columns: 1fr; }
     #mobile-profiler .residency-row { grid-template-columns: 130px minmax(160px, 1fr); }
     #mobile-profiler .residency-values { grid-column: 2; justify-content: flex-start; }
+    #mobile-profiler .stability-metrics { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
   }
   @media (max-width: 720px) {
     #mobile-profiler .app-topbar { align-items: flex-start; flex-wrap: wrap; }
@@ -1887,12 +2576,18 @@ REPORT_FRAGMENT = r"""
     #mobile-profiler .residency-values { grid-column: 1; }
     #mobile-profiler .contributor-row { grid-template-columns: minmax(0, 1fr) 65px; }
     #mobile-profiler .contributor-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
+    #mobile-profiler .correlation-scale { margin-left: 0; }
+    #mobile-profiler .correlation-row { grid-template-columns: minmax(100px, 145px) minmax(130px, 1fr) 46px; gap: 8px; }
   }
   @media (max-width: 440px) {
     #mobile-profiler .metric-grid { grid-template-columns: 1fr; }
     #mobile-profiler .device-block { width: 100%; justify-content: flex-start; text-align: left; }
     #mobile-profiler .metric-value { font-size: 22px; }
     #mobile-profiler .sample-detail { display: grid; grid-template-columns: 1fr; }
+    #mobile-profiler .stability-metrics { grid-template-columns: 1fr; }
+    #mobile-profiler .correlation-row { grid-template-columns: 1fr 46px; }
+    #mobile-profiler .correlation-row .correlation-track { grid-column: 1 / -1; grid-row: 2; }
+    #mobile-profiler .frame-flow-arrow { display: none; }
   }
 </style>
 <div id="mobile-profiler" data-test-mode="@@TEST_MODE@@">
@@ -1921,7 +2616,7 @@ REPORT_FRAGMENT = r"""
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="applications" data-report-only="power">应用</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="cpu">CPU</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system" data-report-only="performance">性能上下文</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="gpu">GPU</button>
+      @@GPU_NAV@@
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="attribution" data-report-only="power">功耗归因</button>
       <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="data">数据质量</button>
     </nav>
@@ -1954,7 +2649,7 @@ REPORT_FRAGMENT = r"""
         </section>
         <section class="analysis-section" data-report-only="power"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         <div class="split-layout" data-report-only="performance">
-          <section class="analysis-section"><h2>性能上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
+          @@OVERVIEW_PERFORMANCE_CONTEXT_SECTION@@
           <section class="analysis-section"><h2>帧表现结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         </div>
       </section>
@@ -2001,10 +2696,11 @@ REPORT_FRAGMENT = r"""
 
       <section class="app-view" data-panel="pipeline" data-report-only="performance" hidden>
         <div class="view-heading"><div><h1>帧率数据流与渲染链路</h1><p>区分应用提交、渲染阶段、系统合成和屏幕刷新；保留无效来源及弃用原因，再定位慢帧形成阶段。</p></div><span class="source-tag counter">多源有效性 / 阶段时延</span></div>
-        <section class="analysis-section"><h2>逐阶段帧数据</h2><div class="data-table-wrap"><table><thead><tr><th>渲染阶段</th><th>状态</th><th>速率 / 耗时</th><th>数据来源</th><th>样本数</th><th>判定说明</th></tr></thead><tbody>@@FRAME_FLOW_ROWS@@</tbody></table></div><div class="availability-note"><strong>解读边界</strong><span>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率不能直接互换；只有绑定当前目标应用并持续产生有效增量的来源才作为主 FPS。</span></div></section>
-        <section class="analysis-section"><h2>阶段耗时分布</h2><div class="data-table-wrap"><table><thead><tr><th>阶段</th><th>帧数</th><th>平均</th><th>P95</th><th>P99</th><th>峰值</th></tr></thead><tbody>@@RENDER_PIPELINE_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>慢帧明细</h2><div class="data-table-wrap"><table><thead><tr><th>帧 ID</th><th>总耗时</th><th>超截止时间</th><th>最大阶段</th><th>阶段耗时</th></tr></thead><tbody>@@SLOW_FRAME_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>渲染与合成热点线程</h2><div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th><th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>@@RENDER_THREAD_ROWS@@</tbody></table></div></section>
+        <section class="analysis-section"><div class="chart-toolbar"><div><h2>逐阶段帧数据</h2><p class="section-copy">沿 APP → RENDER → COMPOSITOR → DISPLAY 展示帧数据的来源、有效性与主数据选择。</p></div></div>@@FRAME_FLOW_VISUAL@@@@FRAME_FLOW_EVIDENCE@@<div class="availability-note"><strong>解读边界</strong><span>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率不能直接互换；只有绑定当前目标应用并持续产生有效增量的来源才作为主 FPS。</span></div></section>
+        @@FRAME_STABILITY_SECTION@@
+        @@RENDER_PIPELINE_SECTION@@
+        @@SLOW_FRAME_SECTION@@
+        @@PIPELINE_RENDER_THREAD_SECTION@@
         @@PERFORMANCE_POWER_RECORDING@@
       </section>
 
@@ -2023,31 +2719,20 @@ REPORT_FRAGMENT = r"""
         <section class="analysis-section"><div class="chart-toolbar"><div><h2>频率驻留</h2><p class="section-copy">按负载加权的低、中、高频使用比例。</p></div><div class="legend-row"><span><i class="legend-swatch band-low"></i>低频</span><span><i class="legend-swatch band-balanced"></i>中频</span><span><i class="legend-swatch band-high"></i>高频</span></div></div><div class="residency-list">@@RESIDENCY_ROWS@@</div></section>
         <section class="analysis-section" data-report-only="power"><h2>集群功耗压力汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
         <section class="analysis-section" data-report-only="performance"><h2>CPU 调度资源汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>平均负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th></tr></thead><tbody>@@PERFORMANCE_CPU_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>进程 CPU 快照</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>总占用</th><th>用户态</th><th>内核态</th></tr></thead><tbody>@@PROCESS_ROWS@@</tbody></table></div></section>
+        @@CPU_PROCESS_SECTION@@
       </section>
 
       <section class="app-view" data-panel="system" data-report-only="performance" hidden>
         <div class="view-heading"><div><h1>性能资源与调度上下文</h1><p>帧表现结合 CPU/GPU、可用频率、cpuset、ADPF、热点进程和热限制解释；不进行进程功耗归因。</p></div><span class="source-tag counter">平台实测计数器</span></div>
         <div class="metric-grid">@@PERFORMANCE_CARDS@@</div>
-        <div class="split-layout">
-          <section class="analysis-section"><h2>刷新档位驻留</h2><div class="residency-list">@@REFRESH_RESIDENCY_ROWS@@</div></section>
-          <section class="analysis-section"><h2>关键上下文</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>当前值</th><th>说明</th></tr></thead><tbody>@@PERFORMANCE_CONTEXT_ROWS@@</tbody></table></div></section>
-        </div>
+        @@PERFORMANCE_CONTEXT_SECTIONS@@
         <section class="analysis-section">@@PERFORMANCE_INTERFERENCE_STATUS@@</section>
-        <section class="analysis-section"><h2>进程调度热点</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>全程平均 CPU</th><th>进入 Top 时平均</th><th>峰值</th><th>快照数</th></tr></thead><tbody>@@PERFORMANCE_PROCESS_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>RenderThread / SurfaceFlinger / Composer</h2><div class="data-table-wrap"><table><thead><tr><th>线程</th><th>PID / TID</th><th>可见时平均 CPU</th><th>峰值 CPU</th><th>快照数</th></tr></thead><tbody>@@RENDER_THREAD_ROWS@@</tbody></table></div></section>
+        @@PERFORMANCE_PROCESS_SECTION@@
+        @@SYSTEM_RENDER_THREAD_SECTION@@
         <div class="availability-note"><strong>解读边界</strong><span>帧率与帧耗时来自平台公开的合成器或前台窗口统计；详细 Android framestats 用于定位 UI / RenderThread 到 BufferQueue 的阶段耗时。插帧仅在读取到显式厂商开关时判定。整机功耗仅作为同期记录，不拆分到进程、UID 或组件。</span></div>
       </section>
 
-      <section class="app-view" data-panel="gpu" hidden>
-        <div class="view-heading"><div><h1>GPU 证据</h1><p>@@GPU_COPY@@</p></div></div>
-        <section class="analysis-section"><div class="status-line">@@GPU_STATUS@@</div></section>
-        <div>@@GPU_METRIC@@</div>
-        <section class="analysis-section"><div class="chart-surface" id="gpu-chart-surface"><svg id="gpu-chart" role="img" aria-label="GPU telemetry timeline"></svg></div></section>
-        <section class="analysis-section" data-report-only="power"><h2>按 UID 的 GPU 工作</h2><div class="data-table-wrap"><table><thead><tr><th>包名 / UID</th><th>活跃时长</th><th>运行占比</th><th>来源</th></tr></thead><tbody>@@GPU_UID_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="power"><h2>GPU 进程内存快照</h2><div class="data-table-wrap"><table><thead><tr><th>进程</th><th>PID</th><th>内存</th><th>占 GPU 总量</th></tr></thead><tbody>@@GPU_MEMORY_ROWS@@</tbody></table></div></section>
-        <div data-report-only="performance">@@PERFORMANCE_POWER_RECORDING@@</div>
-      </section>
+      @@GPU_SECTION@@
 
       <section class="app-view" data-panel="attribution" data-report-only="power" hidden>
         <div class="view-heading"><div><h1>功耗归因</h1><p>@@ATTRIBUTION_COPY@@</p></div><span class="source-tag @@ATTRIBUTION_TAG_KIND@@">@@ATTRIBUTION_TAG@@</span></div>
@@ -2061,6 +2746,7 @@ REPORT_FRAGMENT = r"""
         <div class="view-heading"><div><h1>数据质量</h1><p>查看本次测试的实测、计数器与模型数据来源。</p></div></div>
         <section class="analysis-section"><h2>采集项与干扰控制</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div></section>
         <section class="analysis-section"><h2>数据来源</h2><div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div></section>
+        @@ANALYSIS_COVERAGE_SECTION@@
         @@WARNING_SECTION@@
         <section class="analysis-section"><details><summary>查看完整会话元数据</summary><pre class="metadata-block">@@METADATA@@</pre></details></section>
       </section>
@@ -2160,6 +2846,20 @@ REPORT_FRAGMENT = r"""
     if (minimum === maximum) { minimum -= 1; maximum += 1; }
     const pad = (maximum - minimum) * 0.08;
     return [minimum - pad, maximum + pad];
+  }
+  function quantile(values, ratio) {
+    const ordered = values.filter(finite).map(Number).sort((a, b) => a - b);
+    if (!ordered.length) return null;
+    const position = Math.max(0, Math.min(1, Number(ratio))) * (ordered.length - 1);
+    const lower = Math.floor(position), upper = Math.min(ordered.length - 1, lower + 1);
+    const fraction = position - lower;
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction;
+  }
+  function frameIntervals() {
+    return frameTimeline
+      .flatMap(item => Array.isArray(item.frame_intervals_ms) ? item.frame_intervals_ms : [])
+      .filter(value => finite(value) && Number(value) > 0 && Number(value) < 10000)
+      .map(Number);
   }
   function pointString(values, x, y) {
     return values.map((value, index) => finite(value) ? `${x(samples[index].elapsed_s).toFixed(2)},${y(Number(value)).toFixed(2)}` : null).filter(Boolean).join(" ");
@@ -2265,6 +2965,77 @@ REPORT_FRAGMENT = r"""
     return lanes;
   }
   function renderTimeline() { renderLanes(root.querySelector("#timeline-chart"), timelineLanes()); }
+
+  function renderFrameStability() {
+    const svg = root.querySelector("#frame-interval-chart");
+    const intervals = frameIntervals();
+    if (!svg || !intervals.length) return;
+    const width = chartWidth(svg), height = 310;
+    const margin = { left: width < 560 ? 48 : 58, right: 24, top: 30, bottom: 48 };
+    const budget = finite(svg.dataset.budgetMs) && Number(svg.dataset.budgetMs) > 0
+      ? Number(svg.dataset.budgetMs)
+      : null;
+    const issueThreshold = finite(svg.dataset.issueMs) && Number(svg.dataset.issueMs) > 0
+      ? Number(svg.dataset.issueMs)
+      : budget != null ? budget * 1.5 : null;
+    const q01 = quantile(intervals, .01) || Math.min(...intervals);
+    const q99 = quantile(intervals, .99) || Math.max(...intervals);
+    let minimum = Math.max(0, budget ? Math.min(q01, budget * .72) : q01 * .82);
+    let maximum = budget ? Math.max(budget * 1.6, q99 * 1.08) : q99 * 1.14;
+    if (!finite(maximum) || maximum <= minimum) maximum = minimum + Math.max(1, minimum * .25);
+    const binCount = width < 560 ? 14 : 22;
+    const binWidth = (maximum - minimum) / binCount;
+    const counts = Array.from({ length: binCount }, () => 0);
+    let lowerTail = 0, upperTail = 0;
+    intervals.forEach(value => {
+      if (value < minimum) lowerTail += 1;
+      if (value > maximum) upperTail += 1;
+      const index = Math.max(0, Math.min(binCount - 1, Math.floor((value - minimum) / binWidth)));
+      counts[index] += 1;
+    });
+    const peak = Math.max(1, ...counts);
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const x = value => margin.left + (Number(value) - minimum) / (maximum - minimum) * plotWidth;
+    const y = value => margin.top + (peak - Number(value)) / peak * plotHeight;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.replaceChildren();
+    for (let tick = 0; tick <= 4; tick++) {
+      const count = peak * (4 - tick) / 4;
+      const yPos = margin.top + plotHeight * tick / 4;
+      svg.appendChild(svgNode("line", { x1: margin.left, x2: width - margin.right, y1: yPos, y2: yPos, class: "grid" }));
+      svg.appendChild(svgNode("text", { x: margin.left - 8, y: yPos + 4, "text-anchor": "end", class: "axis-text" }, String(Math.round(count))));
+    }
+    for (let tick = 0; tick <= 4; tick++) {
+      const value = minimum + (maximum - minimum) * tick / 4;
+      const xPos = x(value);
+      svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: margin.top, y2: height - margin.bottom, class: "grid" }));
+      svg.appendChild(svgNode("text", { x: xPos, y: height - 18, "text-anchor": "middle", class: "axis-text" }, `${value.toFixed(value >= 10 ? 1 : 2)} ms`));
+    }
+    const slotWidth = plotWidth / binCount;
+    counts.forEach((count, index) => {
+      const start = minimum + index * binWidth;
+      const end = start + binWidth;
+      const tail = (issueThreshold != null && end > issueThreshold) || (index === binCount - 1 && upperTail > 0);
+      const edge = !tail && budget != null && end > budget;
+      const barHeight = Math.max(count ? 1 : 0, plotHeight - (y(count) - margin.top));
+      svg.appendChild(svgNode("rect", {
+        x: margin.left + index * slotWidth + 1,
+        y: height - margin.bottom - barHeight,
+        width: Math.max(1, slotWidth - 2),
+        height: barHeight,
+        class: `histogram-bar${tail ? " tail" : edge ? " edge" : ""}`
+      }));
+    });
+    if (budget != null && budget >= minimum && budget <= maximum) {
+      const budgetX = x(budget);
+      svg.appendChild(svgNode("line", { x1: budgetX, x2: budgetX, y1: margin.top, y2: height - margin.bottom, class: "budget-line" }));
+      svg.appendChild(svgNode("text", { x: Math.min(width - margin.right, budgetX + 6), y: margin.top + 13, class: "budget-label" }, `帧预算 ${budget.toFixed(2)} ms`));
+    }
+    svg.appendChild(svgNode("text", { x: margin.left, y: 17, class: "axis-text" }, `样本 ${intervals.length.toLocaleString("zh-CN")} · 柱高为帧数`));
+    const tailText = [lowerTail ? `<${minimum.toFixed(2)} ms: ${lowerTail}` : "", upperTail ? `>${maximum.toFixed(2)} ms: ${upperTail}` : ""].filter(Boolean).join(" · ");
+    if (tailText) svg.appendChild(svgNode("text", { x: width - margin.right, y: 17, "text-anchor": "end", class: "axis-text" }, `长尾汇总 ${tailText}`));
+  }
 
   function renderFlow() {
     if (testMode !== "power") return;
@@ -2545,6 +3316,7 @@ REPORT_FRAGMENT = r"""
       if (view === "timeline") renderTimeline();
       if (view === "flow") renderFlow();
       if (view === "test-items") renderTestItems();
+      if (view === "pipeline") renderFrameStability();
       if (view === "cpu") renderCpu();
       if (view === "gpu") renderGpu();
     });
@@ -2581,9 +3353,10 @@ REPORT_FRAGMENT = r"""
   let resizeTimer = null;
   window.addEventListener("resize", () => {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => selectSample(selectedIndex), 100);
+    resizeTimer = window.setTimeout(() => { selectSample(selectedIndex); renderFrameStability(); }, 100);
   });
   selectSample(testMode === "performance" ? Math.max(0, samples.length - 1) : 0);
+  renderFrameStability();
   const initialView = new URLSearchParams(window.location.search).get("view") || window.location.hash.slice(1);
   const initialTab = initialView ? Array.from(root.querySelectorAll("[data-view]")).find(tab => tab.dataset.view === initialView && window.getComputedStyle(tab).display !== "none") : null;
   if (initialTab && initialView !== "overview") initialTab.click();
@@ -2854,7 +3627,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
             f'<span>预期场景：{_escape(expected)} · 实际前台：{_escape(observed)} · 备注：{_escape(note)}。'
             "Profiler 与 BTR2 可先后启动，测试项以导入日志对齐区间为准。</span></div>"
         )
-    warnings = analysis.get("warnings", []) if isinstance(analysis, dict) else []
+    warnings = _report_warning_items(analysis, test_mode)
     warning_section = ""
     if warnings:
         warning_section = (
@@ -2876,6 +3649,54 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         if gpu_metric_name
         else ""
     )
+    gpu_page_available = _gpu_report_available(analysis, test_mode)
+    gpu_nav = (
+        '<button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="gpu">GPU</button>'
+        if gpu_page_available
+        else ""
+    )
+    gpu_section = ""
+    if gpu_page_available:
+        gpu_chart_section = (
+            '<section class="analysis-section"><div class="chart-surface" id="gpu-chart-surface">'
+            '<svg id="gpu-chart" role="img" aria-label="GPU telemetry timeline"></svg></div></section>'
+            if _gpu_live_available(analysis)
+            else ""
+        )
+        gpu_uid_section = ""
+        gpu_memory_section = ""
+        if test_mode == "power":
+            work_by_uid = gpu_analysis.get("work_by_uid", [])
+            if isinstance(work_by_uid, list) and work_by_uid:
+                gpu_uid_section = (
+                    '<section class="analysis-section"><h2>按 UID 的 GPU 工作</h2>'
+                    '<div class="data-table-wrap"><table><thead><tr><th>包名 / UID</th><th>活跃时长</th>'
+                    '<th>运行占比</th><th>来源</th></tr></thead><tbody>'
+                    + gpu_uid_rows
+                    + "</tbody></table></div></section>"
+                )
+            memory = gpu_analysis.get("memory", {})
+            memory = memory if isinstance(memory, dict) else {}
+            process_memory = memory.get("processes", [])
+            if isinstance(process_memory, list) and process_memory:
+                gpu_memory_section = (
+                    '<section class="analysis-section"><h2>GPU 进程内存快照</h2>'
+                    '<div class="data-table-wrap"><table><thead><tr><th>进程</th><th>PID</th>'
+                    '<th>内存</th><th>占 GPU 总量</th></tr></thead><tbody>'
+                    + gpu_memory_rows
+                    + "</tbody></table></div></section>"
+                )
+        gpu_section = (
+            '<section class="app-view" data-panel="gpu" hidden>'
+            '<div class="view-heading"><div><h1>GPU 证据</h1>'
+            f'<p>{_escape(profile["gpu_copy"])}</p></div></div>'
+            f'<section class="analysis-section"><div class="status-line">{gpu_status}</div></section>'
+            f'<div>{gpu_metric}</div>'
+            + gpu_chart_section
+            + gpu_uid_section
+            + gpu_memory_section
+            + "</section>"
+        )
     payload = {
         "metadata": metadata,
         "analysis": analysis,
@@ -2903,6 +3724,11 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@PERFORMANCE_CARDS@@": _performance_cards(analysis),
         "@@REFRESH_RESIDENCY_ROWS@@": _refresh_residency_rows(analysis),
         "@@PERFORMANCE_CONTEXT_ROWS@@": _performance_context_rows(analysis),
+        "@@OVERVIEW_PERFORMANCE_CONTEXT_SECTION@@": _performance_context_section(
+            analysis,
+            "性能上下文",
+        ),
+        "@@PERFORMANCE_CONTEXT_SECTIONS@@": _performance_context_sections(analysis),
         "@@PERFORMANCE_POWER_RECORDING@@": _performance_power_recording(analysis),
         "@@POWER_PRESSURE_SECTIONS@@": _power_pressure_sections(analysis),
         "@@POWER_PRESSURE_DRIVER_ROWS@@": _power_pressure_driver_rows(analysis),
@@ -2910,12 +3736,25 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@RUNTIME_SETTING_ROWS@@": _runtime_setting_rows(analysis),
         "@@MEMORY_PRESSURE_SUMMARY@@": _memory_pressure_summary(analysis),
         "@@FRAME_FLOW_ROWS@@": _frame_flow_rows(analysis),
+        "@@FRAME_FLOW_VISUAL@@": _frame_flow_visual(analysis),
+        "@@FRAME_FLOW_EVIDENCE@@": _frame_flow_evidence(analysis),
+        "@@FRAME_STABILITY_SECTION@@": _frame_stability_section(analysis),
         "@@RENDER_PIPELINE_ROWS@@": _render_pipeline_rows(analysis),
+        "@@RENDER_PIPELINE_SECTION@@": _render_pipeline_section(analysis),
         "@@SLOW_FRAME_ROWS@@": _slow_frame_rows(analysis),
+        "@@SLOW_FRAME_SECTION@@": _slow_frame_section(analysis),
         "@@RENDER_THREAD_ROWS@@": _render_thread_rows(analysis),
+        "@@PIPELINE_RENDER_THREAD_SECTION@@": _render_thread_section(analysis),
+        "@@SYSTEM_RENDER_THREAD_SECTION@@": _render_thread_section(
+            analysis,
+            "RenderThread / SurfaceFlinger / Composer",
+        ),
         "@@PERFORMANCE_PROCESS_ROWS@@": _performance_process_rows(analysis),
+        "@@PERFORMANCE_PROCESS_SECTION@@": _performance_process_section(analysis),
         "@@PERFORMANCE_INTERFERENCE_STATUS@@": _performance_interference_status(analysis),
         "@@GPU_METRIC_BUTTON@@": gpu_button,
+        "@@GPU_NAV@@": gpu_nav,
+        "@@GPU_SECTION@@": gpu_section,
         "@@SLIDER_MAX@@": str(max(0, len(samples) - 1)),
         "@@CPU_ROWS@@": cpu_rows,
         "@@PERFORMANCE_CPU_ROWS@@": _performance_cpu_rows(analysis),
@@ -2927,6 +3766,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@CPU_SELECTORS@@": selectors,
         "@@RESIDENCY_ROWS@@": residency_rows,
         "@@PROCESS_ROWS@@": _process_rows(analysis),
+        "@@CPU_PROCESS_SECTION@@": _cpu_process_section(analysis),
         "@@PRIORITY_STATUS@@": priority_status,
         "@@PRIORITY_ROWS@@": priority_rows,
         "@@SYSTEM_COPY@@": _escape(profile["system_copy"]),
@@ -2980,6 +3820,11 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         ),
         "@@SOURCE_ROWS@@": _source_rows(analysis),
         "@@CAPTURE_CONFIGURATION_ROWS@@": _capture_configuration_rows(metadata),
+        "@@ANALYSIS_COVERAGE_SECTION@@": _analysis_coverage_section(
+            analysis,
+            test_mode,
+            gpu_page_available,
+        ),
         "@@WARNING_SECTION@@": warning_section,
         "@@METADATA@@": _escape(json.dumps(metadata, ensure_ascii=False, indent=2)),
         "@@DATA@@": _json_for_script(payload),

@@ -84,14 +84,22 @@ def _run_bridge_json(
             check=False,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
-    except (OSError, TypeError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        operation = str(arguments[0]) if arguments else "operation"
+        raise RuntimeError(
+            f"iOS {operation} timed out after {timeout_s:.0f} seconds"
+        ) from exc
+    except (OSError, TypeError) as exc:
         raise RuntimeError(f"iOS sidecar could not start: {exc}") from exc
     if result.returncode != 0:
-        raise RuntimeError(
+        message = (
             result.stderr.strip()
             or result.stdout.strip()
             or f"iOS sidecar exited with code {result.returncode}"
         )
+        if message.upper().startswith("ERROR:"):
+            message = message.split(":", 1)[1].strip()
+        raise RuntimeError(message)
     for line in reversed(result.stdout.splitlines()):
         if not line.strip():
             continue
@@ -180,6 +188,7 @@ def list_ios_devices(
     raw_devices = raw_devices if isinstance(raw_devices, list) else []
     endpoints = _load_endpoints()
     devices: Dict[str, Dict[str, str]] = {}
+    unavailable_wireless: Dict[str, str] = {}
     for raw in raw_devices:
         if not isinstance(raw, dict) or not raw.get("udid"):
             continue
@@ -187,14 +196,18 @@ def list_ios_devices(
         cached = dict(endpoints.get(udid, {}))
         host = raw.get("host") or raw.get("wireless_host") or cached.get("host")
         port = raw.get("port") or raw.get("wireless_port") or cached.get("port")
-        if host and isinstance(port, (int, float)):
-            _save_endpoint(udid, host, port, raw)
         remote_ready = _endpoint_reachable(host, port)
-        state = str(raw.get("state") or "offline")
         if remote_ready:
-            state = "device"
+            _save_endpoint(udid, host, port, raw)
         reported_connection = str(raw.get("connection_type") or "usb").lower()
         usb_present = reported_connection == "usb"
+        if not usb_present and not remote_ready:
+            endpoint = f"{host}:{port}" if host and port else "no reachable endpoint"
+            unavailable_wireless[udid] = endpoint
+            continue
+        state = str(raw.get("state") or "offline") if usb_present else "device"
+        if remote_ready:
+            state = "device"
         connection_type = (
             "usb"
             if usb_present
@@ -224,19 +237,22 @@ def list_ios_devices(
         }
 
     for udid, cached in endpoints.items():
-        if udid in devices:
+        if udid in devices or udid in unavailable_wireless:
             continue
         host = cached.get("host")
         port = cached.get("port")
-        state = "device" if _endpoint_reachable(host, port) else "offline"
+        if not _endpoint_reachable(host, port):
+            endpoint = f"{host}:{port}" if host and port else "no reachable endpoint"
+            unavailable_wireless[udid] = endpoint
+            continue
         devices[udid] = {
             "serial": ios_device_id(udid),
             "udid": udid,
-            "state": state,
+            "state": "device",
             "platform": "ios",
             "connection_type": "wireless",
             "transports": "wireless",
-            "wireless_ready": str(state == "device").lower(),
+            "wireless_ready": "true",
             "model": str(cached.get("model") or cached.get("name") or "iPhone"),
             "product": str(cached.get("product_type") or "iOS"),
             "product_version": str(cached.get("product_version") or ""),
@@ -244,6 +260,19 @@ def list_ios_devices(
             "port": str(port or ""),
             "remote_paired": "true",
         }
+    if not devices and unavailable_wireless:
+        endpoints_text = ", ".join(
+            f"{ios_device_id(udid)} ({endpoint})"
+            for udid, endpoint in unavailable_wireless.items()
+        )
+        unavailable_error = (
+            "The cached iOS wireless connection is no longer reachable: "
+            f"{endpoints_text}. Connect the iPhone by USB, keep it unlocked, "
+            "and create iOS wireless pairing again."
+        )
+        bridge_error = " | ".join(
+            value for value in (bridge_error, unavailable_error) if value
+        )
     return list(devices.values()), bridge_error
 
 
@@ -286,8 +315,28 @@ def pair_ios_device(
     endpoint = endpoint if isinstance(endpoint, dict) else {}
     device = result.get("device")
     device = device if isinstance(device, dict) else {}
-    _save_endpoint(udid, endpoint.get("host"), endpoint.get("port"), device)
+    host = str(endpoint.get("host") or "").strip()
+    try:
+        port = int(endpoint.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not host or not port:
+        raise RuntimeError(
+            "RemotePairing completed, but no reachable Wi-Fi endpoint was discovered "
+            f"within {timeout_s:g} seconds. Keep the iPhone unlocked, confirm Wi-Fi "
+            "connections are enabled, place the computer and iPhone on the same LAN, "
+            "and allow Bonjour/RemotePairing through the firewall."
+        )
+    if not _endpoint_reachable(host, port, timeout_s=2.0):
+        raise RuntimeError(
+            f"RemotePairing returned {host}:{port}, but the endpoint is not reachable. "
+            "Keep the iPhone unlocked, verify both devices are on the same LAN, and "
+            "check VPN, access-point isolation, and firewall settings."
+        )
+    _save_endpoint(udid, host, port, device)
+    result["endpoint"] = {**endpoint, "host": host, "port": port}
     result["serial"] = ios_device_id(udid)
+    result["connected"] = True
     return result
 
 
