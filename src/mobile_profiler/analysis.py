@@ -259,6 +259,8 @@ def sample_intervals(
 ) -> List[Tuple[Sample, Sample, float]]:
     intervals: List[Tuple[Sample, Sample, float]] = []
     for previous, current in zip(samples, samples[1:]):
+        if bool(getattr(current, "_report_break_before", False)):
+            continue
         delta_s = current.uptime_s - previous.uptime_s
         if delta_s <= 0:
             continue
@@ -427,6 +429,8 @@ def analyze_cpu(
         total_load_weight = 0.0
         reference_max = hardware_max_mhz or (max(frequencies) if frequencies else 1.0) or 1.0
         for index, (current, following) in enumerate(zip(samples, samples[1:])):
+            if bool(getattr(following, "_report_break_before", False)):
+                continue
             delta_s = max(0.0, following.uptime_s - current.uptime_s)
             if max_gap_s is not None and delta_s > max_gap_s:
                 continue
@@ -3747,13 +3751,42 @@ def analyze_performance_contexts(
             platform = "android"
     is_android = platform == "android"
 
+    def context_screen_active(item: ContextSample) -> bool:
+        screen_state = str(item.screen_state or "").strip().lower()
+        return not screen_state or screen_state in {"awake", "on"}
+
+    harmony_display_contexts = [
+        item
+        for item in ordered
+        if item.source == "harmony_ability_render_service"
+        or bool(item.performance.get("render_service_compositor_source"))
+    ]
+    non_smartperf_refresh_contexts = [
+        item
+        for item in ordered
+        if not bool(item.performance.get("smartperf_source"))
+    ]
+    refresh_contexts = (
+        harmony_display_contexts
+        if platform == "harmony" and harmony_display_contexts
+        else non_smartperf_refresh_contexts
+        if platform == "harmony" and non_smartperf_refresh_contexts
+        else ordered
+    )
+
     refresh_values = [
         float(item.refresh_rate_hz)
-        for item in ordered
-        if isinstance(item.refresh_rate_hz, (int, float)) and item.refresh_rate_hz > 0
+        for item in refresh_contexts
+        if context_screen_active(item)
+        and isinstance(item.refresh_rate_hz, (int, float))
+        and item.refresh_rate_hz > 0
     ]
     current_refresh = refresh_values[-1] if refresh_values else None
-    if current_refresh is None and isinstance(latest.get("refresh_rate_hz"), (int, float)):
+    if (
+        current_refresh is None
+        and (latest_context is None or context_screen_active(latest_context))
+        and isinstance(latest.get("refresh_rate_hz"), (int, float))
+    ):
         current_refresh = float(latest["refresh_rate_hz"])
 
     supported_refresh_rates = set()
@@ -3871,7 +3904,8 @@ def analyze_performance_contexts(
     all_frame_rows = [
         item.performance
         for item in performance_contexts
-        if isinstance(item.performance.get("frame_sample_count"), (int, float))
+        if context_screen_active(item)
+        and isinstance(item.performance.get("frame_sample_count"), (int, float))
         and float(item.performance.get("frame_sample_count") or 0) > 0
     ]
     surface_frame_rows = [
@@ -3880,12 +3914,20 @@ def analyze_performance_contexts(
     smartperf_frame_rows = [
         item for item in all_frame_rows if bool(item.get("smartperf_source"))
     ]
-    render_service_frame_rows = [
+    legacy_render_service_frame_rows = [
         item
         for item in all_frame_rows
         if not bool(item.get("smartperf_source"))
         and not bool(item.get("surface_frame_source"))
     ]
+    explicit_render_service_frame_rows = [
+        item
+        for item in legacy_render_service_frame_rows
+        if bool(item.get("render_service_compositor_source"))
+    ]
+    render_service_frame_rows = (
+        explicit_render_service_frame_rows or legacy_render_service_frame_rows
+    )
     using_surface_frames = is_android and bool(surface_frame_rows)
     using_smartperf_frames = platform == "harmony" and bool(smartperf_frame_rows)
     frame_rows = (
@@ -4394,6 +4436,38 @@ def analyze_performance_contexts(
         else None
     )
 
+    surface_contexts = [
+        item
+        for item in performance_contexts
+        if bool(item.performance.get("surface_frame_source"))
+    ]
+    smartperf_contexts = [
+        item
+        for item in performance_contexts
+        if bool(item.performance.get("smartperf_source"))
+    ]
+    legacy_render_service_contexts = [
+        item
+        for item in performance_contexts
+        if not bool(item.performance.get("smartperf_source"))
+        and not bool(item.performance.get("surface_frame_source"))
+    ]
+    explicit_render_service_contexts = [
+        item
+        for item in legacy_render_service_contexts
+        if bool(item.performance.get("render_service_compositor_source"))
+    ]
+    render_service_contexts = (
+        explicit_render_service_contexts or legacy_render_service_contexts
+    )
+    primary_frame_contexts = (
+        surface_contexts
+        if using_surface_frames
+        else smartperf_contexts
+        if using_smartperf_frames
+        else render_service_contexts
+    )
+
     frame_rate_timeline = list(counter_timeline) if using_gfxinfo_counters else []
     if not frame_rate_timeline:
         frame_rate_timeline = [
@@ -4423,13 +4497,89 @@ def analyze_performance_contexts(
                 ),
                 "refresh_rate_hz": item.refresh_rate_hz,
             }
-            for item in performance_contexts
-            if isinstance(item.performance.get("compositor_fps"), (int, float))
-            and (
-                not using_surface_frames
-                or bool(item.performance.get("surface_frame_source"))
-            )
+            for item in primary_frame_contexts
+            if context_screen_active(item)
+            and isinstance(item.performance.get("compositor_fps"), (int, float))
         ]
+
+    def context_frame_rate_timeline(
+        source_contexts: Sequence[ContextSample],
+    ) -> List[Dict[str, object]]:
+        timeline: List[Dict[str, object]] = []
+        for item in source_contexts:
+            if not context_screen_active(item):
+                continue
+            value = item.performance.get("compositor_fps")
+            if not isinstance(value, (int, float)):
+                continue
+            average_interval = item.performance.get("frame_interval_average_ms")
+            frame_count = item.performance.get("frame_sample_count")
+            duration_s = (
+                float(frame_count) * float(average_interval) / 1000.0
+                if isinstance(frame_count, (int, float))
+                and isinstance(average_interval, (int, float))
+                and float(average_interval) > 0
+                else None
+            )
+            timeline.append(
+                {
+                    "uptime_s": item.uptime_s,
+                    "duration_s": duration_s,
+                    "frame_count": (
+                        int(frame_count) if isinstance(frame_count, (int, float)) else None
+                    ),
+                    "value": float(value),
+                    "frame_rate_fps": float(value),
+                }
+            )
+        return timeline
+
+    counter_flow_timeline = [
+        {
+            **item,
+            "value": float(item["frame_rate_fps"]),
+        }
+        for item in counter_timeline
+        if isinstance(item.get("frame_rate_fps"), (int, float))
+    ]
+    surface_flow_timeline = context_frame_rate_timeline(
+        surface_contexts if using_surface_frames else render_service_contexts
+    )
+    smartperf_flow_timeline = context_frame_rate_timeline(smartperf_contexts)
+    render_service_flow_timeline = context_frame_rate_timeline(
+        render_service_contexts
+    )
+    refresh_points_by_uptime: Dict[float, Dict[str, object]] = {}
+    for item in refresh_contexts:
+        if (
+            not isinstance(item.refresh_rate_hz, (int, float))
+            or item.refresh_rate_hz <= 0
+            or not context_screen_active(item)
+        ):
+            continue
+        refresh_points_by_uptime[round(item.uptime_s, 6)] = {
+            "uptime_s": item.uptime_s,
+            "value": float(item.refresh_rate_hz),
+            "refresh_rate_hz": float(item.refresh_rate_hz),
+            "source": item.source,
+        }
+    refresh_flow_points = [
+        refresh_points_by_uptime[key] for key in sorted(refresh_points_by_uptime)
+    ]
+    refresh_flow_timeline: List[Dict[str, object]] = []
+    for point in refresh_flow_points:
+        if (
+            not refresh_flow_timeline
+            or abs(float(point["value"]) - float(refresh_flow_timeline[-1]["value"]))
+            > 0.1
+        ):
+            refresh_flow_timeline.append(point)
+    if (
+        refresh_flow_points
+        and refresh_flow_timeline[-1]["uptime_s"]
+        != refresh_flow_points[-1]["uptime_s"]
+    ):
+        refresh_flow_timeline.append(refresh_flow_points[-1])
 
     def flow_metric(
         label: str,
@@ -4460,6 +4610,9 @@ def analyze_performance_contexts(
         sample_count: object = None,
         confidence: str = "",
         metrics: Sequence[Optional[Dict[str, object]]] = (),
+        timeline: Sequence[Dict[str, object]] = (),
+        timeline_unit: str = "FPS",
+        timeline_value_label: str = "帧率",
     ) -> Dict[str, object]:
         return {
             "key": key,
@@ -4476,6 +4629,9 @@ def analyze_performance_contexts(
             ),
             "confidence": confidence,
             "metrics": [item for item in metrics if isinstance(item, dict)],
+            "timeline": [item for item in timeline if isinstance(item, dict)],
+            "timeline_unit": timeline_unit,
+            "timeline_value_label": timeline_value_label,
         }
 
     latest_screen_state = str(
@@ -4524,6 +4680,9 @@ def analyze_performance_contexts(
                     flow_metric("1% Low", counter_one_percent_low_fps, "FPS", 1),
                     flow_metric("超时", counter_deadline_missed, "帧", 0),
                 ),
+                timeline=counter_flow_timeline,
+                timeline_unit="帧/s",
+                timeline_value_label="提交速率",
             )
         )
 
@@ -4557,6 +4716,9 @@ def analyze_performance_contexts(
                         1,
                     ),
                 ),
+                timeline=(),
+                timeline_unit="FPS",
+                timeline_value_label="无独立帧率计数",
             )
         )
 
@@ -4605,6 +4767,9 @@ def analyze_performance_contexts(
                     flow_metric("1% Low", compositor_one_percent_low_fps, "FPS", 1),
                     flow_metric("P95 间隔", compositor_frame_p95_ms, "ms", 2),
                 ),
+                timeline=surface_flow_timeline,
+                timeline_unit="FPS",
+                timeline_value_label="呈现帧率",
             )
         )
 
@@ -4632,6 +4797,9 @@ def analyze_performance_contexts(
                 metrics=(
                     flow_metric("显示/应用倍率", display_to_frame_ratio, "×", 2),
                 ),
+                timeline=refresh_flow_timeline,
+                timeline_unit="Hz",
+                timeline_value_label="显示刷新率",
             )
         )
     elif platform == "harmony":
@@ -4665,6 +4833,9 @@ def analyze_performance_contexts(
                 metrics=(
                     flow_metric("P95 抖动", smartperf_p95, "ms", 2),
                 ),
+                timeline=smartperf_flow_timeline,
+                timeline_unit="FPS",
+                timeline_value_label="应用 FPS",
             )
         )
         frame_flow_stages.append(
@@ -4684,6 +4855,9 @@ def analyze_performance_contexts(
                 ),
                 sample_count=smartperf_sample_count,
                 confidence="high" if isinstance(smartperf_p95, (int, float)) else "low",
+                timeline=(),
+                timeline_unit="FPS",
+                timeline_value_label="无独立帧率计数",
             )
         )
         if isinstance(render_service_compositor_fps, (int, float)):
@@ -4712,6 +4886,9 @@ def analyze_performance_contexts(
                     for item in render_service_frame_rows
                 ),
                 confidence="medium" if composer_status != "unavailable" else "low",
+                timeline=render_service_flow_timeline,
+                timeline_unit="FPS",
+                timeline_value_label="合成器 FPS",
             )
         )
         frame_flow_stages.append(
@@ -4733,6 +4910,9 @@ def analyze_performance_contexts(
                 metrics=(
                     flow_metric("显示/应用倍率", display_to_frame_ratio, "×", 2),
                 ),
+                timeline=refresh_flow_timeline,
+                timeline_unit="Hz",
+                timeline_value_label="显示刷新率",
             )
         )
 
@@ -4753,10 +4933,15 @@ def analyze_performance_contexts(
         "invalid_count": sum(
             1 for item in frame_flow_stages if item.get("status") == "invalid"
         ),
+        "timeline_stage_count": sum(
+            1
+            for item in frame_flow_stages
+            if isinstance(item.get("timeline"), list) and item.get("timeline")
+        ),
         "stages": frame_flow_stages,
         "note": (
             "不同阶段的数值语义不同：应用提交速率、合成器呈现 FPS 与屏幕刷新率不能直接互换。"
-            "主数据只选择与当前目标应用绑定且能连续产生有效增量的来源。"
+            "时间轴按采样窗口展示实际可读节点；没有独立计数的内部阶段不会用延迟或刷新率冒充 FPS。"
         ),
     }
 
@@ -4806,6 +4991,7 @@ def analyze_performance_contexts(
         "one_percent_low_source": one_percent_low_source,
         "one_percent_low_confidence": one_percent_low_confidence,
         "frame_rate_timeline": frame_rate_timeline,
+        "refresh_rate_timeline": refresh_flow_timeline,
         "frame_flow": frame_flow,
         "gfxinfo_submission_fps": gfxinfo_submission_fps,
         "surface_present_fps": surface_present_fps,

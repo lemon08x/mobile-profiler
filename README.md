@@ -406,6 +406,11 @@ Useful recording options:
   overflowing SurfaceFlinger's short timestamp ring.
 - `--capture-preset auto|power-standard|performance-standard|low-overhead|harmony-smartperf`:
   select a collector preset; SmartPerf is available only for HarmonyOS Performance mode.
+  The standard presets keep time-series data with direct report consumers enabled. Whole-system
+  process/thread scans, scheduler snapshots, delivered-touch/hitch counters, target-process
+  snapshots, and BatteryStats model attribution are opt-in diagnostics by default.
+  Power Standard keeps CPU/GPU, foreground/display, thermal, and before/after settings evidence;
+  Performance Standard adds FPS and detailed frame timing while leaving system diagnostics off.
 - `--enable-feature NAME` / `--disable-feature NAME`: repeatable per-feature overrides.
 - `--harmony-high-performance`: temporarily apply HarmonyOS
   `power-shell setmode 602`; valid only in HarmonyOS Performance mode.

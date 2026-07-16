@@ -23,6 +23,7 @@ CAPTURE_FEATURES: Dict[str, Dict[str, str]] = {
         "label": "内存频率",
         "description": "读取 DDR/DRAM/DMC/MIF 频率。",
         "overhead": "low",
+        "default_off_reason": "量产设备常不暴露可读内存频率节点，仅在 Probe 确认可用时按需开启",
     },
     "foreground_window": {
         "label": "前台应用与窗口",
@@ -43,26 +44,31 @@ CAPTURE_FEATURES: Dict[str, Dict[str, str]] = {
         "label": "Harmony hitch 统计",
         "description": "读取前台 RenderService 窗口的 hitch 累计计数。",
         "overhead": "medium",
+        "default_off_reason": "当前报告不使用累计 hitch 形成独立结论，仅在专项排查时开启",
     },
     "touch_events": {
         "label": "触控事件",
         "description": "记录系统已分发的触控事件；不推断面板硬件采样率。",
         "overhead": "medium",
+        "default_off_reason": "只能统计系统已分发事件，不能得到硬件触控采样率或稳定性能结论",
     },
     "target_process": {
         "label": "目标应用资源",
-        "description": "记录目标游戏进程的 CPU 与内存资源。",
+        "description": "在支持的后端记录目标游戏进程的 CPU 与内存快照。",
         "overhead": "low",
+        "default_off_reason": "当前报告没有目标进程 CPU/内存时间序列或独立结论，专项排查时开启",
     },
     "process_snapshots": {
         "label": "全系统进程快照",
         "description": "周期扫描全系统进程，用于发现后台竞争与三方负载。",
         "overhead": "high",
+        "default_off_reason": "全系统轮询开销较高，结果主要是时间相关性上下文，默认关闭",
     },
     "hot_threads": {
         "label": "热点线程快照",
         "description": "周期扫描热点线程与渲染/合成线程。",
         "overhead": "high",
+        "default_off_reason": "仅在已经出现卡顿后用于线程定位，默认关闭以降低观察者开销",
     },
     "thermal": {
         "label": "温度与热限制",
@@ -73,16 +79,19 @@ CAPTURE_FEATURES: Dict[str, Dict[str, str]] = {
         "label": "调度与资源分配",
         "description": "记录 cpuset、Governor、进程状态、ADPF 或 PowerManager 上下文。",
         "overhead": "high",
+        "default_off_reason": "当前只能提供调度状态上下文，不能独立判断帧率或功耗因果，默认关闭",
     },
     "runtime_settings": {
         "label": "系统设置快照",
         "description": "在测试前后读取亮度、刷新率、网络、定位等设置。",
         "overhead": "medium",
+        "default_off_reason": "仅用于测试前后条件核对；性能模式默认关闭",
     },
     "power_attribution": {
         "label": "功耗来源归因",
         "description": "采集 BatteryStats、UID、Wakelock 与组件功耗模型。",
         "overhead": "high",
+        "default_off_reason": "BatteryStats 与组件模型不是物理电源轨，且会重置并执行重型收尾命令，默认关闭",
     },
 }
 
@@ -99,6 +108,7 @@ CAPTURE_PRESET_LABELS = {
 PLATFORM_UNAVAILABLE_FEATURES: Dict[str, Dict[str, str]] = {
     "android": {
         "harmony_hitches": "Android 使用 gfxinfo/SurfaceFlinger，不读取 Harmony RenderService hitch",
+        "touch_events": "当前 Android 会话采集器不产生可分析的触控事件时间序列",
     },
     "harmony": {
         "hot_threads": "当前 HarmonyOS 量产接口不启用全系统线程扫描",
@@ -112,10 +122,21 @@ PLATFORM_UNAVAILABLE_FEATURES: Dict[str, Dict[str, str]] = {
         "frame_details": "当前 iOS sidecar 不提供 Core Animation 详细帧时间戳",
         "harmony_hitches": "Harmony RenderService hitch 不适用于 iOS",
         "touch_events": "当前 iOS sidecar 不采集系统触控事件",
+        "target_process": "当前 iOS sidecar 不提供由该开关单独控制的目标进程时间序列",
         "hot_threads": "当前 iOS sidecar 提供进程快照，不提供全系统线程扫描",
         "scheduler": "iOS 量产接口不公开 Android cpuset/ADPF 调度状态",
         "runtime_settings": "当前 iOS sidecar 不采集 Android settings 类型快照",
         "power_attribution": "iOS DVT powerScore 是相对诊断分数，不作为物理功耗来源归因",
+    },
+}
+
+
+PLATFORM_REQUIRED_FEATURES: Dict[str, Dict[str, str]] = {
+    "ios": {
+        "cpu_usage": "iOS DVT 基础流固定包含 CPU 使用率",
+        "gpu_metrics": "iOS DVT 基础流固定包含 Graphics 利用率",
+        "foreground_window": "iOS application-state 基础流固定包含前台应用状态",
+        "thermal": "iOS 电池诊断基础流固定包含电池温度",
     },
 }
 
@@ -131,13 +152,8 @@ _POWER_STANDARD = _feature_map(
         "cpu_frequency",
         "gpu_metrics",
         "foreground_window",
-        "target_process",
-        "process_snapshots",
-        "hot_threads",
         "thermal",
-        "scheduler",
         "runtime_settings",
-        "power_attribution",
     }
 )
 
@@ -149,13 +165,7 @@ _PERFORMANCE_STANDARD = _feature_map(
         "foreground_window",
         "frame_rate",
         "frame_details",
-        "harmony_hitches",
-        "touch_events",
-        "target_process",
-        "process_snapshots",
-        "hot_threads",
         "thermal",
-        "scheduler",
     }
 )
 
@@ -191,7 +201,7 @@ def _preset_features(preset: str, test_mode: str) -> Dict[str, bool]:
     if preset == "low-overhead":
         enabled = {"cpu_usage", "foreground_window"}
         if test_mode == "performance":
-            enabled.update({"frame_rate", "target_process", "thermal"})
+            enabled.update({"frame_rate", "thermal"})
         return _feature_map(enabled)
     raise ValueError(f"unknown capture preset: {preset}")
 
@@ -224,14 +234,15 @@ def resolve_capture_configuration(
         raise ValueError("Harmony SmartPerf preset is available only in performance mode")
 
     features = _preset_features(effective_preset, mode)
-    reasons: Dict[str, str] = {
-        name: (
+    reasons: Dict[str, str] = {}
+    for name, enabled in features.items():
+        definition = CAPTURE_FEATURES[name]
+        reasons[name] = (
             f"由“{CAPTURE_PRESET_LABELS[effective_preset]}”预设启用"
             if enabled
-            else f"未包含在“{CAPTURE_PRESET_LABELS[effective_preset]}”预设中"
+            else definition.get("default_off_reason")
+            or f"未包含在“{CAPTURE_PRESET_LABELS[effective_preset]}”预设中"
         )
-        for name, enabled in features.items()
-    }
 
     for name in enable_features:
         if name not in CAPTURE_FEATURES:
@@ -276,6 +287,19 @@ def resolve_capture_configuration(
         if features[name]:
             features[name] = False
         reasons[name] = reason
+    if platform_name == "harmony" and effective_preset != "harmony-smartperf":
+        harmony_native_unavailable = {
+            "gpu_metrics": "HarmonyOS 原生 HDC 后端当前没有会话内 GPU 频率或负载时间序列",
+            "memory_frequency": "HarmonyOS 原生 HDC 后端当前没有会话内 DDR 频率时间序列",
+            "frame_details": "HarmonyOS 原生 HDC 后端当前不产生可分析的详细帧阶段时间戳",
+            "target_process": "HarmonyOS 原生 HDC 后端当前不产生目标进程 CPU/内存时间序列",
+        }
+        for name, reason in harmony_native_unavailable.items():
+            features[name] = False
+            reasons[name] = reason
+    for name, reason in PLATFORM_REQUIRED_FEATURES.get(platform_name, {}).items():
+        features[name] = True
+        reasons[name] = reason
 
     backend = (
         "harmony_smartperf"
@@ -312,7 +336,7 @@ def capture_features_from_metadata(metadata: Mapping[str, object]) -> Dict[str, 
         values = configuration.get("features", {})
         if isinstance(values, Mapping) and any(name in values for name in CAPTURE_FEATURES):
             return {
-                name: bool(values.get(name, False))
+                name: bool(values.get(name, True))
                 for name in CAPTURE_FEATURES
             }
     return {name: True for name in CAPTURE_FEATURES}

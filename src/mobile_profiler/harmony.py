@@ -567,6 +567,10 @@ def parse_harmony_compositor_fps(
     missed = [value for value in intervals_ms if value > budget_ms * 1.5]
     severe = [value for value in intervals_ms if value > budget_ms * 2.5]
     frozen = [value for value in intervals_ms if value > budget_ms * 4.5]
+    slowest_count = max(1, math.ceil(len(intervals_ms) * 0.01))
+    slowest_average_ms = statistics.fmean(
+        sorted(intervals_ms, reverse=True)[:slowest_count]
+    )
     missed_slots = sum(
         max(0, int(round(value / budget_ms)) - 1)
         for value in intervals_ms
@@ -578,6 +582,9 @@ def parse_harmony_compositor_fps(
         "frame_interval_average_ms": average_ms,
         "frame_interval_p95_ms": _percentile_value(intervals_ms, 0.95),
         "frame_interval_maximum_ms": max(intervals_ms),
+        "one_percent_low_fps": (
+            1000.0 / slowest_average_ms if slowest_average_ms > 0 else None
+        ),
         "frame_sample_count": len(intervals_ms),
         "missed_vsync_interval_count": len(missed),
         "severe_frame_interval_count": len(severe),
@@ -1784,6 +1791,7 @@ def build_harmony_smartperf_context(
     *,
     foreground_activity: Optional[str] = None,
     base_performance: Optional[Dict[str, object]] = None,
+    screen_state: Optional[str] = None,
     frame_rate_enabled: bool = True,
     frame_details_enabled: bool = True,
 ) -> ContextSample:
@@ -1846,11 +1854,16 @@ def build_harmony_smartperf_context(
             "smartperf_source": "SP_daemon",
         }
     )
+    resolved_screen_state = str(
+        screen_state
+        or performance.get("display_power_state")
+        or "awake"
+    ).strip().lower()
     return ContextSample(
         uptime_s=sample.uptime_s,
         foreground_package=target_package,
         foreground_activity=foreground_activity,
-        screen_state="awake",
+        screen_state=resolved_screen_state,
         brightness_raw=(
             float(performance["brightness_raw"])
             if isinstance(performance.get("brightness_raw"), (int, float))
@@ -1989,6 +2002,7 @@ def collect_harmony_smartperf_session(
     next_process = started
     next_scheduler = started
     next_extra_context = started
+    latest_screen_state: Optional[str] = None
     warned: set[str] = set()
 
     def warn_once(key: str, message: str) -> None:
@@ -2061,6 +2075,7 @@ def collect_harmony_smartperf_session(
 
     def accept_record(record: Dict[str, str]) -> None:
         nonlocal last_checkpoint, next_process, next_scheduler, next_extra_context
+        nonlocal latest_screen_state
         sample = build_harmony_smartperf_sample(
             record,
             result.sample_count,
@@ -2091,6 +2106,7 @@ def collect_harmony_smartperf_session(
                 target_package,
                 foreground_activity=foreground_activity,
                 base_performance=base_performance,
+                screen_state=latest_screen_state,
                 frame_rate_enabled=bool(features.get("frame_rate")),
                 frame_details_enabled=bool(features.get("frame_details")),
             )
@@ -2127,7 +2143,11 @@ def collect_harmony_smartperf_session(
             next_scheduler = _advance_due(next_scheduler, max(5.0, scheduler_interval_s), now)
 
         if (
-            (features.get("harmony_hitches") or features.get("touch_events"))
+            (
+                features.get("harmony_hitches")
+                or features.get("touch_events")
+                or features.get("frame_rate")
+            )
             and now >= next_extra_context
         ):
             context, error = collect_harmony_context(
@@ -2136,12 +2156,14 @@ def collect_harmony_smartperf_session(
                 include_power_state=False,
                 include_foreground=False,
                 include_window=bool(features.get("harmony_hitches")),
-                include_display=False,
-                include_frame_rate=False,
+                include_display=bool(features.get("frame_rate")),
+                include_frame_rate=bool(features.get("frame_rate")),
                 include_hitches=bool(features.get("harmony_hitches")),
                 include_touch=bool(features.get("touch_events")),
             )
             if context is not None:
+                if context.screen_state:
+                    latest_screen_state = context.screen_state
                 journal.append_context(context)
                 result.context_count += 1
             elif error:

@@ -4,7 +4,7 @@ import copy
 import html
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .models import APP_NAME
 
@@ -149,6 +149,7 @@ COMPONENT_LABELS = {
 }
 CLUSTER_LABELS = {
     "Little": "小核",
+    "Middle": "中核",
     "Big": "大核",
     "Performance": "性能核",
     "Prime": "超大核",
@@ -601,7 +602,7 @@ def _power_pressure_sections(analysis: Dict[str, object]) -> str:
             + _power_pressure_task_rows(analysis)
             + "</tbody></table></div></section>"
         )
-    if settings.get("rows"):
+    if int(settings.get("changed_count") or 0) > 0:
         sections.append(
             '<section class="analysis-section"><h2>系统设置变化</h2>'
             '<div class="data-table-wrap"><table><thead><tr><th>设置</th><th>开始</th>'
@@ -696,6 +697,21 @@ def _frame_flow_visual(analysis: Dict[str, object]) -> str:
             + "</article>"
         )
     return '<div class="frame-flow-visual">' + '<span class="frame-flow-arrow" aria-hidden="true">→</span>'.join(cards) + "</div>"
+
+
+def _frame_flow_history_section(analysis: Dict[str, object]) -> str:
+    stages = _frame_flow_stages(analysis)
+    if not stages:
+        return ""
+    return (
+        '<div class="frame-flow-history-report">'
+        '<div class="chart-toolbar"><div><h2>完整链路节点帧率趋势</h2>'
+        '<p class="section-copy">在同一时间轴上分别展示应用提交、合成器呈现与显示刷新率。'
+        '平台未公开独立帧计数的节点保留为空轨，不使用阶段延迟冒充 FPS。</p></div></div>'
+        '<div class="chart-surface frame-flow-history-surface">'
+        '<svg id="frame-flow-history-chart" role="img" aria-label="完整渲染链路节点帧率与刷新率趋势"></svg>'
+        '</div></div>'
+    )
 
 
 def _frame_flow_evidence(analysis: Dict[str, object]) -> str:
@@ -2120,6 +2136,162 @@ def _finding_rows(analysis: Dict[str, object]) -> str:
     )
 
 
+def _test_item_conclusion_section(
+    analysis: Dict[str, object],
+    test_mode: str,
+) -> str:
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    rows = [
+        item
+        for item in test_items.get("rows", [])
+        if isinstance(item, dict)
+    ] if isinstance(test_items.get("rows"), list) else []
+    spans = [
+        item
+        for item in test_items.get("spans", [])
+        if isinstance(item, dict)
+    ] if isinstance(test_items.get("spans"), list) else []
+    if not rows and not spans:
+        return ""
+    if test_mode == "performance":
+        matrix = (
+            '<div class="data-table-wrap"><table><thead><tr>'
+            + _performance_test_item_headers(analysis)
+            + '</tr></thead><tbody>'
+            + _performance_test_item_rows(analysis)
+            + '</tbody></table></div>'
+            if rows
+            else ""
+        )
+        details = (
+            '<div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th>'
+            '<th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th>'
+            '<th>异常帧</th><th>整机功耗</th><th>置信度</th></tr></thead><tbody>'
+            + _performance_test_item_span_rows(analysis)
+            + '</tbody></table></div>'
+            if spans
+            else ""
+        )
+    else:
+        matrix = (
+            '<div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th>'
+            '<th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th>'
+            '<th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th>'
+            '<th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th>'
+            '<th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th>'
+            '<th>系统干扰</th><th>置信度</th></tr></thead><tbody>'
+            + _test_item_rows(analysis)
+            + '</tbody></table></div>'
+            if rows
+            else ""
+        )
+        details = (
+            '<div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th>'
+            '<th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th>'
+            '<th>系统干扰</th><th>前台应用</th></tr></thead><tbody>'
+            + _test_item_span_rows(analysis)
+            + '</tbody></table></div>'
+            if spans
+            else ""
+        )
+    return (
+        '<section class="analysis-section"><h2>按测试项形成的结论证据</h2>'
+        '<details class="evidence-details"><summary>查看测试项聚合与单次执行明细</summary>'
+        + matrix
+        + details
+        + '</details></section>'
+    )
+
+
+def _analysis_conclusion_sections(
+    analysis: Dict[str, object],
+    test_mode: str,
+) -> str:
+    findings = analysis.get("findings", [])
+    findings = [item for item in findings if isinstance(item, dict)] if isinstance(findings, list) else []
+    if findings:
+        sections = [
+            '<section class="analysis-section"><h2>结论摘要</h2>'
+            '<div class="finding-list">' + _finding_rows(analysis) + '</div></section>'
+        ]
+    else:
+        sections = [
+            '<section class="analysis-section"><div class="priority-callout">'
+            '<span class="status-dot good"></span><div>'
+            '<strong>本次没有形成可独立陈述的异常结论</strong>'
+            '<span>分析模块只保留证据充分的判断；请以原始数据页中的完整时间序列为准。</span>'
+            '</div></div></section>'
+        ]
+
+    if test_mode == "performance":
+        render = analysis.get("render_performance", {})
+        render = render if isinstance(render, dict) else {}
+        performance = analysis.get("performance", {})
+        performance = performance if isinstance(performance, dict) else {}
+        has_frame_evidence = bool(render.get("bottlenecks")) or bool(
+            _frame_interval_values(analysis)
+        ) or (
+            isinstance(performance.get("frame_sample_count"), (int, float))
+            and float(performance.get("frame_sample_count") or 0.0) > 0
+        )
+        if has_frame_evidence:
+            sections.append(
+                '<section class="analysis-section"><h2>帧表现判断</h2>'
+                + _performance_interference_status(analysis)
+                + '</section>'
+            )
+        for section in (
+            _frame_stability_section(analysis),
+            _render_pipeline_section(analysis),
+            _slow_frame_section(analysis),
+        ):
+            if section:
+                sections.append(section)
+        has_issue = bool(render.get("bottlenecks")) or (
+            isinstance(performance.get("frame_issue_pct"), (int, float))
+            and float(performance.get("frame_issue_pct") or 0.0) >= 2.0
+        )
+        if has_issue:
+            for section in (
+                _render_thread_section(analysis),
+                _performance_process_section(analysis),
+            ):
+                if section:
+                    sections.append(section)
+    else:
+        brightness = _brightness_throttling_section(analysis)
+        if brightness:
+            sections.append(brightness)
+        pressure = analysis.get("power_pressure", {})
+        pressure = pressure if isinstance(pressure, dict) else {}
+        memory = analysis.get("memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        settings = analysis.get("runtime_settings", {})
+        settings = settings if isinstance(settings, dict) else {}
+        if (
+            memory.get("available")
+            or pressure.get("drivers")
+            or pressure.get("tasks")
+            or int(settings.get("changed_count") or 0) > 0
+        ):
+            sections.append(_power_pressure_sections(analysis))
+        components = analysis.get("components", [])
+        components = [item for item in components if isinstance(item, dict)] if isinstance(components, list) else []
+        if components:
+            sections.append(
+                '<section class="analysis-section"><h2>功耗贡献模型证据</h2>'
+                '<details class="evidence-details"><summary>查看不可直接相加的模型贡献项</summary>'
+                '<div class="contributor-list">' + _component_rows(analysis) + '</div>'
+                '</details></section>'
+            )
+
+    test_items = _test_item_conclusion_section(analysis, test_mode)
+    if test_items:
+        sections.append(test_items)
+    return "".join(sections)
+
+
 def _source_rows(analysis: Dict[str, object]) -> str:
     render = analysis.get("render_performance", {})
     render = render if isinstance(render, dict) else {}
@@ -2350,22 +2522,43 @@ def _lttb_indices(samples: List[Dict[str, object]], threshold: int) -> List[int]
 def _report_bundle(bundle: Dict[str, object], threshold: int = 1200) -> Dict[str, object]:
     prepared = copy.deepcopy(bundle)
     samples = prepared.get("samples", [])
-    if not isinstance(samples, list) or len(samples) <= threshold:
-        return prepared
-    indices = _lttb_indices(samples, threshold)
-    prepared["samples"] = [samples[index] for index in indices]
+    indices: Optional[List[int]] = None
+    if isinstance(samples, list) and len(samples) > threshold:
+        indices = _lttb_indices(samples, threshold)
+        prepared["samples"] = [samples[index] for index in indices]
     analysis = prepared.get("analysis", {})
     if isinstance(analysis, dict):
         cpu = analysis.get("cpu", {})
-        if isinstance(cpu, dict):
+        if isinstance(cpu, dict) and indices is not None:
             timeline = cpu.get("timeline", [])
             if isinstance(timeline, list) and len(timeline) == len(samples):
                 cpu["timeline"] = [timeline[index] for index in indices]
-        analysis["report_payload"] = {
-            "raw_sample_count": len(samples),
-            "display_sample_count": len(indices),
-            "downsample_method": "largest-triangle-three-buckets on measured power",
-        }
+        performance = analysis.get("performance", {})
+        if isinstance(performance, dict):
+            frame_flow = performance.get("frame_flow", {})
+            if isinstance(frame_flow, dict):
+                stages = frame_flow.get("stages", [])
+                if isinstance(stages, list):
+                    for stage in stages:
+                        if not isinstance(stage, dict):
+                            continue
+                        timeline = stage.get("timeline", [])
+                        if not isinstance(timeline, list) or len(timeline) <= threshold:
+                            continue
+                        step = (len(timeline) - 1) / float(threshold - 1)
+                        selected = sorted(
+                            {
+                                min(len(timeline) - 1, round(index * step))
+                                for index in range(threshold)
+                            }
+                        )
+                        stage["timeline"] = [timeline[index] for index in selected]
+        if indices is not None:
+            analysis["report_payload"] = {
+                "raw_sample_count": len(samples),
+                "display_sample_count": len(indices),
+                "downsample_method": "largest-triangle-three-buckets on measured power",
+            }
     return prepared
 
 
@@ -2487,6 +2680,43 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .metric-value { margin-top: 12px; font-size: 25px; font-weight: 500; white-space: nowrap; }
   #mobile-profiler .metric-value small { color: var(--app-muted); font-size: 12px; font-weight: 400; }
   #mobile-profiler .metric-context { margin-top: 5px; overflow-wrap: anywhere; }
+  #mobile-profiler .raw-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  #mobile-profiler .raw-metric-card { min-width: 0; overflow: hidden; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface); }
+  #mobile-profiler .raw-metric-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 11px 12px 7px; }
+  #mobile-profiler .raw-metric-heading > div { min-width: 0; display: grid; gap: 3px; }
+  #mobile-profiler .raw-metric-heading > div:last-child { flex: 0 0 auto; text-align: right; }
+  #mobile-profiler .raw-metric-heading strong { font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+  #mobile-profiler .raw-metric-heading span { color: var(--app-muted); font-size: 10px; overflow-wrap: anywhere; }
+  #mobile-profiler .raw-metric-heading .raw-current-value { color: var(--app-text); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #mobile-profiler .raw-metric-card svg { display: block; width: 100%; min-height: 220px; }
+  #mobile-profiler .raw-grid-line { stroke: var(--app-border); stroke-width: 1; }
+  #mobile-profiler .raw-axis-text { fill: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .raw-series-line { fill: none; stroke-width: 1.8; }
+  #mobile-profiler .raw-selected-line { stroke: var(--app-muted); stroke-width: 1; }
+  #mobile-profiler .raw-selected-dot { fill: var(--app-bg); stroke-width: 2; }
+  #mobile-profiler .raw-excluded-window { fill: var(--series-3); opacity: .08; }
+  #mobile-profiler .raw-delete-window { fill: var(--series-4); opacity: .16; }
+  #mobile-profiler .raw-empty { padding: 42px 16px; border: 1px solid var(--app-border); color: var(--app-muted); text-align: center; }
+  #mobile-profiler .raw-sample-surface .sample-control { border-top: 0; }
+  #mobile-profiler .report-range-editor { display: grid; gap: 10px; padding: 12px; border-top: 1px solid var(--app-border); }
+  #mobile-profiler .report-range-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  #mobile-profiler .report-range-field { display: grid; gap: 6px; color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .report-range-field > span { display: flex; justify-content: space-between; gap: 10px; }
+  #mobile-profiler .report-range-field strong { color: var(--app-text); font-weight: 500; font-variant-numeric: tabular-nums; }
+  #mobile-profiler .report-range-field input { width: 100%; accent-color: var(--series-4); }
+  #mobile-profiler .report-range-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  #mobile-profiler .report-range-status { color: var(--app-muted); font-size: 11px; }
+  #mobile-profiler .report-range-status[data-state="error"] { color: var(--series-4); }
+  #mobile-profiler .delete-report-range {
+    border: 1px solid color-mix(in srgb, var(--series-4) 58%, var(--app-border));
+    border-radius: 5px;
+    padding: 7px 11px;
+    background: color-mix(in srgb, var(--series-4) 9%, transparent);
+    color: var(--series-4);
+    cursor: pointer;
+  }
+  #mobile-profiler .delete-report-range:hover:not(:disabled) { background: color-mix(in srgb, var(--series-4) 15%, transparent); }
+  #mobile-profiler .delete-report-range:disabled { cursor: not-allowed; opacity: .45; }
   #mobile-profiler .source-tag {
     display: inline-flex;
     align-items: center;
@@ -2529,6 +2759,16 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .frame-stage-metrics small { color: var(--app-muted); font-size: 10px; }
   #mobile-profiler .frame-stage-metrics strong { font-size: 11px; font-weight: 500; }
   #mobile-profiler .frame-flow-arrow { display: grid; place-items: center; flex: 0 0 18px; color: var(--app-muted); font-size: 18px; }
+  #mobile-profiler .frame-flow-history-report { margin-top: 16px; }
+  #mobile-profiler .frame-flow-history-surface svg { min-height: 340px; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-label { fill: var(--app-text); font-size: 11px; font-weight: 550; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-value,
+  #mobile-profiler .frame-flow-history-surface .flow-lane-empty { fill: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-empty { font-size: 9px; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-line { fill: none; stroke-width: 2; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-line.reference { stroke-dasharray: 6 4; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-line.invalid { opacity: .58; stroke-dasharray: 3 4; }
+  #mobile-profiler .frame-flow-history-surface .flow-lane-dot { stroke: var(--app-bg); stroke-width: 1.5; }
   #mobile-profiler .stability-metrics { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 8px; margin-bottom: 10px; }
   #mobile-profiler .stability-metrics > div { display: grid; gap: 5px; padding: 10px 12px; border: 1px solid var(--app-border); background: var(--app-surface); }
   #mobile-profiler .stability-metrics span { color: var(--app-muted); font-size: 11px; }
@@ -2661,12 +2901,14 @@ REPORT_FRAGMENT = r"""
     #mobile-profiler .nav-tab[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--series-1); }
     #mobile-profiler .app-content { padding: 16px 12px; }
     #mobile-profiler .metric-grid { grid-template-columns: 1fr 1fr; }
+    #mobile-profiler .report-range-fields { grid-template-columns: 1fr; }
     #mobile-profiler .residency-row { grid-template-columns: 1fr; }
     #mobile-profiler .residency-values { grid-column: 1; }
     #mobile-profiler .contributor-row { grid-template-columns: minmax(0, 1fr) 65px; }
     #mobile-profiler .contributor-row .bar-track { grid-column: 1 / -1; grid-row: 2; }
     #mobile-profiler .correlation-scale { margin-left: 0; }
     #mobile-profiler .correlation-row { grid-template-columns: minmax(100px, 145px) minmax(130px, 1fr) 46px; gap: 8px; }
+    #mobile-profiler .raw-metric-grid { grid-template-columns: 1fr; }
   }
   @media (max-width: 440px) {
     #mobile-profiler .metric-grid { grid-template-columns: 1fr; }
@@ -2695,150 +2937,37 @@ REPORT_FRAGMENT = r"""
     </div>
   </header>
   <div class="app-workspace">
-    <nav class="side-tabs" role="tablist" aria-label="报告页面">
-      <button type="button" class="nav-tab" role="tab" aria-selected="true" data-view="overview">概览</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="timeline">时间线</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="flow" data-report-only="power">测试流程</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="test-items">测试项分析</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="pressure" data-report-only="power">功耗压力</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="pipeline" data-report-only="performance">渲染链路</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="applications" data-report-only="power">应用</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="cpu">CPU</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="system" data-report-only="performance">性能上下文</button>
-      @@GPU_NAV@@
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="attribution" data-report-only="power">功耗归因</button>
-      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="data">数据质量</button>
+    <nav class="side-tabs" role="tablist" aria-label="报告主要部分">
+      <button type="button" class="nav-tab" role="tab" aria-selected="true" data-view="raw">原始数据</button>
+      <button type="button" class="nav-tab" role="tab" aria-selected="false" data-view="analysis">分析结论</button>
     </nav>
     <main class="app-content">
-      <section class="app-view" data-panel="overview">
-        <div class="view-heading"><div><h1>@@OVERVIEW_TITLE@@</h1><p>@@GENERATED@@</p></div><span class="source-tag measured">@@OVERVIEW_TAG@@</span></div>
-        <div class="metric-grid" data-report-only="power">@@SUMMARY_CARDS@@</div>
-        <div class="metric-grid" data-report-only="performance">@@PERFORMANCE_CARDS@@</div>
-        <div data-report-only="performance">@@PERFORMANCE_POWER_RECORDING@@</div>
-        <section class="analysis-section">
-          <div class="chart-toolbar">
-            <div><h2>实测遥测</h2><p class="section-copy">@@OVERVIEW_COPY@@</p></div>
-            <div class="segment-control" aria-label="概览指标">
-              <button type="button" class="segment-button active" data-overview-metric="power_mw" data-report-only="power">功率</button>
-              <button type="button" class="segment-button" data-overview-metric="current_ma" data-report-only="power">电流</button>
-              <button type="button" class="segment-button" data-overview-metric="cpu_pct">CPU</button>
-              <button type="button" class="segment-button" data-overview-metric="frame_rate_fps" data-report-only="performance">FPS</button>
-              <button type="button" class="segment-button" data-overview-metric="frame_time_ms" data-report-only="performance">帧耗时</button>
-              <button type="button" class="segment-button" data-overview-metric="voltage_mv" data-report-only="power">电压</button>
-              @@GPU_METRIC_BUTTON@@
-            </div>
+      <section class="app-view" data-panel="raw">
+        <div class="view-heading"><div><h1>原始数据随时间变化</h1><p>只展示本次已启用并实际采到有效样本的指标；所有图表共享同一时间轴并同时呈现。</p></div><span class="source-tag measured" id="raw-metric-count">等待数据</span></div>
+        <div class="chart-surface raw-sample-surface">
+          <div class="sample-control">
+            <input id="overview-slider" type="range" min="0" max="@@SLIDER_MAX@@" value="0" aria-label="选择所有原始图表的同一时间点">
+            <div class="sample-detail" id="sample-detail" aria-live="polite"></div>
           </div>
-          <div class="chart-surface">
-            <svg id="overview-chart" role="img" aria-label="Selected power telemetry timeline"></svg>
-            <div class="sample-control">
-              <input id="overview-slider" type="range" min="0" max="@@SLIDER_MAX@@" value="0" aria-label="Selected telemetry sample">
-              <div class="sample-detail" id="sample-detail" aria-live="polite"></div>
+          <div class="report-range-editor" aria-label="删除报告时间段">
+            <div class="report-range-fields">
+              <label class="report-range-field" for="report-range-start"><span>删除起点 <strong id="report-range-start-value">--</strong></span><input id="report-range-start" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
+              <label class="report-range-field" for="report-range-end"><span>删除终点 <strong id="report-range-end-value">--</strong></span><input id="report-range-end" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
             </div>
+            <div class="report-range-actions"><span class="report-range-status" id="report-range-status" aria-live="polite">拖动起点和终点选择要删除的时间段。</span><button class="delete-report-range" id="delete-report-range" type="button" disabled>删除选中时间段记录</button></div>
           </div>
-        </section>
-        @@BRIGHTNESS_THROTTLING_SECTION@@
-        <section class="analysis-section" data-report-only="power"><h2>分析结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
-        <div class="split-layout" data-report-only="performance">
-          @@OVERVIEW_PERFORMANCE_CONTEXT_SECTION@@
-          <section class="analysis-section"><h2>帧表现结论</h2><div class="finding-list">@@FINDINGS@@</div></section>
         </div>
-      </section>
-
-      <section class="app-view" data-panel="timeline" hidden>
-        <div class="view-heading"><div><h1>对齐时间线</h1><p>@@TIMELINE_COPY@@</p></div></div>
-        <section class="analysis-section">
-          <div class="chart-surface"><svg id="timeline-chart" role="img" aria-label="Aligned telemetry lanes"></svg></div>
-        </section>
-      </section>
-
-      <section class="app-view" data-panel="flow" data-report-only="power" hidden>
-        <div class="view-heading"><div><h1>测试流程</h1><p>前台应用与导入测试事件均已对齐至电池侧实测功率。</p></div><span class="source-tag counter">按设备 uptime 对齐</span></div>
-        <section class="analysis-section">
-          <div class="chart-surface"><svg id="flow-chart" role="img" aria-label="Power, foreground applications and external events on one timeline"></svg></div>
-        </section>
-        <section class="analysis-section"><h2>阶段能耗</h2><div class="data-table-wrap"><table><thead><tr><th>阶段 / 状态</th><th>次数</th><th>持续时间</th><th>能量</th><th>平均功率</th><th>置信度</th></tr></thead><tbody>@@PHASE_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>五分钟窗口</h2><div class="data-table-wrap"><table><thead><tr><th>窗口</th><th>有效覆盖</th><th>能量</th><th>平均功率</th><th>主要前台应用</th></tr></thead><tbody>@@WINDOW_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>导入的持续事件</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>事件</th><th>持续时间</th><th>能量</th><th>置信度</th></tr></thead><tbody>@@EVENT_ROWS@@</tbody></table></div></section>
-      </section>
-
-      <section class="app-view" data-panel="test-items" hidden>
-        <div class="view-heading"><div><h1>测试项分析</h1><p>@@TEST_ITEM_COPY@@</p></div><span class="source-tag counter">点击表格行可聚焦时间窗口</span></div>
-        @@CAPTURE_START_NOTE@@
-        <section class="analysis-section">@@TEST_ITEM_STATUS@@</section>
-        <section class="analysis-section">
-          <div class="chart-toolbar">
-            <div><h2>多泳道时间线</h2><p class="section-copy">@@TEST_ITEM_TIMELINE_COPY@@</p></div>
-            <button type="button" class="segment-button" id="test-range-reset">显示全程</button>
-          </div>
-          <div class="chart-surface"><svg id="test-item-chart" role="img" aria-label="Per-test power, foreground activity, system activity, thermal and scheduler lanes"></svg></div>
-        </section>
-        <section class="analysis-section" data-report-only="power"><h2>功耗测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr><th>测试项</th><th>时长</th><th>能量</th><th>mWh/min</th><th>平均 / P95 / 峰值功率</th><th>CPU 平均 / 峰值</th><th>GPU 平均 / 峰值</th><th>电池起止 / 传感器峰值</th><th>GC</th><th>kworker</th><th>平台后台活动 / 热限制</th><th>主要进程 / 活动</th><th>系统干扰</th><th>置信度</th></tr></thead><tbody>@@TEST_ITEM_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="performance"><h2>性能测试项矩阵</h2><div class="data-table-wrap"><table><thead><tr>@@PERFORMANCE_TEST_ITEM_HEADERS@@</tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="power"><h2>单次执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>能量</th><th>平均 / P95 / 峰值功率</th><th>系统干扰</th><th>前台应用</th></tr></thead><tbody>@@TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="performance"><h2>单次性能执行明细</h2><div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th><th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th><th>异常帧</th><th>整机功耗</th><th>置信度</th></tr></thead><tbody>@@PERFORMANCE_TEST_ITEM_SPAN_ROWS@@</tbody></table></div></section>
-        <div class="availability-note"><strong>解读边界</strong><span>@@TEST_ITEM_BOUNDARY@@</span></div>
-      </section>
-
-      <section class="app-view" data-panel="pressure" data-report-only="power" hidden>
-        <div class="view-heading"><div><h1>功耗压力分析</h1><p>解释电流和功率为什么随任务负载、调度、频率与系统设置变化。</p></div><span class="source-tag counter">时间相关性，不是独立电源轨</span></div>
-        @@POWER_PRESSURE_SECTIONS@@
-      </section>
-
-      <section class="app-view" data-panel="pipeline" data-report-only="performance" hidden>
-        <div class="view-heading"><div><h1>帧率数据流与渲染链路</h1><p>区分应用提交、渲染阶段、系统合成和屏幕刷新；保留无效来源及弃用原因，再定位慢帧形成阶段。</p></div><span class="source-tag counter">多源有效性 / 阶段时延</span></div>
-        <section class="analysis-section"><div class="chart-toolbar"><div><h2>逐阶段帧数据</h2><p class="section-copy">沿 APP → RENDER → COMPOSITOR → DISPLAY 展示帧数据的来源、有效性与主数据选择。</p></div></div>@@FRAME_FLOW_VISUAL@@@@FRAME_FLOW_EVIDENCE@@<div class="availability-note"><strong>解读边界</strong><span>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率不能直接互换；只有绑定当前目标应用并持续产生有效增量的来源才作为主 FPS。</span></div></section>
-        @@FRAME_STABILITY_SECTION@@
-        @@RENDER_PIPELINE_SECTION@@
-        @@SLOW_FRAME_SECTION@@
-        @@PIPELINE_RENDER_THREAD_SECTION@@
-        @@PERFORMANCE_POWER_RECORDING@@
-      </section>
-
-      <section class="app-view" data-panel="applications" data-report-only="power" hidden>
-        <div class="view-heading"><div><h1>前台应用</h1><p>按采样到的前台包名分配电池侧整机实测能量。</p></div><span class="source-tag counter">上下文覆盖率 @@APP_COVERAGE@@%</span></div>
-        <section class="analysis-section"><h2>应用能耗</h2><div class="data-table-wrap"><table><thead><tr><th>包名</th><th>持续时间</th><th>时间占比</th><th>能量</th><th>平均功率</th><th>进入次数</th><th>置信度</th></tr></thead><tbody>@@APPLICATION_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>前台应用切换</h2><div class="data-table-wrap"><table><thead><tr><th>已运行时间</th><th>包名</th><th>Activity</th></tr></thead><tbody>@@TRANSITION_ROWS@@</tbody></table></div></section>
-      </section>
-
-      <section class="app-view" data-panel="cpu" hidden>
-        <div class="view-heading"><div><h1>@@CPU_TITLE@@</h1><p>@@CPU_COPY@@</p></div><span class="source-tag @@CPU_TAG_KIND@@">@@CPU_TAG@@</span></div>
-        <section class="analysis-section">
-          <div class="chart-toolbar"><div><h2>集群时间线</h2><p class="section-copy">@@CPU_TIMELINE_COPY@@</p></div><div class="segment-control" aria-label="CPU 集群">@@CPU_SELECTORS@@</div></div>
-          <div class="chart-surface"><svg id="cpu-chart" role="img" aria-label="CPU cluster frequency impact timeline"></svg></div>
-        </section>
-        <section class="analysis-section"><div class="chart-toolbar"><div><h2>频率驻留</h2><p class="section-copy">按负载加权的低、中、高频使用比例。</p></div><div class="legend-row"><span><i class="legend-swatch band-low"></i>低频</span><span><i class="legend-swatch band-balanced"></i>中频</span><span><i class="legend-swatch band-high"></i>高频</span></div></div><div class="residency-list">@@RESIDENCY_ROWS@@</div></section>
-        <section class="analysis-section" data-report-only="power"><h2>集群功耗压力汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th><th>模型功率</th><th>高频增量</th><th>功率相关性</th></tr></thead><tbody>@@CPU_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section" data-report-only="performance"><h2>CPU 调度资源汇总</h2><div class="data-table-wrap"><table><thead><tr><th>CPU 集群</th><th>平均负载</th><th>负载加权频率</th><th>观测峰值 / 硬件上限</th></tr></thead><tbody>@@PERFORMANCE_CPU_ROWS@@</tbody></table></div></section>
-        @@CPU_PROCESS_SECTION@@
-      </section>
-
-      <section class="app-view" data-panel="system" data-report-only="performance" hidden>
-        <div class="view-heading"><div><h1>性能资源与调度上下文</h1><p>帧表现结合 CPU/GPU、可用频率、cpuset、ADPF、热点进程和热限制解释；不进行进程功耗归因。</p></div><span class="source-tag counter">平台实测计数器</span></div>
-        <div class="metric-grid">@@PERFORMANCE_CARDS@@</div>
-        @@PERFORMANCE_CONTEXT_SECTIONS@@
-        <section class="analysis-section">@@PERFORMANCE_INTERFERENCE_STATUS@@</section>
-        @@PERFORMANCE_PROCESS_SECTION@@
-        @@SYSTEM_RENDER_THREAD_SECTION@@
-        <div class="availability-note"><strong>解读边界</strong><span>帧率与帧耗时来自平台公开的合成器或前台窗口统计；详细 Android framestats 用于定位 UI / RenderThread 到 BufferQueue 的阶段耗时。插帧仅在读取到显式厂商开关时判定。整机功耗仅作为同期记录，不拆分到进程、UID 或组件。</span></div>
-      </section>
-
-      @@GPU_SECTION@@
-
-      <section class="app-view" data-panel="attribution" data-report-only="power" hidden>
-        <div class="view-heading"><div><h1>功耗归因</h1><p>@@ATTRIBUTION_COPY@@</p></div><span class="source-tag @@ATTRIBUTION_TAG_KIND@@">@@ATTRIBUTION_TAG@@</span></div>
-        @@ATTRIBUTION_NOTE@@
-        <section class="analysis-section"><h2>模型贡献项</h2><div class="contributor-list">@@COMPONENT_ROWS@@</div></section>
-        <section class="analysis-section"><h2>主要归因 UID</h2><div class="data-table-wrap"><table><thead><tr><th>包名</th><th>UID</th><th>模型用量</th><th>主要组件</th></tr></thead><tbody>@@UID_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>内核 Wakelock</h2><div class="data-table-wrap"><table><thead><tr><th>名称</th><th>持续时间</th><th>次数</th></tr></thead><tbody>@@WAKELOCK_ROWS@@</tbody></table></div></section>
-      </section>
-
-      <section class="app-view" data-panel="data" hidden>
-        <div class="view-heading"><div><h1>数据质量</h1><p>查看本次测试的实测、计数器与模型数据来源。</p></div></div>
-        <section class="analysis-section"><h2>采集项与干扰控制</h2><div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div></section>
-        <section class="analysis-section"><h2>数据来源</h2><div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div></section>
-        @@ANALYSIS_COVERAGE_SECTION@@
+        <div class="raw-metric-grid" id="raw-metric-grid" aria-live="polite"></div>
+        <details class="evidence-details"><summary>查看采集配置与数据来源</summary>
+          <div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div>
+          <div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div>
+        </details>
         @@WARNING_SECTION@@
-        <section class="analysis-section"><details><summary>查看完整会话元数据</summary><pre class="metadata-block">@@METADATA@@</pre></details></section>
+      </section>
+
+      <section class="app-view" data-panel="analysis" hidden>
+        <div class="view-heading"><div><h1>分析结论</h1><p>只展示能够由本次有效数据支持的判断与必要证据；无数据或证据不足的模块不会占用页面。</p></div><span class="source-tag counter">证据驱动</span></div>
+        @@ANALYSIS_CONCLUSION_SECTIONS@@
       </section>
     </main>
   </div>
@@ -2847,33 +2976,41 @@ REPORT_FRAGMENT = r"""
 (() => {
   const root = document.getElementById("mobile-profiler");
   const bundle = @@DATA@@;
+  const metadata = bundle.metadata || {};
   const samples = bundle.samples || [];
   const contexts = (bundle.contexts || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
   const events = (bundle.events || []).slice().sort((a, b) => Number(a.device_uptime_s) - Number(b.device_uptime_s));
   const analysis = bundle.analysis || {};
   const cpu = analysis.cpu || { clusters: [], timeline: [] };
   const gpu = analysis.gpu || {};
+  const performance = analysis.performance || {};
+  const thermal = analysis.thermal || {};
+  const frameFlow = performance.frame_flow || {};
   const brightnessDim = analysis.brightness_throttling || {};
   const brightnessDimPoints = (brightnessDim.points || []).slice().sort((a, b) => Number(a.elapsed_s) - Number(b.elapsed_s));
+  const brightnessTimeline = (brightnessDim.timeline || []).slice().sort((a, b) => Number(a.elapsed_s) - Number(b.elapsed_s));
+  const thermalTimeline = (thermal.timeline || []).slice().sort((a, b) => Number(a.elapsed_s) - Number(b.elapsed_s));
   const testMode = root.dataset.testMode || "power";
-  const frameTimeline = (((analysis.performance || {}).frame_rate_timeline) || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
+  const frameTimeline = (performance.frame_rate_timeline || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
+  const refreshTimeline = (performance.refresh_rate_timeline || []).slice().sort((a, b) => Number(a.uptime_s || a.elapsed_s) - Number(b.uptime_s || b.elapsed_s));
+  const captureConfiguration = metadata.capture_configuration || {};
+  const captureFeatures = captureConfiguration.features || {};
   const testItems = analysis.test_items || { rows: [], spans: [], instant_events: [] };
+  const reportEdits = metadata.report_edits || {};
+  const reportExcludedRanges = Array.isArray(reportEdits.excluded_ranges) ? reportEdits.excluded_ranges : [];
+  const reportRunName = (() => {
+    const match = window.location.pathname.match(/\/runs\/([^/]+)\/report\.html$/);
+    if (!match) return "";
+    try { return decodeURIComponent(match[1]); } catch (_error) { return ""; }
+  })();
   const colors = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)", "var(--series-6)"];
   let selectedIndex = 0;
-  let overviewMetric = testMode === "performance" ? "frame_rate_fps" : "power_mw";
   let selectedCluster = cpu.clusters.length ? cpu.clusters[0].name : null;
   let testRange = null;
-
-  const metricDefinitions = {
-    power_mw: { label: "功率", unit: "mW", color: colors[0], value: sample => sample.power_mw },
-    current_ma: { label: "放电电流幅值", unit: "mA", color: colors[1], value: sample => sample.current_ma },
-    cpu_pct: { label: "CPU", unit: "%", color: colors[2], value: sample => sample.cpu_pct },
-    frame_rate_fps: { label: "帧率", unit: "FPS", color: colors[0], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_rate_fps },
-    frame_time_ms: { label: "帧耗时 P99", unit: "ms", color: colors[3], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_time_p99_ms || (frameForUptime(sample.uptime_s) || {}).frame_time_p95_ms },
-    voltage_mv: { label: "电压", unit: "mV", color: colors[4], value: sample => sample.voltage_mv },
-    gpu_frequency_mhz: { label: "GPU 频率", unit: "MHz", color: colors[5], value: sample => sample.gpu_frequency_mhz },
-    gpu_load_pct: { label: "GPU 负载", unit: "%", color: colors[5], value: sample => sample.gpu_load_pct }
-  };
+  let rawMetrics = [];
+  let reportRangeTouched = false;
+  let reportRangeStartIndex = 0;
+  let reportRangeEndIndex = 0;
 
   function svgNode(name, attrs = {}, text = "") {
     const node = document.createElementNS("http://www.w3.org/2000/svg", name);
@@ -2883,8 +3020,18 @@ REPORT_FRAGMENT = r"""
   }
   function finite(value) { return value != null && Number.isFinite(Number(value)); }
   function clusterLabel(cluster) {
-    const labels = { Little: "小核", Big: "大核", Performance: "性能核", Prime: "超大核" };
+    const labels = { Little: "小核", Middle: "中核", Big: "大核", Performance: "性能核", Prime: "超大核" };
     return labels[cluster.label] || cluster.label || cluster.name || "CPU";
+  }
+  function cpuCoreGroupLabel(cluster) {
+    const cores = (Array.isArray(cluster && cluster.cores) ? cluster.cores : [])
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+    if (!cores.length) return clusterLabel(cluster);
+    const contiguous = cores.every((core, index) => index === 0 || core === cores[index - 1] + 1);
+    if (contiguous && cores.length > 1) return `CPU${cores[0]}–${cores.at(-1)}`;
+    return cores.map(core => `CPU${core}`).join(" / ");
   }
   function format(value, unit) {
     if (!finite(value)) return "n/a";
@@ -2927,7 +3074,34 @@ REPORT_FRAGMENT = r"""
       }));
     });
   }
-  function sessionStartUptime() { return samples.length ? Number(samples[0].uptime_s || 0) : 0; }
+  function sessionStartUptime() {
+    if (finite(reportEdits.time_origin_uptime_s)) return Number(reportEdits.time_origin_uptime_s);
+    return samples.length ? Number(samples[0].uptime_s || 0) : 0;
+  }
+  function reportExcludedElapsedRanges() {
+    const origin = sessionStartUptime();
+    return reportExcludedRanges.map(range => ({
+      start: finite(range.start_elapsed_s) ? Number(range.start_elapsed_s) : Number(range.start_uptime_s) - origin,
+      end: finite(range.end_elapsed_s) ? Number(range.end_elapsed_s) : Number(range.end_uptime_s) - origin,
+    })).filter(range => finite(range.start) && finite(range.end) && range.end > range.start);
+  }
+  function crossesReportExcludedRange(previousElapsed, currentElapsed) {
+    return reportExcludedElapsedRanges().some(range => (
+      Number(previousElapsed) <= range.start && Number(currentElapsed) >= range.end
+    ));
+  }
+  function selectedReportRange() {
+    if (!reportRangeTouched || !samples.length) return null;
+    const start = samples[Math.min(reportRangeStartIndex, reportRangeEndIndex)];
+    const end = samples[Math.max(reportRangeStartIndex, reportRangeEndIndex)];
+    if (!start || !end) return null;
+    return {
+      start,
+      end,
+      startIndex: Math.min(reportRangeStartIndex, reportRangeEndIndex),
+      endIndex: Math.max(reportRangeStartIndex, reportRangeEndIndex),
+    };
+  }
   function contextForUptime(uptime) {
     let selected = null;
     for (const context of contexts) {
@@ -2944,6 +3118,313 @@ REPORT_FRAGMENT = r"""
     }
     return selected;
   }
+  function featureEnabled(name) {
+    const keys = Object.keys(captureFeatures);
+    return !keys.length || captureFeatures[name] === true;
+  }
+  function elapsedForPoint(point) {
+    if (finite(point && point.elapsed_s)) return Math.max(0, Number(point.elapsed_s));
+    if (finite(point && point.uptime_s)) return Math.max(0, Number(point.uptime_s) - sessionStartUptime());
+    return null;
+  }
+  function metricPoints(rows, value) {
+    return (Array.isArray(rows) ? rows : [])
+      .map(row => {
+        const elapsed = elapsedForPoint(row);
+        const next = value(row);
+        return elapsed == null || !finite(next) ? null : { elapsed, value: Number(next) };
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.elapsed - right.elapsed);
+  }
+  function rawMetricDefinitions() {
+    const metrics = [];
+    const add = definition => {
+      const features = Array.isArray(definition.features)
+        ? definition.features
+        : definition.feature ? [definition.feature] : [];
+      if (features.length && !features.some(featureEnabled)) return;
+      const points = (definition.points || [])
+        .filter(point => point && finite(point.elapsed) && finite(point.value))
+        .map(point => ({ elapsed: Number(point.elapsed), value: Number(point.value) }))
+        .sort((left, right) => left.elapsed - right.elapsed);
+      if (!points.length) return;
+      if (definition.requiresPositive && !points.some(point => point.value > 0)) return;
+      metrics.push({ ...definition, points });
+    };
+    const sampleMetric = (definition, value) => add({
+      ...definition,
+      points: metricPoints(samples, value),
+    });
+    const frameMetric = (definition, value) => add({
+      ...definition,
+      feature: "frame_rate",
+      points: metricPoints(frameTimeline, value),
+    });
+
+    sampleMetric({ key: "power_mw", label: "整机功耗", unit: "mW", source: "电池侧实测", color: colors[0] }, sample => sample.power_mw);
+    sampleMetric({ key: "current_ma", label: "电流幅值", unit: "mA", source: "电池基础通道", color: colors[1] }, sample => sample.current_ma);
+    sampleMetric({ key: "voltage_mv", label: "电压", unit: "mV", source: "电池基础通道", color: colors[4], requiresPositive: true }, sample => sample.voltage_mv);
+    sampleMetric({ key: "cpu_pct", label: "CPU 整体负载", unit: "%", source: "整机利用率", color: colors[2], feature: "cpu_usage" }, sample => sample.cpu_pct);
+
+    const frequencyGroups = Array.isArray(cpu.clusters) && cpu.clusters.length
+      ? cpu.clusters
+      : Array.from(new Set(samples.flatMap(sample => Object.keys(sample.frequencies_mhz || {}))))
+        .map(name => ({ name, label: name, cores: [] }));
+    frequencyGroups.forEach((cluster, index) => {
+      sampleMetric({
+        key: `cpu_frequency:${cluster.name}`,
+        label: `${cpuCoreGroupLabel(cluster)} 共享频率`,
+        unit: "MHz",
+        source: `${clusterLabel(cluster)} · ${cluster.name || "cpufreq policy"}`,
+        color: colors[(index + 3) % colors.length],
+        feature: "cpu_frequency",
+        requiresPositive: true,
+      }, sample => (sample.frequencies_mhz || {})[cluster.name]);
+    });
+
+    frameMetric({ key: "frame_rate_fps", label: "主帧率", unit: "FPS", source: performance.frame_source || "前台帧计数", color: colors[0], requiresPositive: true }, frame => frame.frame_rate_fps);
+    frameMetric({ key: "one_percent_low_fps", label: "1% Low 帧率", unit: "FPS", source: performance.one_percent_low_source || "逐窗口帧间隔", color: colors[4], requiresPositive: true }, frame => frame.one_percent_low_fps);
+    frameMetric({ key: "frame_time_p95_ms", label: "帧耗时 P95", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true }, frame => frame.frame_time_p95_ms);
+    frameMetric({ key: "frame_time_p99_ms", label: "帧耗时 P99", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true }, frame => frame.frame_time_p99_ms);
+    frameMetric({ key: "frame_issue_pct", label: "异常帧比例", unit: "%", source: "截止时间 / VSync", color: colors[3] }, frame => frame.frame_issue_pct);
+
+    add({
+      key: "refresh_rate_hz",
+      label: "屏幕刷新率",
+      unit: "Hz",
+      source: performance.refresh_residency_source || "显示模式",
+      color: colors[5],
+      features: ["foreground_window", "frame_rate"],
+      requiresPositive: true,
+      step: true,
+      points: metricPoints(refreshTimeline, point => finite(point.value) ? point.value : point.refresh_rate_hz),
+    });
+
+    (Array.isArray(frameFlow.stages) ? frameFlow.stages : []).forEach((stage, index) => {
+      add({
+        key: `frame_stage:${stage.key || index}`,
+        label: `链路节点 · ${stage.phase || "STAGE"} ${stage.label || stage.key || index + 1}`,
+        unit: stage.timeline_unit || stage.unit || "FPS",
+        source: stage.source || "渲染链路计数",
+        color: colors[index % colors.length],
+        feature: "frame_rate",
+        requiresPositive: true,
+        step: stage.key === "display_scanout",
+        points: metricPoints(stage.timeline, point => finite(point.value)
+          ? point.value
+          : finite(point.frame_rate_fps) ? point.frame_rate_fps : point.refresh_rate_hz),
+      });
+    });
+
+    sampleMetric({ key: "gpu_load_pct", label: "GPU 负载", unit: "%", source: "GPU 计数器", color: colors[1], feature: "gpu_metrics" }, sample => sample.gpu_load_pct);
+    sampleMetric({ key: "gpu_frequency_mhz", label: "GPU 频率", unit: "MHz", source: "GPU 频率节点", color: colors[5], feature: "gpu_metrics", requiresPositive: true }, sample => sample.gpu_frequency_mhz);
+    sampleMetric({ key: "memory_frequency_mhz", label: "内存频率", unit: "MHz", source: "DMC / DRAM / MIF", color: colors[4], feature: "memory_frequency", requiresPositive: true }, sample => sample.memory_frequency_mhz);
+    sampleMetric({ key: "battery_temperature_c", label: "电池温度", unit: "°C", source: "BatteryService", color: colors[3], feature: "thermal" }, sample => sample.battery_temperature_c);
+
+    const sensorRows = Array.isArray(thermal.sensors) ? thermal.sensors : [];
+    sensorRows.forEach((sensor, index) => {
+      const name = String(sensor && sensor.name || `sensor-${index + 1}`);
+      if (/battery/i.test(name)) return;
+      add({
+        key: `thermal_sensor:${name}`,
+        label: `温度传感器 · ${name}`,
+        unit: sensor.unit || "°C",
+        source: "ThermalService",
+        color: colors[(index + 3) % colors.length],
+        feature: "thermal",
+        points: metricPoints(thermalTimeline, point => (point.sensors || {})[name]),
+      });
+    });
+    add({
+      key: "thermal_status",
+      label: "热状态等级",
+      unit: "级",
+      source: "ThermalService",
+      color: colors[3],
+      feature: "thermal",
+      step: true,
+      points: metricPoints(thermalTimeline, point => point.status),
+    });
+
+    add({
+      key: "requested_brightness_pct",
+      label: "系统请求亮度",
+      unit: "%",
+      source: "DisplayManager",
+      color: colors[4],
+      features: ["foreground_window", "thermal"],
+      points: metricPoints(brightnessTimeline, point => finite(point.requested_brightness) ? Number(point.requested_brightness) * 100 : null),
+    });
+    add({
+      key: "effective_brightness_pct",
+      label: "显示侧有效亮度",
+      unit: "%",
+      source: "DisplayManager / Thermal HAL",
+      color: colors[3],
+      features: ["foreground_window", "thermal"],
+      points: metricPoints(brightnessTimeline, point => finite(point.effective_brightness) ? Number(point.effective_brightness) * 100 : null),
+    });
+    add({
+      key: "brightness_thermal_cap_pct",
+      label: "亮度热上限",
+      unit: "%",
+      source: "DisplayManager thermal cap",
+      color: colors[3],
+      feature: "thermal",
+      points: metricPoints(brightnessTimeline, point => finite(point.thermal_cap) ? Number(point.thermal_cap) * 100 : null),
+    });
+    return metrics;
+  }
+  function rawMetricPointAt(metric, elapsed) {
+    let selected = null;
+    for (const point of metric.points) {
+      if (point.elapsed > elapsed) break;
+      selected = point;
+    }
+    return selected;
+  }
+  function rawMaximumTime() {
+    return Math.max(
+      maxTime(),
+      ...rawMetrics.flatMap(metric => metric.points.map(point => point.elapsed)),
+    );
+  }
+  function renderRawMetricChart(metric) {
+    const svg = metric.svg;
+    if (!svg || !metric.points.length || !samples.length) return;
+    const width = chartWidth(svg), height = 220;
+    const margin = { left: width < 440 ? 54 : 62, right: 14, top: 16, bottom: 32 };
+    const maximumTime = rawMaximumTime();
+    const maximumValue = Math.max(1, ...metric.points.map(point => point.value)) * 1.08;
+    const x = value => margin.left + Math.max(0, Math.min(maximumTime, Number(value))) / maximumTime * (width - margin.left - margin.right);
+    const y = value => margin.top + (maximumValue - Math.max(0, Number(value))) / maximumValue * (height - margin.top - margin.bottom);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("aria-label", `${metric.label}随时间变化，纵轴从 0 ${metric.unit} 开始`);
+    svg.replaceChildren();
+    svg.appendChild(svgNode("title", {}, `${metric.label}随时间变化`));
+    for (let tick = 0; tick <= 3; tick++) {
+      const ratio = tick / 3;
+      const value = maximumValue * (1 - ratio);
+      const yPos = margin.top + ratio * (height - margin.top - margin.bottom);
+      svg.appendChild(svgNode("line", { x1: margin.left, x2: width - margin.right, y1: yPos, y2: yPos, class: "raw-grid-line" }));
+      svg.appendChild(svgNode("text", { x: margin.left - 7, y: yPos + 3, "text-anchor": "end", class: "raw-axis-text" }, format(value, metric.unit)));
+    }
+    for (let tick = 0; tick <= 4; tick++) {
+      const elapsed = maximumTime * tick / 4;
+      const xPos = x(elapsed);
+      svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: margin.top, y2: height - margin.bottom, class: "raw-grid-line" }));
+      svg.appendChild(svgNode("text", { x: xPos, y: height - 10, "text-anchor": tick === 0 ? "start" : tick === 4 ? "end" : "middle", class: "raw-axis-text" }, formatTime(elapsed)));
+    }
+    reportExcludedElapsedRanges().forEach(range => {
+      const startX = x(range.start);
+      const endX = x(range.end);
+      svg.appendChild(svgNode("rect", {
+        x: startX,
+        y: margin.top,
+        width: Math.max(1, endX - startX),
+        height: height - margin.top - margin.bottom,
+        class: "raw-excluded-window",
+      }));
+    });
+    const deleteSelection = selectedReportRange();
+    if (deleteSelection) {
+      const startX = x(deleteSelection.start.elapsed_s);
+      const endX = x(deleteSelection.end.elapsed_s);
+      svg.appendChild(svgNode("rect", {
+        x: startX,
+        y: margin.top,
+        width: Math.max(1, endX - startX),
+        height: height - margin.top - margin.bottom,
+        class: "raw-delete-window",
+      }));
+    }
+    const coordinates = metric.points.map(point => ({ ...point, x: x(point.elapsed), y: y(point.value) }));
+    const segments = [];
+    coordinates.forEach(coordinate => {
+      const segment = segments.at(-1);
+      if (!segment || (segment.length && crossesReportExcludedRange(segment.at(-1).elapsed, coordinate.elapsed))) {
+        segments.push([]);
+      }
+      segments.at(-1).push(coordinate);
+    });
+    segments.forEach((segment, segmentIndex) => {
+      if (segment.length === 1) {
+        svg.appendChild(svgNode("circle", { cx: segment[0].x, cy: segment[0].y, r: 3.5, fill: metric.color }));
+        return;
+      }
+      let path = `M${segment[0].x.toFixed(2)},${segment[0].y.toFixed(2)}`;
+      for (let index = 1; index < segment.length; index += 1) {
+        const previous = segment[index - 1];
+        const current = segment[index];
+        path += metric.step
+          ? ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`
+          : ` L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+      }
+      if (metric.step && segmentIndex === segments.length - 1 && segment.at(-1).elapsed < maximumTime) {
+        path += ` L${x(maximumTime).toFixed(2)},${segment.at(-1).y.toFixed(2)}`;
+      }
+      svg.appendChild(svgNode("path", { d: path, class: "raw-series-line", stroke: metric.color }));
+    });
+    const selectedElapsed = Number(samples[selectedIndex].elapsed_s || 0);
+    const selectedPoint = rawMetricPointAt(metric, selectedElapsed);
+    const selectedX = x(selectedElapsed);
+    svg.appendChild(svgNode("line", { x1: selectedX, x2: selectedX, y1: margin.top, y2: height - margin.bottom, class: "raw-selected-line" }));
+    if (selectedPoint) {
+      svg.appendChild(svgNode("circle", { cx: x(selectedPoint.elapsed), cy: y(selectedPoint.value), r: 3.5, class: "raw-selected-dot", stroke: metric.color }));
+      metric.valueNode.textContent = format(selectedPoint.value, metric.unit);
+    } else {
+      metric.valueNode.textContent = "n/a";
+    }
+  }
+  function renderRawMetricCharts() {
+    rawMetrics.forEach(renderRawMetricChart);
+  }
+  function renderRawMetricGrid() {
+    const container = root.querySelector("#raw-metric-grid");
+    const count = root.querySelector("#raw-metric-count");
+    if (!container) return;
+    rawMetrics = rawMetricDefinitions();
+    container.replaceChildren();
+    if (count) count.textContent = `${rawMetrics.length} 项有效时间序列`;
+    if (!rawMetrics.length) {
+      const empty = document.createElement("div");
+      empty.className = "raw-empty";
+      empty.textContent = "本次没有形成可展示的有效原始时间序列。";
+      container.appendChild(empty);
+      return;
+    }
+    rawMetrics.forEach(metric => {
+      const article = document.createElement("article");
+      article.className = "raw-metric-card";
+      article.setAttribute("data-raw-metric", metric.key);
+      const heading = document.createElement("div");
+      heading.className = "raw-metric-heading";
+      const labelGroup = document.createElement("div");
+      const label = document.createElement("strong");
+      label.textContent = metric.label;
+      const source = document.createElement("span");
+      source.textContent = metric.source;
+      labelGroup.append(label, source);
+      const valueGroup = document.createElement("div");
+      const current = document.createElement("strong");
+      current.className = "raw-current-value";
+      current.textContent = "n/a";
+      const values = metric.points.map(point => point.value);
+      const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const range = document.createElement("span");
+      range.textContent = `均 ${format(average, metric.unit)} · 峰 ${format(Math.max(...values), metric.unit)}`;
+      valueGroup.append(current, range);
+      heading.append(labelGroup, valueGroup);
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("role", "img");
+      metric.svg = svg;
+      metric.valueNode = current;
+      article.append(heading, svg);
+      container.appendChild(article);
+    });
+    window.requestAnimationFrame(renderRawMetricCharts);
+  }
   function nearestIndex(time) {
     let best = 0;
     let distance = Infinity;
@@ -2956,11 +3437,8 @@ REPORT_FRAGMENT = r"""
   function domain(values) {
     const valid = values.filter(finite).map(Number);
     if (!valid.length) return [0, 1];
-    let minimum = Math.min(...valid);
-    let maximum = Math.max(...valid);
-    if (minimum === maximum) { minimum -= 1; maximum += 1; }
-    const pad = (maximum - minimum) * 0.08;
-    return [minimum - pad, maximum + pad];
+    const maximum = Math.max(0, ...valid);
+    return [0, Math.max(1, maximum * 1.08)];
   }
   function quantile(values, ratio) {
     const ordered = values.filter(finite).map(Number).sort((a, b) => a - b);
@@ -2988,41 +3466,6 @@ REPORT_FRAGMENT = r"""
       selectSample(nearestIndex(time));
     });
     svg.appendChild(overlay);
-  }
-
-  function renderOverview() {
-    const svg = root.querySelector("#overview-chart");
-    if (!svg || !samples.length) return;
-    const width = chartWidth(svg), height = 300;
-    const margin = { left: width < 560 ? 62 : 72, right: width < 560 ? 14 : 24, top: 22, bottom: 38 };
-    const metric = metricDefinitions[overviewMetric];
-    const values = samples.map(metric.value);
-    const [minimum, maximum] = domain(values);
-    const x = time => margin.left + Number(time) / maxTime() * (width - margin.left - margin.right);
-    const y = value => margin.top + (maximum - value) / (maximum - minimum) * (height - margin.top - margin.bottom);
-    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.replaceChildren();
-    for (let tick = 0; tick <= 4; tick++) {
-      const ratio = tick / 4;
-      const yPos = margin.top + ratio * (height - margin.top - margin.bottom);
-      const value = maximum - ratio * (maximum - minimum);
-      svg.appendChild(svgNode("line", { x1: margin.left, x2: width - margin.right, y1: yPos, y2: yPos, class: "grid" }));
-      svg.appendChild(svgNode("text", { x: margin.left - 9, y: yPos + 4, "text-anchor": "end", class: "axis-text" }, format(value, metric.unit)));
-    }
-    for (let tick = 0; tick <= 5; tick++) {
-      const seconds = maxTime() * tick / 5;
-      const xPos = x(seconds);
-      svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: margin.top, y2: height - margin.bottom, class: "grid" }));
-      svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": "middle", class: "axis-text" }, formatTime(seconds)));
-    }
-    svg.appendChild(svgNode("polyline", { points: pointString(values, x, y), fill: "none", stroke: metric.color, "stroke-width": 2.2 }));
-    appendBrightnessMarkers(svg, x, margin.top, height - margin.bottom);
-    const selected = samples[selectedIndex];
-    const selectedValue = metric.value(selected);
-    const xPos = x(selected.elapsed_s);
-    svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: margin.top, y2: height - margin.bottom, class: "crosshair" }));
-    if (finite(selectedValue)) svg.appendChild(svgNode("circle", { cx: xPos, cy: y(Number(selectedValue)), r: 4.5, class: "selected-point", stroke: metric.color }));
-    attachOverlay(svg, width, height, margin.left, margin.right, margin.top, margin.bottom);
   }
 
   function renderLanes(svg, lanes) {
@@ -3060,6 +3503,100 @@ REPORT_FRAGMENT = r"""
     const selectedX = x(samples[selectedIndex].elapsed_s);
     svg.appendChild(svgNode("line", { x1: selectedX, x2: selectedX, y1: top, y2: height - bottom, class: "crosshair" }));
     attachOverlay(svg, width, height, left, right, top, bottom);
+  }
+
+  function renderFrameFlowHistory() {
+    const svg = root.querySelector("#frame-flow-history-chart");
+    const stages = Array.isArray(frameFlow.stages) ? frameFlow.stages : [];
+    if (!svg || !stages.length) return;
+    const laneColors = {
+      app_submission: colors[0],
+      render_queue: colors[1],
+      surface_present: colors[4],
+      display_scanout: "#9e8cff",
+    };
+    const startUptime = sessionStartUptime();
+    const lanes = stages.map((stage, index) => {
+      const points = (Array.isArray(stage.timeline) ? stage.timeline : [])
+        .map(point => {
+          const elapsed = finite(point.elapsed_s)
+            ? Number(point.elapsed_s)
+            : finite(point.uptime_s) ? Math.max(0, Number(point.uptime_s) - startUptime) : null;
+          const value = finite(point.value)
+            ? Number(point.value)
+            : finite(point.frame_rate_fps)
+              ? Number(point.frame_rate_fps)
+              : finite(point.refresh_rate_hz) ? Number(point.refresh_rate_hz) : null;
+          return elapsed == null || value == null ? null : { elapsed, value };
+        })
+        .filter(Boolean)
+        .sort((left, right) => left.elapsed - right.elapsed);
+      return {
+        key: String(stage.key || `stage-${index}`),
+        phase: String(stage.phase || "STAGE"),
+        label: String(stage.label || stage.key || `节点 ${index + 1}`),
+        valueLabel: String(stage.timeline_value_label || "帧率"),
+        unit: String(stage.timeline_unit || "FPS"),
+        status: String(stage.status || "unavailable"),
+        color: laneColors[stage.key] || colors[index % colors.length],
+        points,
+      };
+    });
+    const allPoints = lanes.flatMap(lane => lane.points);
+    const width = chartWidth(svg), compact = width < 680;
+    const left = compact ? 120 : 166, right = compact ? 48 : 66, top = 22, bottom = 36, laneHeight = compact ? 76 : 82;
+    const height = top + bottom + laneHeight * lanes.length;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.style.minHeight = `${height}px`;
+    svg.replaceChildren();
+    const maximumTime = Math.max(maxTime(), ...allPoints.map(point => point.elapsed));
+    const observedMaximum = Math.max(
+      1,
+      Number(performance.peak_refresh_rate_hz || 0),
+      ...allPoints.map(point => point.value),
+    );
+    const maximumValue = Math.max(30, Math.ceil(observedMaximum / 30) * 30);
+    const x = value => left + Math.max(0, Math.min(maximumTime, Number(value))) / maximumTime * (width - left - right);
+    for (let tick = 0; tick <= 5; tick++) {
+      const elapsed = maximumTime * tick / 5;
+      const xPos = x(elapsed);
+      svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: top, y2: height - bottom, class: "grid" }));
+      svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": tick === 0 ? "start" : tick === 5 ? "end" : "middle", class: "axis-text" }, formatTime(elapsed)));
+    }
+    lanes.forEach((lane, laneIndex) => {
+      const laneTop = top + laneIndex * laneHeight;
+      const laneBottom = laneTop + laneHeight - 15;
+      const y = value => laneBottom - Math.max(0, Math.min(maximumValue, Number(value))) / maximumValue * (laneBottom - laneTop - 12);
+      const latestPoint = lane.points.at(-1);
+      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 24, class: "flow-lane-label" }, `${lane.phase} · ${lane.label}`));
+      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 43, class: "flow-lane-value" }, latestPoint ? `${lane.valueLabel} ${format(latestPoint.value, lane.unit)}` : lane.valueLabel));
+      svg.appendChild(svgNode("text", { x: width - 8, y: laneTop + 14, "text-anchor": "end", class: "axis-text" }, format(maximumValue, lane.unit)));
+      svg.appendChild(svgNode("text", { x: width - 8, y: laneBottom, "text-anchor": "end", class: "axis-text" }, `0 ${lane.unit}`));
+      svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: laneBottom + 5, y2: laneBottom + 5, class: "grid" }));
+      if (!lane.points.length) {
+        const emptyLabel = lane.key === "display_scanout"
+          ? "暂无有效刷新率时间序列"
+          : lane.key === "render_queue"
+            ? "仅有阶段耗时，无独立 FPS 计数"
+            : "平台未公开该节点的独立帧率时间序列";
+        svg.appendChild(svgNode("text", { x: left + 10, y: laneTop + 35, class: "flow-lane-empty" }, emptyLabel));
+        return;
+      }
+      const coordinates = lane.points.map(point => ({ ...point, x: x(point.elapsed), y: y(point.value) }));
+      let path = `M${coordinates[0].x.toFixed(2)},${coordinates[0].y.toFixed(2)}`;
+      for (let index = 1; index < coordinates.length; index += 1) {
+        const previous = coordinates[index - 1], current = coordinates[index];
+        path += lane.key === "display_scanout"
+          ? ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`
+          : ` L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+      }
+      if (lane.key === "display_scanout" && coordinates.at(-1).elapsed < maximumTime) {
+        path += ` L${x(maximumTime).toFixed(2)},${coordinates.at(-1).y.toFixed(2)}`;
+      }
+      svg.appendChild(svgNode("path", { d: path, class: `flow-lane-line ${lane.status}`, stroke: lane.color }));
+      const last = coordinates.at(-1);
+      svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 3.4, class: "flow-lane-dot", fill: lane.color }));
+    });
   }
 
   function timelineLanes() {
@@ -3408,20 +3945,101 @@ REPORT_FRAGMENT = r"""
     if (slider) slider.value = String(selectedIndex);
     const context = contextForUptime(sample.uptime_s);
     const packageName = context && context.foreground_package ? context.foreground_package : "未知";
-    const frame = frameForUptime(sample.uptime_s) || {};
-    detail.innerHTML = testMode === "performance"
-      ? `<span><strong>${formatTime(sample.elapsed_s)}</strong></span><span>帧率 <strong>${format(frame.frame_rate_fps, "FPS")}</strong></span><span>P99 <strong>${format(frame.frame_time_p99_ms || frame.frame_time_p95_ms, "ms")}</strong></span><span>CPU <strong>${format(sample.cpu_pct, "%")}</strong></span><span>整机功耗 <strong>${format(sample.power_mw, "mW")}</strong></span>`
-      : `<span><strong>${formatTime(sample.elapsed_s)}</strong></span><span>功率 <strong>${format(sample.power_mw, "mW")}</strong></span><span>电流 <strong>${format(sample.current_ma, "mA")}</strong></span><span>CPU <strong>${format(sample.cpu_pct, "%")}</strong></span><span>应用 <strong>${packageName}</strong></span>`;
+    detail.innerHTML = `<span>同步时间 <strong>${formatTime(sample.elapsed_s)}</strong></span>`
+      + `<span>样本 <strong>${selectedIndex + 1} / ${samples.length}</strong></span>`
+      + `<span>有效曲线 <strong>${rawMetrics.length}</strong></span>`
+      + `<span>前台 <strong>${packageName}</strong></span>`;
   }
   function selectSample(index) {
     selectedIndex = Math.max(0, Math.min(samples.length - 1, Number(index)));
     updateSampleDetail();
-    renderOverview();
-    renderTimeline();
-    renderFlow();
-    renderTestItems();
-    renderCpu();
-    renderGpu();
+    renderRawMetricCharts();
+  }
+  function updateReportRangeEditor(changed = "") {
+    const startInput = root.querySelector("#report-range-start");
+    const endInput = root.querySelector("#report-range-end");
+    const startValue = root.querySelector("#report-range-start-value");
+    const endValue = root.querySelector("#report-range-end-value");
+    const status = root.querySelector("#report-range-status");
+    const deleteButton = root.querySelector("#delete-report-range");
+    if (!startInput || !endInput || !status || !deleteButton || !samples.length) return;
+    const maximum = Math.max(0, samples.length - 1);
+    let start = Math.max(0, Math.min(maximum, Number(startInput.value || 0)));
+    let end = Math.max(0, Math.min(maximum, Number(endInput.value || 0)));
+    if (changed) reportRangeTouched = true;
+    if (changed === "start" && start >= end) {
+      end = Math.min(maximum, start + 1);
+      if (end <= start) start = Math.max(0, end - 1);
+    } else if (changed === "end" && end <= start) {
+      start = Math.max(0, end - 1);
+      if (end <= start) end = Math.min(maximum, start + 1);
+    }
+    reportRangeStartIndex = start;
+    reportRangeEndIndex = end;
+    startInput.value = String(start);
+    endInput.value = String(end);
+    if (startValue) startValue.textContent = formatTime(samples[start].elapsed_s);
+    if (endValue) endValue.textContent = formatTime(samples[end].elapsed_s);
+    const selectedCount = reportRangeTouched && end > start ? end - start + 1 : 0;
+    const canDelete = Boolean(
+      reportRunName
+      && reportRangeTouched
+      && end > start
+      && samples.length - selectedCount >= 2
+    );
+    deleteButton.disabled = !canDelete;
+    status.dataset.state = "";
+    if (!reportRunName) {
+      status.textContent = "独立 HTML 报告保持只读；请从仪表盘的历史报告中打开后删除时间段。";
+    } else if (!reportRangeTouched) {
+      const edited = Number(reportEdits.excluded_range_count || reportExcludedRanges.length || 0);
+      status.textContent = `${edited ? `已删除 ${edited} 个时间段；` : ""}拖动起点和终点选择要删除的记录。`;
+    } else if (end <= start) {
+      status.textContent = "删除终点必须晚于起点。";
+      status.dataset.state = "error";
+    } else if (samples.length - selectedCount < 2) {
+      status.textContent = "该范围会删除过多记录，报告至少需要保留两个样本。";
+      status.dataset.state = "error";
+    } else {
+      status.textContent = `已选择 ${formatTime(samples[start].elapsed_s)} – ${formatTime(samples[end].elapsed_s)} · 当前报告显示 ${selectedCount} 个样本。`;
+    }
+    if (changed) selectSample(changed === "start" ? start : end);
+  }
+  async function deleteSelectedReportRange() {
+    const selection = selectedReportRange();
+    const status = root.querySelector("#report-range-status");
+    const button = root.querySelector("#delete-report-range");
+    if (!selection || !status || !button || !reportRunName) return;
+    const startLabel = formatTime(selection.start.elapsed_s);
+    const endLabel = formatTime(selection.end.elapsed_s);
+    if (!window.confirm(`确认删除 ${startLabel} – ${endLabel} 的记录？报告会重新计算统计和分析结论。`)) return;
+    button.disabled = true;
+    button.textContent = "正在删除并重建报告…";
+    status.dataset.state = "";
+    status.textContent = "正在保存排除区间并重新生成报告，请稍候。";
+    try {
+      const response = await fetch("/api/report/delete-range", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          run_name: reportRunName,
+          start_uptime_s: Number(selection.start.uptime_s),
+          end_uptime_s: Number(selection.end.uptime_s),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      status.textContent = `已删除 ${Number(result.deleted_sample_count || 0)} 个原始样本，正在刷新报告。`;
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set("edited", String(Date.now()));
+      window.location.replace(nextUrl.toString());
+    } catch (error) {
+      status.dataset.state = "error";
+      status.textContent = `删除失败：${error.message || error}`;
+      button.disabled = false;
+    } finally {
+      button.textContent = "删除选中时间段记录";
+    }
   }
 
   root.querySelectorAll(".nav-tab").forEach(tab => tab.addEventListener("click", () => {
@@ -3429,23 +4047,10 @@ REPORT_FRAGMENT = r"""
     root.querySelectorAll(".nav-tab").forEach(peer => peer.setAttribute("aria-selected", peer === tab ? "true" : "false"));
     root.querySelectorAll(".app-view").forEach(panel => { panel.hidden = panel.dataset.panel !== view; });
     window.requestAnimationFrame(() => {
-      if (view === "overview") renderOverview();
-      if (view === "timeline") renderTimeline();
-      if (view === "flow") renderFlow();
-      if (view === "test-items") renderTestItems();
-      if (view === "pipeline") renderFrameStability();
-      if (view === "cpu") renderCpu();
-      if (view === "gpu") renderGpu();
+      if (view === "raw") renderRawMetricCharts();
+      if (view === "analysis") renderFrameStability();
     });
   }));
-  root.querySelectorAll("[data-overview-metric]").forEach(button => button.addEventListener("click", () => {
-    overviewMetric = button.dataset.overviewMetric;
-    root.querySelectorAll("[data-overview-metric]").forEach(peer => peer.classList.toggle("active", peer === button));
-    renderOverview();
-  }));
-  root.querySelectorAll("[data-overview-metric]").forEach(button => {
-    button.classList.toggle("active", button.dataset.overviewMetric === overviewMetric);
-  });
   root.querySelectorAll("[data-cpu-cluster]").forEach(button => button.addEventListener("click", () => {
     selectedCluster = button.dataset.cpuCluster;
     root.querySelectorAll("[data-cpu-cluster]").forEach(peer => peer.classList.toggle("active", peer === button));
@@ -3467,16 +4072,24 @@ REPORT_FRAGMENT = r"""
   });
   const slider = root.querySelector("#overview-slider");
   if (slider) slider.addEventListener("input", () => selectSample(slider.value));
+  const reportRangeStart = root.querySelector("#report-range-start");
+  const reportRangeEnd = root.querySelector("#report-range-end");
+  const deleteReportRange = root.querySelector("#delete-report-range");
+  if (reportRangeStart) reportRangeStart.addEventListener("input", () => updateReportRangeEditor("start"));
+  if (reportRangeEnd) reportRangeEnd.addEventListener("input", () => updateReportRangeEditor("end"));
+  if (deleteReportRange) deleteReportRange.addEventListener("click", deleteSelectedReportRange);
   let resizeTimer = null;
   window.addEventListener("resize", () => {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => { selectSample(selectedIndex); renderFrameStability(); }, 100);
+    resizeTimer = window.setTimeout(() => { renderRawMetricCharts(); renderFrameStability(); }, 100);
   });
+  renderRawMetricGrid();
   selectSample(testMode === "performance" ? Math.max(0, samples.length - 1) : 0);
+  updateReportRangeEditor();
   renderFrameStability();
   const initialView = new URLSearchParams(window.location.search).get("view") || window.location.hash.slice(1);
   const initialTab = initialView ? Array.from(root.querySelectorAll("[data-view]")).find(tab => tab.dataset.view === initialView && window.getComputedStyle(tab).display !== "none") : null;
-  if (initialTab && initialView !== "overview") initialTab.click();
+  if (initialTab && initialView !== "raw") initialTab.click();
 })();
 </script>
 """
@@ -3847,6 +4460,10 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         ),
         "@@PERFORMANCE_CONTEXT_SECTIONS@@": _performance_context_sections(analysis),
         "@@PERFORMANCE_POWER_RECORDING@@": _performance_power_recording(analysis),
+        "@@ANALYSIS_CONCLUSION_SECTIONS@@": _analysis_conclusion_sections(
+            analysis,
+            test_mode,
+        ),
         "@@BRIGHTNESS_THROTTLING_SECTION@@": _brightness_throttling_section(analysis),
         "@@POWER_PRESSURE_SECTIONS@@": _power_pressure_sections(analysis),
         "@@POWER_PRESSURE_DRIVER_ROWS@@": _power_pressure_driver_rows(analysis),
@@ -3855,6 +4472,7 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
         "@@MEMORY_PRESSURE_SUMMARY@@": _memory_pressure_summary(analysis),
         "@@FRAME_FLOW_ROWS@@": _frame_flow_rows(analysis),
         "@@FRAME_FLOW_VISUAL@@": _frame_flow_visual(analysis),
+        "@@FRAME_FLOW_HISTORY_SECTION@@": _frame_flow_history_section(analysis),
         "@@FRAME_FLOW_EVIDENCE@@": _frame_flow_evidence(analysis),
         "@@FRAME_STABILITY_SECTION@@": _frame_stability_section(analysis),
         "@@RENDER_PIPELINE_ROWS@@": _render_pipeline_rows(analysis),

@@ -55,6 +55,12 @@ from .models import (
     SystemSnapshot,
     ThermalSnapshot,
 )
+from .storage import (
+    REPORT_EDITS_FILENAME,
+    load_report_excluded_ranges,
+    read_samples_csv,
+    write_report_excluded_ranges,
+)
 
 
 MAX_LIVE_POINTS = 900
@@ -855,6 +861,57 @@ class LiveTelemetryReader:
             }
         )
         session_start_uptime = samples[0].uptime_s if samples else None
+        timeline_start_uptime = (
+            session_start_uptime
+            if session_start_uptime is not None
+            else contexts[0].uptime_s if contexts else None
+        )
+
+        def live_timeline_points(value: object) -> List[Dict[str, object]]:
+            rows = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+            if timeline_start_uptime is not None:
+                rows = [
+                    {
+                        **item,
+                        "elapsed_s": max(
+                            0.0,
+                            float(item.get("uptime_s") or 0.0) - timeline_start_uptime,
+                        ),
+                    }
+                    for item in rows
+                    if isinstance(item.get("uptime_s"), (int, float))
+                ]
+            if len(rows) > MAX_LIVE_POINTS:
+                stride = max(1, math.ceil(len(rows) / MAX_LIVE_POINTS))
+                displayed_rows = rows[::stride][:MAX_LIVE_POINTS]
+                if displayed_rows[-1] is not rows[-1]:
+                    displayed_rows = [*displayed_rows[: MAX_LIVE_POINTS - 1], rows[-1]]
+                rows = displayed_rows
+            return rows
+
+        frame_flow = performance.get("frame_flow", {})
+        if isinstance(frame_flow, dict):
+            flow_stages = frame_flow.get("stages", [])
+            if isinstance(flow_stages, list):
+                performance = {
+                    **performance,
+                    "refresh_rate_timeline": live_timeline_points(
+                        performance.get("refresh_rate_timeline", [])
+                    ),
+                    "frame_flow": {
+                        **frame_flow,
+                        "stages": [
+                            {
+                                **stage,
+                                "timeline": live_timeline_points(
+                                    stage.get("timeline", [])
+                                ),
+                            }
+                            for stage in flow_stages
+                            if isinstance(stage, dict)
+                        ],
+                    },
+                }
         performance_timeline = performance.get("frame_rate_timeline", [])
         performance_series = [
             {
@@ -1077,6 +1134,8 @@ class LiveTelemetryReader:
                     "direction": latest.direction,
                     "voltage_mv": latest.voltage_mv,
                     "cpu_pct": latest.cpu_pct,
+                    "cluster_cpu_pct": dict(latest.cluster_cpu_pct),
+                    "frequencies_mhz": dict(latest.frequencies_mhz),
                     "temperature_c": latest.battery_temperature_c,
                     "gpu_frequency_mhz": latest.gpu_frequency_mhz,
                     "gpu_load_pct": latest.gpu_load_pct,
@@ -1113,6 +1172,8 @@ class LiveTelemetryReader:
                     "current_ma": sample.current_ma,
                     "voltage_mv": sample.voltage_mv,
                     "cpu_pct": sample.cpu_pct,
+                    "cluster_cpu_pct": dict(sample.cluster_cpu_pct),
+                    "frequencies_mhz": dict(sample.frequencies_mhz),
                     "temperature_c": sample.battery_temperature_c,
                     "gpu_frequency_mhz": sample.gpu_frequency_mhz,
                     "gpu_load_pct": sample.gpu_load_pct,
@@ -2008,10 +2069,13 @@ class DashboardManager:
             (value - minimum) / max(1, maximum - minimum)
             * (normalized_maximum - normalized_minimum)
         )
+        display_normalized = max(0.0, min(1.0, normalized))
         display_value_format = str(
             capability.get("display_value_format") or "normalized"
         )
-        display_value = str(value) if display_value_format == "raw" else f"{normalized:.7f}"
+        # Some OEMs return their raw integer scale from get-brightness, while
+        # set-brightness still follows Android's normalized 0..1 shell contract.
+        display_value = f"{display_normalized:.7f}"
         display_result = adb_shell(
             self.adb,
             device,
@@ -2034,16 +2098,17 @@ class DashboardManager:
             if display_value_format == "raw":
                 display_applied = abs(display_current - value) <= 0.5
             else:
-                display_applied = abs(display_current - normalized) <= max(
-                    1e-4,
-                    float(capability.get("normalized_step") or 0.0) * 1.5,
+                display_applied = (
+                    abs(display_current - display_normalized)
+                    <= max(
+                        1e-4,
+                        float(capability.get("normalized_step") or 0.0) * 1.5,
+                    )
                 )
         refreshed.update(
             {
                 "requested": value,
-                "display_requested": (
-                    float(value) if display_value_format == "raw" else normalized
-                ),
+                "display_requested": display_normalized,
                 "display_applied": display_applied,
                 "applied": setting_applied and display_applied is not False,
                 "previous_mode": previous_mode,
@@ -2375,6 +2440,10 @@ class DashboardManager:
         capture_preset = str(payload.get("capture_preset") or "auto").strip().lower()
         if capture_preset not in set(capture_preset_names()):
             raise ValueError("unknown capture preset")
+        if capture_preset == "harmony-smartperf" and platform != "harmony":
+            raise ValueError("Harmony SmartPerf preset requires a HarmonyOS HDC device")
+        if capture_preset == "harmony-smartperf" and test_mode != "performance":
+            raise ValueError("Harmony SmartPerf preset is available only in performance mode")
         raw_capture_features = payload.get("capture_features")
         capture_features: Dict[str, bool] = {}
         if raw_capture_features is not None:
@@ -2694,6 +2763,59 @@ class DashboardManager:
             "run_name": run_dir.name,
             "report_path": str(run_dir / "report.html"),
             "report_url": self.report_url(run_dir.name),
+            "output": output,
+        }
+
+    def delete_report_range(self, payload: Dict[str, object]) -> Dict[str, object]:
+        run_dir = self._resolve_run_dir(payload)
+        self._ensure_run_idle(run_dir)
+        try:
+            start_uptime_s = float(payload.get("start_uptime_s"))
+            end_uptime_s = float(payload.get("end_uptime_s"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("start_uptime_s and end_uptime_s must be numbers") from exc
+        if not math.isfinite(start_uptime_s) or not math.isfinite(end_uptime_s):
+            raise ValueError("Report range boundaries must be finite")
+        if end_uptime_s <= start_uptime_s:
+            raise ValueError("end_uptime_s must be greater than start_uptime_s")
+
+        samples = read_samples_csv(run_dir / "samples.csv")
+        if len(samples) < 2:
+            raise RuntimeError("Run does not contain enough report samples")
+        deleted_sample_count = sum(
+            1
+            for sample in samples
+            if start_uptime_s <= float(sample.uptime_s) <= end_uptime_s
+        )
+        if deleted_sample_count == 0:
+            raise ValueError("Selected range does not contain any report samples")
+        if len(samples) - deleted_sample_count < 2:
+            raise ValueError("Deleting this range would leave fewer than two samples")
+
+        edits_path = run_dir / REPORT_EDITS_FILENAME
+        previous_edits = edits_path.read_bytes() if edits_path.exists() else None
+        ranges = load_report_excluded_ranges(run_dir)
+        try:
+            edits = write_report_excluded_ranges(
+                run_dir,
+                [*ranges, (start_uptime_s, end_uptime_s)],
+            )
+            output = self._run_cli(
+                ["report", str(run_dir)],
+                f"Deleting report range for {run_dir.name}",
+            )
+        except Exception:
+            if previous_edits is None:
+                edits_path.unlink(missing_ok=True)
+            else:
+                edits_path.write_bytes(previous_edits)
+            raise
+        return {
+            "run_name": run_dir.name,
+            "report_path": str(run_dir / "report.html"),
+            "report_url": self.report_url(run_dir.name),
+            "deleted_sample_count": deleted_sample_count,
+            "excluded_range_count": len(edits.get("excluded_ranges", [])),
             "output": output,
         }
 
@@ -3037,6 +3159,9 @@ class DashboardManager:
             burst = 620.0 * math.exp(-((index - 122.0) / 13.0) ** 2)
             power = baseline + burst + 55.0 * math.sin(index / 3.7)
             cpu = 27.0 + 13.0 * math.sin(index / 15.0) + burst / 45.0
+            little_cpu = max(0.0, min(100.0, cpu * 0.82 + 8.0))
+            middle_cpu = max(0.0, min(100.0, cpu * 0.58 + burst / 70.0))
+            big_cpu = max(0.0, min(100.0, cpu * 0.32 + burst / 95.0))
             temperature = 31.2 + index * 0.007 + 0.15 * math.sin(index / 24.0)
             voltage = 3898.0 - index * 0.12
             series.append(
@@ -3046,6 +3171,16 @@ class DashboardManager:
                     "current_ma": power / max(3.6, voltage / 1000.0),
                     "voltage_mv": voltage,
                     "cpu_pct": min(100.0, cpu),
+                    "cluster_cpu_pct": {
+                        "policy0": little_cpu,
+                        "policy4": middle_cpu,
+                        "policy7": big_cpu,
+                    },
+                    "frequencies_mhz": {
+                        "policy0": 1050.0 + 360.0 * max(0.0, math.sin(index / 17.0)),
+                        "policy4": 1420.0 + 620.0 * max(0.0, math.sin(index / 19.0)),
+                        "policy7": 980.0 + 980.0 * max(0.0, math.sin(index / 23.0)),
+                    },
                     "temperature_c": temperature,
                     "gpu_frequency_mhz": 420.0 + 220.0 * max(0.0, math.sin(index / 21.0)),
                 }
@@ -3062,6 +3197,12 @@ class DashboardManager:
                     - 12.0 * math.exp(-((index - 122.0) / 16.0) ** 2)
                     - 3.0 * max(0.0, math.sin(index / 9.0)),
                 ),
+                "one_percent_low_fps": max(
+                    32.0,
+                    104.0
+                    - 30.0 * math.exp(-((index - 122.0) / 13.0) ** 2)
+                    - 8.0 * max(0.0, math.sin(index / 7.0)),
+                ),
                 "frame_time_average_ms": 8.5,
                 "frame_time_p95_ms": (
                     9.2 + 15.0 * math.exp(-((index - 122.0) / 12.0) ** 2)
@@ -3072,14 +3213,33 @@ class DashboardManager:
                 "frame_issue_pct": (
                     0.4 + 3.2 * math.exp(-((index - 122.0) / 14.0) ** 2)
                 ),
-                "refresh_rate_hz": 120.0,
+                "refresh_rate_hz": 60.0 if 92 <= index < 124 else 120.0,
             }
             for index in range(2, 240, 2)
+        ]
+        demo_present_timeline = [
+            {
+                "elapsed_s": float(item["elapsed_s"]),
+                "uptime_s": float(item["uptime_s"]),
+                "value": float(item["frame_rate_fps"]),
+                "frame_rate_fps": float(item["frame_rate_fps"]),
+            }
+            for item in performance_series
+        ]
+        demo_refresh_timeline = [
+            {
+                "elapsed_s": float(item["elapsed_s"]),
+                "uptime_s": float(item["uptime_s"]),
+                "value": float(item["refresh_rate_hz"]),
+                "refresh_rate_hz": float(item["refresh_rate_hz"]),
+            }
+            for item in performance_series
         ]
         return {
             "status": "demo",
             "running": False,
             "is_demo": True,
+            "test_mode": "performance",
             "title": "Runtime UI preview",
             "run_name": "demo-preview",
             "output_dir": str(self.output_root / "demo-preview"),
@@ -3094,6 +3254,31 @@ class DashboardManager:
             "elapsed_s": 239.0,
             "requested_duration_s": 360.0,
             "progress": 239.0 / 360.0,
+            "metadata": {
+                "platform": "android",
+                "test_mode": "performance",
+                "capture_configuration": {
+                    "preset": "performance",
+                    "features": {
+                        "cpu_usage": True,
+                        "cpu_frequency": True,
+                        "gpu_metrics": True,
+                        "memory_frequency": False,
+                        "foreground_window": True,
+                        "frame_rate": True,
+                        "frame_details": True,
+                        "harmony_hitches": False,
+                        "touch_events": True,
+                        "target_process": True,
+                        "process_snapshots": True,
+                        "hot_threads": True,
+                        "thermal": True,
+                        "scheduler": True,
+                        "runtime_settings": True,
+                        "power_attribution": False,
+                    },
+                },
+            },
             "latest": {
                 **latest,
                 "uptime_s": 100239.0,
@@ -3161,6 +3346,7 @@ class DashboardManager:
                     {"refresh_rate_hz": 60.0, "estimated_duration_s": 32.0, "share_pct": 13.4},
                     {"refresh_rate_hz": 120.0, "estimated_duration_s": 207.0, "share_pct": 86.6},
                 ],
+                "refresh_rate_timeline": demo_refresh_timeline,
                 "sampled_compositor_fps": 117.8,
                 "minimum_sampled_compositor_fps": 92.4,
                 "sampled_frame_rate_fps": 117.8,
@@ -3180,9 +3366,10 @@ class DashboardManager:
                     "valid_count": 2,
                     "reference_count": 1,
                     "invalid_count": 1,
+                    "timeline_stage_count": 2,
                     "note": (
                         "不同阶段的数值语义不同：应用提交速率、合成器呈现 FPS 与屏幕刷新率"
-                        "不能直接互换。主数据只选择与当前目标应用绑定且持续产生有效增量的来源。"
+                        "不能直接互换。没有独立计数的节点不会用延迟或刷新率冒充 FPS。"
                     ),
                     "stages": [
                         {
@@ -3198,6 +3385,9 @@ class DashboardManager:
                             "sample_count": 0,
                             "confidence": "low",
                             "metrics": [],
+                            "timeline": [],
+                            "timeline_unit": "帧/s",
+                            "timeline_value_label": "提交速率",
                         },
                         {
                             "key": "render_queue",
@@ -3212,6 +3402,9 @@ class DashboardManager:
                             "sample_count": 864,
                             "confidence": "high",
                             "metrics": [{"label": "截止超时", "value": 0.84, "unit": "%", "digits": 2}],
+                            "timeline": [],
+                            "timeline_unit": "FPS",
+                            "timeline_value_label": "无独立帧率计数",
                         },
                         {
                             "key": "surface_present",
@@ -3229,6 +3422,9 @@ class DashboardManager:
                                 {"label": "1% Low", "value": 88.6, "unit": "FPS", "digits": 1},
                                 {"label": "P95 间隔", "value": 16.72, "unit": "ms", "digits": 2},
                             ],
+                            "timeline": demo_present_timeline,
+                            "timeline_unit": "FPS",
+                            "timeline_value_label": "呈现帧率",
                         },
                         {
                             "key": "display_scanout",
@@ -3243,6 +3439,9 @@ class DashboardManager:
                             "sample_count": None,
                             "confidence": "high",
                             "metrics": [{"label": "显示/应用倍率", "value": 1.02, "unit": "×", "digits": 2}],
+                            "timeline": demo_refresh_timeline,
+                            "timeline_unit": "Hz",
+                            "timeline_value_label": "显示刷新率",
                         },
                     ],
                 },
@@ -3284,7 +3483,8 @@ class DashboardManager:
                 "display_height_px": 2856,
                 "render_width_px": 1260,
                 "render_height_px": 2736,
-                "render_resolution_source": "SurfaceFlinger GraphicBuffer",
+                "render_resolution_source": "演示数据 · 模拟 SurfaceFlinger GraphicBuffer",
+                "render_resolution_evidence": "SurfaceView demo-preview (BLAST Consumer)",
                 "render_resolution_estimated": False,
                 "render_resolution_available": True,
                 "render_scale_pct": 95.5,
@@ -3577,6 +3777,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.import_run_log(payload)
             elif path == "/api/report":
                 result = self.server.manager.regenerate_run(payload)
+            elif path == "/api/report/delete-range":
+                result = self.server.manager.delete_report_range(payload)
             elif path == "/api/recover":
                 result = self.server.manager.recover_run(payload)
             elif path == "/api/compare":

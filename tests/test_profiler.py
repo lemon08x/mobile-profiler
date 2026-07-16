@@ -46,10 +46,18 @@ from mobile_profiler.collector import (
     parse_sampler_line,
     parse_normalized_samples,
 )
-from mobile_profiler.cli import filter_events_by_metadata, run_harmony_record
+from mobile_profiler.cli import (
+    _filter_report_events,
+    filter_events_by_metadata,
+    finalize_run,
+    run_harmony_record,
+)
 from mobile_profiler.comparison import build_comparison_html, build_run_comparison
 from mobile_profiler.evidence import create_evidence_archive
-from mobile_profiler.features import resolve_capture_configuration
+from mobile_profiler.features import (
+    capture_features_from_metadata,
+    resolve_capture_configuration,
+)
 from mobile_profiler.ios import (
     _load_endpoints,
     collect_ios_session,
@@ -116,10 +124,13 @@ from mobile_profiler.report import _report_bundle, build_report_fragment
 from mobile_profiler.storage import (
     RunJournal,
     load_contexts,
+    normalize_report_excluded_ranges,
     load_scheduler_snapshots,
     load_system_snapshots,
     load_thermal_snapshots,
     read_samples_csv,
+    write_jsonl,
+    write_report_excluded_ranges,
     write_samples_csv,
 )
 
@@ -719,6 +730,53 @@ class CpuAnalysisTests(unittest.TestCase):
         self.assertTrue(cluster["model_available"])
         self.assertGreater(cluster["frequency_premium_mw"], 0.0)
         self.assertGreater(cluster["modeled_power_mw"], cluster["frequency_premium_mw"])
+
+    def test_frequency_residency_skips_deleted_range_boundary(self) -> None:
+        samples = []
+        for index, (uptime_s, frequency) in enumerate(
+            ((100.0, 500.0), (103.0, 2000.0), (104.0, 2000.0))
+        ):
+            samples.append(
+                Sample(
+                    index=index,
+                    elapsed_s=float(index),
+                    uptime_s=uptime_s,
+                    current_ma=300.0,
+                    signed_current_ma=-300.0,
+                    voltage_mv=3800.0,
+                    power_mw=1140.0,
+                    direction="discharging",
+                    cpu_pct=50.0,
+                    core_cpu_pct={"0": 50.0},
+                    cluster_cpu_pct={"policy0": 50.0},
+                    frequencies_mhz={"policy0": frequency},
+                )
+            )
+        samples[1]._report_break_before = True
+
+        result = analyze_cpu(
+            samples,
+            [
+                {
+                    "name": "policy0",
+                    "label": "CPU",
+                    "cluster_index": 0,
+                    "cores": [0],
+                    "max_khz": 2_000_000,
+                }
+            ],
+            {},
+            max_gap_s=3.0,
+        )
+
+        residency = {
+            item["band"]: item
+            for item in result["clusters"][0]["residency"]
+        }
+        self.assertEqual(residency["low"]["time_pct"], 0.0)
+        self.assertEqual(residency["high"]["time_pct"], 100.0)
+        self.assertEqual(residency["low"]["load_weighted_pct"], 0.0)
+        self.assertEqual(residency["high"]["load_weighted_pct"], 100.0)
 
 
 class GpuAnalysisTests(unittest.TestCase):
@@ -1523,6 +1581,7 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertEqual(frame["frame_sample_count"], 3)
         self.assertEqual(frame["missed_vsync_interval_count"], 1)
         self.assertGreater(float(frame["frame_interval_p95_ms"]), 30.0)
+        self.assertAlmostEqual(float(frame["one_percent_low_fps"]), 30.0, places=1)
 
         window = parse_harmony_window_manager(
             "WindowName DisplayId Pid WinId Type Mode Flag ZOrd Orientation [ x y w h ]\n"
@@ -1605,6 +1664,21 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertEqual(flow["surface_present"]["status"], "primary")
         self.assertAlmostEqual(flow["surface_present"]["value"], 88.9, places=1)
         self.assertEqual(flow["display_scanout"]["status"], "reference")
+        self.assertEqual(
+            [(item["uptime_s"], item["value"]) for item in result["refresh_rate_timeline"]],
+            [(100.0, 60.0), (110.0, 120.0)],
+        )
+        self.assertEqual(flow["app_submission"]["timeline"], [])
+        self.assertEqual(flow["render_queue"]["timeline"], [])
+        self.assertEqual(
+            [item["value"] for item in flow["surface_present"]["timeline"]],
+            [59.8, 118.0],
+        )
+        self.assertEqual(
+            [item["value"] for item in flow["display_scanout"]["timeline"]],
+            [60.0, 120.0],
+        )
+        self.assertEqual(result["frame_flow"]["timeline_stage_count"], 2)
 
     def test_android_performance_context_analysis_uses_counter_deltas(self) -> None:
         contexts = [
@@ -1673,6 +1747,158 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(flow["app_submission"]["value"], 6.0)
         self.assertEqual(flow["surface_present"]["status"], "unavailable")
         self.assertEqual(flow["display_scanout"]["status"], "reference")
+        self.assertEqual(
+            [(item["uptime_s"], item["value"]) for item in flow["app_submission"]["timeline"]],
+            [(110.0, 6.0)],
+        )
+        self.assertEqual(flow["render_queue"]["timeline"], [])
+        self.assertEqual(flow["surface_present"]["timeline"], [])
+        self.assertEqual(
+            [item["value"] for item in flow["display_scanout"]["timeline"]],
+            [60.0, 60.0],
+        )
+        self.assertEqual(result["frame_flow"]["timeline_stage_count"], 2)
+
+    def test_harmony_frame_flow_keeps_smartperf_and_render_service_timelines_separate(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                refresh_rate_hz=60.0,
+                source="harmony_smartperf",
+                performance={
+                    "platform": "harmony",
+                    "smartperf_source": "SP_daemon",
+                    "frame_sample_count": 58,
+                    "compositor_fps": 58.0,
+                },
+            ),
+            ContextSample(
+                101.0,
+                refresh_rate_hz=60.0,
+                source="harmony_ability_render_service",
+                performance={
+                    "platform": "harmony",
+                    "render_service_compositor_source": True,
+                    "frame_sample_count": 60,
+                    "compositor_fps": 60.0,
+                },
+            ),
+            ContextSample(
+                102.0,
+                refresh_rate_hz=120.0,
+                source="harmony_smartperf",
+                performance={
+                    "platform": "harmony",
+                    "smartperf_source": "SP_daemon",
+                    "frame_sample_count": 57,
+                    "compositor_fps": 57.0,
+                },
+            ),
+            ContextSample(
+                103.0,
+                refresh_rate_hz=120.0,
+                source="harmony_ability_render_service",
+                performance={
+                    "platform": "harmony",
+                    "render_service_compositor_source": True,
+                    "frame_sample_count": 59,
+                    "compositor_fps": 59.0,
+                },
+            ),
+        ]
+
+        result = analyze_performance_contexts(contexts, {"platform": "harmony"})
+
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(
+            [item["value"] for item in flow["app_submission"]["timeline"]],
+            [58.0, 57.0],
+        )
+        self.assertEqual(
+            [item["value"] for item in flow["surface_present"]["timeline"]],
+            [60.0, 59.0],
+        )
+        self.assertEqual(
+            [item["frame_rate_fps"] for item in result["frame_rate_timeline"]],
+            [58.0, 57.0],
+        )
+        self.assertEqual(
+            [(item["uptime_s"], item["value"]) for item in result["refresh_rate_timeline"]],
+            [(101.0, 60.0), (103.0, 120.0)],
+        )
+        self.assertEqual(flow["render_queue"]["timeline"], [])
+
+    def test_harmony_frame_and_refresh_timelines_exclude_asleep_contexts(self) -> None:
+        contexts = [
+            ContextSample(
+                100.0,
+                screen_state="Awake",
+                refresh_rate_hz=60.0,
+                source="harmony_ability_render_service",
+                performance={
+                    "platform": "harmony",
+                    "render_service_compositor_source": True,
+                    "frame_sample_count": 60,
+                    "compositor_fps": 60.0,
+                },
+            ),
+            ContextSample(
+                105.0,
+                screen_state="Asleep",
+                refresh_rate_hz=120.0,
+                source="harmony_ability_render_service",
+                performance={
+                    "platform": "harmony",
+                    "render_service_compositor_source": True,
+                    "frame_sample_count": 5,
+                    "compositor_fps": 1.0,
+                },
+            ),
+        ]
+
+        result = analyze_performance_contexts(contexts, {"platform": "harmony"})
+
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(result["current_refresh_rate_hz"], 60.0)
+        self.assertEqual(result["observed_refresh_rates_hz"], [60.0])
+        self.assertEqual(result["refresh_switch_count"], 0)
+        self.assertEqual(
+            [item["frame_rate_fps"] for item in result["frame_rate_timeline"]],
+            [60.0],
+        )
+        self.assertEqual(
+            [item["value"] for item in flow["surface_present"]["timeline"]],
+            [60.0],
+        )
+        self.assertEqual(
+            [item["value"] for item in flow["display_scanout"]["timeline"]],
+            [60.0],
+        )
+
+    def test_refresh_timeline_compression_preserves_short_rate_switches(self) -> None:
+        contexts = [
+            ContextSample(
+                float(uptime),
+                screen_state="Awake",
+                refresh_rate_hz=float(rate),
+                source="harmony_ability_render_service",
+                performance={"platform": "harmony"},
+            )
+            for uptime, rate in (
+                (100, 60),
+                (101, 60),
+                (102, 120),
+                (103, 60),
+                (104, 60),
+            )
+        ]
+
+        result = analyze_performance_contexts(contexts, {"platform": "harmony"})
+
+        self.assertEqual(
+            [(item["uptime_s"], item["value"]) for item in result["refresh_rate_timeline"]],
+            [(100.0, 60.0), (102.0, 120.0), (103.0, 60.0), (104.0, 60.0)],
+        )
 
     def test_android_surface_frames_override_static_gfxinfo_counter(self) -> None:
         contexts = [
@@ -1727,6 +1953,14 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertEqual(flow["app_submission"]["value"], 0.0)
         self.assertEqual(flow["surface_present"]["status"], "primary")
         self.assertAlmostEqual(flow["surface_present"]["value"], 60.07)
+        self.assertEqual(
+            [item["value"] for item in flow["surface_present"]["timeline"]],
+            [60.07],
+        )
+        self.assertEqual(
+            [item["value"] for item in flow["display_scanout"]["timeline"]],
+            [120.0, 120.0],
+        )
 
     def test_android_frame_pipeline_and_performance_test_items_follow_slow_frame_path(self) -> None:
         def frame_record(frame_id: int, base: int, completed_ms: int) -> dict[str, int]:
@@ -1929,6 +2163,9 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertEqual(result["frame_rate_label"], "应用 UI 帧提交速率")
         self.assertEqual(result["frame_unavailable_reason"], "screen asleep")
         self.assertIsNone(result["touch_interaction_count"])
+        self.assertEqual(result["refresh_rate_timeline"], [])
+        flow = {item["key"]: item for item in result["frame_flow"]["stages"]}
+        self.assertEqual(flow["display_scanout"]["timeline"], [])
 
     def test_harmony_normalized_sample_preserves_signed_current_and_cpu_delta(self) -> None:
         policies = [
@@ -1983,6 +2220,7 @@ class HarmonyAdapterTests(unittest.TestCase):
         self.assertTrue(features["frame_rate"])
         self.assertFalse(features["frame_details"])
         self.assertTrue(features["touch_events"])
+        self.assertTrue(features["target_process"])
         self.assertFalse(features["power_attribution"])
         self.assertFalse(features["hot_threads"])
         self.assertEqual(performance["backend"], "harmony_smartperf")
@@ -1995,18 +2233,62 @@ class HarmonyAdapterTests(unittest.TestCase):
         android = resolve_capture_configuration(
             "performance", "android", "performance-standard"
         )
-        self.assertFalse(android["features"]["harmony_hitches"])
-        self.assertFalse(android["features"]["memory_frequency"])
+        self.assertEqual(
+            {name for name, enabled in android["features"].items() if enabled},
+            {
+                "cpu_usage",
+                "cpu_frequency",
+                "gpu_metrics",
+                "foreground_window",
+                "frame_rate",
+                "frame_details",
+                "thermal",
+            },
+        )
         power = resolve_capture_configuration("power", "android", "power-standard")
-        self.assertFalse(power["features"]["memory_frequency"])
+        self.assertEqual(
+            {name for name, enabled in power["features"].items() if enabled},
+            {
+                "cpu_usage",
+                "cpu_frequency",
+                "gpu_metrics",
+                "foreground_window",
+                "thermal",
+                "runtime_settings",
+            },
+        )
+        self.assertEqual(
+            power["base_channels"],
+            ["battery_current", "battery_voltage", "device_timestamp"],
+        )
+        auto_power = resolve_capture_configuration("power", "android", "auto")
+        self.assertEqual(auto_power["preset"], "power-standard")
+        self.assertEqual(auto_power["features"], power["features"])
+        auto_performance = resolve_capture_configuration(
+            "performance", "android", "auto"
+        )
+        self.assertEqual(auto_performance["preset"], "performance-standard")
+        self.assertEqual(auto_performance["features"], android["features"])
+        harmony_native = resolve_capture_configuration(
+            "performance", "harmony", "performance-standard"
+        )
+        self.assertEqual(
+            {name for name, enabled in harmony_native["features"].items() if enabled},
+            {
+                "cpu_usage",
+                "cpu_frequency",
+                "foreground_window",
+                "frame_rate",
+                "thermal",
+            },
+        )
         ios = resolve_capture_configuration(
             "performance", "ios", "performance-standard"
         )
-        self.assertTrue(ios["features"]["cpu_usage"])
-        self.assertTrue(ios["features"]["gpu_metrics"])
-        self.assertTrue(ios["features"]["target_process"])
-        self.assertTrue(ios["features"]["process_snapshots"])
-        self.assertTrue(ios["features"]["thermal"])
+        self.assertEqual(
+            {name for name, enabled in ios["features"].items() if enabled},
+            {"cpu_usage", "gpu_metrics", "foreground_window", "thermal"},
+        )
         for name in (
             "cpu_frequency",
             "memory_frequency",
@@ -2014,12 +2296,50 @@ class HarmonyAdapterTests(unittest.TestCase):
             "frame_details",
             "harmony_hitches",
             "touch_events",
+            "target_process",
+            "process_snapshots",
             "hot_threads",
             "scheduler",
             "runtime_settings",
             "power_attribution",
         ):
             self.assertFalse(ios["features"][name], name)
+        ios_required = resolve_capture_configuration(
+            "power",
+            "ios",
+            "low-overhead",
+            disable_features=["cpu_usage", "gpu_metrics", "foreground_window", "thermal"],
+        )
+        for name in ("cpu_usage", "gpu_metrics", "foreground_window", "thermal"):
+            self.assertTrue(ios_required["features"][name], name)
+        android_touch = resolve_capture_configuration(
+            "performance",
+            "android",
+            "performance-standard",
+            enable_features=["touch_events"],
+        )
+        self.assertFalse(android_touch["features"]["touch_events"])
+        harmony_gpu = resolve_capture_configuration(
+            "performance",
+            "harmony",
+            "performance-standard",
+            enable_features=["gpu_metrics", "frame_details", "target_process"],
+        )
+        for name in ("gpu_metrics", "frame_details", "target_process"):
+            self.assertFalse(harmony_gpu["features"][name], name)
+
+    def test_capture_metadata_partial_features_keep_legacy_channels_enabled(self) -> None:
+        self.assertTrue(all(capture_features_from_metadata({}).values()))
+        features = capture_features_from_metadata(
+            {
+                "capture_configuration": {
+                    "features": {"frame_rate": False},
+                }
+            }
+        )
+        self.assertFalse(features["frame_rate"])
+        self.assertTrue(features["cpu_usage"])
+        self.assertTrue(features["gpu_metrics"])
 
     def test_smartperf_parser_builds_native_sample_and_frame_context(self) -> None:
         text = """
@@ -2551,6 +2871,150 @@ class IosAdapterTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_exposes_persistent_time_range_delete_controls(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index),
+                uptime_s=100.0 + index,
+                current_ma=300.0,
+                signed_current_ma=-300.0,
+                voltage_mv=3800.0,
+                power_mw=1140.0,
+                direction="discharging",
+                cpu_pct=20.0,
+            )
+            for index in range(3)
+        ]
+        fragment = build_report_fragment(
+            {
+                "metadata": {
+                    "title": "range delete",
+                    "platform": "android",
+                    "test_mode": "power",
+                    "device": {},
+                    "cpu_policies": [],
+                },
+                "analysis": {
+                    "summary": {"duration_s": 2.0, "sample_count": 3},
+                    "cpu": {"clusters": [], "timeline": []},
+                    "gpu": {},
+                    "thermal": {},
+                    "applications": {},
+                    "external_events": {},
+                    "warnings": [],
+                    "findings": [],
+                    "data_sources": [],
+                },
+                "samples": [sample.__dict__ for sample in samples],
+            }
+        )
+
+        self.assertIn('id="report-range-start"', fragment)
+        self.assertIn('id="report-range-end"', fragment)
+        self.assertIn('id="report-range-status"', fragment)
+        self.assertIn('id="delete-report-range" type="button" disabled', fragment)
+        self.assertIn('/api/report/delete-range', fragment)
+        self.assertIn("start_uptime_s", fragment)
+        self.assertIn("end_uptime_s", fragment)
+        self.assertIn("raw-delete-window", fragment)
+        self.assertIn("raw-excluded-window", fragment)
+
+    def test_report_excluded_ranges_merge_and_split_duration_events(self) -> None:
+        ranges = normalize_report_excluded_ranges(
+            [
+                {"start_uptime_s": 103.0, "end_uptime_s": 105.0},
+                {"start_uptime_s": 104.0, "end_uptime_s": 106.0},
+            ]
+        )
+        events = [
+            ExternalEvent(100.0, "阶段", "运行", duration_s=10.0),
+            ExternalEvent(104.0, "瞬时", "标记"),
+            ExternalEvent(111.0, "保留", "标记"),
+        ]
+
+        filtered = _filter_report_events(events, ranges)
+
+        self.assertEqual(ranges, [(103.0, 106.0)])
+        self.assertEqual(
+            [(event.device_uptime_s, event.duration_s) for event in filtered[:2]],
+            [(100.0, 3.0), (106.0, 4.0)],
+        )
+        self.assertTrue(all(event.metadata.get("report_edit_split") for event in filtered[:2]))
+        self.assertEqual(filtered[-1].name, "保留")
+
+    def test_finalize_run_reapplies_report_edits_without_rewriting_source_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            raw_path = raw_dir / "sampler-stream.txt"
+            raw_path.write_text("", encoding="utf-8")
+            metadata = {
+                "title": "edited report",
+                "platform": "android",
+                "test_mode": "power",
+                "sample_interval_s": 1.0,
+                "battery_start": {
+                    "voltage_mv": 3800.0,
+                    "status": "discharging",
+                },
+                "device": {},
+                "cpu_policies": [],
+            }
+            (root / "metadata.json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            samples = [
+                Sample(
+                    index=index,
+                    elapsed_s=float(index),
+                    uptime_s=100.0 + index,
+                    current_ma=300.0,
+                    signed_current_ma=-300.0,
+                    voltage_mv=3800.0,
+                    power_mw=1140.0,
+                    direction="discharging",
+                    cpu_pct=20.0,
+                )
+                for index in range(7)
+            ]
+            write_samples_csv(root / "samples.csv", samples, metadata)
+            contexts = [
+                ContextSample(101.0, foreground_package="deleted"),
+                ContextSample(106.0, foreground_package="kept"),
+            ]
+            events = [ExternalEvent(101.0, "deleted", "marker"), ExternalEvent(106.0, "kept", "marker")]
+            write_jsonl(root / "contexts.jsonl", contexts)
+            write_jsonl(root / "events.jsonl", events)
+            write_report_excluded_ranges(root, [(100.0, 101.0), (103.0, 104.0)])
+            original_raw = raw_path.read_bytes()
+            original_contexts = (root / "contexts.jsonl").read_bytes()
+            original_events = (root / "events.jsonl").read_bytes()
+
+            first_analysis, _ = finalize_run(root)
+            first_samples = read_samples_csv(root / "samples.csv")
+            second_analysis, _ = finalize_run(root)
+            second_samples = read_samples_csv(root / "samples.csv")
+            source_samples = read_samples_csv(root / "report-source-samples.csv")
+            stored_metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+            final_raw = raw_path.read_bytes()
+            final_contexts = (root / "contexts.jsonl").read_bytes()
+            final_events = (root / "events.jsonl").read_bytes()
+
+        self.assertEqual([sample.uptime_s for sample in first_samples], [102.0, 105.0, 106.0])
+        self.assertEqual([sample.uptime_s for sample in second_samples], [102.0, 105.0, 106.0])
+        self.assertEqual([sample.elapsed_s for sample in second_samples], [0.0, 3.0, 4.0])
+        self.assertEqual([sample.uptime_s for sample in source_samples], [float(value) for value in range(100, 107)])
+        self.assertAlmostEqual(first_analysis["summary"]["covered_duration_s"], 1.0)
+        self.assertAlmostEqual(second_analysis["summary"]["covered_duration_s"], 1.0)
+        self.assertEqual(stored_metadata["report_edits"]["time_origin_uptime_s"], 102.0)
+        self.assertEqual(stored_metadata["report_edits"]["excluded_sample_count"], 4)
+        self.assertEqual(final_raw, original_raw)
+        self.assertEqual(final_contexts, original_contexts)
+        self.assertEqual(final_events, original_events)
+
     def test_report_lists_and_marks_each_brightness_throttling_point(self) -> None:
         samples = [
             Sample(
@@ -2639,14 +3103,18 @@ class ReportTests(unittest.TestCase):
         )
 
         self.assertEqual(analysis["brightness_throttling"]["point_count"], 2)
-        self.assertIn("疑似降亮度点", fragment)
-        self.assertEqual(fragment.count('class="brightness-point-row"'), 2)
-        self.assertIn('data-brightness-time="10.000"', fragment)
-        self.assertIn('data-brightness-time="20.000"', fragment)
-        self.assertIn('source-tag medium">疑似', fragment)
-        self.assertIn('source-tag high">确认', fragment)
-        self.assertIn("系统设定亮度和显示侧有效亮度分开记录", fragment)
+        self.assertEqual(
+            [item["status"] for item in analysis["brightness_throttling"]["points"]],
+            ["suspected", "confirmed"],
+        )
+        self.assertIn('data-panel="raw"', fragment)
+        self.assertIn('key: "requested_brightness_pct"', fragment)
+        self.assertIn('key: "effective_brightness_pct"', fragment)
+        self.assertIn('key: "brightness_thermal_cap_pct"', fragment)
+        self.assertIn('features: ["foreground_window", "thermal"]', fragment)
         self.assertIn("appendBrightnessMarkers", fragment)
+        self.assertIn("确认热降亮", fragment)
+        self.assertIn("疑似热降亮", fragment)
 
     def test_power_and_performance_modes_separate_analysis_and_report_focus(self) -> None:
         samples = [
@@ -2771,6 +3239,7 @@ class ReportTests(unittest.TestCase):
                 "performance",
                 "android",
                 "performance-standard",
+                enable_features=["process_snapshots"],
             ),
         }
         performance = analyze_run(
@@ -2814,18 +3283,184 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn('id="mobile-profiler"', power_fragment)
         self.assertIn('data-test-mode="power"', power_fragment)
-        self.assertIn("功耗压力分析", power_fragment)
-        self.assertIn("系统设置变化", power_fragment)
+        self.assertEqual(power_fragment.count('class="nav-tab"'), 2)
+        self.assertEqual(power_fragment.count('class="app-view"'), 2)
+        self.assertIn('data-view="raw"', power_fragment)
+        self.assertIn('data-view="analysis"', power_fragment)
+        self.assertIn('data-panel="raw"', power_fragment)
+        self.assertIn('data-panel="analysis"', power_fragment)
+        self.assertIn("原始数据随时间变化", power_fragment)
+        self.assertIn("分析结论", power_fragment)
+        self.assertIn("资源与整机功率相关性", power_fragment)
+        self.assertNotIn("系统设置变化", power_fragment)
         self.assertIn('data-test-mode="performance"', performance_fragment)
-        self.assertIn("帧率数据流与渲染链路", performance_fragment)
-        self.assertIn("逐阶段帧数据", performance_fragment)
-        self.assertIn("性能测试项矩阵", performance_fragment)
-        self.assertIn("性能模式不继续拆分组件、UID、Wakelock", performance_fragment)
+        self.assertEqual(performance_fragment.count('class="nav-tab"'), 2)
+        self.assertEqual(performance_fragment.count('class="app-view"'), 2)
+        self.assertIn('data-view="raw"', performance_fragment)
+        self.assertIn('data-view="analysis"', performance_fragment)
+        self.assertIn('key: "frame_rate_fps"', performance_fragment)
+        self.assertIn('key: "one_percent_low_fps"', performance_fragment)
+        self.assertIn('key: `frame_stage:${stage.key || index}`', performance_fragment)
+        self.assertIn("按测试项形成的结论证据", performance_fragment)
+        self.assertNotIn("功耗贡献模型证据", performance_fragment)
         self.assertNotIn("<td><strong>渲染分辨率</strong></td>", performance_fragment)
         self.assertNotIn("<td><strong>插帧 / MEMC</strong></td>", performance_fragment)
         self.assertNotIn("内存频率 平均 / P95", performance_fragment)
+        self.assertNotIn('data-view="overview"', power_fragment)
+        self.assertNotIn('data-view="timeline"', performance_fragment)
         self.assertNotIn("@@", power_fragment)
         self.assertNotIn("@@", performance_fragment)
+
+    def test_report_raw_small_multiples_filter_by_capture_feature_and_valid_data(self) -> None:
+        capture_configuration = resolve_capture_configuration(
+            "performance",
+            "android",
+            "performance-standard",
+            disable_features=["gpu_metrics", "memory_frequency", "thermal"],
+        )
+        fragment = build_report_fragment(
+            {
+                "metadata": {
+                    "title": "raw metric filtering",
+                    "platform": "android",
+                    "test_mode": "performance",
+                    "device": {},
+                    "cpu_policies": [],
+                    "capture_configuration": capture_configuration,
+                },
+                "samples": [
+                    {
+                        "elapsed_s": 0.0,
+                        "uptime_s": 100.0,
+                        "power_mw": 0.0,
+                        "current_ma": 0.0,
+                        "voltage_mv": 3800.0,
+                        "cpu_pct": 0.0,
+                        "gpu_load_pct": 77.0,
+                        "gpu_frequency_mhz": 777.0,
+                        "memory_frequency_mhz": 933.0,
+                        "battery_temperature_c": 36.5,
+                        "frequencies_mhz": {"policy0": 0.0},
+                    }
+                ],
+                "analysis": {
+                    "test_mode": "performance",
+                    "summary": {"duration_s": 0.0, "sample_count": 1},
+                    "cpu": {
+                        "clusters": [
+                            {
+                                "name": "policy0",
+                                "label": "Little",
+                                "cores": [0, 1, 2, 3],
+                            }
+                        ],
+                        "timeline": [],
+                    },
+                    "gpu": {"frequency_available": True, "load_available": True},
+                    "performance": {
+                        "frame_rate_timeline": [
+                            {
+                                "uptime_s": 100.0,
+                                "frame_rate_fps": 60.0,
+                                "one_percent_low_fps": 52.0,
+                                "frame_time_p95_ms": 17.0,
+                            }
+                        ],
+                        "refresh_rate_timeline": [
+                            {"uptime_s": 100.0, "refresh_rate_hz": 60.0}
+                        ],
+                    },
+                    "render_performance": {},
+                    "thermal": {"sensors": [], "timeline": []},
+                    "scheduler": {},
+                    "applications": {},
+                    "external_events": {},
+                    "warnings": [],
+                    "findings": [],
+                    "data_sources": [],
+                },
+            }
+        )
+
+        self.assertIn('id="raw-metric-grid"', fragment)
+        self.assertIn("function rawMetricDefinitions()", fragment)
+        self.assertIn("const captureFeatures = captureConfiguration.features || {};", fragment)
+        self.assertIn("return !keys.length || captureFeatures[name] === true;", fragment)
+        self.assertIn(
+            "if (features.length && !features.some(featureEnabled)) return;",
+            fragment,
+        )
+        self.assertIn("if (!points.length) return;", fragment)
+        self.assertIn(
+            "if (definition.requiresPositive && !points.some(point => point.value > 0)) return;",
+            fragment,
+        )
+        self.assertIn('key: "power_mw"', fragment)
+        self.assertIn('key: "current_ma"', fragment)
+        self.assertIn('key: "voltage_mv"', fragment)
+        self.assertIn('key: "cpu_pct"', fragment)
+        self.assertIn('feature: "cpu_usage"', fragment)
+        self.assertIn('key: `cpu_frequency:${cluster.name}`', fragment)
+        self.assertIn('feature: "cpu_frequency"', fragment)
+        self.assertIn('feature: "frame_rate"', fragment)
+        self.assertIn('features: ["foreground_window", "frame_rate"]', fragment)
+        self.assertIn('feature: "gpu_metrics"', fragment)
+        self.assertIn('feature: "memory_frequency"', fragment)
+        self.assertIn('feature: "thermal"', fragment)
+        self.assertIn('requiresPositive: true', fragment)
+        self.assertIn('"gpu_metrics":false', fragment)
+        self.assertIn('"memory_frequency":false', fragment)
+        self.assertIn('"thermal":false', fragment)
+        self.assertIn("本次没有形成可独立陈述的异常结论", fragment)
+
+    def test_report_analysis_renders_each_supported_finding_once(self) -> None:
+        fragment = build_report_fragment(
+            {
+                "metadata": {
+                    "title": "finding placement",
+                    "platform": "android",
+                    "test_mode": "power",
+                    "device": {},
+                    "cpu_policies": [],
+                },
+                "samples": [
+                    {
+                        "elapsed_s": 0.0,
+                        "uptime_s": 100.0,
+                        "power_mw": 1000.0,
+                        "current_ma": 250.0,
+                        "voltage_mv": 4000.0,
+                    }
+                ],
+                "analysis": {
+                    "test_mode": "power",
+                    "summary": {"duration_s": 0.0, "sample_count": 1},
+                    "findings": [
+                        {
+                            "level": "measured",
+                            "title": "唯一结论标题",
+                            "detail": "唯一结论正文",
+                        }
+                    ],
+                    "cpu": {"clusters": [], "timeline": []},
+                    "performance": {"frame_rate_timeline": []},
+                    "render_performance": {},
+                    "thermal": {},
+                    "scheduler": {},
+                    "applications": {},
+                    "external_events": {},
+                    "warnings": [],
+                    "data_sources": [],
+                },
+            }
+        )
+
+        analysis_start = fragment.index('data-panel="analysis"')
+        self.assertEqual(fragment.count("唯一结论标题"), 1)
+        self.assertEqual(fragment.count("唯一结论正文"), 1)
+        self.assertGreater(fragment.index("唯一结论标题"), analysis_start)
+        self.assertEqual(fragment.count('class="finding-list"'), 1)
+        self.assertNotIn("本次没有形成可独立陈述的异常结论", fragment)
 
     def test_report_records_capture_controls_and_harmony_performance_restore(self) -> None:
         capture_configuration = resolve_capture_configuration(
@@ -2890,7 +3525,8 @@ class ReportTests(unittest.TestCase):
                 },
             }
         )
-        self.assertIn("采集项与干扰控制", fragment)
+        self.assertIn('data-panel="raw"', fragment)
+        self.assertIn("查看采集配置与数据来源", fragment)
         self.assertIn("Harmony SmartPerf 采集", fragment)
         self.assertIn("用户显式关闭以降低采集干扰", fragment)
         self.assertIn("power-shell setmode 602", fragment)
@@ -2990,8 +3626,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(analysis["cpu"]["source"], "HarmonyOS /proc/stat + hidumper --cpufreq")
         self.assertIsNone(analysis["thermal"]["maximum_status"])
         self.assertIn("HarmonyOS 6.1.0.130", fragment)
-        self.assertIn("HDC 实测计数器", fragment)
-        self.assertIn("Android BatteryStats、ADPF", fragment)
+        self.assertIn("HarmonyOS BatteryService · hidumper", fragment)
+        self.assertIn('key: `cpu_frequency:${cluster.name}`', fragment)
+        self.assertNotIn("Android BatteryStats、ADPF", fragment)
         self.assertIn("GPU sysfs is restricted", fragment)
 
     def test_ios_analysis_and_report_keep_physical_power_separate_from_dvt_scores(self) -> None:
@@ -3079,8 +3716,9 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn("Mobile Profiler", fragment)
         self.assertIn("iOS 26.5.2", fragment)
-        self.assertIn("相对分数 ≠ mW", fragment)
-        self.assertIn('data-overview-metric="gpu_load_pct"', fragment)
+        self.assertIn("iOS DVT sysmontap · powerScore（相对分数）", fragment)
+        self.assertIn('key: "gpu_load_pct"', fragment)
+        self.assertIn('feature: "gpu_metrics"', fragment)
         self.assertNotIn("@@PLATFORM_NAME@@", fragment)
 
     def test_report_payload_downsamples_long_session_with_cpu_alignment(self) -> None:
@@ -3096,12 +3734,29 @@ class ReportTests(unittest.TestCase):
                         {"elapsed_s": float(index), "modeled_power_mw": float(index)}
                         for index in range(3600)
                     ]
-                }
+                },
+                "performance": {
+                    "frame_flow": {
+                        "stages": [
+                            {
+                                "key": "display_scanout",
+                                "timeline": [
+                                    {"uptime_s": float(index), "value": 120.0}
+                                    for index in range(3600)
+                                ],
+                            }
+                        ]
+                    }
+                },
             },
         }
         prepared = _report_bundle(bundle)
         self.assertEqual(len(prepared["samples"]), 1200)
         self.assertEqual(len(prepared["analysis"]["cpu"]["timeline"]), 1200)
+        flow_timeline = prepared["analysis"]["performance"]["frame_flow"]["stages"][0]["timeline"]
+        self.assertEqual(len(flow_timeline), 1200)
+        self.assertEqual(flow_timeline[0]["uptime_s"], 0.0)
+        self.assertEqual(flow_timeline[-1]["uptime_s"], 3599.0)
         self.assertEqual(prepared["samples"][0]["elapsed_s"], 0.0)
         self.assertEqual(prepared["samples"][-1]["elapsed_s"], 3599.0)
 
@@ -3146,6 +3801,7 @@ class ReportTests(unittest.TestCase):
                     "frame_flow": {
                         "stages": [
                             {
+                                "key": "app_submission",
                                 "phase": "APP",
                                 "label": "应用提交",
                                 "status": "invalid",
@@ -3153,8 +3809,11 @@ class ReportTests(unittest.TestCase):
                                 "unit": "帧/s",
                                 "source": "gfxinfo",
                                 "detail": "没有有效增量",
+                                "timeline": [],
+                                "timeline_unit": "帧/s",
                             },
                             {
+                                "key": "surface_present",
                                 "phase": "COMPOSITOR",
                                 "label": "合成器呈现",
                                 "status": "primary",
@@ -3162,6 +3821,25 @@ class ReportTests(unittest.TestCase):
                                 "unit": "FPS",
                                 "source": "SurfaceFlinger",
                                 "sample_count": 5,
+                                "timeline": [
+                                    {"uptime_s": 10.0, "value": 59.8},
+                                ],
+                                "timeline_unit": "FPS",
+                                "timeline_value_label": "呈现帧率",
+                            },
+                            {
+                                "key": "display_scanout",
+                                "phase": "DISPLAY",
+                                "label": "屏幕刷新",
+                                "status": "reference",
+                                "value": 60.0,
+                                "unit": "Hz",
+                                "source": "active display mode",
+                                "timeline": [
+                                    {"uptime_s": 10.0, "value": 60.0},
+                                ],
+                                "timeline_unit": "Hz",
+                                "timeline_value_label": "显示刷新率",
                             },
                         ]
                     },
@@ -3186,16 +3864,19 @@ class ReportTests(unittest.TestCase):
             },
         }
         fragment = build_report_fragment(bundle)
-        self.assertIn('class="frame-flow-visual"', fragment)
+        self.assertIn('data-panel="raw"', fragment)
+        self.assertIn('data-panel="analysis"', fragment)
+        self.assertIn('key: `frame_stage:${stage.key || index}`', fragment)
+        self.assertIn("points: metricPoints(stage.timeline", fragment)
+        self.assertIn('feature: "frame_rate"', fragment)
         self.assertIn('id="frame-interval-chart"', fragment)
+        self.assertIn("return [0, Math.max(1, maximum * 1.08)];", fragment)
         self.assertIn("单周期内 / 跨预算异常", fragment)
-        self.assertIn("分析覆盖与省略项", fragment)
-        self.assertIn("GPU 页面已省略", fragment)
+        self.assertIn("本次没有形成可独立陈述的异常结论", fragment)
         self.assertNotIn('<h2>阶段耗时分布</h2>', fragment)
         self.assertNotIn('<h2>慢帧明细</h2>', fragment)
         self.assertNotIn('<h2>渲染与合成热点线程</h2>', fragment)
         self.assertNotIn('data-view="gpu"', fragment)
-        self.assertNotIn("GPU 频率/负载数据源不可用", fragment)
 
         bundle["analysis"]["gpu"].update(
             {
@@ -3239,11 +3920,12 @@ class ReportTests(unittest.TestCase):
             ],
             "bottlenecks": [],
         }
+        bundle["analysis"]["performance"]["frame_issue_pct"] = 4.0
         valid_fragment = build_report_fragment(bundle)
         self.assertIn('<h2>阶段耗时分布</h2>', valid_fragment)
         self.assertIn('<h2>慢帧明细</h2>', valid_fragment)
         self.assertIn('<h2>渲染与合成热点线程</h2>', valid_fragment)
-        self.assertIn('data-view="gpu"', valid_fragment)
+        self.assertNotIn('data-view="gpu"', valid_fragment)
 
     def test_power_report_visualizes_resource_correlation_and_hides_empty_gpu_page(self) -> None:
         fragment = build_report_fragment(
@@ -3304,7 +3986,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("查看相关性计算证据", fragment)
         self.assertNotIn('data-view="gpu"', fragment)
         self.assertIn("资源与整机功率相关性", fragment)
-        self.assertNotIn("GPU 频率/负载数据源不可用", fragment)
+        self.assertEqual(fragment.count('class="nav-tab"'), 2)
 
     def test_report_prioritizes_performance_context_and_keeps_only_compact_interference(self) -> None:
         bundle = {
@@ -3374,18 +4056,19 @@ class ReportTests(unittest.TestCase):
             },
         }
         fragment = build_report_fragment(bundle)
-        self.assertIn("功耗测试概览", fragment)
-        self.assertIn("功耗压力分析", fragment)
-        self.assertIn("刷新档位驻留", fragment)
-        self.assertIn("合成器抽样 FPS", fragment)
+        self.assertIn("原始数据随时间变化", fragment)
+        self.assertIn("分析结论", fragment)
+        self.assertEqual(fragment.count('class="nav-tab"'), 2)
+        self.assertEqual(fragment.count('class="app-view"'), 2)
+        self.assertIn('id="raw-metric-grid"', fragment)
+        self.assertIn("本次没有形成可独立陈述的异常结论", fragment)
         self.assertNotIn("硬件触控采样率未公开", fragment)
         self.assertNotIn("热控与调度状态", fragment)
         self.assertIn("DEX AOT compilation", fragment)
-        self.assertIn("数据质量", fragment)
-        self.assertIn("测试项分析", fragment)
-        self.assertIn("功耗测试项矩阵", fragment)
+        self.assertIn("查看采集配置与数据来源", fragment)
+        self.assertNotIn('data-view="data"', fragment)
+        self.assertNotIn('data-view="test-items"', fragment)
         self.assertIn("Adreno830v2", fragment)
-        self.assertIn("GPU 进程内存快照", fragment)
         self.assertIn("surfaceflinger", fragment)
         self.assertNotIn(">Session Overview<", fragment)
         self.assertNotIn("@@PRIORITY_ROWS@@", fragment)

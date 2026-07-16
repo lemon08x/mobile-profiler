@@ -32,6 +32,69 @@
     if (legacyValue !== undefined) localStorage.setItem(currentKey, legacyValue);
   });
   const storedPlatform = localStorage.getItem("mobile-profiler-platform");
+  const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1";
+  const liveTimelineLayoutDefinitions = [
+    { key: "cpu_pct", label: "CPU 总负载", hint: "整体 CPU 使用率" },
+    { key: "cpu_frequency", label: "CPU 核心组频率", hint: "按共享 policy 展示" },
+    { key: "frame_rate_fps", label: "渲染帧率与 1% Low", hint: "前台应用呈现帧率" },
+    { key: "frame_flow", label: "渲染链路各节点", hint: "完整链路节点随时间的帧率" },
+    { key: "refresh_rate_hz", label: "显示刷新率", hint: "随时间变化的屏幕档位" },
+    { key: "frame_time_ms", label: "帧耗时 P95 / P99", hint: "详细帧时间戳" },
+    { key: "frame_issue_pct", label: "异常帧占比", hint: "截止时间 / VSync 统计" },
+    { key: "gpu_load_pct", label: "GPU 负载", hint: "图形处理器使用率" },
+    { key: "gpu_frequency_mhz", label: "GPU 频率", hint: "GPU 当前工作频率" },
+    { key: "memory_frequency_mhz", label: "内存 / DMC 频率", hint: "DRAM / DMC / MIF" },
+    { key: "power_mw", label: "整机功率", hint: "电池侧实时功率" },
+    { key: "current_ma", label: "电池电流", hint: "充放电电流幅值" },
+    { key: "voltage_mv", label: "电池电压", hint: "电池端实时电压" },
+    { key: "temperature_c", label: "电池温度", hint: "BatteryService / thermal" },
+  ];
+  const defaultLiveTimelineOrder = liveTimelineLayoutDefinitions.map(item => item.key);
+  const liveTimelineLayoutKeys = new Set(defaultLiveTimelineOrder);
+  const liveTimelineLayoutDefinitionMap = new Map(
+    liveTimelineLayoutDefinitions.map(item => [item.key, item]),
+  );
+
+  function normalizeLiveTimelineOrder(value) {
+    const seen = new Set();
+    const order = [];
+    (Array.isArray(value) ? value : []).forEach(rawKey => {
+      const key = String(rawKey || "");
+      if (!liveTimelineLayoutKeys.has(key) || seen.has(key)) return;
+      seen.add(key);
+      order.push(key);
+    });
+    defaultLiveTimelineOrder.forEach(key => {
+      if (!seen.has(key)) order.push(key);
+    });
+    return order;
+  }
+
+  function normalizeLiveTimelineHidden(value) {
+    return new Set(
+      (Array.isArray(value) ? value : [])
+        .map(rawKey => String(rawKey || ""))
+        .filter(key => liveTimelineLayoutKeys.has(key)),
+    );
+  }
+
+  function loadLiveTimelineLayouts() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(liveTimelineLayoutStorageKey) || "{}");
+      const contexts = stored?.contexts && typeof stored.contexts === "object" ? stored.contexts : {};
+      return Object.fromEntries(
+        Object.entries(contexts).map(([context, layout]) => [
+          context,
+          {
+            order: normalizeLiveTimelineOrder(layout?.order),
+            hidden: normalizeLiveTimelineHidden(layout?.hidden),
+          },
+        ]),
+      );
+    } catch (_error) {
+      return {};
+    }
+  }
 
   const app = {
     state: null,
@@ -57,6 +120,7 @@
     brightnessLoading: false,
     brightnessRequestId: 0,
     captureFeaturesOverridden: false,
+    liveTimelineLayouts: loadLiveTimelineLayouts(),
   };
 
   const platformProfiles = {
@@ -75,8 +139,8 @@
       probeTitle: "Android 设备能力检查",
       probeDescription: "确认电池供电、电流传感器、CPU policy、GPU 节点、gfxinfo 与 SurfaceFlinger 能力。",
       probePlaceholder: "选择在线 Android 设备后运行 Probe。该操作只读，不会开始采集或重置 BatteryStats。",
-      powerDescription: "以电流功率为主，解释任务负载、调度、频率与 Android 设置为何影响续航。",
-      performanceDescription: "以 SurfaceFlinger 呈现 FPS、1% Low、帧间隔、gfxinfo 渲染阶段、调度与热限制为主。",
+      powerDescription: "以电流功率、CPU/GPU、前台场景、热状态和测试条件为主；进程、调度与模型归因按需开启。",
+      performanceDescription: "以 SurfaceFlinger 呈现 FPS、1% Low、帧间隔、渲染阶段、CPU/GPU 与热限制为主；系统诊断按需开启。",
       powerNote: "建议先运行 Probe，确认 powered 为空、BatteryStats 和电流命令可用。",
       performanceNote: "性能模式会读取 BLAST 呈现时间戳并提高窗口、进程和调度快照频率；建议关闭录屏、悬浮窗与其他调试工具。",
     },
@@ -115,22 +179,32 @@
       probeTitle: "HarmonyOS 设备能力检查",
       probeDescription: "确认 BatteryService、CPU/GPU/DDR、RenderService、SmartPerf 和 power-shell 能力。",
       probePlaceholder: "选择在线 HarmonyOS HDC 设备后运行 Probe；该操作只读，不会切换高性能模式。",
-      powerDescription: "以 BatteryService 电流功率为主，解释 CPU/GPU/DDR、任务负载与系统状态。",
-      performanceDescription: "以 SmartPerf/RenderService 帧表现、CPU/GPU/DDR、调度、热限制和 602 能力上限为主。",
+      powerDescription: "以 BatteryService 电流功率、CPU 频率、前台场景和热状态为主；原生后端无效的 GPU/DDR 与系统诊断默认关闭。",
+      performanceDescription: "以 RenderService 帧表现、CPU 频率和热状态为主；选择 SmartPerf 后再启用其原生 GPU、详细帧和目标进程数据。",
       powerNote: "正式功耗测试请使用无线 HDC 并拔掉 USB，确认 BatteryService 处于放电状态。",
       performanceNote: "SmartPerf 采集与设备 602 高性能模式相互独立；能力上限测试会明显增加功耗和温度。",
     },
   };
 
   const platformUnavailableFeatures = {
-    android: new Set(["harmony_hitches"]),
+    android: new Set(["harmony_hitches", "touch_events"]),
     harmony: new Set(["hot_threads", "runtime_settings", "power_attribution"]),
     ios: new Set([
       "cpu_frequency", "memory_frequency", "frame_rate", "frame_details",
-      "harmony_hitches", "touch_events", "hot_threads", "scheduler",
+      "harmony_hitches", "touch_events", "target_process", "hot_threads", "scheduler",
       "runtime_settings", "power_attribution",
     ]),
   };
+
+  const platformRequiredFeatures = {
+    android: new Set(),
+    harmony: new Set(),
+    ios: new Set(["cpu_usage", "gpu_metrics", "foreground_window", "thermal"]),
+  };
+
+  const onePercentLowValue = point => finite(point?.one_percent_low_fps)
+    ? Number(point.one_percent_low_fps)
+    : null;
 
   const metricDefinitions = {
     power_mw: {
@@ -188,7 +262,7 @@
       axis: { minSpan: .3, padding: .04, tickDigits: 2 },
     },
     frame_rate_fps: {
-      title: "实时帧率",
+      title: "实时帧率与 1% Low",
       legend: "Foreground frame rate",
       color: "#4bc6e8",
       value: point => finite(point.frame_rate_fps) ? Number(point.frame_rate_fps) : null,
@@ -197,6 +271,12 @@
       series: "performance",
       secondaryLabel: "1% LOW",
       secondaryQuantile: .01,
+      secondaryValue: onePercentLowValue,
+      overlay: {
+        legend: "1% Low",
+        color: "#f1d267",
+        value: onePercentLowValue,
+      },
       axis: { fixedMin: 0, minSpan: 30, padding: .08, tickDigits: 0 },
       reference: active => {
         const refreshRate = Number(active?.performance?.current_refresh_rate_hz);
@@ -223,8 +303,20 @@
             value: 1000 / refreshRate,
             label: `帧预算 ${formatAxisNumber(1000 / refreshRate, 2)} ms`,
           }
-          : null;
+        : null;
       },
+    },
+    refresh_rate_hz: {
+      title: "显示刷新率",
+      legend: "Display refresh rate",
+      color: "#f1d267",
+      value: point => finite(point.refresh_rate_hz)
+        ? Number(point.refresh_rate_hz)
+        : finite(point.value) ? Number(point.value) : null,
+      unit: "Hz",
+      digits: 0,
+      series: "performance",
+      axis: { fixedMin: 0, minSpan: 60, padding: .05, tickDigits: 0 },
     },
     gpu_load_pct: {
       title: "GPU 负载",
@@ -245,6 +337,48 @@
       axis: { fixedMin: 0, minSpan: 400, padding: .08, tickDigits: 0 },
     },
   };
+
+  function orderedCpuClusters(active) {
+    const clusters = Array.isArray(active?.clusters) ? active.clusters : [];
+    return clusters
+      .map((cluster, index) => ({ cluster, index }))
+      .sort((left, right) => {
+        const leftMaximum = Number(left.cluster?.maximum_mhz);
+        const rightMaximum = Number(right.cluster?.maximum_mhz);
+        if (finite(leftMaximum) && finite(rightMaximum) && leftMaximum !== rightMaximum) {
+          return leftMaximum - rightMaximum;
+        }
+        return left.index - right.index;
+      })
+      .map(item => item.cluster);
+  }
+
+  function cpuClusterDisplayName(cluster, index, clusters) {
+    if (clusters.length === 3) return ["小核", "中核", "大核"][index];
+    const labels = {
+      Little: "小核",
+      Middle: "中核",
+      Big: "大核",
+      Performance: "性能核",
+      Prime: "超大核",
+      CPU: "CPU",
+    };
+    return labels[String(cluster?.label || "")]
+      || cluster?.label
+      || cluster?.name
+      || `集群 ${index + 1}`;
+  }
+
+  function cpuCoreGroupLabel(cluster) {
+    const cores = (Array.isArray(cluster?.cores) ? cluster.cores : [])
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+    if (!cores.length) return "CPU 核心";
+    const contiguous = cores.every((core, index) => index === 0 || core === cores[index - 1] + 1);
+    if (contiguous && cores.length > 1) return `CPU${cores[0]}–${cores.at(-1)}`;
+    return cores.map(core => `CPU${core}`).join(" / ");
+  }
 
   const statusDefinitions = {
     starting: ["正在准备", "SESSION STARTING"],
@@ -321,36 +455,24 @@
 
   function buildChartScale(values, definition) {
     const axis = definition.axis || {};
-    const observedMin = Math.min(...values);
     const observedMax = Math.max(...values);
-    let minimum = finite(axis.fixedMin) ? Number(axis.fixedMin) : observedMin;
-    let maximum = finite(axis.fixedMax) ? Number(axis.fixedMax) : observedMax;
+    let minimum = finite(axis.fixedMin) ? Number(axis.fixedMin) : 0;
+    let maximum = finite(axis.fixedMax) ? Number(axis.fixedMax) : Math.max(minimum, observedMax);
 
     const minimumSpan = Math.max(0, Number(axis.minSpan || 0));
-    if (maximum - minimum < minimumSpan) {
-      if (finite(axis.fixedMin) && !finite(axis.fixedMax)) {
-        maximum = minimum + minimumSpan;
-      } else if (finite(axis.fixedMax) && !finite(axis.fixedMin)) {
-        minimum = maximum - minimumSpan;
-      } else {
-        const midpoint = (minimum + maximum) / 2;
-        minimum = midpoint - minimumSpan / 2;
-        maximum = midpoint + minimumSpan / 2;
-      }
+    if (maximum - minimum < minimumSpan && !finite(axis.fixedMax)) {
+      maximum = minimum + minimumSpan;
     }
 
     const padding = Math.max(0, Number(axis.padding ?? .08));
     const span = Math.max(Number.EPSILON, maximum - minimum);
-    if (!finite(axis.fixedMin)) minimum -= span * padding;
     if (!finite(axis.fixedMax)) maximum += span * padding;
 
     const targetIntervals = Math.max(3, Number(axis.targetIntervals || 4));
     const tickStep = finite(axis.tickStep)
       ? Number(axis.tickStep)
       : niceChartStep((maximum - minimum) / targetIntervals);
-    const scaleMin = finite(axis.fixedMin)
-      ? Number(axis.fixedMin)
-      : Math.floor((minimum + tickStep * 1e-9) / tickStep) * tickStep;
+    const scaleMin = minimum;
     let scaleMax = finite(axis.fixedMax)
       ? Number(axis.fixedMax)
       : Math.ceil((maximum - tickStep * 1e-9) / tickStep) * tickStep;
@@ -439,6 +561,8 @@
     const platform = selectedPlatform();
     const profile = platformProfiles[platform];
     document.body.dataset.platform = platform;
+    $("#config-app-panel-title").textContent = platform === "android" ? "扫描出的应用" : "目标应用";
+    $("#config-app-panel-source").textContent = platform === "android" ? "选择后回填左侧包名" : "请在左侧手工填写";
     $("#platform-title").textContent = profile.title;
     $("#platform-description").textContent = profile.description;
     $("#device-picker-kicker").textContent = profile.deviceKicker;
@@ -455,7 +579,7 @@
     $("#package-input").setAttribute("aria-required", performance ? "true" : "false");
     $("#package-input-hint").textContent = performance
       ? platform === "android"
-        ? "从上方扫描结果选择后会自动填写；扫描失败时也可手工输入包名。"
+        ? "可从设备扫描结果选择；扫描失败时也可直接手工输入包名。"
         : `性能测试必须填写目标${platform === "ios" ? "游戏 Bundle ID" : "游戏 / 应用包名"}。`
       : "功耗测试可留空；填写后会保留目标应用的资源与归因上下文。";
     $("#start-context-input").querySelector('option[value="desktop"]').textContent = profile.desktopLabel;
@@ -469,7 +593,7 @@
       : platform === "harmony" ? "BatteryService / 电流" : "默认 · 电流 / 功率";
     $("#performance-mode-subtitle").textContent = platform === "ios"
       ? "CPU / GPU / 进程"
-      : platform === "harmony" ? "SmartPerf / 1% Low / 602" : "FPS / 1% Low / 调度";
+      : platform === "harmony" ? "SmartPerf / 1% Low / 602" : "FPS / 1% Low / 渲染链路";
     const ios = platform === "ios";
     const harmony = platform === "harmony";
     $("#metric-fps-label").textContent = ios ? "CPU 总负载" : "实时帧率";
@@ -487,43 +611,14 @@
     $("#metric-memory-label").textContent = ios ? "采集器开销" : "内存频率";
     $("#metric-memory-tag").textContent = ios ? "OVERHEAD" : "DMC";
 
-    $("#cluster-panel-title").textContent = ios
-      ? "DVT 进程 CPU"
-      : app.testMode === "performance" ? "CPU 调度分配" : "集群状态";
-    $("#cluster-panel-source").textContent = ios
-      ? "DVT sysmond"
-      : app.testMode === "performance" ? "load / frequency / topology" : "kernel counters";
-    $("#resource-panel-kicker").textContent = ios ? "DVT RESOURCE TELEMETRY" : harmony ? "HARMONY RESOURCE TELEMETRY" : "RESOURCE SCHEDULING";
-    $("#resource-panel-title").textContent = ios ? "iOS 性能资源" : harmony ? "HarmonyOS 资源调度" : "资源调度分配";
+    $("#cluster-panel-title").textContent = "CPU 核心频率";
+    $("#cluster-panel-source").textContent = ios ? "平台未提供" : "cpufreq policy";
+    $("#resource-panel-kicker").textContent = ios ? "DVT RESOURCE TELEMETRY" : harmony ? "HARMONY RESOURCE STATUS" : "RESOURCE STATUS";
+    $("#resource-panel-title").textContent = ios ? "iOS 性能资源" : harmony ? "HarmonyOS 性能资源" : "性能资源状态";
     $("#resource-window-label").textContent = ios ? "前台应用" : "前台窗口";
     $("#performance-evidence-label-1").textContent = ios ? "性能数据源" : "帧率来源";
-    $("#performance-evidence-label-2").textContent = ios ? "整机功耗来源" : "渲染尺寸来源";
+    $("#performance-evidence-label-2").textContent = ios ? "整机功耗来源" : "Surface 缓冲区来源";
     $("#performance-evidence-label-3").textContent = ios ? "观察者开销" : "插帧判定";
-
-    $("#performance-view-kicker").textContent = ios ? "IOS DVT PERFORMANCE CONTEXT" : harmony ? "HARMONY FRAME PERFORMANCE" : "FRAME PERFORMANCE CONTEXT";
-    $("#performance-view-title").textContent = ios ? "iOS 资源与系统负载" : harmony ? "HarmonyOS 帧表现与资源调度" : "帧表现与资源调度";
-    $("#performance-view-description").textContent = ios
-      ? "围绕 DVT CPU/GPU、目标进程、物理整机功耗、温度和采集器开销分析性能。"
-      : harmony
-        ? "围绕 SmartPerf/RenderService 帧节奏、1% Low、CPU/GPU/DDR、调度、热限制和 602 能力上限分析性能。"
-        : "围绕刷新率、1% Low、帧延迟、渲染链路、CPU/GPU/内存资源、调度和热限制分析游戏性能。";
-    const statLabels = ios
-      ? ["CPU LOAD", "GPU LOAD", "SYSTEM LOAD", "OBSERVER CPU"]
-      : ["REFRESH RATE", "FRAME RATE", "FRAME P95", "TOUCHES"];
-    statLabels.forEach((label, index) => { $(`#performance-stat-label-${index + 1}`).textContent = label; });
-    $("#performance-list-kicker").textContent = ios ? "DVT RESOURCE SUMMARY" : "REFRESH RESIDENCY";
-    $("#performance-list-title").textContent = ios ? "资源采样摘要" : "刷新档位驻留";
-    $("#performance-switch-label").textContent = ios ? "前台状态" : "刷新切换";
-    $("#performance-frame-count-label").textContent = ios ? "进程快照" : "采样帧数";
-    $("#performance-window-label").textContent = ios ? "前台应用" : "前台窗口";
-    $("#performance-display-label").textContent = ios ? "显示参数" : "分辨率 / 亮度";
-    $("#interference-table-kicker").textContent = ios ? "BACKGROUND RESOURCE WATCH" : harmony ? "HARMONY RESOURCE INTERFERENCE" : "SCHEDULING INTERFERENCE";
-    $("#interference-table-title").textContent = ios ? "后台资源异常" : harmony ? "资源竞争异常" : "调度竞争异常";
-    $("#performance-observability-note").innerHTML = ios
-      ? "<strong>边界：</strong>iOS 当前页面展示 DVT 诊断遥测和 PowerTelemetry 整机物理功耗，不提供通用应用 FPS、Core Animation 详细帧时间戳或 Android 调度接口。"
-      : harmony
-        ? "<strong>边界：</strong>HarmonyOS 使用 SmartPerf/RenderService 的应用帧抖动与合成节奏；量产 HDC 不提供 Android gfxinfo 的逐阶段 framestats，整机功耗只记录趋势和汇总。"
-        : "<strong>边界：</strong>原生游戏优先使用前台 SurfaceView/BLAST 的 SurfaceFlinger 呈现时间戳，普通 View 应用回退 gfxinfo；详细 framestats 用于分析 UI / RenderThread 到 BufferQueue 的延迟。整机功耗只记录趋势和汇总，不拆分第三方任务、UID 或组件来源。";
     $("#power-pressure-kicker").textContent = ios ? "IOS POWER OBSERVABILITY" : harmony ? "HARMONY POWER PRESSURE" : "POWER PRESSURE";
     $("#power-pressure-title").textContent = ios ? "iOS 功耗与观察者开销" : harmony ? "HarmonyOS 功耗压力解释" : "功耗压力解释";
     $("#power-pressure-source").textContent = ios ? "PowerTelemetry / DVT / observer" : harmony ? "CPU / GPU / DDR / 进程 / 系统状态" : "负载 / 频率 / 设置与整机功率";
@@ -583,8 +678,6 @@
       setTestMode(app.testMode, { initial: true });
       renderPerformanceMetrics(app.state.active);
       renderPerformanceResources(app.state.active);
-      renderSystem(app.state.active);
-      renderSchedulerHistory(app.state.active);
       renderChart();
     }
   }
@@ -603,6 +696,13 @@
     const seconds = total % 60;
     if (hours) return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
     return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function defaultMarkerName(now = new Date()) {
+    const hours = String(now.getHours()).padStart(2, "0");
+    const minutes = String(now.getMinutes()).padStart(2, "0");
+    const seconds = String(now.getSeconds()).padStart(2, "0");
+    return `时间标记 ${hours}:${minutes}:${seconds}`;
   }
 
   function formatShortDuration(value) {
@@ -659,14 +759,11 @@
   const capturePresetFeatures = {
     "power-standard": new Set([
       "cpu_usage", "cpu_frequency", "gpu_metrics",
-      "foreground_window", "target_process", "process_snapshots", "hot_threads",
-      "thermal", "scheduler", "runtime_settings", "power_attribution",
+      "foreground_window", "thermal", "runtime_settings",
     ]),
     "performance-standard": new Set([
       "cpu_usage", "cpu_frequency", "gpu_metrics",
-      "foreground_window", "frame_rate", "frame_details", "harmony_hitches",
-      "touch_events", "target_process", "process_snapshots", "hot_threads",
-      "thermal", "scheduler",
+      "foreground_window", "frame_rate", "frame_details", "thermal",
     ]),
     "harmony-smartperf": new Set([
       "cpu_usage", "cpu_frequency", "gpu_metrics",
@@ -839,7 +936,7 @@
   function presetFeatureSet(preset) {
     if (preset !== "low-overhead") return capturePresetFeatures[preset] || new Set();
     return new Set(app.testMode === "performance"
-      ? ["cpu_usage", "foreground_window", "frame_rate", "target_process", "thermal"]
+      ? ["cpu_usage", "foreground_window", "frame_rate", "thermal"]
       : ["cpu_usage", "foreground_window"]);
   }
 
@@ -872,24 +969,49 @@
     if (!showHighPerformance && highPerformanceInput) highPerformanceInput.checked = false;
 
     const forcedOff = new Set(platformUnavailableFeatures[platform] || []);
+    const forcedOn = new Set(platformRequiredFeatures[platform] || []);
     if (performance) forcedOff.add("power_attribution");
+    if (platform === "harmony" && effectiveCapturePreset() !== "harmony-smartperf") {
+      ["gpu_metrics", "memory_frequency", "frame_details", "target_process"].forEach(name => forcedOff.add(name));
+    }
     const probeData = currentProbe()?.data || {};
     const memoryUnavailable = platform === "android"
       && probeData.capabilities?.memory_frequency === false;
+    const gpuUnavailable = platform === "android"
+      && Boolean(Object.keys(probeData).length)
+      && !probeData.gpu_source?.frequency_path
+      && !probeData.gpu_source?.load_path;
+    const smartPerfGpuUnavailable = platform === "harmony"
+      && effectiveCapturePreset() === "harmony-smartperf"
+      && probeData.capabilities?.smartperf_gpu_metrics === false;
     if (memoryUnavailable) forcedOff.add("memory_frequency");
+    if (gpuUnavailable || smartPerfGpuUnavailable) forcedOff.add("gpu_metrics");
     $$('[data-capture-feature]').forEach(input => {
       const name = input.dataset.captureFeature;
-      const disabled = forcedOff.has(name) || Boolean(app.state?.active?.running);
+      const required = forcedOn.has(name);
+      const disabled = forcedOff.has(name) || required || Boolean(app.state?.active?.running);
       if (forcedOff.has(name)) input.checked = false;
+      else if (required) input.checked = true;
       input.disabled = disabled;
       const row = input.closest("label");
       row?.classList.toggle("feature-unavailable", forcedOff.has(name));
+      row?.classList.toggle("feature-required", required);
       if (row) {
         row.title = forcedOff.has(name)
           ? name === "memory_frequency" && memoryUnavailable
             ? probeData.memory_probe?.limitations || "设备未向 ADB shell 公开可读的 DMC/DRAM 实时频率"
+            : name === "gpu_metrics" && (gpuUnavailable || smartPerfGpuUnavailable)
+              ? probeData.gpu_probe?.reason || "当前设备没有可用的会话内 GPU 频率或负载数据源"
             : `${platformLabel(platform)} 当前采集后端不提供此项目`
-          : "";
+          : required
+            ? `${platformLabel(platform)} 基础数据流固定包含此项目，不会启动额外诊断动作`
+            : "";
+        const impact = row.querySelector(".feature-impact");
+        if (impact) {
+          impact.dataset.defaultLabel ||= impact.textContent;
+          impact.textContent = required ? "固定" : impact.dataset.defaultLabel;
+          impact.classList.toggle("fixed", required);
+        }
       }
     });
 
@@ -911,11 +1033,41 @@
     }
 
     const inputs = $$('[data-capture-feature]');
+    const finalValues = Object.fromEntries(inputs.map(input => [
+      input.dataset.captureFeature,
+      input.checked,
+    ]));
+    const running = Boolean(app.state?.active?.running);
+    [
+      ["process-interval-input", "process_snapshots"],
+      ["thread-interval-input", "hot_threads"],
+      ["thermal-interval-input", "thermal"],
+      ["scheduler-interval-input", "scheduler"],
+    ].forEach(([id, feature]) => {
+      const interval = $("#" + id);
+      if (!interval) return;
+      const enabled = Boolean(finalValues[feature]);
+      interval.disabled = running || !enabled;
+      interval.closest(".form-field")?.classList.toggle("capture-interval-disabled", !enabled);
+    });
+    const performanceInterval = $("#performance-interval-input");
+    if (performanceInterval) {
+      const enabled = Boolean(finalValues.foreground_window || finalValues.frame_rate);
+      performanceInterval.disabled = running || !enabled;
+      performanceInterval.closest(".form-field")?.classList.toggle("capture-interval-disabled", !enabled);
+    }
+    ["no-reset-input", "full-history-input"].forEach(id => {
+      const input = $("#" + id);
+      if (!input) return;
+      const enabled = Boolean(finalValues.power_attribution);
+      input.disabled = running || !enabled;
+      input.closest(".compact-check")?.classList.toggle("capture-option-disabled", !enabled);
+    });
     const count = inputs.filter(input => input.checked).length;
     $("#capture-feature-count").textContent = `${count} / ${inputs.length} 已启用`;
     $("#system-monitor-input").checked = [
       "process_snapshots", "hot_threads", "thermal", "scheduler",
-    ].some(name => Boolean($(`[data-capture-feature="${name}"]`)?.checked));
+    ].some(name => Boolean(finalValues[name]));
     const presetLabel = $("#capture-preset-input")?.selectedOptions?.[0]?.textContent || "采集预设";
     const advancedBadge = $("#advanced-setting-count");
     if (advancedBadge) {
@@ -925,12 +1077,12 @@
     }
     $("#capture-preset-hint").textContent = customized
       ? `${presetLabel} · 已逐项覆盖；基础电流、电压和时间戳仍保留。`
-      : `${presetLabel} · 可继续逐项关闭以降低测试干扰。`;
+      : `${presetLabel} · 默认只开启能形成原始曲线或有效结论的数据。`;
     $("#capture-feature-note").textContent = showHighPerformance
       ? "SmartPerf 采集与设备高性能模式相互独立；高性能模式会改变设备功耗和热状态。"
       : platform === "ios"
-        ? "iOS 仅启用 DVT/PowerTelemetry 实际可提供的项目；基础电流、电压和时间戳保留。"
-        : "基础电流、电压和设备时间戳始终保留。";
+        ? "iOS 的 CPU、GPU、前台状态与电池温度属于固定基础流；专项诊断动作默认关闭。"
+        : "基础电流、电压和设备时间戳始终保留；无稳定结论的专项诊断默认关闭。";
   }
 
   function applyModeDefaults(previousMode, nextMode) {
@@ -975,7 +1127,6 @@
 
     const performance = nextMode === "performance";
     const profile = platformProfiles[selectedPlatform()];
-    if (!performance && app.activeView === "system") switchView("live");
     $("#test-mode-title").textContent = performance ? "性能测试模式" : "功耗测试模式";
     $("#test-mode-description").textContent = performance ? profile.performanceDescription : profile.powerDescription;
     $("#capture-config-title").textContent = performance ? "性能采集配置" : "功耗采集配置";
@@ -997,7 +1148,9 @@
         : new Set(["frame_rate_fps", "frame_time_ms", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz"])
       : new Set(["power_mw", "current_ma", "cpu_pct", "memory_frequency_mhz", "temperature_c", "voltage_mv"]);
     if (previousMode !== nextMode && iosPerformance) app.metric = "cpu_pct";
-    else if (!validMetrics.has(app.metric)) app.metric = performance ? iosPerformance ? "cpu_pct" : "frame_rate_fps" : "power_mw";
+    else if (!validMetrics.has(app.metric)) {
+      app.metric = performance ? iosPerformance ? "cpu_pct" : "frame_rate_fps" : "power_mw";
+    }
     $$("[data-metric]").forEach(button => {
       button.classList.toggle("active", button.dataset.metric === app.metric);
     });
@@ -1026,13 +1179,13 @@
   }
 
   function captureFeatureEnabled(active, name) {
-    const liveFeatures = active?.config?.capture_features;
-    if (liveFeatures && Object.prototype.hasOwnProperty.call(liveFeatures, name)) {
-      return Boolean(liveFeatures[name]);
-    }
     const metadataFeatures = active?.metadata?.capture_configuration?.features;
     if (metadataFeatures && Object.prototype.hasOwnProperty.call(metadataFeatures, name)) {
       return Boolean(metadataFeatures[name]);
+    }
+    const liveFeatures = active?.config?.capture_features;
+    if (liveFeatures && Object.prototype.hasOwnProperty.call(liveFeatures, name)) {
+      return Boolean(liveFeatures[name]);
     }
     const input = $(`[data-capture-feature="${name}"]`);
     return input ? Boolean(input.checked) : true;
@@ -1099,6 +1252,27 @@
     };
   }
 
+  function renderResolutionPresentation(active, performance = {}) {
+    const rawSource = String(performance.render_resolution_source || "").trim();
+    const evidence = String(performance.render_resolution_evidence || "").trim();
+    let source = rawSource;
+    if (active?.is_demo) {
+      source = rawSource.startsWith("演示数据")
+        ? rawSource
+        : `演示数据 · 模拟 ${rawSource || "Surface 缓冲区尺寸"}`;
+    } else if (rawSource === "SurfaceFlinger GraphicBuffer") {
+      source = "SurfaceFlinger · 前台 SurfaceView/BLAST GraphicBuffer（启动时快照）";
+    }
+    const boundary = performance.render_resolution_estimated
+      ? "这是窗口或显示模式估算值，不等同于应用实际渲染缓冲区。"
+      : "这是应用提交给系统合成器的 Surface 缓冲区尺寸；动态分辨率、升采样、裁剪和多 Surface 都可能使它不同于游戏引擎内部渲染分辨率。";
+    return {
+      source: source || "当前采集链路未提供可验证的应用缓冲区尺寸",
+      evidence: evidence ? `命中层：${evidence}` : "",
+      boundary,
+    };
+  }
+
   function gpuTelemetryAvailable(active) {
     if (!active) return true;
     if (!captureFeatureEnabled(active, "gpu_metrics")) return false;
@@ -1137,12 +1311,9 @@
   function sparklineMarkup(values) {
     const selected = values.slice(-60).filter(finite).map(Number);
     if (selected.length < 2) return '<svg class="live-sparkline" viewBox="0 0 86 42" aria-hidden="true"><line x1="2" y1="21" x2="84" y2="21"></line></svg>';
-    let minimum = Math.min(...selected);
-    let maximum = Math.max(...selected);
-    if (minimum === maximum) {
-      minimum -= 1;
-      maximum += 1;
-    }
+    const minimum = 0;
+    let maximum = Math.max(0, ...selected);
+    if (maximum <= minimum) maximum = minimum + 1;
     const points = selected.map((value, index) => {
       const x = 2 + index / (selected.length - 1) * 82;
       const y = 38 - (value - minimum) / Math.max(.0001, maximum - minimum) * 34;
@@ -1158,19 +1329,28 @@
     const performanceMode = (active?.test_mode || app.testMode) === "performance";
     const keys = performanceMode
       ? platform === "ios"
-        ? ["cpu_pct", "gpu_load_pct", "power_mw", "temperature_c"]
-        : ["frame_rate_fps", "frame_time_ms", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c", "power_mw"]
-      : ["power_mw", "current_ma", "voltage_mv", "cpu_pct", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c"];
+        ? ["gpu_load_pct", "power_mw", "temperature_c"]
+        : ["frame_rate_fps", "frame_time_ms", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c", "power_mw"]
+      : ["power_mw", "current_ma", "voltage_mv", "gpu_load_pct", "gpu_frequency_mhz", "memory_frequency_mhz", "temperature_c"];
     const cards = [];
     keys.forEach(key => {
       if (key === "memory_frequency_mhz" && !captureFeatureEnabled(active, "memory_frequency")) return;
       const definition = metricDefinitions[key];
+      if (!definition) return;
       const source = definition.series === "performance" ? active?.performance_series : active?.series;
       const values = (Array.isArray(source) ? source : []).map(definition.value).filter(finite).map(Number);
       if (!values.length) return;
       const current = values.at(-1);
       const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-      const secondary = percentile(values, definition.secondaryQuantile ?? .95);
+      const secondaryValues = typeof definition.secondaryValue === "function"
+        ? (Array.isArray(source) ? source : [])
+          .map(definition.secondaryValue)
+          .filter(finite)
+          .map(Number)
+        : [];
+      const secondary = typeof definition.secondaryValue === "function"
+        ? (secondaryValues.length ? secondaryValues.at(-1) : null)
+        : percentile(values, definition.secondaryQuantile ?? .95);
       const powerFlow = powerFlowPresentation(active);
       const title = key === "power_mw"
         ? powerFlow.chartPowerTitle
@@ -1297,11 +1477,40 @@
     $("#server-detail").textContent = detail;
   }
 
+  function mountConfigurationView() {
+    const target = $("#config-view-content");
+    const formTarget = $("#config-form-column");
+    const appPickerTarget = $("#config-app-picker-content");
+    const modeBar = $("#test-mode-bar");
+    const controlPanel = $(".control-panel");
+    const appPicker = $(".app-picker");
+    const runtimeLayout = $(".runtime-layout");
+    if (!target || !formTarget || !appPickerTarget || !modeBar || !controlPanel || !appPicker || !runtimeLayout) return;
+    target.prepend(modeBar);
+    formTarget.append(controlPanel);
+    appPickerTarget.append(appPicker);
+    runtimeLayout.classList.add("monitoring-only");
+  }
+
   function switchView(view) {
-    const requested = view === "thermal" ? "system" : view;
-    const target = ["live", "system", "device", "history", "tools"].includes(requested) ? requested : "live";
+    const legacyTools = view === "tools";
+    const legacySystem = view === "system" || view === "thermal";
+    const requested = legacySystem
+      ? "live"
+      : legacyTools ? "history" : view;
+    const target = ["live", "config", "device", "history"].includes(requested)
+      ? requested
+      : "live";
     app.activeView = target;
-    location.hash = target;
+    if (legacyTools || legacySystem) {
+      window.history.replaceState(null, "", `#${target}`);
+    } else if (location.hash !== `#${target}`) {
+      location.hash = target;
+    }
+    if (legacyTools) {
+      const historyTools = $("#history-tools-details");
+      if (historyTools) historyTools.open = true;
+    }
     $$(".nav-item").forEach(button => {
       const active = button.dataset.view === target;
       button.classList.toggle("active", active);
@@ -1315,12 +1524,15 @@
     });
     $("#page-heading").textContent = {
       live: "实时监控",
-      system: "性能上下文",
+      config: "测试配置",
       device: "设备能力",
-      history: "历史报告",
-      tools: "工具与交付",
+      history: "历史报告与交付",
     }[target];
-    if (target === "live") requestAnimationFrame(renderChart);
+    if (target === "live") {
+      requestAnimationFrame(() => {
+        renderChart();
+      });
+    }
   }
 
   function selectedDevice() {
@@ -1342,6 +1554,7 @@
     app.selectedScannedPackage = "";
     const search = $("#app-search-input");
     const select = $("#app-select");
+    const resultDetails = $("#app-result-details");
     const resultList = $("#app-result-list");
     if (search) {
       search.value = "";
@@ -1353,19 +1566,19 @@
     }
     if (resultList) {
       resultList.innerHTML = "";
-      resultList.classList.add("hidden");
     }
+    if (resultDetails) {
+      resultDetails.classList.add("hidden");
+      resultDetails.open = false;
+    }
+    if ($("#app-result-summary")) $("#app-result-summary").textContent = "展开查看应用列表";
     if ($("#app-picker-status")) $("#app-picker-status").textContent = "尚未扫描";
-    if ($("#app-picker-selection")) {
-      $("#app-picker-selection").textContent = packageInput?.value.trim()
-        ? `${packageInput.value.trim()} · 手工输入`
-        : "未选择目标应用";
-    }
   }
 
   function renderAppOptions() {
     const select = $("#app-select");
     const search = $("#app-search-input");
+    const resultDetails = $("#app-result-details");
     const resultList = $("#app-result-list");
     if (!select || !search || !resultList) return;
     const query = search.value.trim().toLowerCase();
@@ -1383,7 +1596,7 @@
     select.innerHTML = "";
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.textContent = filtered.length ? "请选择测试游戏 / 应用" : query ? "没有匹配的应用" : "未发现应用";
+    placeholder.textContent = filtered.length ? "请选择设备应用" : query ? "没有匹配的应用" : "未发现应用";
     select.appendChild(placeholder);
     [
       [true, "第三方应用"],
@@ -1405,7 +1618,7 @@
     const packageValue = $("#package-input").value.trim();
     if (filtered.some(item => item.package === packageValue)) select.value = packageValue;
     const shown = filtered.slice(0, 80);
-    resultList.classList.toggle("hidden", !app.scannedAppsDevice);
+    resultDetails?.classList.toggle("hidden", !app.scannedAppsDevice);
     resultList.innerHTML = shown.length ? shown.map(item => {
       const packageName = String(item.package || "");
       const activity = String(item.activity || item.component || "").split(".").at(-1) || "应用";
@@ -1423,10 +1636,9 @@
     $("#app-picker-status").textContent = query
       ? `匹配 ${filtered.length} / ${apps.length} 个${noun}`
       : `已扫描 ${apps.length} 个${noun}`;
-    const scannedMatch = apps.some(item => item.package === packageValue);
-    $("#app-picker-selection").textContent = packageValue
-      ? `${packageValue} · ${scannedMatch ? "已选择" : "手工输入"}`
-      : "未选择目标应用";
+    if ($("#app-result-summary")) {
+      $("#app-result-summary").textContent = `${filtered.length} / ${apps.length} 个应用`;
+    }
     const running = Boolean(app.state?.active?.running);
     const currentScan = Boolean(app.scannedAppsDevice && app.scannedAppsDevice === selectedDevice());
     search.disabled = !currentScan || running;
@@ -1659,6 +1871,7 @@
 
   function renderPerformanceMetrics(active) {
     if (activePlatform(active) === "ios") {
+      $("#live-resolution-note")?.classList.add("hidden");
       const latest = active?.latest || {};
       const summary = active?.summary || {};
       const context = active?.context || {};
@@ -1729,14 +1942,21 @@
     const renderAvailable = Boolean(performance.render_resolution_available)
       && finite(renderWidth)
       && finite(renderHeight);
+    const renderPresentation = renderResolutionPresentation(active, performance);
     $("#metric-render-resolution-card")?.classList.toggle("hidden", !renderAvailable);
     $("#performance-render-evidence")?.classList.toggle("hidden", !renderAvailable);
+    $("#live-resolution-note")?.classList.toggle("hidden", !renderAvailable);
     $("#metric-render-resolution").textContent = finite(renderWidth) && finite(renderHeight)
       ? Number(renderWidth).toFixed(0) + " × " + Number(renderHeight).toFixed(0)
       : "--";
-    $("#metric-render-resolution-sub").textContent = performance.render_resolution_estimated
-      ? "显示分辨率回退值"
-      : performance.render_resolution_source || "等待前台窗口边界";
+    $("#metric-render-resolution-sub").textContent = renderAvailable
+      ? `来源：${renderPresentation.source}`
+      : "当前采集链路未提供可验证的应用缓冲区尺寸";
+    $("#live-resolution-value").textContent = renderAvailable
+      ? `${Number(renderWidth).toFixed(0)} × ${Number(renderHeight).toFixed(0)}`
+      : "--";
+    $("#live-resolution-source").textContent = `数据来源：${renderPresentation.source}${renderPresentation.evidence ? ` · ${renderPresentation.evidence}` : ""}`;
+    $("#live-resolution-boundary").textContent = renderPresentation.boundary;
 
     const interpolationLabels = {
       detected: "已开启",
@@ -1804,30 +2024,6 @@
     const performance = active?.performance || {};
     const context = active?.context || {};
     const monitor = active?.system_monitor || {};
-    const scheduler = monitor.scheduler || {};
-    const cpusets = scheduler.cpusets || {};
-    const policies = Array.isArray(scheduler.cpu_policies) ? scheduler.cpu_policies : [];
-    const processStates = Array.isArray(scheduler.watched_processes) ? scheduler.watched_processes : [];
-    const hintSessions = Array.isArray(scheduler.hint_sessions) ? scheduler.hint_sessions : [];
-    const foregroundPackage = context.foreground_package || "";
-    const foregroundProcess = processStates.find(item => item.name === foregroundPackage)
-      || processStates.find(item => foregroundPackage && String(item.name || "").startsWith(foregroundPackage + ":"))
-      || null;
-
-    $("#resource-top-app-cpuset").textContent = cpusets["top-app"] || "--";
-    $("#resource-foreground-sched").textContent = foregroundProcess
-      ? "group " + String(foregroundProcess.current_sched_group ?? "--")
-        + " / procState " + String(foregroundProcess.current_proc_state ?? "--")
-        + " / adj " + String(foregroundProcess.oom_adj ?? "--")
-      : foregroundPackage ? foregroundPackage + " · 等待调度快照" : "--";
-    const governors = [...new Set(policies.map(item => item.governor).filter(Boolean))];
-    $("#resource-governors").textContent = governors.length
-      ? governors.join(" / ")
-      : policies.length ? "仅公开频率上下限" : "--";
-    const graphicsHints = hintSessions.filter(item => item.graphics_pipeline).length;
-    $("#resource-adpf").textContent = hintSessions.length
-      ? String(hintSessions.length) + " 个活动会话" + (graphicsHints ? " · " + String(graphicsHints) + " 个图形管线" : "")
-      : scheduler.availability?.hint_session_supported === false ? "设备不支持" : "0 / 等待快照";
 
     const latest = active?.latest || {};
     const gpuParts = [];
@@ -1858,18 +2054,19 @@
     $("#resource-whole-power").textContent = finite(latest.power_mw)
       ? (Number(latest.power_mw) / 1000).toFixed(3) + " W · 只记录整机"
       : "--";
-    $("#resource-snapshot-source").textContent = Number(monitor.scheduler_snapshot_count || 0)
-      ? String(monitor.scheduler_snapshot_count) + " snapshots"
-      : platform === "harmony" ? "PowerManager / SmartPerf" : "cpuset / ADPF";
+    $("#resource-snapshot-source").textContent = platform === "harmony"
+      ? "SmartPerf / thermal"
+      : "sampler / thermal";
 
     $("#performance-frame-source").textContent = performance.frame_source || "平台窗口 / 合成器计数";
     $("#performance-frame-confidence").textContent = performance.one_percent_low_confidence
       ? "1% Low 置信度：" + performance.one_percent_low_confidence
       : performance.frame_unavailable_reason || "等待有效帧计数";
-    $("#performance-render-source").textContent = performance.render_resolution_source || "--";
+    const renderPresentation = renderResolutionPresentation(active, performance);
+    $("#performance-render-source").textContent = `数据来源：${renderPresentation.source}`;
     $("#performance-render-scale").textContent = finite(performance.render_scale_pct)
-      ? "相对显示模式 " + Number(performance.render_scale_pct).toFixed(1) + "%"
-      : "等待前台窗口边界";
+      ? `缓冲区 / 当前显示模式 ${Number(performance.render_scale_pct).toFixed(1)}% · ${renderPresentation.evidence || renderPresentation.boundary}`
+      : renderPresentation.evidence || renderPresentation.boundary;
     $("#performance-interpolation-source").textContent = performance.frame_interpolation_label || "--";
     const interpolationEvidence = Array.isArray(performance.frame_interpolation_evidence)
       ? performance.frame_interpolation_evidence
@@ -1938,6 +2135,193 @@
     }
   }
 
+  function renderFrameFlowHistory(active, frameFlow) {
+    const svg = $("#frame-flow-history-chart");
+    const empty = $("#frame-flow-history-empty");
+    const source = $("#frame-flow-history-source");
+    if (!svg || !empty || !source) return;
+    const stages = Array.isArray(frameFlow?.stages) ? frameFlow.stages : [];
+    const latest = active?.latest || {};
+    const sessionStartUptime = finite(latest.uptime_s) && finite(latest.elapsed_s)
+      ? Number(latest.uptime_s) - Number(latest.elapsed_s)
+      : null;
+    const colors = ["#4bc6e8", "#35d49a", "#f1d267", "#9e8cff", "#ff657d"];
+    const laneColors = {
+      app_submission: colors[0],
+      render_queue: colors[1],
+      surface_present: colors[2],
+      display_scanout: colors[3],
+    };
+    const lanes = stages.map((stage, index) => {
+      const points = (Array.isArray(stage?.timeline) ? stage.timeline : [])
+        .map(point => {
+          const elapsed = finite(point?.elapsed_s)
+            ? Number(point.elapsed_s)
+            : sessionStartUptime !== null && finite(point?.uptime_s)
+              ? Math.max(0, Number(point.uptime_s) - sessionStartUptime)
+              : null;
+          const value = finite(point?.value)
+            ? Number(point.value)
+            : finite(point?.frame_rate_fps)
+              ? Number(point.frame_rate_fps)
+              : finite(point?.refresh_rate_hz)
+                ? Number(point.refresh_rate_hz)
+                : null;
+          return elapsed === null || value === null ? null : { elapsed, value };
+        })
+        .filter(Boolean)
+        .sort((left, right) => left.elapsed - right.elapsed);
+      return {
+        key: String(stage?.key || `stage-${index}`),
+        phase: String(stage?.phase || "STAGE"),
+        label: String(stage?.label || stage?.key || `节点 ${index + 1}`),
+        valueLabel: String(stage?.timeline_value_label || "帧率"),
+        unit: String(stage?.timeline_unit || "FPS"),
+        status: String(stage?.status || "unavailable"),
+        color: laneColors[stage?.key] || colors[index % colors.length],
+        points,
+      };
+    });
+    const allPoints = lanes.flatMap(lane => lane.points);
+    svg.replaceChildren();
+    if (!lanes.length) {
+      empty.classList.remove("hidden");
+      source.textContent = active?.running ? "等待节点时间序列" : "没有可用节点时间序列";
+      return;
+    }
+    empty.classList.add("hidden");
+    const populatedLaneCount = lanes.filter(lane => lane.points.length).length;
+    source.textContent = `${populatedLaneCount} / ${lanes.length} 个节点 · ${allPoints.length} 个时间点`;
+
+    const width = Math.max(520, Math.round(svg.clientWidth || 1000));
+    const compact = width < 720;
+    const left = compact ? 128 : 174;
+    const right = compact ? 50 : 70;
+    const top = 22;
+    const bottom = 36;
+    const laneHeight = compact ? 76 : 82;
+    const height = top + bottom + laneHeight * lanes.length;
+    const maximumTime = Math.max(
+      1,
+      Number(latest.elapsed_s || active?.elapsed_s || 0),
+      ...allPoints.map(point => point.elapsed),
+    );
+    const observedMaximum = Math.max(
+      1,
+      Number(active?.performance?.peak_refresh_rate_hz || 0),
+      ...allPoints.map(point => point.value),
+    );
+    const maximumValue = Math.max(30, Math.ceil(observedMaximum / 30) * 30);
+    const x = value => left + Number(value) / maximumTime * (width - left - right);
+
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.style.height = `${height}px`;
+    svg.setAttribute(
+      "aria-label",
+      `完整渲染链路节点时间趋势，共 ${populatedLaneCount} 个可用节点，纵轴统一从 0 开始`,
+    );
+    const ticks = buildTimeTicks(0, maximumTime, compact ? 3 : 5);
+    ticks.forEach((value, index) => {
+      const position = x(value);
+      svg.appendChild(svgNode("line", {
+        x1: position,
+        x2: position,
+        y1: top,
+        y2: height - bottom,
+        class: "flow-history-grid",
+      }));
+      svg.appendChild(svgNode("text", {
+        x: position,
+        y: height - 12,
+        "text-anchor": index === 0 ? "start" : index === ticks.length - 1 ? "end" : "middle",
+        class: "flow-history-axis",
+      }, formatDuration(value)));
+    });
+
+    lanes.forEach((lane, laneIndex) => {
+      const laneTop = top + laneIndex * laneHeight;
+      const laneBottom = laneTop + laneHeight - 15;
+      const y = value => laneBottom - clamp(Number(value), 0, maximumValue)
+        / maximumValue * (laneBottom - laneTop - 12);
+      const latestPoint = lane.points.at(-1);
+      svg.appendChild(svgNode("text", {
+        x: 12,
+        y: laneTop + 24,
+        class: "flow-history-label",
+      }, `${lane.phase} · ${lane.label}`));
+      svg.appendChild(svgNode("text", {
+        x: 12,
+        y: laneTop + 43,
+        class: "flow-history-value",
+      }, latestPoint
+        ? `${lane.valueLabel} ${latestPoint.value.toFixed(lane.unit === "Hz" ? 0 : 1)} ${lane.unit}`
+        : lane.valueLabel));
+      svg.appendChild(svgNode("text", {
+        x: width - 8,
+        y: laneTop + 14,
+        "text-anchor": "end",
+        class: "flow-history-axis",
+      }, `${formatAxisNumber(maximumValue, 0)} ${lane.unit}`));
+      svg.appendChild(svgNode("text", {
+        x: width - 8,
+        y: laneBottom,
+        "text-anchor": "end",
+        class: "flow-history-axis",
+      }, `0 ${lane.unit}`));
+      svg.appendChild(svgNode("line", {
+        x1: left,
+        x2: width - right,
+        y1: laneBottom + 5,
+        y2: laneBottom + 5,
+        class: "flow-history-separator",
+      }));
+      if (!lane.points.length) {
+        const emptyLabel = lane.key === "display_scanout"
+          ? "暂无有效刷新率时间序列"
+          : lane.key === "render_queue"
+            ? "仅有阶段耗时，无独立 FPS 计数"
+            : "平台未公开该节点的独立帧率时间序列";
+        svg.appendChild(svgNode("text", {
+          x: left + 10,
+          y: laneTop + 35,
+          class: "flow-history-empty-label",
+        }, emptyLabel));
+        return;
+      }
+      const coordinates = lane.points.map(point => ({
+        ...point,
+        x: x(point.elapsed),
+        y: y(point.value),
+      }));
+      let path = `M${coordinates[0].x.toFixed(2)},${coordinates[0].y.toFixed(2)}`;
+      for (let index = 1; index < coordinates.length; index += 1) {
+        const previous = coordinates[index - 1];
+        const current = coordinates[index];
+        if (lane.key === "display_scanout") {
+          path += ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+        } else {
+          path += ` L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+        }
+      }
+      if (lane.key === "display_scanout" && coordinates.at(-1).elapsed < maximumTime) {
+        path += ` L${x(maximumTime).toFixed(2)},${coordinates.at(-1).y.toFixed(2)}`;
+      }
+      svg.appendChild(svgNode("path", {
+        d: path,
+        class: `flow-history-line ${lane.status}`,
+        style: `--lane-color:${lane.color}`,
+      }));
+      const last = coordinates.at(-1);
+      svg.appendChild(svgNode("circle", {
+        cx: last.x,
+        cy: last.y,
+        r: 3.4,
+        class: "flow-history-dot",
+        style: `--lane-color:${lane.color}`,
+      }));
+    });
+  }
+
   function renderRenderPipeline(active) {
     const platform = activePlatform(active);
     const performance = active?.performance || {};
@@ -1959,6 +2343,7 @@
       invalid: "无效",
       unavailable: "无数据",
     };
+    renderFrameFlowHistory(active, frameFlow);
     const allowedStatuses = new Set(Object.keys(statusLabels));
     const primaryStage = flowStages.find(item => item?.key === frameFlow.primary_key)
       || flowStages.find(item => item?.status === "primary");
@@ -2054,39 +2439,28 @@
     $$("[data-test-mode]").forEach(button => { button.disabled = running; });
     $$(".platform-switch [data-platform]").forEach(button => { button.disabled = running; });
     $("#system-monitor-input").disabled = running;
+    updateAppScannerAvailability();
     updateCaptureFeatureControls();
   }
 
   function renderClusters(active) {
     const container = $("#cluster-list");
     if (activePlatform(active) === "ios") {
-      const processes = Array.isArray(active?.system_monitor?.processes)
-        ? active.system_monitor.processes.slice(0, 6)
-        : [];
-      if (!processes.length) {
-        container.innerHTML = '<div class="empty-row">等待 DVT 进程 CPU 数据</div>';
-        return;
-      }
-      container.innerHTML = processes.map(process => {
-        const load = finite(process.cpu_pct) ? clamp(Number(process.cpu_pct), 0, 100) : 0;
-        return `<div class="cluster-row"><div class="cluster-name"><strong>${escapeHtml(process.name || process.command || "process")}</strong><small>PID ${escapeHtml(process.pid ?? "--")}</small></div><div class="cluster-bar"><span style="width:${load.toFixed(1)}%"></span></div><div class="cluster-load">${finite(process.cpu_pct) ? `${Number(process.cpu_pct).toFixed(1)}%` : "--"}</div><div class="cluster-frequency"><span>${formatBytes(process.resident_bytes)}</span><small> memory</small></div></div>`;
-      }).join("");
+      container.innerHTML = '<div class="empty-row">iOS 当前不提供可验证的逐核心频率</div>';
       return;
     }
-    const clusters = Array.isArray(active?.clusters) ? active.clusters : [];
+    const clusters = orderedCpuClusters(active);
     if (!clusters.length) {
-      container.innerHTML = '<div class="empty-row">等待 CPU 数据</div>';
+      container.innerHTML = '<div class="empty-row">等待 CPU 频率数据</div>';
       return;
     }
-    container.innerHTML = clusters.map(cluster => {
-      const load = finite(cluster.load_pct) ? clamp(Number(cluster.load_pct), 0, 100) : 0;
+    container.innerHTML = clusters.map((cluster, index) => {
       const frequency = finite(cluster.frequency_mhz) ? Number(cluster.frequency_mhz) : null;
       const maximum = finite(cluster.maximum_mhz) ? Number(cluster.maximum_mhz) : null;
+      const displayName = cpuClusterDisplayName(cluster, index, clusters);
       return `<div class="cluster-row">
-        <div class="cluster-name"><strong>${escapeHtml(cluster.label || cluster.name)}</strong><small>cores ${(cluster.cores || []).join(", ") || "--"}</small></div>
-        <div class="cluster-bar"><span style="width:${load.toFixed(1)}%"></span></div>
-        <div class="cluster-load">${finite(cluster.load_pct) ? `${Number(cluster.load_pct).toFixed(1)}%` : "--"}</div>
-        <div class="cluster-frequency"><span>${frequency === null ? "--" : `${frequency.toFixed(0)} MHz`}</span><small>${maximum === null ? "" : `/ ${maximum.toFixed(0)}`}</small></div>
+        <div class="cluster-name"><strong>${escapeHtml(cpuCoreGroupLabel(cluster))}</strong><small>${escapeHtml(displayName)} · ${escapeHtml(cluster.name || "policy")} 共享频率</small></div>
+        <div class="cluster-frequency"><span>${frequency === null ? "--" : `${frequency.toFixed(0)} MHz`}</span><small>${maximum === null ? "等待频率上限" : `上限 ${maximum.toFixed(0)} MHz`}</small></div>
       </div>`;
     }).join("");
   }
@@ -2280,8 +2654,11 @@
     const effectiveBrightness = finite(brightnessState.effective_raw_estimate)
       ? ` → 有效约 ${Number(brightnessState.effective_raw_estimate).toFixed(0)}`
       : "";
+    const displaySource = isHarmony
+      ? "HarmonyOS RenderService activeMode"
+      : "Android dumpsys display 活动模式";
     $("#performance-window-value").textContent = performance.foreground_window_name ? `${performance.foreground_window_name}${finite(performance.foreground_window_id) ? ` · #${performance.foreground_window_id}` : ""}` : "--";
-    $("#performance-display-value").textContent = `${resolution} / ${brightness}${effectiveBrightness}`;
+    $("#performance-display-value").textContent = `${resolution} / ${brightness}${effectiveBrightness} · ${displaySource}`;
     $("#performance-gpu-value").textContent = performance.gpu_renderer || "--";
     $("#performance-temperature-value").textContent = hottest && finite(hottest.value_c) ? `${Number(hottest.value_c).toFixed(1)} °C · ${hottest.name || "sensor"}` : finite(active?.latest?.temperature_c) ? `${Number(active.latest.temperature_c).toFixed(1)} °C · battery` : "--";
     $("#performance-switch-value").textContent = `${Number(performance.refresh_switch_count || 0)} 次`;
@@ -2453,189 +2830,638 @@
     if (nearBottom) container.scrollTop = container.scrollHeight;
   }
 
+  const liveTimelinePalette = ["#4bc6e8", "#9e8cff", "#ffb45c", "#35d49a", "#f1d267", "#ff657d"];
+
+  function liveTimelineLayoutContext(active = app.state?.active) {
+    const platform = activePlatform(active);
+    const requestedMode = String(active?.test_mode || active?.metadata?.test_mode || app.testMode || "power").toLowerCase();
+    const mode = requestedMode === "performance" ? "performance" : "power";
+    return `${platform}:${mode}`;
+  }
+
+  function currentLiveTimelineLayout(active = app.state?.active) {
+    const context = liveTimelineLayoutContext(active);
+    if (!app.liveTimelineLayouts[context]) {
+      app.liveTimelineLayouts[context] = {
+        order: [...defaultLiveTimelineOrder],
+        hidden: new Set(),
+      };
+    }
+    return app.liveTimelineLayouts[context];
+  }
+
+  function saveLiveTimelineLayouts() {
+    try {
+      const contexts = Object.fromEntries(
+        Object.entries(app.liveTimelineLayouts).map(([context, layout]) => [
+          context,
+          {
+            order: normalizeLiveTimelineOrder(layout?.order),
+            hidden: [...normalizeLiveTimelineHidden([...(layout?.hidden || [])])],
+          },
+        ]),
+      );
+      localStorage.setItem(
+        liveTimelineLayoutStorageKey,
+        JSON.stringify({ version: 1, contexts }),
+      );
+    } catch (_error) {
+      // Display preferences are optional; telemetry rendering must continue if storage is unavailable.
+    }
+  }
+
+  function liveTimelineGroupKey(lane) {
+    const key = String(lane?.key || "");
+    return key.startsWith("frame-flow-") ? "frame_flow" : key;
+  }
+
+  function applyLiveTimelineLayout(active, lanes) {
+    const layout = currentLiveTimelineLayout(active);
+    const rank = new Map(layout.order.map((key, index) => [key, index]));
+    return (Array.isArray(lanes) ? lanes : [])
+      .map((lane, index) => ({ lane, index, group: liveTimelineGroupKey(lane) }))
+      .filter(item => liveTimelineLayoutKeys.has(item.group) && !layout.hidden.has(item.group))
+      .sort((left, right) => (
+        (rank.get(left.group) ?? defaultLiveTimelineOrder.length)
+        - (rank.get(right.group) ?? defaultLiveTimelineOrder.length)
+        || left.index - right.index
+      ))
+      .map(item => item.lane);
+  }
+
+  function renderLiveTimelineConfiguration(active, availableLanes) {
+    const container = $("#live-timeline-config-list");
+    const count = $("#live-timeline-config-count");
+    if (!container || !count) return;
+    const context = liveTimelineLayoutContext(active);
+    const layout = currentLiveTimelineLayout(active);
+    const definitions = layout.order
+      .map(key => liveTimelineLayoutDefinitionMap.get(key))
+      .filter(Boolean);
+    const lanesByGroup = new Map();
+    (Array.isArray(availableLanes) ? availableLanes : []).forEach(lane => {
+      const group = liveTimelineGroupKey(lane);
+      if (!lanesByGroup.has(group)) lanesByGroup.set(group, []);
+      lanesByGroup.get(group).push(lane);
+    });
+    const enabledCount = definitions.filter(item => !layout.hidden.has(item.key)).length;
+    count.textContent = `${enabledCount} / ${definitions.length} 类开启`;
+
+    const signature = JSON.stringify({
+      context,
+      order: layout.order,
+      hidden: [...layout.hidden].sort(),
+      available: definitions.map(item => [
+        item.key,
+        ...(lanesByGroup.get(item.key) || []).map(lane => `${lane.key}:${lane.source}`),
+      ]),
+    });
+    if (container.dataset.signature === signature) return;
+    container.dataset.signature = signature;
+    container.innerHTML = definitions.map((definition, index) => {
+      const groupedLanes = lanesByGroup.get(definition.key) || [];
+      const hidden = layout.hidden.has(definition.key);
+      const availability = groupedLanes.length
+        ? definition.key === "frame_flow"
+          ? `${groupedLanes.length} 个链路节点有数据`
+          : `有数据 · ${groupedLanes[0].source}`
+        : "等待有效数据";
+      return `<div class="live-timeline-config-row${hidden ? " is-hidden" : ""}" data-live-timeline-row="${escapeHtml(definition.key)}">
+        <label class="live-timeline-config-toggle">
+          <input type="checkbox" data-live-timeline-toggle="${escapeHtml(definition.key)}"${hidden ? "" : " checked"} aria-label="显示 ${escapeHtml(definition.label)}">
+          <span class="live-timeline-config-copy"><strong>${escapeHtml(definition.label)}</strong><small>${escapeHtml(definition.hint)} · ${escapeHtml(availability)}</small></span>
+        </label>
+        <span class="live-timeline-config-actions">
+          <button class="live-timeline-order-button" type="button" data-live-timeline-move="-1" data-live-timeline-key="${escapeHtml(definition.key)}" aria-label="上移 ${escapeHtml(definition.label)}"${index === 0 ? " disabled" : ""}>↑</button>
+          <button class="live-timeline-order-button" type="button" data-live-timeline-move="1" data-live-timeline-key="${escapeHtml(definition.key)}" aria-label="下移 ${escapeHtml(definition.label)}"${index === definitions.length - 1 ? " disabled" : ""}>↓</button>
+        </span>
+      </div>`;
+    }).join("");
+  }
+
+  function setLiveTimelineVisibility(active, key, visible) {
+    if (!liveTimelineLayoutKeys.has(key)) return false;
+    const layout = currentLiveTimelineLayout(active);
+    if (visible) layout.hidden.delete(key);
+    else layout.hidden.add(key);
+    saveLiveTimelineLayouts();
+    return true;
+  }
+
+  function moveLiveTimelineLayoutItem(active, key, direction) {
+    if (!liveTimelineLayoutKeys.has(key)) return false;
+    const layout = currentLiveTimelineLayout(active);
+    const index = layout.order.indexOf(key);
+    const target = index + Number(direction);
+    if (index < 0 || target < 0 || target >= layout.order.length) return false;
+    [layout.order[index], layout.order[target]] = [layout.order[target], layout.order[index]];
+    saveLiveTimelineLayouts();
+    return true;
+  }
+
+  function downsampleTimelinePoints(points, limit = 900) {
+    if (points.length <= limit) return points;
+    const lastIndex = points.length - 1;
+    return Array.from({ length: limit }, (_, index) => (
+      points[Math.round(index / (limit - 1) * lastIndex)]
+    ));
+  }
+
+  function timelinePoints(source, value, { positive = false } = {}) {
+    const points = (Array.isArray(source) ? source : [])
+      .map((raw, index) => ({
+        elapsed: finite(raw?.elapsed_s) ? Number(raw.elapsed_s) : Number(index),
+        value: value(raw),
+        raw,
+      }))
+      .filter(point => finite(point.elapsed) && finite(point.value))
+      .filter(point => !positive || Number(point.value) > 0)
+      .map(point => ({ ...point, value: Number(point.value) }));
+    return downsampleTimelinePoints(points);
+  }
+
+  function liveMetricSource(active, key) {
+    const platform = activePlatform(active);
+    const performance = active?.performance || {};
+    const labels = {
+      power_mw: active?.latest?.power_source || (platform === "ios" ? "PowerTelemetryData.SystemLoad" : platform === "harmony" ? "HarmonyOS BatteryService" : "Android fuel gauge / BatteryService"),
+      current_ma: platform === "harmony" ? "HarmonyOS BatteryService" : platform === "ios" ? "PowerTelemetry / battery diagnostics" : "Android fuel gauge current_now",
+      voltage_mv: platform === "harmony" ? "HarmonyOS BatteryService" : "Battery voltage sensor",
+      cpu_pct: platform === "ios" ? "DVT sysmond" : "累计 /proc/stat",
+      frame_rate_fps: performance.frame_source || (platform === "harmony" ? "SmartPerf / RenderService" : "前台窗口 / SurfaceFlinger"),
+      refresh_rate_hz: platform === "harmony" ? "RenderService screen activeMode" : "SurfaceFlinger / display context",
+      frame_time_ms: performance.render_pipeline?.frame_metric_source || performance.frame_source || "详细帧时间戳",
+      gpu_load_pct: platform === "ios" ? "DVT graphics" : platform === "harmony" ? "SmartPerf GPU" : "GPU sysfs / driver",
+      gpu_frequency_mhz: platform === "harmony" ? "SmartPerf GPU" : "GPU devfreq / sysfs",
+      memory_frequency_mhz: platform === "harmony" ? "SmartPerf DDR" : "DMC / MIF devfreq",
+      temperature_c: platform === "ios" ? "battery diagnostics" : "BatteryService / thermal",
+    };
+    return labels[key] || "runtime sampler";
+  }
+
+  function metricTimelineLane(active, key, {
+    feature = null,
+    enabled = null,
+    source = null,
+    title = null,
+    seriesLabel = null,
+    sourceLabel = null,
+    positive = false,
+    step = false,
+  } = {}) {
+    if (feature && !captureFeatureEnabled(active, feature)) return null;
+    if (enabled !== null && !enabled) return null;
+    const definition = metricDefinitions[key];
+    if (!definition) return null;
+    const rows = source || (definition.series === "performance" ? active?.performance_series : active?.series);
+    const points = timelinePoints(rows, definition.value, { positive });
+    if (!points.length) return null;
+    const series = [{
+      key,
+      label: seriesLabel || definition.legend,
+      color: definition.color,
+      points,
+      step,
+    }];
+    const overlay = definition.overlay && typeof definition.overlay.value === "function"
+      ? definition.overlay
+      : null;
+    if (overlay) {
+      const overlayPoints = timelinePoints(rows, overlay.value, { positive });
+      if (overlayPoints.length) {
+        series.push({
+          key: `${key}-overlay`,
+          label: overlay.legend || "Secondary",
+          color: overlay.color || "#f1d267",
+          points: overlayPoints,
+          dashed: true,
+          step,
+        });
+      }
+    }
+    return {
+      key,
+      title: title || definition.title,
+      source: sourceLabel || liveMetricSource(active, key),
+      unit: definition.unit,
+      digits: definition.digits,
+      axis: definition.axis,
+      reference: typeof definition.reference === "function" ? definition.reference(active) : null,
+      series,
+    };
+  }
+
+  function cpuFrequencyTimelineLane(active) {
+    if (!captureFeatureEnabled(active, "cpu_frequency") || activePlatform(active) === "ios") return null;
+    const rows = Array.isArray(active?.series) ? active.series : [];
+    const clusters = orderedCpuClusters(active);
+    const clusterMap = new Map(clusters.map(cluster => [String(cluster.name || ""), cluster]));
+    const keys = [];
+    clusters.forEach(cluster => {
+      const name = String(cluster.name || "");
+      if (name && !keys.includes(name)) keys.push(name);
+    });
+    rows.forEach(row => {
+      Object.keys(row?.frequencies_mhz || {}).forEach(name => {
+        if (!keys.includes(name)) keys.push(name);
+      });
+    });
+    const series = keys.map((name, index) => {
+      const cluster = clusterMap.get(name);
+      const clusterIndex = cluster ? clusters.indexOf(cluster) : index;
+      const displayName = cluster
+        ? cpuClusterDisplayName(cluster, clusterIndex, clusters)
+        : `频率组 ${index + 1}`;
+      const coreLabel = cluster ? cpuCoreGroupLabel(cluster) : name;
+      return {
+        key: `cpu-frequency-${name}`,
+        label: `${displayName} ${coreLabel}`,
+        color: liveTimelinePalette[index % liveTimelinePalette.length],
+        points: timelinePoints(rows, row => row?.frequencies_mhz?.[name], { positive: true }),
+      };
+    }).filter(item => item.points.length);
+    if (!series.length) return null;
+    const maximum = Math.max(0, ...clusters.map(cluster => Number(cluster.maximum_mhz || 0)));
+    return {
+      key: "cpu_frequency",
+      title: "CPU 核心组频率",
+      source: activePlatform(active) === "harmony" ? "hidumper --cpufreq · policy 共享频率" : "cpufreq policy 共享频率",
+      unit: "MHz",
+      digits: 0,
+      axis: maximum > 0
+        ? { fixedMin: 0, fixedMax: maximum, tickDigits: 0 }
+        : { fixedMin: 0, minSpan: 1000, padding: .08, tickDigits: 0 },
+      reference: null,
+      series,
+    };
+  }
+
+  function frameTimingTimelineLane(active) {
+    if (!captureFeatureEnabled(active, "frame_details")) return null;
+    const rows = Array.isArray(active?.performance_series) ? active.performance_series : [];
+    const series = [
+      {
+        key: "frame-time-p95",
+        label: "P95",
+        color: "#9e8cff",
+        points: timelinePoints(rows, row => finite(row?.frame_time_p95_ms) ? Number(row.frame_time_p95_ms) : null, { positive: true }),
+      },
+      {
+        key: "frame-time-p99",
+        label: "P99",
+        color: "#ff657d",
+        points: timelinePoints(rows, row => finite(row?.frame_time_p99_ms) ? Number(row.frame_time_p99_ms) : null, { positive: true }),
+        dashed: true,
+      },
+    ].filter(item => item.points.length);
+    if (!series.length) return null;
+    return {
+      key: "frame_time_ms",
+      title: "帧耗时",
+      source: liveMetricSource(active, "frame_time_ms"),
+      unit: "ms",
+      digits: 2,
+      axis: metricDefinitions.frame_time_ms.axis,
+      reference: metricDefinitions.frame_time_ms.reference(active),
+      series,
+    };
+  }
+
+  function frameIssueTimelineLane(active) {
+    if (!captureFeatureEnabled(active, "frame_details")) return null;
+    const rows = Array.isArray(active?.performance_series) ? active.performance_series : [];
+    const points = timelinePoints(rows, row => finite(row?.frame_issue_pct) ? Number(row.frame_issue_pct) : null);
+    if (!points.length) return null;
+    return {
+      key: "frame_issue_pct",
+      title: "异常帧占比",
+      source: active?.performance?.frame_issue_label || "截止时间 / VSync 统计",
+      unit: "%",
+      digits: 2,
+      axis: { fixedMin: 0, minSpan: 2, padding: .1, tickDigits: 1 },
+      reference: null,
+      series: [{ key: "frame-issue", label: "异常帧", color: "#ff657d", points }],
+    };
+  }
+
+  function frameFlowTimelineLanes(active) {
+    if (!captureFeatureEnabled(active, "frame_rate")) return [];
+    const flow = active?.performance?.frame_flow || {};
+    const primaryKey = String(flow.primary_key || "");
+    const stages = Array.isArray(flow.stages) ? flow.stages : [];
+    return stages.flatMap((stage, index) => {
+      const key = String(stage?.key || `stage-${index}`);
+      if (key === primaryKey || key === "display_scanout") return [];
+      const unit = String(stage?.timeline_unit || stage?.unit || "FPS");
+      const points = timelinePoints(
+        stage?.timeline,
+        row => finite(row?.value)
+          ? Number(row.value)
+          : finite(row?.frame_rate_fps) ? Number(row.frame_rate_fps) : null,
+      );
+      if (!points.length || !points.some(point => point.value > 0)) return [];
+      return [{
+        key: `frame-flow-${key}`,
+        title: `渲染链路 · ${stage.label || key}`,
+        source: stage.source || "平台帧链路计数",
+        unit,
+        digits: unit === "ms" ? 2 : 1,
+        axis: { fixedMin: 0, minSpan: unit === "ms" ? 10 : 30, padding: .08, tickDigits: unit === "ms" ? 1 : 0 },
+        reference: null,
+        series: [{
+          key: `frame-flow-${key}-series`,
+          label: stage.timeline_value_label || stage.value_label || stage.label || key,
+          color: liveTimelinePalette[(index + 2) % liveTimelinePalette.length],
+          points,
+          dashed: ["reference", "invalid"].includes(String(stage.status || "")),
+          step: key === "display_scanout",
+        }],
+      }];
+    });
+  }
+
+  function liveTimelineLanes(active) {
+    if (!active) return [];
+    const powerFlow = powerFlowPresentation(active);
+    const refreshRows = Array.isArray(active?.performance?.refresh_rate_timeline)
+      && active.performance.refresh_rate_timeline.length
+      ? active.performance.refresh_rate_timeline
+      : active?.performance_series;
+    const frameFlowLanes = frameFlowTimelineLanes(active);
+    return [
+      metricTimelineLane(active, "cpu_pct", { feature: "cpu_usage", seriesLabel: "CPU 总负载" }),
+      cpuFrequencyTimelineLane(active),
+      metricTimelineLane(active, "frame_rate_fps", { feature: "frame_rate", seriesLabel: "渲染帧率" }),
+      ...frameFlowLanes,
+      metricTimelineLane(active, "refresh_rate_hz", {
+        enabled: captureFeatureEnabled(active, "foreground_window") || captureFeatureEnabled(active, "frame_rate"),
+        source: refreshRows,
+        seriesLabel: "显示刷新率",
+        step: true,
+      }),
+      frameTimingTimelineLane(active),
+      frameIssueTimelineLane(active),
+      metricTimelineLane(active, "gpu_load_pct", { feature: "gpu_metrics", seriesLabel: "GPU 负载" }),
+      metricTimelineLane(active, "gpu_frequency_mhz", { feature: "gpu_metrics", seriesLabel: "GPU 频率", positive: true }),
+      metricTimelineLane(active, "memory_frequency_mhz", { feature: "memory_frequency", seriesLabel: "内存频率", positive: true }),
+      metricTimelineLane(active, "power_mw", {
+        title: powerFlow.chartPowerTitle,
+        seriesLabel: powerFlow.chartPowerTitle,
+        sourceLabel: liveMetricSource(active, "power_mw"),
+      }),
+      metricTimelineLane(active, "current_ma", {
+        title: powerFlow.chartCurrentTitle,
+        seriesLabel: powerFlow.chartCurrentTitle,
+        sourceLabel: liveMetricSource(active, "current_ma"),
+      }),
+      metricTimelineLane(active, "voltage_mv", { seriesLabel: "电池电压", positive: true }),
+      metricTimelineLane(active, "temperature_c", { feature: "thermal", seriesLabel: "电池温度" }),
+    ].filter(Boolean);
+  }
+
+  function timelinePath(coordinates, step = false) {
+    if (!coordinates.length) return "";
+    const intervals = coordinates.slice(1)
+      .map((point, index) => point.elapsed - coordinates[index].elapsed)
+      .filter(value => value > 0)
+      .sort((left, right) => left - right);
+    const medianInterval = intervals.length ? intervals[Math.floor(intervals.length / 2)] : 0;
+    const gapLimit = Math.max(10, medianInterval * 5);
+    let path = `M${coordinates[0].x.toFixed(2)},${coordinates[0].y.toFixed(2)}`;
+    for (let index = 1; index < coordinates.length; index += 1) {
+      const point = coordinates[index];
+      const previous = coordinates[index - 1];
+      if (point.elapsed - previous.elapsed > gapLimit) {
+        path += ` M${point.x.toFixed(2)},${point.y.toFixed(2)}`;
+      } else if (step) {
+        path += ` H${point.x.toFixed(2)} V${point.y.toFixed(2)}`;
+      } else {
+        path += ` L${point.x.toFixed(2)},${point.y.toFixed(2)}`;
+      }
+    }
+    return path;
+  }
+
+  function compactLaneTicks(scale) {
+    if (scale.ticks.length <= 3) return scale.ticks;
+    return [...new Set([
+      scale.ticks[0],
+      scale.ticks[Math.floor((scale.ticks.length - 1) / 2)],
+      scale.ticks.at(-1),
+    ])];
+  }
+
+  function truncateTimelineLabel(value, length) {
+    const text = String(value || "");
+    return text.length > length ? `${text.slice(0, Math.max(1, length - 1))}…` : text;
+  }
+
   function renderChart() {
     const svg = $("#live-chart");
     const empty = $("#chart-empty");
     const active = app.state?.active;
-    const baseDefinition = metricDefinitions[app.metric];
-    const powerFlow = powerFlowPresentation(active);
-    const definition = app.metric === "power_mw"
-      ? { ...baseDefinition, title: powerFlow.chartPowerTitle, legend: powerFlow.chartPowerLegend }
-      : app.metric === "current_ma"
-        ? { ...baseDefinition, title: powerFlow.chartCurrentTitle, legend: powerFlow.chartCurrentLegend }
-        : baseDefinition;
-    const sourceSeries = definition.series === "performance"
-      ? active?.performance_series
-      : active?.series;
-    const series = Array.isArray(sourceSeries) ? sourceSeries : [];
-    $("#chart-title").textContent = definition.title;
-    $("#chart-legend").textContent = definition.legend;
-    $("#chart-secondary-label").textContent = definition.secondaryLabel || "P95";
-    $(".legend-line").style.background = definition.color;
-    svg.style.setProperty("--chart-color", definition.color);
-    const points = series
-      .map(point => ({ elapsed: Number(point.elapsed_s || 0), value: definition.value(point), raw: point }))
-      .filter(point => finite(point.value));
+    const availableLanes = liveTimelineLanes(active);
+    renderLiveTimelineConfiguration(active, availableLanes);
+    const lanes = applyLiveTimelineLayout(active, availableLanes);
     svg.replaceChildren();
-    if (points.length < 2) {
+    if (!lanes.length) {
+      svg.style.height = "260px";
+      svg.setAttribute("viewBox", "0 0 1000 260");
       empty.classList.remove("hidden");
-      $("#chart-average").textContent = "--";
-      $("#chart-p95").textContent = "--";
-      $("#chart-range").textContent = "--";
+      const allHidden = availableLanes.length > 0;
+      empty.querySelector("strong").textContent = allHidden ? "已隐藏所有图表" : "等待遥测数据";
+      empty.querySelector("small").textContent = allHidden
+        ? "在“显示内容与顺序”中重新打开需要的数据"
+        : "开始采集后，已开启且有效的曲线将在这里实时更新";
+      $("#live-timeline-source").textContent = allHidden
+        ? `0 / ${availableLanes.length} 条数据泳道正在显示`
+        : active
+          ? "已开启项目尚无有效时间序列"
+          : "等待采集配置与时间序列";
       app.chartGeometry = null;
       return;
     }
-    empty.classList.add("hidden");
-    const values = points.map(point => Number(point.value));
-    const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-    const p95 = percentile(values, definition.secondaryQuantile ?? .95);
-    $("#chart-average").textContent = `${average.toFixed(definition.digits)} ${definition.unit}`;
-    $("#chart-p95").textContent = p95 === null ? "--" : `${p95.toFixed(definition.digits)} ${definition.unit}`;
 
+    empty.classList.add("hidden");
     const width = Math.max(320, Math.round(svg.clientWidth || 1000));
-    const height = Math.max(240, Math.round(svg.clientHeight || 320));
-    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    const compact = width < 520;
+    const compact = width < 620;
+    const laneHeight = compact ? 112 : 106;
     const margins = {
-      left: compact ? 52 : 64,
-      right: compact ? 12 : 20,
-      top: 28,
-      bottom: compact ? 38 : 40,
+      left: compact ? 104 : 142,
+      right: compact ? 14 : 22,
+      top: 8,
+      bottom: compact ? 40 : 42,
     };
+    const height = margins.top + lanes.length * laneHeight + margins.bottom;
     const plotWidth = width - margins.left - margins.right;
-    const plotHeight = height - margins.top - margins.bottom;
-    const minTime = Math.min(...points.map(point => point.elapsed));
-    const maxTime = Math.max(...points.map(point => point.elapsed));
-    const scale = buildChartScale(values, definition);
-    const minValue = scale.minimum;
-    const maxValue = scale.maximum;
-    const rangeMinimum = formatAxisNumber(minValue, scale.tickDigits);
-    const rangeMaximum = formatAxisNumber(maxValue, scale.tickDigits);
-    $("#chart-range").textContent = `${rangeMinimum}–${rangeMaximum} ${definition.unit}`;
+    const maxPointElapsed = Math.max(0, ...lanes.flatMap(lane => lane.series.flatMap(item => item.points.map(point => point.elapsed))));
+    const minTime = 0;
+    const maxTime = Math.max(1, Number(active?.elapsed_s || 0), maxPointElapsed);
+    const xFor = elapsed => margins.left + (Number(elapsed) / maxTime) * plotWidth;
+    svg.style.height = `${height}px`;
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.setAttribute(
       "aria-label",
-      `${definition.title}，坐标范围 ${rangeMinimum} 到 ${rangeMaximum} ${definition.unit}`,
+      `${lanes.length} 条实时数据泳道，共用 ${formatDuration(minTime)} 到 ${formatDuration(maxTime)} 的时间横轴；${lanes.map(lane => lane.title).join("、")}`,
     );
-    const xFor = elapsed => margins.left + ((elapsed - minTime) / Math.max(.001, maxTime - minTime)) * plotWidth;
-    const yFor = value => margins.top + (1 - (value - minValue) / Math.max(.001, maxValue - minValue)) * plotHeight;
+    $("#live-timeline-source").textContent = `${lanes.length} / ${availableLanes.length} 条数据泳道 · ${formatDuration(minTime)}–${formatDuration(maxTime)} · 自定义显示顺序`;
 
-    const grid = svgNode("g", { class: "chart-grid" });
-    grid.appendChild(svgNode("text", {
-      x: margins.left,
-      y: 15,
-      class: "axis-unit",
-    }, definition.unit));
-    scale.ticks.forEach(value => {
-      const y = yFor(value);
-      const isBoundary = Math.abs(value - minValue) < 1e-9 || Math.abs(value - maxValue) < 1e-9;
-      grid.appendChild(svgNode("line", {
-        x1: margins.left,
-        y1: y,
-        x2: width - margins.right,
-        y2: y,
-        class: `grid-line grid-line-y${isBoundary ? " grid-line-boundary" : ""}`,
-      }));
-      grid.appendChild(svgNode("line", {
-        x1: margins.left - 4,
-        y1: y,
-        x2: margins.left,
-        y2: y,
-        class: "axis-tick",
-      }));
-      grid.appendChild(svgNode("text", {
-        x: margins.left - 9,
+    const backgrounds = svgNode("g", { class: "timeline-backgrounds" });
+    lanes.forEach((lane, index) => {
+      const y = margins.top + index * laneHeight;
+      backgrounds.appendChild(svgNode("rect", {
+        x: 0,
         y,
-        "text-anchor": "end",
-        "dominant-baseline": "middle",
-        class: "axis-label axis-label-y",
-      }, formatAxisNumber(value, scale.tickDigits)));
+        width,
+        height: laneHeight,
+        class: `timeline-lane-bg${index % 2 ? " alternate" : ""}`,
+      }));
+      backgrounds.appendChild(svgNode("line", {
+        x1: 0,
+        y1: y + laneHeight,
+        x2: width,
+        y2: y + laneHeight,
+        class: "timeline-lane-separator",
+      }));
     });
-    const timeTicks = buildTimeTicks(minTime, maxTime, compact ? 3 : width < 760 ? 4 : 5);
+    svg.appendChild(backgrounds);
+
+    const timeGrid = svgNode("g", { class: "timeline-time-grid" });
+    const timeTicks = buildTimeTicks(minTime, maxTime, compact ? 3 : width < 900 ? 5 : 7);
     timeTicks.forEach((elapsed, index) => {
       const x = xFor(elapsed);
-      grid.appendChild(svgNode("line", {
+      timeGrid.appendChild(svgNode("line", {
         x1: x,
         y1: margins.top,
         x2: x,
         y2: height - margins.bottom,
-        class: "grid-line grid-line-x",
+        class: "timeline-time-line",
       }));
-      grid.appendChild(svgNode("line", {
-        x1: x,
-        y1: height - margins.bottom,
-        x2: x,
-        y2: height - margins.bottom + 4,
-        class: "axis-tick",
-      }));
-      grid.appendChild(svgNode("text", {
+      timeGrid.appendChild(svgNode("text", {
         x,
         y: height - 14,
         "text-anchor": index === 0 ? "start" : index === timeTicks.length - 1 ? "end" : "middle",
-        class: "axis-label axis-label-x",
+        class: "timeline-time-label",
       }, formatDuration(elapsed)));
     });
-    grid.appendChild(svgNode("line", {
-      x1: margins.left,
-      y1: margins.top,
-      x2: margins.left,
-      y2: height - margins.bottom,
-      class: "axis-line",
-    }));
-    grid.appendChild(svgNode("line", {
-      x1: margins.left,
-      y1: height - margins.bottom,
-      x2: width - margins.right,
-      y2: height - margins.bottom,
-      class: "axis-line",
-    }));
-    svg.appendChild(grid);
+    svg.appendChild(timeGrid);
 
-    const reference = typeof definition.reference === "function"
-      ? definition.reference(active)
-      : null;
-    let referenceLabel = null;
-    if (reference && finite(reference.value) && reference.value >= minValue && reference.value <= maxValue) {
-      const referenceY = yFor(Number(reference.value));
-      const referenceLabelY = referenceY <= margins.top + 14 ? referenceY + 15 : referenceY - 6;
-      svg.appendChild(svgNode("line", {
-        x1: margins.left,
-        y1: referenceY,
-        x2: width - margins.right,
-        y2: referenceY,
-        class: "reference-line",
-      }));
-      const referenceLabelWidth = Math.min(
-        compact ? 116 : 150,
-        Math.max(76, String(reference.label).length * (compact ? 5.8 : 6.4) + 12),
-      );
-      referenceLabel = svgNode("g", { class: "reference-label-group" });
-      referenceLabel.appendChild(svgNode("rect", {
-        x: width - margins.right - referenceLabelWidth,
-        y: referenceLabelY - 11,
-        width: referenceLabelWidth,
-        height: 16,
-        rx: 4,
-        class: "reference-label-bg",
-      }));
-      referenceLabel.appendChild(svgNode("text", {
-        x: width - margins.right - 5,
-        y: referenceLabelY,
-        "text-anchor": "end",
-        class: "reference-label",
-      }, reference.label));
-    }
+    const geometryLanes = [];
+    lanes.forEach((lane, laneIndex) => {
+      const laneTop = margins.top + laneIndex * laneHeight;
+      const plotTop = laneTop + 35;
+      const plotBottom = laneTop + laneHeight - 15;
+      const plotHeight = plotBottom - plotTop;
+      const values = lane.series.flatMap(item => item.points.map(point => Number(point.value)));
+      const scale = buildChartScale(values, { axis: lane.axis, digits: lane.digits });
+      const yFor = value => plotTop + (1 - (Number(value) - scale.minimum) / Math.max(.001, scale.maximum - scale.minimum)) * plotHeight;
+      const laneGroup = svgNode("g", { class: "timeline-lane" });
+      laneGroup.appendChild(svgNode("title", {}, `${lane.title} · 数据来源：${lane.source}`));
+      laneGroup.appendChild(svgNode("text", {
+        x: 10,
+        y: laneTop + 17,
+        class: "timeline-lane-title",
+      }, lane.title));
+      laneGroup.appendChild(svgNode("text", {
+        x: 10,
+        y: laneTop + 31,
+        class: "timeline-lane-source",
+      }, truncateTimelineLabel(lane.source, compact ? 14 : 22)));
 
-    const coordinates = points.map(point => ({ ...point, x: xFor(point.elapsed), y: yFor(Number(point.value)) }));
-    const linePath = coordinates.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
-    const areaPath = `${linePath} L${coordinates.at(-1).x.toFixed(2)},${height - margins.bottom} L${coordinates[0].x.toFixed(2)},${height - margins.bottom} Z`;
-    svg.appendChild(svgNode("path", { d: areaPath, class: "series-area" }));
-    svg.appendChild(svgNode("path", { d: linePath, class: "series-line" }));
+      compactLaneTicks(scale).forEach(value => {
+        const y = yFor(value);
+        laneGroup.appendChild(svgNode("line", {
+          x1: margins.left,
+          y1: y,
+          x2: width - margins.right,
+          y2: y,
+          class: "timeline-value-grid",
+        }));
+        laneGroup.appendChild(svgNode("text", {
+          x: margins.left - 7,
+          y,
+          "text-anchor": "end",
+          "dominant-baseline": "middle",
+          class: "timeline-value-label",
+        }, formatAxisNumber(value, scale.tickDigits)));
+      });
+
+      let legendX = margins.left + 5;
+      lane.series.forEach((item, index) => {
+        const latest = item.points.at(-1);
+        const legend = `${item.label} ${Number(latest.value).toFixed(lane.digits)} ${lane.unit}`;
+        const estimatedWidth = 24 + legend.length * (compact ? 5.2 : 5.8);
+        if (legendX + estimatedWidth > width - margins.right && index > 0) return;
+        laneGroup.appendChild(svgNode("line", {
+          x1: legendX,
+          y1: laneTop + 17,
+          x2: legendX + 13,
+          y2: laneTop + 17,
+          class: `timeline-legend-line${item.dashed ? " secondary" : ""}`,
+          style: `--lane-color:${item.color}`,
+        }));
+        laneGroup.appendChild(svgNode("text", {
+          x: legendX + 18,
+          y: laneTop + 20,
+          class: "timeline-legend-label",
+        }, legend));
+        legendX += estimatedWidth;
+      });
+
+      if (lane.reference && finite(lane.reference.value)
+        && Number(lane.reference.value) >= scale.minimum
+        && Number(lane.reference.value) <= scale.maximum) {
+        const referenceY = yFor(lane.reference.value);
+        laneGroup.appendChild(svgNode("line", {
+          x1: margins.left,
+          y1: referenceY,
+          x2: width - margins.right,
+          y2: referenceY,
+          class: "timeline-reference-line",
+        }));
+        laneGroup.appendChild(svgNode("text", {
+          x: width - margins.right - 4,
+          y: referenceY - 4,
+          "text-anchor": "end",
+          class: "timeline-reference-label",
+        }, lane.reference.label));
+      }
+
+      const geometrySeries = [];
+      lane.series.forEach(item => {
+        const coordinates = item.points.map(point => ({
+          ...point,
+          x: xFor(point.elapsed),
+          y: yFor(point.value),
+        }));
+        const path = timelinePath(coordinates, item.step);
+        if (coordinates.length >= 2) {
+          laneGroup.appendChild(svgNode("path", {
+            d: path,
+            class: `timeline-series-line${item.dashed ? " secondary" : ""}`,
+            style: `--lane-color:${item.color}`,
+          }));
+        }
+        const latest = coordinates.at(-1);
+        laneGroup.appendChild(svgNode("circle", {
+          cx: latest.x,
+          cy: latest.y,
+          r: item.dashed ? 2.8 : 3.4,
+          class: "timeline-series-dot",
+          style: `--lane-color:${item.color}`,
+        }));
+        geometrySeries.push({ ...item, coordinates });
+      });
+      geometryLanes.push({ ...lane, series: geometrySeries, plotTop, plotBottom, scale });
+      svg.appendChild(laneGroup);
+    });
+
     const dimPoints = Array.isArray(active?.brightness_throttling?.points)
       ? active.brightness_throttling.points
       : [];
     dimPoints.forEach(point => {
       const elapsed = Number(point.elapsed_s || 0);
-      if (elapsed < minTime || elapsed > maxTime) return;
+      if (!finite(elapsed) || elapsed < minTime || elapsed > maxTime) return;
       const status = String(point.status || "suspected");
       const x = xFor(elapsed);
       const marker = svgNode("line", {
@@ -2647,19 +3473,27 @@
       });
       marker.appendChild(svgNode("title", {}, `${formatDuration(elapsed)} · ${status === "confirmed" ? "确认热降亮" : "疑似热降亮"} · ${point.reason || "显示侧热限制"}`));
       svg.appendChild(marker);
-      svg.appendChild(svgNode("circle", {
-        cx: x,
-        cy: margins.top + 6,
-        r: status === "confirmed" ? 4.5 : 3.5,
-        class: `brightness-dim-dot ${status}`,
-      }));
     });
-    const last = coordinates.at(-1);
-    svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 4, class: "latest-marker" }));
-    const hoverLine = svgNode("line", { x1: last.x, y1: margins.top, x2: last.x, y2: height - margins.bottom, class: "hover-line", opacity: 0 });
+
+    const hoverLine = svgNode("line", {
+      x1: margins.left,
+      y1: margins.top,
+      x2: margins.left,
+      y2: height - margins.bottom,
+      class: "timeline-hover-line",
+      opacity: 0,
+    });
     svg.appendChild(hoverLine);
-    if (referenceLabel) svg.appendChild(referenceLabel);
-    app.chartGeometry = { coordinates, width, height, margins, hoverLine, definition };
+    app.chartGeometry = {
+      lanes: geometryLanes,
+      width,
+      height,
+      margins,
+      minTime,
+      maxTime,
+      plotWidth,
+      hoverLine,
+    };
   }
 
   function renderActive(active) {
@@ -2743,8 +3577,6 @@
     renderPerformanceResources(active);
     renderPowerPressure(active);
     renderRenderPipeline(active);
-    renderSystem(active);
-    renderSchedulerHistory(active);
     renderConsole(active);
     renderLiveDetails(active);
     renderChart();
@@ -3109,7 +3941,6 @@
     window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
     window.addEventListener("resize", () => requestAnimationFrame(() => {
       renderChart();
-      renderSchedulerHistory(app.state?.active);
     }));
     document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshState(); });
 
@@ -3402,6 +4233,7 @@
           ? currentPackage
           : "";
         renderAppOptions();
+        $("#app-result-details").open = true;
         updateAppScannerAvailability(selected);
         const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
         notify(
@@ -3419,7 +4251,11 @@
       }
     });
 
-    $("#app-search-input").addEventListener("input", renderAppOptions);
+    $("#app-search-input").addEventListener("input", () => {
+      const details = $("#app-result-details");
+      if (details && !details.classList.contains("hidden")) details.open = true;
+      renderAppOptions();
+    });
     $("#app-select").addEventListener("change", event => {
       const packageName = event.target.value;
       if (!packageName) return;
@@ -3472,7 +4308,7 @@
         return;
       }
       if (payload.test_mode === "performance" && !payload.package) {
-        notify("请选择测试游戏 / 应用", "性能测试必须绑定具体包名；Android 可先扫描手机应用后选择。", "error", 8000);
+        notify("请填写目标游戏 / 应用包名", "性能测试必须绑定具体包名；Android 可先扫描手机应用后选择。", "error", 8000);
         $("#package-input").focus();
         return;
       }
@@ -3507,12 +4343,14 @@
     });
 
     $("#add-marker").addEventListener("click", async () => {
-      const name = prompt("请输入时间标记名称，例如：BTR2 开始、进入视频测试、发现异常");
-      if (!name || !name.trim()) return;
+      const defaultName = defaultMarkerName();
+      const name = prompt("请输入时间标记名称，例如：BTR2 开始、进入视频测试、发现异常", defaultName);
+      if (name === null) return;
+      const resolvedName = name.trim() || defaultName;
       try {
         const marker = await api("/api/marker", {
           method: "POST",
-          body: JSON.stringify({ name: name.trim() }),
+          body: JSON.stringify({ name: resolvedName }),
         });
         notify("时间标记已保存", `${marker.name} · uptime ${Number(marker.device_uptime_s).toFixed(3)} s`, "success");
       } catch (error) {
@@ -3682,29 +4520,60 @@
       $("#tool-output-link").classList.add("hidden");
     });
 
+    const liveTimelineConfigList = $("#live-timeline-config-list");
+    liveTimelineConfigList.addEventListener("change", event => {
+      const input = event.target.closest("[data-live-timeline-toggle]");
+      if (!input) return;
+      const key = String(input.dataset.liveTimelineToggle || "");
+      if (setLiveTimelineVisibility(app.state?.active, key, input.checked)) renderChart();
+    });
+    liveTimelineConfigList.addEventListener("click", event => {
+      const button = event.target.closest("[data-live-timeline-move]");
+      if (!button || button.disabled) return;
+      const key = String(button.dataset.liveTimelineKey || "");
+      const direction = Number(button.dataset.liveTimelineMove || 0);
+      if (moveLiveTimelineLayoutItem(app.state?.active, key, direction)) renderChart();
+    });
+
     const chartWrap = $("#chart-wrap");
     chartWrap.addEventListener("mousemove", event => {
       const geometry = app.chartGeometry;
-      if (!geometry?.coordinates?.length) return;
+      if (!geometry?.lanes?.length) return;
       const rect = chartWrap.getBoundingClientRect();
       const viewX = ((event.clientX - rect.left) / rect.width) * geometry.width;
-      let nearest = geometry.coordinates[0];
-      let distance = Math.abs(nearest.x - viewX);
-      geometry.coordinates.forEach(point => {
-        const nextDistance = Math.abs(point.x - viewX);
-        if (nextDistance < distance) {
-          nearest = point;
-          distance = nextDistance;
-        }
-      });
-      geometry.hoverLine.setAttribute("x1", nearest.x);
-      geometry.hoverLine.setAttribute("x2", nearest.x);
+      const plotX = clamp(
+        viewX,
+        geometry.margins.left,
+        geometry.width - geometry.margins.right,
+      );
+      const elapsed = (plotX - geometry.margins.left) / Math.max(1, geometry.plotWidth)
+        * geometry.maxTime;
+      geometry.hoverLine.setAttribute("x1", plotX);
+      geometry.hoverLine.setAttribute("x2", plotX);
       geometry.hoverLine.setAttribute("opacity", "1");
       const tooltip = $("#chart-tooltip");
       tooltip.classList.remove("hidden");
-      tooltip.innerHTML = `${escapeHtml(formatDuration(nearest.elapsed))}<strong>${Number(nearest.value).toFixed(geometry.definition.digits)} ${escapeHtml(geometry.definition.unit)}</strong>`;
-      const tooltipX = clamp(event.clientX - rect.left + 12, 8, rect.width - 145);
-      const tooltipY = clamp(event.clientY - rect.top - 20, 8, rect.height - 54);
+      const rows = geometry.lanes.map(lane => {
+        const values = lane.series.map(item => {
+          let nearest = item.coordinates[0];
+          let distance = Math.abs(nearest.elapsed - elapsed);
+          item.coordinates.forEach(point => {
+            const nextDistance = Math.abs(point.elapsed - elapsed);
+            if (nextDistance < distance) {
+              nearest = point;
+              distance = nextDistance;
+            }
+          });
+          const label = lane.series.length > 1 ? `${item.label} ` : "";
+          return `${escapeHtml(label)}${Number(nearest.value).toFixed(lane.digits)} ${escapeHtml(lane.unit)}`;
+        }).join(" / ");
+        return `<span class="chart-tooltip-row"><em>${escapeHtml(lane.title)}</em><b>${values}</b></span>`;
+      }).join("");
+      tooltip.innerHTML = `<time>${escapeHtml(formatDuration(elapsed))}</time>${rows}`;
+      const tooltipWidth = Math.max(210, tooltip.offsetWidth || 0);
+      const tooltipHeight = Math.max(54, tooltip.offsetHeight || 0);
+      const tooltipX = clamp(event.clientX - rect.left + 12, 8, rect.width - tooltipWidth - 8);
+      const tooltipY = clamp(event.clientY - rect.top - 20, 8, rect.height - tooltipHeight - 8);
       tooltip.style.left = `${tooltipX}px`;
       tooltip.style.top = `${tooltipY}px`;
     });
@@ -3714,9 +4583,11 @@
     });
   }
 
+  mountConfigurationView();
   bindEvents();
   setPlatform(app.platform, { initial: true });
   setTestMode("power", { initial: true });
   switchView(app.activeView);
+  renderChart();
   pollLoop();
 })();

@@ -60,6 +60,111 @@ class LiveTelemetryTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["direction"], "charging")
             self.assertEqual(snapshot["battery"]["powered"], ["AC"])
 
+    def test_reader_exposes_cpu_cluster_history_for_live_details(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {
+                            "voltage_mv": 3800.0,
+                            "status": "discharging",
+                        },
+                        "cpu_policies": [
+                            {
+                                "name": "policy0",
+                                "path": "/sys/policy0",
+                                "cluster_index": 0,
+                                "label": "Little",
+                                "cores": [0, 1, 2, 3],
+                                "max_khz": 2200000,
+                            },
+                            {
+                                "name": "policy4",
+                                "path": "/sys/policy4",
+                                "cluster_index": 1,
+                                "label": "Big",
+                                "cores": [4, 5, 6],
+                                "max_khz": 3200000,
+                            },
+                            {
+                                "name": "policy7",
+                                "path": "/sys/policy7",
+                                "cluster_index": 2,
+                                "label": "Prime",
+                                "cores": [7],
+                                "max_khz": 3800000,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            normalized = [
+                {
+                    "index": 0,
+                    "elapsed_s": 0.0,
+                    "uptime_s": 100.0,
+                    "current_ma": 300.0,
+                    "signed_current_ma": -300.0,
+                    "voltage_mv": 3800.0,
+                    "power_mw": 1140.0,
+                    "direction": "discharging",
+                    "cpu_pct": 30.0,
+                    "cluster_cpu_pct": {
+                        "policy0": 40.0,
+                        "policy4": 20.0,
+                        "policy7": 10.0,
+                    },
+                    "frequencies_mhz": {
+                        "policy0": 1200.0,
+                        "policy4": 1800.0,
+                        "policy7": 2200.0,
+                    },
+                },
+                {
+                    "index": 1,
+                    "elapsed_s": 1.0,
+                    "uptime_s": 101.0,
+                    "current_ma": 320.0,
+                    "signed_current_ma": -320.0,
+                    "voltage_mv": 3798.0,
+                    "power_mw": 1215.36,
+                    "direction": "discharging",
+                    "cpu_pct": 45.0,
+                    "cluster_cpu_pct": {
+                        "policy0": 55.0,
+                        "policy4": 35.0,
+                        "policy7": 15.0,
+                    },
+                    "frequencies_mhz": {
+                        "policy0": 1500.0,
+                        "policy4": 2300.0,
+                        "policy7": 2800.0,
+                    },
+                },
+            ]
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "\n".join(f"N|{json.dumps(item)}" for item in normalized) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            self.assertEqual(
+                snapshot["series"][0]["cluster_cpu_pct"],
+                {"policy0": 40.0, "policy4": 20.0, "policy7": 10.0},
+            )
+            self.assertEqual(snapshot["series"][1]["frequencies_mhz"]["policy7"], 2800.0)
+            self.assertEqual(snapshot["latest"]["cluster_cpu_pct"]["policy4"], 35.0)
+            self.assertEqual(
+                [item["name"] for item in snapshot["clusters"]],
+                ["policy0", "policy4", "policy7"],
+            )
+
     def test_reader_converts_append_only_sampler_stream(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -256,7 +361,30 @@ class LiveTelemetryTests(unittest.TestCase):
                 snapshot["performance_series"][0]["frame_rate_fps"],
                 50.0,
             )
+            self.assertAlmostEqual(
+                snapshot["performance_series"][0]["one_percent_low_fps"],
+                50.0,
+            )
             self.assertEqual(snapshot["performance"]["one_percent_low_fps"], 50.0)
+            frame_flow = {
+                item["key"]: item
+                for item in snapshot["performance"]["frame_flow"]["stages"]
+            }
+            self.assertAlmostEqual(
+                frame_flow["app_submission"]["timeline"][0]["elapsed_s"],
+                1.0,
+            )
+            self.assertEqual(
+                [
+                    round(item["elapsed_s"], 1)
+                    for item in frame_flow["display_scanout"]["timeline"]
+                ],
+                [0.2, 1.0],
+            )
+            self.assertEqual(
+                [item["value"] for item in snapshot["performance"]["refresh_rate_timeline"]],
+                [60.0, 60.0],
+            )
             self.assertIn("power_pressure", snapshot)
             self.assertIn("render_performance", snapshot)
             self.assertTrue(snapshot["runtime_settings"]["available"] is False)
@@ -379,7 +507,7 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(applied["manual_mode_changed"])
             self.assertEqual(applied["previous_mode"], 1)
 
-    def test_android_brightness_uses_raw_display_value_for_oem_scale(self) -> None:
+    def test_android_brightness_normalizes_display_command_for_oem_scale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory))
             ready_devices = ([{
@@ -389,11 +517,11 @@ class UiServerTests(unittest.TestCase):
             }], None)
             before = {
                 "current": 2119,
-                "minimum": 66,
+                "minimum": 2,
                 "maximum": 4095,
                 "normalized_minimum": 0.016,
                 "normalized_maximum": 1.0,
-                "normalized_step": 0.984 / 4029,
+                "normalized_step": 0.984 / 4093,
                 "display_current": 2119.0,
                 "display_value_format": "raw",
                 "mode": 0,
@@ -418,13 +546,15 @@ class UiServerTests(unittest.TestCase):
                 })
 
             commands = [call.args[2] for call in shell.call_args_list]
+            normalized = 0.016 + ((2000 - 2) / (4095 - 2) * 0.984)
             self.assertEqual(
                 commands,
                 [
                     ["settings", "put", "system", "screen_brightness", "2000"],
-                    ["cmd", "display", "set-brightness", "2000"],
+                    ["cmd", "display", "set-brightness", f"{normalized:.7f}"],
                 ],
             )
+            self.assertAlmostEqual(applied["display_requested"], normalized)
             self.assertTrue(applied["display_applied"])
             self.assertTrue(applied["applied"])
 
@@ -647,9 +777,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-15", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-27", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-15", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-27", timeout=5) as response:
                     javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -672,38 +802,237 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("鸿蒙无线", html)
             self.assertIn("iOS 无线", html)
             self.assertIn("断开无线", html)
-            self.assertIn("性能上下文", html)
+            self.assertNotIn('data-view="system"', html)
+            self.assertNotIn('data-panel="system"', html)
             self.assertIn("功耗测试模式", html)
-            self.assertIn("FPS / 1% Low / 调度", html)
+            self.assertIn("FPS / 1% Low / 渲染链路", html)
             self.assertIn("必要设置", html)
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn("platform-ui-15", html)
+            self.assertIn("platform-ui-27", html)
             self.assertIn("屏幕热降亮监控", html)
             self.assertNotIn('<details class="advanced-settings" open', html)
             self.assertIn(".capture-feature-card input", css)
             self.assertIn("pointer-events: auto", css)
             self.assertIn("captureFeaturesOverridden", javascript)
+            self.assertIn("原始时间序列", html)
+            self.assertIn("手机采集内容", html)
+            self.assertIn("默认只开启有原始曲线或有效结论的项目", html)
+            self.assertIn("专项诊断", html)
+            self.assertIn("默认关闭 · 仅在明确问题假设下开启", html)
+            self.assertIn("保留现有 BatteryStats（--no-reset）", html)
+            self.assertIn("归因可能混入测试前的活动", html)
+            self.assertIn("启用 BatteryStats full-history", html)
+            self.assertIn("当前版本测试结束后不会自动关闭 full-history", html)
+            self.assertIn(".compact-check.option-with-help", css)
+            self.assertNotIn("性能干扰监控", html)
+            self.assertIn('id="system-monitor-input" name="system_monitor" type="checkbox" checked hidden', html)
+            self.assertIn('data-capture-feature="foreground_window" checked', html)
+            self.assertIn('data-capture-feature="runtime_settings" checked', html)
+            for feature in (
+                "target_process",
+                "process_snapshots",
+                "hot_threads",
+                "scheduler",
+                "power_attribution",
+                "harmony_hitches",
+                "touch_events",
+            ):
+                self.assertNotIn(f'data-capture-feature="{feature}" checked', html)
+            self.assertIn("const platformRequiredFeatures", javascript)
+            self.assertIn('android: new Set(["harmony_hitches", "touch_events"])', javascript)
+            self.assertIn('effectiveCapturePreset() !== "harmony-smartperf"', javascript)
+            self.assertIn('["gpu_metrics", "memory_frequency", "frame_details", "target_process"]', javascript)
+            self.assertIn("capture-interval-disabled", javascript)
+            self.assertIn(".capture-interval-disabled", css)
+            self.assertIn(".capture-feature-card.feature-required", css)
+            power_preset_start = javascript.index('"power-standard": new Set([')
+            power_preset_end = javascript.index("]),", power_preset_start)
+            power_preset = javascript[power_preset_start:power_preset_end]
+            self.assertIn('"runtime_settings"', power_preset)
+            self.assertNotIn('"process_snapshots"', power_preset)
+            self.assertNotIn('"power_attribution"', power_preset)
+            performance_preset_start = javascript.index('"performance-standard": new Set([')
+            performance_preset_end = javascript.index("]),", performance_preset_start)
+            performance_preset = javascript[performance_preset_start:performance_preset_end]
+            self.assertIn('"frame_rate"', performance_preset)
+            self.assertIn('"frame_details"', performance_preset)
+            self.assertNotIn('"target_process"', performance_preset)
+            self.assertNotIn('"scheduler"', performance_preset)
+            self.assertIn("function defaultMarkerName", javascript)
+            self.assertIn("const defaultName = defaultMarkerName()", javascript)
+            self.assertIn('发现异常", defaultName)', javascript)
+            self.assertIn("if (name === null) return", javascript)
+            self.assertIn("name.trim() || defaultName", javascript)
+            self.assertIn("JSON.stringify({ name: resolvedName })", javascript)
             self.assertIn('api("/api/brightness"', javascript)
             self.assertIn("renderBrightnessThrottling", javascript)
+            self.assertIn("renderFrameFlowHistory", javascript)
+            self.assertIn('lane.key === "display_scanout"', javascript)
+            self.assertIn('}, `0 ${lane.unit}`)', javascript)
+            self.assertIn("仅有阶段耗时，无独立 FPS 计数", javascript)
+            self.assertIn("暂无有效刷新率时间序列", javascript)
+            self.assertNotIn('cpu_cluster:', javascript)
+            self.assertIn("cpuCoreGroupLabel", javascript)
+            self.assertIn("共享频率", javascript)
+            self.assertIn("CPU CORE FREQUENCY", html)
+            self.assertIn("grid-template-columns: minmax(140px, 1fr) auto", css)
+            self.assertNotIn(".cluster-frequency { display: none; }", css)
+            self.assertIn("let minimum = finite(axis.fixedMin) ? Number(axis.fixedMin) : 0", javascript)
+            self.assertIn("const minimum = 0", javascript)
             self.assertIn("brightness-dim-marker", css)
+            self.assertIn("flow-history-line", css)
+            self.assertIn('id="live-timeline-source"', html)
+            self.assertIn('id="live-timeline-config"', html)
+            self.assertIn('id="live-timeline-config-list"', html)
+            self.assertIn('id="live-timeline-config-count"', html)
+            self.assertIn("仅控制实时图表，不影响采集数据和测试报告", html)
+            self.assertIn('id="live-resolution-note"', html)
+            self.assertIn("实时数据时间轴", html)
+            self.assertNotIn('class="metric-tabs"', html)
+            self.assertIn("liveTimelineLanes", javascript)
+            self.assertIn('const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1"', javascript)
+            self.assertIn("function normalizeLiveTimelineOrder", javascript)
+            self.assertIn("function loadLiveTimelineLayouts", javascript)
+            self.assertIn("function saveLiveTimelineLayouts", javascript)
+            self.assertIn("function applyLiveTimelineLayout", javascript)
+            self.assertIn("function renderLiveTimelineConfiguration", javascript)
+            self.assertIn("function moveLiveTimelineLayoutItem", javascript)
+            self.assertIn('return `${platform}:${mode}`', javascript)
+            self.assertIn("localStorage.getItem(liveTimelineLayoutStorageKey)", javascript)
+            self.assertIn("liveTimelineLayoutStorageKey,\n        JSON.stringify({ version: 1, contexts })", javascript)
+            self.assertIn("data-live-timeline-toggle", javascript)
+            self.assertIn("data-live-timeline-move", javascript)
+            self.assertIn("renderLiveTimelineConfiguration(active, availableLanes)", javascript)
+            self.assertIn("applyLiveTimelineLayout(active, availableLanes)", javascript)
+            self.assertIn("已隐藏所有图表", javascript)
+            self.assertIn("等待有效数据", javascript)
+            self.assertIn("cpuFrequencyTimelineLane", javascript)
+            self.assertIn("frameFlowTimelineLanes", javascript)
+            self.assertIn("const minTime = 0", javascript)
+            self.assertIn("Number(active?.elapsed_s || 0), maxPointElapsed", javascript)
+            layout_start = javascript.index("const liveTimelineLayoutDefinitions = [")
+            layout_end = javascript.index("];", layout_start)
+            layout_block = javascript[layout_start:layout_end]
+            expected_layout = [
+                "cpu_pct",
+                "cpu_frequency",
+                "frame_rate_fps",
+                "frame_flow",
+                "refresh_rate_hz",
+                "frame_time_ms",
+                "frame_issue_pct",
+                "gpu_load_pct",
+                "gpu_frequency_mhz",
+                "memory_frequency_mhz",
+                "power_mw",
+                "current_ma",
+                "voltage_mv",
+                "temperature_c",
+            ]
+            for previous, following in zip(expected_layout, expected_layout[1:]):
+                self.assertLess(layout_block.index(previous), layout_block.index(following))
+            self.assertLess(
+                javascript.index("const metadataFeatures = active?.metadata?.capture_configuration?.features"),
+                javascript.index("const liveFeatures = active?.config?.capture_features"),
+            )
+            self.assertIn("timeline-series-line", css)
+            self.assertIn("timeline-hover-line", css)
+            self.assertIn(".live-timeline-config-row", css)
+            self.assertIn(".live-timeline-config-toggle", css)
+            self.assertIn(".live-timeline-order-button", css)
+            self.assertIn(".live-timeline-config-copy small { white-space: normal; }", css)
+            self.assertIn("one_percent_low_fps", javascript)
+            self.assertIn("step: true", javascript)
+            self.assertIn("SurfaceFlinger · 前台 SurfaceView/BLAST GraphicBuffer", javascript)
+            self.assertIn("不等同于游戏引擎内部渲染分辨率", html)
             self.assertIn("扫描手机应用", html)
+            self.assertIn("扫描出的应用", html)
+            self.assertNotIn("选择测试游戏 / 应用", html)
+            self.assertIn('id="app-result-details"', html)
+            self.assertNotIn('id="app-result-details" open', html)
+            self.assertIn("已扫描应用与包名", html)
+            self.assertNotIn('id="app-picker-selection"', html)
+            self.assertIn('.app-result-details:not([open]) > :not(summary)', css)
+            self.assertNotIn('$("#app-result-details").open = false', javascript)
+            self.assertIn('$("#app-result-details").open = true', javascript)
             self.assertIn('title="${escapeHtml(packageName)}"', javascript)
             self.assertIn("overflow-wrap: anywhere", css)
             self.assertIn("32 分钟", html)
-            self.assertIn("资源调度分配", html)
+            self.assertIn("性能资源状态", html)
+            self.assertNotIn('id="resource-top-app-cpuset"', html)
+            self.assertNotIn('$("#resource-top-app-cpuset")', javascript)
             self.assertIn("功耗压力解释", html)
             self.assertIn("帧率数据流与渲染链路", html)
+            self.assertIn('id="frame-flow-history-chart"', html)
+            self.assertIn("完整链路节点帧率趋势", html)
             self.assertIn("内存频率", html)
-            self.assertIn("FRAME RATE", html)
-            self.assertIn("硬件采样率未公开", html)
             self.assertNotIn('data-view="thermal"', html)
-            self.assertIn("工具与交付", html)
+            self.assertIn('data-view="config"', html)
+            self.assertIn("测试配置", html)
+            self.assertNotIn('data-view="tools"', html)
+            self.assertNotIn('data-panel="tools"', html)
+            self.assertIn('id="history-tools-details"', html)
+            self.assertIn("报告维护与交付工具", html)
+            self.assertIn("mountConfigurationView", javascript)
+            self.assertIn('id="config-view-columns"', html)
+            self.assertIn('id="config-form-column"', html)
+            self.assertIn('id="config-app-column"', html)
+            self.assertIn('id="config-app-picker-content"', html)
+            self.assertIn("formTarget.append(controlPanel)", javascript)
+            self.assertIn("appPickerTarget.append(appPicker)", javascript)
+            self.assertIn(".config-view-columns", css)
+            self.assertIn("grid-template-columns: minmax(0, 1.35fr) minmax(360px, .85fr)", css)
+            self.assertIn('body:not([data-platform="android"]) .config-app-placeholder', css)
+            self.assertEqual(html.count('id="package-input"'), 1)
+            self.assertEqual(html.count('id="scan-apps"'), 1)
+            self.assertIn('const legacyTools = view === "tools"', javascript)
+            self.assertIn('const legacySystem = view === "system" || view === "thermal"', javascript)
+            self.assertIn('const target = ["live", "config", "device", "history"].includes(requested)', javascript)
+            self.assertNotIn('system: "性能上下文"', javascript)
+            self.assertIn('window.history.replaceState(null, "", `#${target}`)', javascript)
+            self.assertIn("historyTools.open = true", javascript)
+            self.assertIn(".runtime-layout.monitoring-only", css)
+            self.assertIn(".history-tools-details", css)
             self.assertIn("导入 BTR2 日志", html)
             self.assertTrue(state["active"]["is_demo"])
+            self.assertEqual(state["active"]["test_mode"], "performance")
             self.assertIn("portable_build_available", state["tooling"])
             self.assertEqual(len(state["active"]["series"]), 240)
+            self.assertTrue(
+                all(
+                    "one_percent_low_fps" in item
+                    for item in state["active"]["performance_series"]
+                )
+            )
+            self.assertEqual(
+                set(state["active"]["series"][0]["cluster_cpu_pct"]),
+                {"policy0", "policy4", "policy7"},
+            )
+            self.assertEqual(
+                set(state["active"]["series"][0]["frequencies_mhz"]),
+                {"policy0", "policy4", "policy7"},
+            )
+            self.assertEqual(state["active"]["performance_series"][0]["elapsed_s"], 2.0)
+            self.assertEqual(
+                state["active"]["performance"]["refresh_rate_timeline"][0]["elapsed_s"],
+                2.0,
+            )
+            self.assertTrue(
+                state["active"]["metadata"]["capture_configuration"]["features"]["frame_rate"]
+            )
+            self.assertEqual(
+                state["active"]["performance"]["render_resolution_source"],
+                "演示数据 · 模拟 SurfaceFlinger GraphicBuffer",
+            )
+            self.assertIn(
+                "BLAST Consumer",
+                state["active"]["performance"]["render_resolution_evidence"],
+            )
+            self.assertFalse(
+                state["active"]["performance"]["render_resolution_estimated"]
+            )
             self.assertEqual(state["active"]["performance"]["current_refresh_rate_hz"], 120.0)
             self.assertEqual(
                 state["active"]["performance"]["frame_flow"]["primary_key"],
@@ -712,6 +1041,19 @@ class UiServerTests(unittest.TestCase):
             self.assertEqual(
                 len(state["active"]["performance"]["frame_flow"]["stages"]),
                 4,
+            )
+            demo_flow = {
+                item["key"]: item
+                for item in state["active"]["performance"]["frame_flow"]["stages"]
+            }
+            self.assertEqual(demo_flow["render_queue"]["timeline"], [])
+            self.assertEqual(
+                set(item["value"] for item in demo_flow["display_scanout"]["timeline"]),
+                {60.0, 120.0},
+            )
+            self.assertEqual(
+                state["active"]["performance"]["frame_flow"]["timeline_stage_count"],
+                2,
             )
             self.assertEqual(
                 state["active"]["system_monitor"]["active_priority"][0]["watch_name"],
@@ -734,6 +1076,13 @@ class UiServerTests(unittest.TestCase):
             manager = DashboardManager("missing-adb", root)
             manager.regenerate_run = Mock(
                 return_value={"run_name": "phone-a", "report_url": "/runs/phone-a/report.html"}
+            )
+            manager.delete_report_range = Mock(
+                return_value={
+                    "run_name": "phone-a",
+                    "report_url": "/runs/phone-a/report.html",
+                    "deleted_sample_count": 3,
+                }
             )
             manager.enable_tcpip = Mock(
                 return_value={
@@ -770,6 +1119,19 @@ class UiServerTests(unittest.TestCase):
                 )
                 with urlopen(request, timeout=5) as response:
                     api_result = json.loads(response.read().decode("utf-8"))
+                delete_range_payload = {
+                    "run_name": "phone-a",
+                    "start_uptime_s": 101.0,
+                    "end_uptime_s": 103.0,
+                }
+                delete_range_request = Request(
+                    base + "/api/report/delete-range",
+                    data=json.dumps(delete_range_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(delete_range_request, timeout=5) as response:
+                    delete_range_result = json.loads(response.read().decode("utf-8"))
                 tcpip_request = Request(
                     base + "/api/tcpip",
                     data=json.dumps({"device": "USB123", "port": 5555}).encode("utf-8"),
@@ -805,11 +1167,13 @@ class UiServerTests(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertEqual(api_result["run_name"], "phone-a")
+            self.assertEqual(delete_range_result["deleted_sample_count"], 3)
             self.assertTrue(tcpip_result["tcpip_enabled"])
             self.assertTrue(disconnect_result["disconnected"])
             self.assertEqual(apps_result["apps"][0]["package"], "com.example.game")
             self.assertIn("comparison", comparison_html)
             manager.regenerate_run.assert_called_once_with({"run_name": "phone-a"})
+            manager.delete_report_range.assert_called_once_with(delete_range_payload)
             manager.enable_tcpip.assert_called_once_with({"device": "USB123", "port": 5555})
             manager.disconnect_device.assert_called_once_with(
                 {"address": "192.168.21.90:5555"}
@@ -1016,6 +1380,53 @@ class UiServerTests(unittest.TestCase):
                             "run_name": "missing-game",
                         }
                     )
+
+    def test_ui_rejects_incompatible_harmony_smartperf_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            with (
+                patch(
+                    "mobile_profiler.ui.list_adb_devices",
+                    return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                ),
+                patch("mobile_profiler.ui.subprocess.Popen") as popen,
+            ):
+                with self.assertRaisesRegex(ValueError, "requires a HarmonyOS HDC device"):
+                    manager.start_record(
+                        {
+                            "device": "SERIAL",
+                            "platform": "android",
+                            "test_mode": "performance",
+                            "package": "com.example.game",
+                            "capture_preset": "harmony-smartperf",
+                        }
+                    )
+            popen.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), hdc="custom-hdc")
+            with (
+                patch("mobile_profiler.ui.list_adb_devices", return_value=([], None)),
+                patch(
+                    "mobile_profiler.ui.list_harmony_devices",
+                    return_value=(
+                        [{"serial": "harmony:PHONE", "state": "device", "platform": "harmony"}],
+                        None,
+                    ),
+                ),
+                patch("mobile_profiler.ui.list_ios_devices", return_value=([], None)),
+                patch("mobile_profiler.ui.subprocess.Popen") as popen,
+            ):
+                with self.assertRaisesRegex(ValueError, "available only in performance mode"):
+                    manager.start_record(
+                        {
+                            "device": "harmony:PHONE",
+                            "platform": "harmony",
+                            "test_mode": "power",
+                            "capture_preset": "harmony-smartperf",
+                        }
+                    )
+            popen.assert_not_called()
 
     def test_harmony_ui_passes_capture_switches_and_high_performance_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1311,6 +1722,85 @@ class UiServerTests(unittest.TestCase):
         self.assertEqual(marker["device_uptime_s"], 123.5)
         self.assertEqual(stored["source"], "runtime_ui")
         self.assertEqual(stored["metadata"]["foreground_package"], "com.example")
+
+    def test_report_range_delete_persists_edit_and_regenerates_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "phone-a"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            manager = DashboardManager("adb", root)
+            samples = [Mock(uptime_s=float(value)) for value in range(100, 105)]
+            with (
+                patch("mobile_profiler.ui.read_samples_csv", return_value=samples),
+                patch.object(manager, "_run_cli", return_value="ok") as run_cli,
+            ):
+                result = manager.delete_report_range(
+                    {
+                        "run_name": "phone-a",
+                        "start_uptime_s": 101.0,
+                        "end_uptime_s": 103.0,
+                    }
+                )
+            edits = json.loads((run_dir / "report-edits.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["deleted_sample_count"], 3)
+        self.assertEqual(result["excluded_range_count"], 1)
+        self.assertEqual(
+            edits["excluded_ranges"],
+            [{"start_uptime_s": 101.0, "end_uptime_s": 103.0}],
+        )
+        run_cli.assert_called_once_with(
+            ["report", str(run_dir.resolve())],
+            "Deleting report range for phone-a",
+        )
+
+    def test_report_range_delete_rolls_back_edit_when_regeneration_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "phone-a"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            edits_path = run_dir / "report-edits.json"
+            original = b'{"schema_version":1,"excluded_ranges":[]}'
+            edits_path.write_bytes(original)
+            manager = DashboardManager("adb", root)
+            samples = [Mock(uptime_s=float(value)) for value in range(100, 106)]
+            with (
+                patch("mobile_profiler.ui.read_samples_csv", return_value=samples),
+                patch.object(manager, "_run_cli", side_effect=RuntimeError("failed")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    manager.delete_report_range(
+                        {
+                            "run_name": "phone-a",
+                            "start_uptime_s": 101.0,
+                            "end_uptime_s": 102.0,
+                        }
+                    )
+            restored = edits_path.read_bytes()
+
+        self.assertEqual(restored, original)
+
+    def test_report_range_delete_rejects_removing_all_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "phone-a"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            manager = DashboardManager("adb", root)
+            samples = [Mock(uptime_s=float(value)) for value in range(100, 103)]
+            with patch("mobile_profiler.ui.read_samples_csv", return_value=samples):
+                with self.assertRaisesRegex(ValueError, "fewer than two samples"):
+                    manager.delete_report_range(
+                        {
+                            "run_name": "phone-a",
+                            "start_uptime_s": 100.0,
+                            "end_uptime_s": 102.0,
+                        }
+                    )
+
+            self.assertFalse((run_dir / "report-edits.json").exists())
 
     def test_ui_report_recover_and_import_reuse_cli_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

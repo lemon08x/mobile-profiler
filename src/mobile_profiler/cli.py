@@ -4,9 +4,10 @@ import argparse
 import json
 import math
 import re
+import shutil
 import signal
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -85,16 +86,19 @@ from .models import (
 from .parsers import first_number, parse_battery, parse_gpu_dump
 from .storage import (
     RunJournal,
+    REPORT_SOURCE_SAMPLES_FILENAME,
     load_clock_sync,
     load_checkpoint,
     load_contexts,
     load_events,
+    load_report_excluded_ranges,
     load_run_metadata,
     load_raw_outputs,
     load_scheduler_snapshots,
     load_system_snapshots,
     load_thermal_snapshots,
     read_samples_csv,
+    uptime_in_report_excluded_ranges,
     write_jsonl,
     write_run_artifacts,
 )
@@ -255,6 +259,61 @@ def _normalize_raw_samples(raw_samples: Sequence[RawSample]) -> list[RawSample]:
     return normalized
 
 
+def _filter_report_observations(
+    values: Sequence[object],
+    ranges: Sequence[tuple[float, float]],
+) -> list[object]:
+    return [
+        item
+        for item in values
+        if not uptime_in_report_excluded_ranges(getattr(item, "uptime_s", None), ranges)
+    ]
+
+
+def _filter_report_events(
+    events: Sequence[ExternalEvent],
+    ranges: Sequence[tuple[float, float]],
+) -> list[ExternalEvent]:
+    filtered: list[ExternalEvent] = []
+    for event in events:
+        start = float(event.device_uptime_s)
+        duration = float(event.duration_s) if isinstance(event.duration_s, (int, float)) else 0.0
+        if duration <= 0:
+            if not uptime_in_report_excluded_ranges(start, ranges):
+                filtered.append(event)
+            continue
+        segments = [(start, start + duration)]
+        for excluded_start, excluded_end in ranges:
+            next_segments: list[tuple[float, float]] = []
+            for segment_start, segment_end in segments:
+                if excluded_end <= segment_start or excluded_start >= segment_end:
+                    next_segments.append((segment_start, segment_end))
+                    continue
+                if excluded_start > segment_start:
+                    next_segments.append((segment_start, excluded_start))
+                if excluded_end < segment_end:
+                    next_segments.append((excluded_end, segment_end))
+            segments = next_segments
+            if not segments:
+                break
+        for segment_start, segment_end in segments:
+            segment_duration = segment_end - segment_start
+            if segment_duration <= 0:
+                continue
+            metadata = dict(event.metadata)
+            if segment_start != start or segment_duration != duration:
+                metadata["report_edit_split"] = True
+            filtered.append(
+                replace(
+                    event,
+                    device_uptime_s=segment_start,
+                    duration_s=segment_duration,
+                    metadata=metadata,
+                )
+            )
+    return filtered
+
+
 def finalize_run(
     output_dir: Path,
     extra_warnings: Sequence[str] = (),
@@ -265,6 +324,7 @@ def finalize_run(
     gpu_source = _gpu_from_metadata(metadata)
     memory_source = _memory_from_metadata(metadata)
     raw_outputs = load_raw_outputs(output_dir)
+    report_excluded_ranges = load_report_excluded_ranges(output_dir)
     sampler_text = raw_outputs.get("sampler-stream") or raw_outputs.get("sampler_stdout") or ""
     normalized_samples = parse_normalized_samples(
         sampler_text,
@@ -321,7 +381,11 @@ def finalize_run(
             max_cpu_gap_s=max(sample_interval * 3.0, sample_interval + 2.0),
         )
         conversion_warnings.extend(converted)
+    elif (output_dir / REPORT_SOURCE_SAMPLES_FILENAME).exists():
+        samples = read_samples_csv(output_dir / REPORT_SOURCE_SAMPLES_FILENAME)
     elif samples_path.exists():
+        if report_excluded_ranges:
+            shutil.copy2(samples_path, output_dir / REPORT_SOURCE_SAMPLES_FILENAME)
         samples = read_samples_csv(samples_path)
     else:
         raise RuntimeError("run contains fewer than two recoverable sampler rows")
@@ -334,6 +398,84 @@ def finalize_run(
     system_snapshots = load_system_snapshots(output_dir)
     thermal_snapshots = load_thermal_snapshots(output_dir)
     scheduler_snapshots = load_scheduler_snapshots(output_dir)
+    previous_report_edits = metadata.get("report_edits", {})
+    previous_report_edits = previous_report_edits if isinstance(previous_report_edits, dict) else {}
+    report_time_origin_uptime_s = float(samples[0].uptime_s)
+    report_edit_counts: Dict[str, int] = {}
+    if report_excluded_ranges:
+        original_sample_count = len(samples)
+        original_context_count = len(contexts)
+        original_event_count = len(events)
+        original_system_count = len(system_snapshots)
+        original_thermal_count = len(thermal_snapshots)
+        original_scheduler_count = len(scheduler_snapshots)
+        samples = [
+            sample
+            for sample in samples
+            if not uptime_in_report_excluded_ranges(sample.uptime_s, report_excluded_ranges)
+        ]
+        if len(samples) < 2:
+            raise RuntimeError("report edits leave fewer than two samples")
+        report_time_origin_uptime_s = float(samples[0].uptime_s)
+        previous_sample: Optional[Sample] = None
+        for index, sample in enumerate(samples):
+            sample.index = index
+            sample.elapsed_s = float(sample.uptime_s) - report_time_origin_uptime_s
+            sample._report_break_before = bool(  # type: ignore[attr-defined]
+                previous_sample is not None
+                and any(
+                    previous_sample.uptime_s <= start and sample.uptime_s >= end
+                    for start, end in report_excluded_ranges
+                )
+            )
+            previous_sample = sample
+        contexts = list(_filter_report_observations(contexts, report_excluded_ranges))
+        events = _filter_report_events(events, report_excluded_ranges)
+        system_snapshots = list(
+            _filter_report_observations(system_snapshots, report_excluded_ranges)
+        )
+        thermal_snapshots = list(
+            _filter_report_observations(thermal_snapshots, report_excluded_ranges)
+        )
+        scheduler_snapshots = list(
+            _filter_report_observations(scheduler_snapshots, report_excluded_ranges)
+        )
+        report_edit_counts = {
+            "sample_count": max(0, original_sample_count - len(samples)),
+            "context_count": max(0, original_context_count - len(contexts)),
+            "event_count": max(0, original_event_count - len(events)),
+            "system_snapshot_count": max(0, original_system_count - len(system_snapshots)),
+            "thermal_snapshot_count": max(0, original_thermal_count - len(thermal_snapshots)),
+            "scheduler_snapshot_count": max(0, original_scheduler_count - len(scheduler_snapshots)),
+        }
+        previous_removed = previous_report_edits.get("removed_records", {})
+        previous_removed = previous_removed if isinstance(previous_removed, dict) else {}
+        for key, value in list(report_edit_counts.items()):
+            previous_value = previous_removed.get(key)
+            if isinstance(previous_value, (int, float)):
+                report_edit_counts[key] = max(value, int(previous_value))
+        metadata["report_edits"] = {
+            "excluded_range_count": len(report_excluded_ranges),
+            "excluded_sample_count": report_edit_counts["sample_count"],
+            "time_origin_uptime_s": report_time_origin_uptime_s,
+            "excluded_ranges": [
+                {
+                    "start_uptime_s": start,
+                    "end_uptime_s": end,
+                    "start_elapsed_s": max(0.0, start - report_time_origin_uptime_s),
+                    "end_elapsed_s": max(0.0, end - report_time_origin_uptime_s),
+                }
+                for start, end in report_excluded_ranges
+            ],
+            "removed_records": report_edit_counts,
+        }
+        conversion_warnings.append(
+            f"报告已删除 {len(report_excluded_ranges)} 个时间段、"
+            f"{report_edit_counts['sample_count']} 个主采样点；统计与结论已重新计算，"
+            "全程累计型系统计数器仍代表完整采集。"
+        )
+    else:
+        metadata.pop("report_edits", None)
     stable_warnings = metadata.get("collection_warnings", [])
     warnings = [str(item) for item in stable_warnings] if isinstance(stable_warnings, list) else []
     warnings.extend(conversion_warnings)
@@ -377,6 +519,7 @@ def finalize_run(
         system_snapshots,
         thermal_snapshots,
         scheduler_snapshots,
+        persist_observation_streams=not bool(report_excluded_ranges),
     )
     with RunJournal(output_dir) as journal:
         journal.checkpoint(

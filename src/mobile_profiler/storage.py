@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import threading
 from dataclasses import asdict
@@ -22,6 +23,8 @@ from .models import (
 
 
 T = TypeVar("T")
+REPORT_EDITS_FILENAME = "report-edits.json"
+REPORT_SOURCE_SAMPLES_FILENAME = "report-source-samples.csv"
 
 
 def _utc_now() -> str:
@@ -36,6 +39,77 @@ def _write_json_atomic(path: Path, value: object) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def normalize_report_excluded_ranges(value: object) -> List[Tuple[float, float]]:
+    items = value if isinstance(value, list) else []
+    ranges: List[Tuple[float, float]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("start_uptime_s"))
+            end = float(item.get("end_uptime_s"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        ranges.append((start, end))
+    merged: List[Tuple[float, float]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def load_report_excluded_ranges(output_dir: Path) -> List[Tuple[float, float]]:
+    path = output_dir / REPORT_EDITS_FILENAME
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    return normalize_report_excluded_ranges(payload.get("excluded_ranges"))
+
+
+def write_report_excluded_ranges(
+    output_dir: Path,
+    ranges: Sequence[Tuple[float, float]],
+) -> Dict[str, object]:
+    normalized = normalize_report_excluded_ranges(
+        [
+            {"start_uptime_s": start, "end_uptime_s": end}
+            for start, end in ranges
+        ]
+    )
+    payload: Dict[str, object] = {
+        "schema_version": 1,
+        "updated_at": _utc_now(),
+        "excluded_ranges": [
+            {"start_uptime_s": start, "end_uptime_s": end}
+            for start, end in normalized
+        ],
+    }
+    _write_json_atomic(output_dir / REPORT_EDITS_FILENAME, payload)
+    return payload
+
+
+def uptime_in_report_excluded_ranges(
+    uptime_s: object,
+    ranges: Sequence[Tuple[float, float]],
+) -> bool:
+    try:
+        value = float(uptime_s)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(value):
+        return False
+    return any(start <= value <= end for start, end in ranges)
 
 
 def write_jsonl(path: Path, values: Iterable[object]) -> None:
@@ -441,6 +515,7 @@ def write_run_artifacts(
     system_snapshots: Optional[Sequence[SystemSnapshot]] = None,
     thermal_snapshots: Optional[Sequence[ThermalSnapshot]] = None,
     scheduler_snapshots: Optional[Sequence[SchedulerSnapshot]] = None,
+    persist_observation_streams: bool = True,
 ) -> Tuple[Path, Path]:
     from .report import write_report_files
 
@@ -452,19 +527,19 @@ def write_run_artifacts(
     (output_dir / "analysis.json").write_text(
         json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    if contexts is not None:
+    if persist_observation_streams and contexts is not None:
         write_jsonl(output_dir / "contexts.jsonl", contexts)
-    if clock_sync is not None:
+    if persist_observation_streams and clock_sync is not None:
         write_jsonl(output_dir / "clock-sync.jsonl", clock_sync)
-    if events is not None:
+    if persist_observation_streams and events is not None:
         write_jsonl(output_dir / "events.jsonl", events)
-    if system_snapshots is not None:
+    if persist_observation_streams and system_snapshots is not None:
         write_jsonl(output_dir / "system-snapshots.jsonl", system_snapshots)
-    if thermal_snapshots is not None:
+    if persist_observation_streams and thermal_snapshots is not None:
         write_jsonl(output_dir / "thermal-snapshots.jsonl", thermal_snapshots)
-    if scheduler_snapshots is not None:
+    if persist_observation_streams and scheduler_snapshots is not None:
         write_jsonl(output_dir / "scheduler-snapshots.jsonl", scheduler_snapshots)
-    if raw_outputs:
+    if persist_observation_streams and raw_outputs:
         raw_dir = output_dir / "raw"
         raw_dir.mkdir(exist_ok=True)
         for key, value in raw_outputs.items():
