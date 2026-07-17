@@ -33,6 +33,7 @@ from .storage import RunJournal
 
 
 HARMONY_DEVICE_PREFIX = "harmony:"
+HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S = 30.0
 _SAMPLE_BEGIN = "__MPP_HARMONY_SAMPLE_BEGIN__"
 _SAMPLE_BATTERY = "__MPP_HARMONY_BATTERY__"
 _SAMPLE_CPU = "__MPP_HARMONY_CPU__"
@@ -63,6 +64,7 @@ def _discover_hdc() -> str:
     program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
     candidates.extend(
         [
+            Path(r"C:\HiSmartPerf-Editor\resources\plugins\ConnectionTool\windows\hdc.exe"),
             program_files
             / "Huawei"
             / "DevEco Studio"
@@ -340,11 +342,13 @@ def parse_harmony_battery(text: str) -> Dict[str, object]:
     temperature_tenths = _number(values.get("temperature"))
     current_ma = _number(values.get("nowCurrent"))
     current_average_ma = _number(values.get("currentAverage"))
-    plugged_code = int(plugged or 0)
+    plugged_code = int(plugged) if plugged is not None else None
     powered_names = {1: "AC", 2: "USB", 3: "wireless"}
     powered = [powered_names.get(plugged_code, "external")] if plugged_code else []
     charging_code = int(charging or 0)
-    if not powered:
+    if plugged_code is None:
+        status = "unknown"
+    elif not powered:
         status = "discharging"
     elif charging_code == 1:
         status = "charging"
@@ -357,6 +361,7 @@ def parse_harmony_battery(text: str) -> Dict[str, object]:
         "status": status,
         "powered": powered,
         "plugged_type": plugged_code,
+        "plugged_state_available": plugged_code is not None,
         "charging_status": charging_code,
         "present": int(_number(values.get("present")) or 0) != 0,
         "technology": values.get("technology"),
@@ -486,6 +491,35 @@ def _percentile_value(values: Sequence[float], quantile: float) -> Optional[floa
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+def _normalize_harmony_screen_state(value: object) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.upper()
+    if normalized in {"ON", "AWAKE", "DIM", "POWER_STATUS_ON"}:
+        return "on"
+    if normalized in {
+        "OFF",
+        "SLEEP",
+        "HIBERNATE",
+        "SHUTDOWN",
+        "SUSPEND",
+        "POWER_STATUS_OFF",
+        "POWER_STATUS_SUSPEND",
+    }:
+        return "off"
+    if normalized in {"DOZE", "STAND_BY", "INACTIVE", "FREEZE"}:
+        return "doze"
+    return text.lower()
+
+
+def _harmony_screen_active(value: object) -> Optional[bool]:
+    state = _normalize_harmony_screen_state(value)
+    if state is None:
+        return None
+    return state == "on"
+
+
 def parse_harmony_render_screen(text: str) -> Dict[str, object]:
     result: Dict[str, object] = {}
     screen_match = re.search(
@@ -498,6 +532,7 @@ def parse_harmony_render_screen(text: str) -> Dict[str, object]:
             {
                 "screen_id": int(screen_match.group(1)),
                 "display_power_state": screen_match.group(2),
+                "screen_state": _normalize_harmony_screen_state(screen_match.group(2)),
                 "brightness_raw": float(screen_match.group(3)),
                 "display_width_px": int(screen_match.group(4)),
                 "display_height_px": int(screen_match.group(5)),
@@ -538,22 +573,20 @@ def parse_harmony_refresh_counts(text: str) -> Dict[str, int]:
     return counts
 
 
-def parse_harmony_compositor_fps(
-    text: str,
+def _harmony_compositor_metrics(
+    timestamps: Sequence[int],
     refresh_rate_hz: Optional[float] = None,
 ) -> Dict[str, object]:
-    timestamps = [
-        int(line.strip())
-        for line in text.splitlines()
-        if re.fullmatch(r"\d{8,20}", line.strip())
-    ]
-    if len(timestamps) < 2:
+    ordered = sorted(
+        {
+            int(value)
+            for value in timestamps
+            if isinstance(value, (int, float)) and int(value) > 0
+        }
+    )
+    if len(ordered) < 2:
         return {}
     rate = float(refresh_rate_hz) if refresh_rate_hz and refresh_rate_hz > 0 else 60.0
-    # RenderService returns newest-first history. Keep about four seconds so
-    # successive context samples do not substantially overlap.
-    limit = max(16, min(481, int(rate * 4.0) + 1))
-    ordered = sorted(set(timestamps[:limit]))
     intervals_ms = [
         (current - previous) / 1_000_000.0
         for previous, current in zip(ordered, ordered[1:])
@@ -591,7 +624,114 @@ def parse_harmony_compositor_fps(
         "frozen_frame_interval_count": len(frozen),
         "missed_vsync_slot_count": missed_slots,
         "frame_budget_ms": budget_ms,
+        "frame_intervals_ms": intervals_ms,
+        "render_service_frame_timestamps_ns": ordered,
+        "render_service_newest_frame_timestamp_ns": ordered[-1],
+        "render_service_frame_window_s": (ordered[-1] - ordered[0]) / 1_000_000_000.0,
     }
+
+
+def parse_harmony_compositor_fps(
+    text: str,
+    refresh_rate_hz: Optional[float] = None,
+    *,
+    display_active: Optional[bool] = None,
+) -> Dict[str, object]:
+    if display_active is not True:
+        return {}
+    timestamps = [
+        int(line.strip())
+        for line in text.splitlines()
+        if re.fullmatch(r"\d{8,20}", line.strip())
+    ]
+    if len(timestamps) < 2:
+        return {}
+    rate = float(refresh_rate_hz) if refresh_rate_hz and refresh_rate_hz > 0 else 60.0
+    newest_first = sorted(set(timestamps), reverse=True)
+    newest = newest_first[0]
+    oldest_allowed = newest - 4_000_000_000
+    inactivity_gap_ns = max(1_000_000_000, int((1_000_000_000.0 / rate) * 30.0))
+    fresh_segment = [newest]
+    previous = newest
+    for timestamp in newest_first[1:]:
+        if timestamp < oldest_allowed or previous - timestamp > inactivity_gap_ns:
+            break
+        fresh_segment.append(timestamp)
+        previous = timestamp
+    return _harmony_compositor_metrics(fresh_segment, rate)
+
+
+_HARMONY_COMPOSITOR_METRIC_KEYS = {
+    "compositor_fps",
+    "render_service_compositor_source",
+    "frame_counter_source",
+    "frame_interval_average_ms",
+    "frame_interval_p95_ms",
+    "frame_interval_maximum_ms",
+    "one_percent_low_fps",
+    "frame_sample_count",
+    "missed_vsync_interval_count",
+    "severe_frame_interval_count",
+    "frozen_frame_interval_count",
+    "missed_vsync_slot_count",
+    "frame_budget_ms",
+    "frame_intervals_ms",
+    "render_service_frame_window_s",
+}
+
+
+def _retain_new_harmony_compositor_metrics(
+    performance: Dict[str, object],
+    previous_timestamp_ns: Optional[int],
+) -> Optional[int]:
+    raw_timestamps = performance.get("render_service_frame_timestamps_ns")
+    if not isinstance(raw_timestamps, list):
+        return previous_timestamp_ns
+    timestamps = sorted(
+        {
+            int(value)
+            for value in raw_timestamps
+            if isinstance(value, (int, float)) and int(value) > 0
+        }
+    )
+    if not timestamps:
+        return previous_timestamp_ns
+    newest = timestamps[-1]
+    for key in _HARMONY_COMPOSITOR_METRIC_KEYS:
+        performance.pop(key, None)
+    if previous_timestamp_ns is None or newest < previous_timestamp_ns:
+        performance["frame_data_available"] = False
+        performance["frame_unavailable_reason"] = (
+            "RenderService frame timestamps established a session baseline; waiting for new frames."
+        )
+        return newest
+
+    new_timestamps = [value for value in timestamps if value > previous_timestamp_ns]
+    if not new_timestamps:
+        performance["frame_data_available"] = False
+        performance["frame_unavailable_reason"] = (
+            "RenderService returned no compositor timestamps newer than the previous sample."
+        )
+        return max(previous_timestamp_ns, newest)
+
+    metric_timestamps = list(new_timestamps)
+    if new_timestamps[0] - previous_timestamp_ns <= 1_000_000_000:
+        metric_timestamps.insert(0, previous_timestamp_ns)
+    refresh_rate = performance.get("refresh_rate_hz")
+    metrics = _harmony_compositor_metrics(
+        metric_timestamps,
+        float(refresh_rate) if isinstance(refresh_rate, (int, float)) else None,
+    )
+    if metrics:
+        performance.update(metrics)
+        performance["frame_data_available"] = True
+        performance.pop("frame_unavailable_reason", None)
+    else:
+        performance["frame_data_available"] = False
+        performance["frame_unavailable_reason"] = (
+            "RenderService returned too few new compositor timestamps for a frame-rate window."
+        )
+    return max(previous_timestamp_ns, newest)
 
 
 def parse_harmony_window_manager(text: str) -> Dict[str, object]:
@@ -749,14 +889,7 @@ def parse_harmony_power_state(text: str) -> Dict[str, object]:
         return {}
     state = match.group(1)
     reason = match.group(2).strip() if match.group(2) else None
-    if state in {"AWAKE", "DIM"}:
-        screen_state = "on"
-    elif state in {"DOZE", "STAND_BY", "INACTIVE"}:
-        screen_state = "doze"
-    elif state in {"SLEEP", "HIBERNATE", "SHUTDOWN"}:
-        screen_state = "off"
-    else:
-        screen_state = state.lower()
+    screen_state = _normalize_harmony_screen_state(state)
     return {"state": state, "reason": reason, "screen_state": screen_state}
 
 
@@ -868,10 +1001,19 @@ def build_harmony_sample(
 
     signed = float(signed_current)
     status = str(battery.get("status") or "unknown")
-    if status == "discharging" or signed < 0:
+    external_power = (
+        bool(battery.get("powered"))
+        if battery.get("plugged_state_available") is True
+        else None
+    )
+    if external_power is False and (status == "discharging" or signed < 0):
         direction = "discharging"
     elif status in {"charging", "full"} or signed > 0:
         direction = "charging"
+    elif external_power is True:
+        direction = "external_power"
+    elif signed < 0:
+        direction = "discharging"
     else:
         direction = "idle"
     current_ma = abs(signed)
@@ -894,6 +1036,10 @@ def build_harmony_sample(
             else None
         ),
         power_source="harmony_battery_service",
+        power_valid_for_consumption=(
+            direction == "discharging" and external_power is False
+        ),
+        external_power=external_power,
     )
     return sample, counters
 
@@ -1130,9 +1276,14 @@ def collect_harmony_context(
     window = parse_harmony_window_manager(sections["__WINDOW__"])
     screen = parse_harmony_render_screen(sections["__SCREEN__"])
     refresh_rate = screen.get("refresh_rate_hz")
+    screen_state = _normalize_harmony_screen_state(
+        power.get("screen_state") or screen.get("screen_state") or screen.get("display_power_state")
+    )
+    display_active = _harmony_screen_active(screen_state)
     frame_pacing = parse_harmony_compositor_fps(
         sections["__COMPOSITOR_FPS__"],
         float(refresh_rate) if isinstance(refresh_rate, (int, float)) else None,
+        display_active=display_active,
     )
     touch = parse_harmony_input_events(sections["__INPUT__"])
     performance: Dict[str, object] = {
@@ -1148,6 +1299,13 @@ def collect_harmony_context(
             "not the panel controller's hardware scan rate."
         ),
     }
+    if include_frame_rate and display_active is not True:
+        performance["frame_data_available"] = False
+        performance["frame_unavailable_reason"] = (
+            "HarmonyOS display is inactive; retained refresh configuration is not current frame output."
+            if display_active is False
+            else "HarmonyOS screen state could not be verified; cached RenderService frame and refresh data were suppressed."
+        )
     window_name = str(window.get("foreground_window_name") or "")
     if include_hitches and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", window_name):
         hitch_result = hdc_shell(
@@ -1163,18 +1321,16 @@ def collect_harmony_context(
             uptime_s=timestamp,
             foreground_package=foreground.get("package"),
             foreground_activity=foreground.get("activity"),
-            screen_state=(
-                str(power.get("screen_state"))
-                if power.get("screen_state")
-                else str(screen.get("display_power_state") or "").lower() or None
-            ),
+            screen_state=screen_state,
             brightness_raw=(
                 float(screen["brightness_raw"])
                 if isinstance(screen.get("brightness_raw"), (int, float))
                 else None
             ),
             refresh_rate_hz=(
-                float(refresh_rate) if isinstance(refresh_rate, (int, float)) else None
+                float(refresh_rate)
+                if isinstance(refresh_rate, (int, float)) and display_active is not None
+                else None
             ),
             performance=performance,
             source="harmony_ability_render_service",
@@ -1494,9 +1650,13 @@ def probe_harmony_device(
     )
     display = parse_harmony_render_screen(performance_sections["__SCREEN__"])
     refresh_rate = display.get("refresh_rate_hz")
+    display_active = _harmony_screen_active(
+        power.get("screen_state") or display.get("screen_state") or display.get("display_power_state")
+    )
     frame_pacing = parse_harmony_compositor_fps(
         performance_sections["__COMPOSITOR_FPS__"],
         float(refresh_rate) if isinstance(refresh_rate, (int, float)) else None,
+        display_active=display_active,
     )
     window = parse_harmony_window_manager(performance_sections["__WINDOW__"])
     gles = parse_harmony_gles(performance_sections["__GLES__"])
@@ -1519,6 +1679,13 @@ def probe_harmony_device(
             "but not the controller hardware scan frequency."
         ),
     }
+    if display_active is not True:
+        performance["frame_data_available"] = False
+        performance["frame_unavailable_reason"] = (
+            "HarmonyOS display is inactive; RenderService history is not current frame output."
+            if display_active is False
+            else "HarmonyOS screen state could not be verified; cached RenderService frame and refresh data were suppressed."
+        )
     system_snapshot, system_error = collect_harmony_system_snapshot(hdc, target)
     connection = {
         "type": selected.get("connection_type"),
@@ -1596,7 +1763,18 @@ def probe_harmony_device(
             "gpu_load": False,
             "smartperf_daemon": smartperf_available,
             "smartperf_gpu_metrics": smartperf_available,
-            "smartperf_ddr_frequency": smartperf_available,
+            # SP_daemon being installed does not prove that this production
+            # build exposes ddrFrequency.  The field is validated from actual
+            # SmartPerf samples during the session.
+            "smartperf_ddr_frequency": None,
+            "smartperf_ddr_frequency_status": (
+                "requires_session_validation" if smartperf_available else "unavailable"
+            ),
+            "smartperf_ddr_frequency_reason": (
+                "SP_daemon 可用，但只有 -d 实际返回可用 ddrFrequency 后才确认 DDR 能力。"
+                if smartperf_available
+                else "SP_daemon 不可用。"
+            ),
             "smartperf_app_fps": smartperf_available,
             "performance_power_mode": bool(power_mode.get("supported")),
             "android_batterystats": False,
@@ -1662,6 +1840,13 @@ def _smartperf_frame_intervals_ms(value: object) -> List[float]:
     return intervals
 
 
+def _smartperf_record_has_sample_fields(record: Dict[str, str]) -> bool:
+    return all(
+        _smartperf_number(record.get(key)) is not None
+        for key in ("timestamp", "currentNow", "voltageNow")
+    )
+
+
 class HarmonySmartPerfParser:
     """Turn SP_daemon's ordered key/value stream into one dictionary per sample."""
 
@@ -1670,18 +1855,25 @@ class HarmonySmartPerfParser:
 
     def feed_line(self, line: str) -> Optional[Dict[str, str]]:
         stripped = line.strip()
-        match = re.match(r"order:\d+\s+([^=]+)=(.*)$", stripped)
+        match = re.match(r"order:(\d+)\s+([^=]+)=(.*)$", stripped)
         if match:
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-            if key == "Battery" and self.current:
+            order = int(match.group(1))
+            key = match.group(2).strip()
+            value = match.group(3).strip()
+            if (order == 0 or key == "Battery") and self.current:
                 completed = self.current
                 self.current = {key: value}
                 return completed
             self.current[key] = value
             return None
         if "command exec finished" in stripped.lower():
-            return self.finish()
+            completed = self.finish()
+            return (
+                completed
+                if completed is not None
+                and _smartperf_record_has_sample_fields(completed)
+                else None
+            )
         return None
 
     def finish(self) -> Optional[Dict[str, str]]:
@@ -1697,10 +1889,10 @@ def parse_harmony_smartperf_output(text: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     for line in text.splitlines():
         row = parser.feed_line(line)
-        if row:
+        if row and _smartperf_record_has_sample_fields(row):
             rows.append(row)
     final = parser.finish()
-    if final:
+    if final and _smartperf_record_has_sample_fields(final):
         rows.append(final)
     return rows
 
@@ -1714,6 +1906,7 @@ def build_harmony_smartperf_sample(
     cpu_frequency_enabled: bool = True,
     gpu_metrics_enabled: bool = True,
     memory_frequency_enabled: bool = True,
+    external_power: Optional[bool] = None,
 ) -> Optional[Sample]:
     timestamp_ms = _smartperf_number(record.get("timestamp"))
     signed_current = _smartperf_number(record.get("currentNow"))
@@ -1763,6 +1956,17 @@ def build_harmony_smartperf_sample(
     )
     signed = float(signed_current)
     current_ma = abs(signed)
+    direction = (
+        "discharging"
+        if signed < 0 and external_power is False
+        else "charging"
+        if signed > 0
+        else "external_power"
+        if external_power is True
+        else "discharging"
+        if signed < 0
+        else "idle"
+    )
     return Sample(
         index=index,
         elapsed_s=0.0,
@@ -1771,7 +1975,7 @@ def build_harmony_smartperf_sample(
         signed_current_ma=signed,
         voltage_mv=float(voltage_mv),
         power_mw=current_ma * float(voltage_mv) / 1000.0,
-        direction="discharging" if signed < 0 else "charging" if signed > 0 else "idle",
+        direction=direction,
         cpu_pct=(max(0.0, min(100.0, float(cpu_pct))) if cpu_pct is not None else None),
         core_cpu_pct=core_cpu_pct,
         cluster_cpu_pct=cluster_cpu_pct,
@@ -1781,6 +1985,10 @@ def build_harmony_smartperf_sample(
         memory_frequency_mhz=memory_frequency,
         battery_temperature_c=_smartperf_number(record.get("Battery")),
         power_source="harmony_smartperf_battery",
+        power_valid_for_consumption=(
+            direction == "discharging" and external_power is False
+        ),
+        external_power=external_power,
     )
 
 
@@ -1790,18 +1998,52 @@ def build_harmony_smartperf_context(
     target_package: str,
     *,
     foreground_activity: Optional[str] = None,
+    actual_foreground_package: Optional[str] = None,
+    actual_foreground_activity: Optional[str] = None,
+    foreground_verified: bool = False,
     base_performance: Optional[Dict[str, object]] = None,
     screen_state: Optional[str] = None,
     frame_rate_enabled: bool = True,
     frame_details_enabled: bool = True,
 ) -> ContextSample:
     refresh_rate = _smartperf_number(record.get("refreshrate"))
-    fps = _smartperf_number(record.get("fps")) if frame_rate_enabled else None
-    intervals = (
+    reported_fps = _smartperf_number(record.get("fps")) if frame_rate_enabled else None
+    reported_intervals = (
         _smartperf_frame_intervals_ms(record.get("fpsJitters"))
         if frame_rate_enabled and frame_details_enabled
         else []
     )
+    resolved_screen_state = _normalize_harmony_screen_state(
+        screen_state
+        or (base_performance or {}).get("display_power_state")
+    )
+    resolved_foreground_package = (
+        str(actual_foreground_package or "").strip() or None
+        if foreground_verified
+        else target_package
+    )
+    resolved_foreground_activity = (
+        str(actual_foreground_activity or "").strip() or None
+        if foreground_verified
+        else foreground_activity
+    )
+    foreground_matches_target = (
+        not foreground_verified or resolved_foreground_package == target_package
+    )
+    target_foreground = (
+        resolved_foreground_package == target_package
+        if foreground_verified and resolved_foreground_package
+        else None
+    )
+    screen_active = _harmony_screen_active(resolved_screen_state)
+    frame_data_accepted = bool(
+        frame_rate_enabled
+        and reported_fps is not None
+        and foreground_matches_target
+        and screen_active is True
+    )
+    fps = reported_fps if frame_data_accepted else None
+    intervals = reported_intervals if frame_data_accepted else []
     refresh_interval_ms = (
         1000.0 / refresh_rate
         if isinstance(refresh_rate, (int, float)) and refresh_rate > 0
@@ -1825,10 +2067,23 @@ def build_harmony_smartperf_context(
         else None
     )
     performance = dict(base_performance or {})
+    for key in _HARMONY_COMPOSITOR_METRIC_KEYS | {
+        "frame_data_available",
+        "frame_unavailable_reason",
+        "frame_interval_p99_ms",
+        "frame_interval_values_ms",
+        "render_service_frame_timestamps_ns",
+        "render_service_newest_frame_timestamp_ns",
+    }:
+        performance.pop(key, None)
     performance.update(
         {
             "platform": "harmony",
-            "foreground_window_name": performance.get("foreground_window_name") or target_package,
+            "foreground_window_name": (
+                resolved_foreground_package
+                if foreground_verified
+                else performance.get("foreground_window_name") or target_package
+            ),
             "frame_counter_source": "HarmonyOS SmartPerf SP_daemon app FPS",
             "compositor_fps": fps,
             "frame_sample_count": len(intervals) or (max(0, int(round(fps))) if fps is not None else 0),
@@ -1844,6 +2099,13 @@ def build_harmony_smartperf_context(
             "severe_frame_interval_count": severe,
             "frozen_frame_interval_count": frozen,
             "frame_interval_values_ms": intervals,
+            "frame_intervals_ms": intervals,
+            "smartperf_reported_fps": reported_fps,
+            # Kept for schema compatibility: this means an actual foreground
+            # probe result was used, not that the target matched the foreground.
+            "smartperf_foreground_verified": foreground_verified,
+            "smartperf_foreground_probe_used": foreground_verified,
+            "smartperf_target_foreground": target_foreground,
             "smartperf_process_id": (
                 int(value)
                 if (value := _smartperf_number(record.get("ProcId"))) is not None
@@ -1854,15 +2116,36 @@ def build_harmony_smartperf_context(
             "smartperf_source": "SP_daemon",
         }
     )
-    resolved_screen_state = str(
-        screen_state
-        or performance.get("display_power_state")
-        or "awake"
-    ).strip().lower()
+    if frame_rate_enabled:
+        performance["frame_data_available"] = frame_data_accepted
+        if frame_data_accepted:
+            performance.pop("frame_unavailable_reason", None)
+        elif foreground_verified and not resolved_foreground_package:
+            performance["frame_unavailable_reason"] = (
+                "HarmonyOS foreground package could not be verified; SmartPerf FPS was not "
+                "attributed to the target."
+            )
+        elif foreground_verified and not foreground_matches_target:
+            performance["frame_unavailable_reason"] = (
+                f"Target package {target_package} is not foreground "
+                f"(current: {resolved_foreground_package}); SmartPerf FPS was suppressed."
+            )
+        elif screen_active is False:
+            performance["frame_unavailable_reason"] = (
+                "HarmonyOS display is inactive; SmartPerf FPS is not current target-app output."
+            )
+        elif screen_active is not True:
+            performance["frame_unavailable_reason"] = (
+                "HarmonyOS screen state could not be verified; SmartPerf FPS was suppressed."
+            )
+        else:
+            performance["frame_unavailable_reason"] = (
+                "SmartPerf did not report FPS for the verified foreground target."
+            )
     return ContextSample(
         uptime_s=sample.uptime_s,
-        foreground_package=target_package,
-        foreground_activity=foreground_activity,
+        foreground_package=resolved_foreground_package,
+        foreground_activity=resolved_foreground_activity,
         screen_state=resolved_screen_state,
         brightness_raw=(
             float(performance["brightness_raw"])
@@ -1870,7 +2153,9 @@ def build_harmony_smartperf_context(
             else None
         ),
         refresh_rate_hz=(
-            float(refresh_rate) if isinstance(refresh_rate, (int, float)) else None
+            float(refresh_rate)
+            if isinstance(refresh_rate, (int, float)) and screen_active is not None
+            else None
         ),
         source="harmony_smartperf",
         performance=performance,
@@ -1993,16 +2278,28 @@ def collect_harmony_smartperf_session(
     process_interval_s: float,
     scheduler_interval_s: float,
     context_interval_s: float,
+    external_power: Optional[bool] = None,
 ) -> HarmonyCollectionResult:
     target = harmony_target(device)
     result = HarmonyCollectionResult()
     started = time.monotonic()
-    deadline = started + float(duration_s)
     last_checkpoint = started
     next_process = started
     next_scheduler = started
     next_extra_context = started
+    # External-power validity is independent of the optional UI/context cadence.
+    # A lightweight 5 s BatteryService check matches Android's battery-state
+    # cadence and bounds the amount of data invalidated after a cable change.
+    battery_probe_interval_s = 5.0
+    next_battery_probe = math.inf
+    current_external_power = external_power
+    collection_started_at: Optional[float] = None
+    collection_deadline: Optional[float] = None
+    first_sample_uptime_s: Optional[float] = None
     latest_screen_state: Optional[str] = None
+    latest_foreground_package: Optional[str] = None
+    latest_foreground_activity: Optional[str] = None
+    last_render_service_timestamp_ns: Optional[int] = None
     warned: set[str] = set()
 
     def warn_once(key: str, message: str) -> None:
@@ -2035,8 +2332,34 @@ def collect_harmony_smartperf_session(
         journal.append_clock_sync(initial_clock)
         result.clock_sync_count += 1
 
-    remaining_s = max(2, int(math.ceil(deadline - time.monotonic())) + 1)
-    command = [hdc, "-t", target, "shell", _smartperf_command(remaining_s, target_package, features)]
+    if features.get("foreground_window") or features.get("frame_rate"):
+        initial_context, initial_context_error = collect_harmony_context(
+            hdc,
+            target,
+            include_power_state=True,
+            include_foreground=True,
+            include_window=False,
+            include_display=False,
+            include_frame_rate=False,
+            include_hitches=False,
+            include_touch=False,
+        )
+        if initial_context is not None:
+            latest_screen_state = initial_context.screen_state
+            latest_foreground_package = initial_context.foreground_package
+            latest_foreground_activity = initial_context.foreground_activity
+        elif initial_context_error:
+            warn_once("initial_context", initial_context_error)
+        next_extra_context = time.monotonic() + max(5.0, context_interval_s)
+
+    requested_sample_count = max(2, int(math.ceil(duration_s)) + 1)
+    command = [
+        hdc,
+        "-t",
+        target,
+        "shell",
+        _smartperf_command(requested_sample_count, target_package, features),
+    ]
     creationflags = 0
     if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
@@ -2072,10 +2395,41 @@ def collect_harmony_smartperf_session(
     stderr_thread.start()
     parser = HarmonySmartPerfParser()
     streams_ended: set[str] = set()
+    startup_deadline = time.monotonic() + max(10.0, reconnect_timeout_s)
 
     def accept_record(record: Dict[str, str]) -> None:
         nonlocal last_checkpoint, next_process, next_scheduler, next_extra_context
-        nonlocal latest_screen_state
+        nonlocal next_battery_probe, current_external_power
+        nonlocal collection_started_at, collection_deadline
+        nonlocal first_sample_uptime_s
+        nonlocal latest_screen_state, latest_foreground_package, latest_foreground_activity
+        nonlocal last_render_service_timestamp_ns
+        now = time.monotonic()
+        if now >= next_battery_probe:
+            battery_result = hdc_shell(
+                hdc,
+                target,
+                "hidumper -s BatteryService -a '-i'",
+                timeout_s=10,
+            )
+            if battery_result.ok:
+                battery_state = parse_harmony_battery(battery_result.stdout)
+                current_external_power = (
+                    bool(battery_state.get("powered"))
+                    if battery_state.get("plugged_state_available") is True
+                    else None
+                )
+            else:
+                current_external_power = None
+                warn_once(
+                    "smartperf_battery_state",
+                    "HarmonyOS SmartPerf 运行期间无法刷新外部供电状态；在下一次明确读取前，功率样本不进入耗电结论。",
+                )
+            next_battery_probe = _advance_due(
+                next_battery_probe,
+                battery_probe_interval_s,
+                time.monotonic(),
+            )
         sample = build_harmony_smartperf_sample(
             record,
             result.sample_count,
@@ -2084,12 +2438,21 @@ def collect_harmony_smartperf_session(
             cpu_frequency_enabled=bool(features.get("cpu_frequency")),
             gpu_metrics_enabled=bool(features.get("gpu_metrics")),
             memory_frequency_enabled=bool(features.get("memory_frequency")),
+            external_power=current_external_power,
         )
         if sample is None:
             warn_once("invalid_record", "SP_daemon emitted a record without usable timestamp/current/voltage.")
             return
         if result.last_device_uptime_s is not None and sample.uptime_s <= result.last_device_uptime_s:
             return
+        if collection_started_at is None:
+            collection_started_at = time.monotonic()
+            first_sample_uptime_s = sample.uptime_s
+            # SP_daemon's -N controls the requested one-second samples.  This
+            # deadline is only a bounded completion grace, not the measurement
+            # start, so setup/probe latency does not consume the requested run.
+            collection_deadline = collection_started_at + float(duration_s) + 3.0
+            next_battery_probe = collection_started_at + battery_probe_interval_s
         journal.append_sampler_line(
             "SP|" + json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         )
@@ -2099,12 +2462,55 @@ def collect_harmony_smartperf_session(
         result.sample_count += 1
         result.last_device_uptime_s = sample.uptime_s
 
+        now = time.monotonic()
+        if (
+            (
+                features.get("foreground_window")
+                or features.get("harmony_hitches")
+                or features.get("touch_events")
+                or features.get("frame_rate")
+            )
+            and now >= next_extra_context
+        ):
+            context, error = collect_harmony_context(
+                hdc,
+                target,
+                include_power_state=True,
+                include_foreground=True,
+                include_window=bool(
+                    features.get("foreground_window") or features.get("harmony_hitches")
+                ),
+                include_display=bool(features.get("frame_rate")),
+                include_frame_rate=bool(features.get("frame_rate")),
+                include_hitches=bool(features.get("harmony_hitches")),
+                include_touch=bool(features.get("touch_events")),
+            )
+            if context is not None:
+                latest_screen_state = context.screen_state
+                latest_foreground_package = context.foreground_package
+                latest_foreground_activity = context.foreground_activity
+                if features.get("frame_rate"):
+                    last_render_service_timestamp_ns = _retain_new_harmony_compositor_metrics(
+                        context.performance,
+                        last_render_service_timestamp_ns,
+                    )
+                journal.append_context(context)
+                result.context_count += 1
+            elif error:
+                warn_once("extra_context", error)
+            next_extra_context = _advance_due(
+                next_extra_context, max(5.0, context_interval_s), now
+            )
+
         if features.get("foreground_window") or features.get("frame_rate"):
             context = build_harmony_smartperf_context(
                 record,
                 sample,
                 target_package,
                 foreground_activity=foreground_activity,
+                actual_foreground_package=latest_foreground_package,
+                actual_foreground_activity=latest_foreground_activity,
+                foreground_verified=True,
                 base_performance=base_performance,
                 screen_state=latest_screen_state,
                 frame_rate_enabled=bool(features.get("frame_rate")),
@@ -2123,7 +2529,6 @@ def collect_harmony_smartperf_session(
                 journal.append_system_snapshot(target_snapshot)
                 result.system_snapshot_count += 1
 
-        now = time.monotonic()
         if features.get("process_snapshots") and now >= next_process:
             snapshot, error = collect_harmony_system_snapshot(hdc, target)
             if snapshot is not None:
@@ -2142,36 +2547,6 @@ def collect_harmony_smartperf_session(
                 warn_once("scheduler", error)
             next_scheduler = _advance_due(next_scheduler, max(5.0, scheduler_interval_s), now)
 
-        if (
-            (
-                features.get("harmony_hitches")
-                or features.get("touch_events")
-                or features.get("frame_rate")
-            )
-            and now >= next_extra_context
-        ):
-            context, error = collect_harmony_context(
-                hdc,
-                target,
-                include_power_state=False,
-                include_foreground=False,
-                include_window=bool(features.get("harmony_hitches")),
-                include_display=bool(features.get("frame_rate")),
-                include_frame_rate=bool(features.get("frame_rate")),
-                include_hitches=bool(features.get("harmony_hitches")),
-                include_touch=bool(features.get("touch_events")),
-            )
-            if context is not None:
-                if context.screen_state:
-                    latest_screen_state = context.screen_state
-                journal.append_context(context)
-                result.context_count += 1
-            elif error:
-                warn_once("extra_context", error)
-            next_extra_context = _advance_due(
-                next_extra_context, max(5.0, context_interval_s), now
-            )
-
         if now - last_checkpoint >= checkpoint_interval_s:
             clock = collect_harmony_clock_sync(hdc, target)
             if clock is not None:
@@ -2181,7 +2556,16 @@ def collect_harmony_smartperf_session(
             last_checkpoint = now
 
     try:
-        while time.monotonic() < deadline and len(streams_ended) < 2:
+        while len(streams_ended) < 2:
+            now = time.monotonic()
+            if collection_deadline is not None and now >= collection_deadline:
+                break
+            if collection_started_at is None and now >= startup_deadline:
+                warn_once(
+                    "smartperf_start_timeout",
+                    "HarmonyOS SP_daemon did not produce its first complete sample before the startup timeout.",
+                )
+                break
             try:
                 name, line = messages.get(timeout=0.5)
             except queue.Empty:
@@ -2200,7 +2584,7 @@ def collect_harmony_smartperf_session(
             if record:
                 accept_record(record)
         final_record = parser.finish()
-        if final_record:
+        if final_record and _smartperf_record_has_sample_fields(final_record):
             accept_record(final_record)
     except KeyboardInterrupt:
         result.stop_reason = "interrupted"
@@ -2217,7 +2601,22 @@ def collect_harmony_smartperf_session(
 
     if result.sample_count < 2:
         raise RuntimeError("HarmonyOS SP_daemon did not produce at least two usable samples")
-    result.stop_reason = "completed" if time.monotonic() >= deadline or process.returncode == 0 else "partial"
+    sample_span_s = (
+        result.last_device_uptime_s - first_sample_uptime_s
+        if result.last_device_uptime_s is not None
+        and first_sample_uptime_s is not None
+        else 0.0
+    )
+    minimum_complete_span_s = max(1.0, float(duration_s) - 1.5)
+    result.stop_reason = (
+        "completed"
+        if sample_span_s >= minimum_complete_span_s
+        else "partial"
+    )
+    if result.stop_reason == "partial":
+        result.warnings.append(
+            f"HarmonyOS SP_daemon covered only {sample_span_s:.2f}s of the requested {duration_s}s window."
+        )
     battery_result = hdc_shell(hdc, target, "hidumper -s BatteryService -a '-i'", timeout_s=15)
     if battery_result.ok:
         result.battery_end = parse_harmony_battery(battery_result.stdout)
@@ -2227,7 +2626,10 @@ def collect_harmony_smartperf_session(
 
 
 def _sampler_script(interval_s: float) -> str:
+    interval_ns = max(50_000_000, int(round(float(interval_s) * 1_000_000_000)))
     return (
+        f"interval_ns={interval_ns}; "
+        "next_ns=$(date +%s%N); "
         "while true; do "
         f"echo {_SAMPLE_BEGIN}; "
         "date +%s.%N; "
@@ -2236,7 +2638,15 @@ def _sampler_script(interval_s: float) -> str:
         f"echo {_SAMPLE_CPU}; "
         "grep '^cpu' /proc/stat; "
         f"echo {_SAMPLE_END}; "
-        f"sleep {max(0.05, interval_s):.3f}; "
+        "next_ns=$((next_ns + interval_ns)); "
+        "now_ns=$(date +%s%N); "
+        "remain_ns=$((next_ns - now_ns)); "
+        "if [ \"$remain_ns\" -gt 0 ]; then "
+        "sec=$((remain_ns / 1000000000)); "
+        "frac=$((remain_ns % 1000000000)); "
+        "delay=$(printf '%d.%09d' \"$sec\" \"$frac\"); "
+        "sleep \"$delay\"; "
+        "else next_ns=$now_ns; fi; "
         "done"
     )
 
@@ -2267,6 +2677,24 @@ def _advance_due(due: float, interval_s: float, now: float) -> float:
     return due
 
 
+def harmony_native_cpu_frequency_schedule_s(
+    scheduler_interval_s: float,
+    scheduler_enabled: bool,
+) -> float:
+    """Return the effective native HDC CPU-frequency refresh cadence.
+
+    A scheduler snapshot already includes the expensive full cpufreq dump, so an
+    explicitly faster scheduler cadence also refreshes frequency data. Otherwise
+    keep cpufreq at the lower-interference 30-second default.
+    """
+    if scheduler_enabled:
+        return min(
+            HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
+            max(5.0, float(scheduler_interval_s)),
+        )
+    return HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S
+
+
 def collect_harmony_session(
     hdc: str,
     device: str,
@@ -2282,6 +2710,7 @@ def collect_harmony_session(
     process_interval_s: float,
     thermal_interval_s: float,
     scheduler_interval_s: float,
+    cpu_frequency_interval_s: float = HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
     context_enabled: bool = True,
     context_sample_interval_s: Optional[float] = None,
     foreground_enabled: bool = True,
@@ -2302,7 +2731,12 @@ def collect_harmony_session(
     outage_started: Optional[float] = None
     previous_cpu: Optional[Dict[str, CpuTimes]] = None
     previous_timestamp: Optional[float] = None
-    frequencies_mhz = dict(initial_frequencies_mhz or {})
+    last_compositor_timestamp_ns: Optional[int] = None
+    frequencies_mhz = (
+        dict(initial_frequencies_mhz or {})
+        if cpu_frequency_enabled
+        else {}
+    )
     warned = set()
     context_interval_s = max(
         1.0,
@@ -2316,11 +2750,8 @@ def collect_harmony_session(
     next_context = started if context_enabled else float("inf")
     next_process = started if process_monitor_enabled else float("inf")
     next_thermal = started if thermal_monitor_enabled else float("inf")
-    next_scheduler = (
-        started
-        if scheduler_monitor_enabled or cpu_frequency_enabled
-        else float("inf")
-    )
+    next_scheduler = started if scheduler_monitor_enabled else float("inf")
+    next_cpu_frequency = started if cpu_frequency_enabled else float("inf")
     max_cpu_gap_s = max(interval_s * 3.0, interval_s + 2.0)
 
     def warn_once(key: str, message: str) -> None:
@@ -2463,6 +2894,11 @@ def collect_harmony_session(
                         include_touch=touch_enabled,
                     )
                     if context is not None:
+                        if frame_rate_enabled:
+                            last_compositor_timestamp_ns = _retain_new_harmony_compositor_metrics(
+                                context.performance,
+                                last_compositor_timestamp_ns,
+                            )
                         journal.append_context(context)
                         result.context_count += 1
                     elif error:
@@ -2487,20 +2923,35 @@ def collect_harmony_session(
                         warn_once("thermal", error)
                     next_thermal = _advance_due(next_thermal, thermal_interval_s, now)
 
-                if (scheduler_monitor_enabled or cpu_frequency_enabled) and now >= next_scheduler:
+                scheduler_due = scheduler_monitor_enabled and now >= next_scheduler
+                cpu_frequency_due = cpu_frequency_enabled and now >= next_cpu_frequency
+                if scheduler_due or cpu_frequency_due:
                     snapshot, latest_frequencies, error = collect_harmony_scheduler_snapshot(
                         hdc, target, policies
                     )
-                    if latest_frequencies:
+                    if latest_frequencies and cpu_frequency_enabled:
                         frequencies_mhz.update(latest_frequencies)
-                    if snapshot is not None and scheduler_monitor_enabled:
+                        next_cpu_frequency = now + max(
+                            5.0,
+                            float(cpu_frequency_interval_s),
+                        )
+                    if snapshot is not None and scheduler_due:
                         journal.append_scheduler_snapshot(snapshot)
                         result.scheduler_snapshot_count += 1
                     elif error:
                         warn_once("scheduler", error)
-                    next_scheduler = _advance_due(
-                        next_scheduler, max(10.0, scheduler_interval_s), now
-                    )
+                    if scheduler_due:
+                        next_scheduler = _advance_due(
+                            next_scheduler,
+                            max(5.0, scheduler_interval_s),
+                            now,
+                        )
+                    if cpu_frequency_due and not latest_frequencies:
+                        next_cpu_frequency = _advance_due(
+                            next_cpu_frequency,
+                            max(5.0, float(cpu_frequency_interval_s)),
+                            now,
+                        )
 
                 if now - last_checkpoint >= checkpoint_interval_s:
                     clock = collect_harmony_clock_sync(hdc, target)

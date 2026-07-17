@@ -23,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from . import __version__ as APP_VERSION
@@ -54,9 +54,15 @@ from .models import (
     SchedulerSnapshot,
     SystemSnapshot,
     ThermalSnapshot,
+    IOS_SYSTEM_LOAD_STALE_AFTER_S,
+    is_consumption_power_sample,
+    is_power_sample_fresh_for_consumption,
 )
+from .messages import localize_collection_warning
 from .storage import (
     REPORT_EDITS_FILENAME,
+    REPORT_SOURCE_SAMPLES_FILENAME,
+    load_contexts,
     load_report_excluded_ranges,
     read_samples_csv,
     write_report_excluded_ranges,
@@ -547,39 +553,508 @@ def _memory_from_metadata(metadata: Dict[str, object]) -> Optional[MemorySource]
         return None
 
 
+def _finite_timeline_value(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _distributed_positions(size: int) -> List[int]:
+    """Return indexes in a centre-first, progressively distributed order."""
+
+    if size <= 0:
+        return []
+    positions: List[int] = []
+    pending = deque([(0, size)])
+    while pending:
+        start, end = pending.popleft()
+        if start >= end:
+            continue
+        middle = (start + end) // 2
+        positions.append(middle)
+        pending.append((start, middle))
+        pending.append((middle + 1, end))
+    return positions
+
+
+def _add_boundary_groups(
+    selected: set[int],
+    groups: Sequence[Sequence[int]],
+    limit: int,
+) -> None:
+    if not groups or len(selected) >= limit:
+        return
+    all_indexes = {
+        index
+        for group in groups
+        for index in group
+        if index >= 0
+    }
+    if len(selected | all_indexes) <= limit:
+        selected.update(all_indexes)
+        return
+
+    # When pathological input contains more boundaries than the point budget,
+    # keep a time-distributed subset instead of silently favouring the start.
+    for position in _distributed_positions(len(groups)):
+        group = {index for index in groups[position] if index >= 0}
+        cost = len(group - selected)
+        if cost <= limit - len(selected):
+            selected.update(group)
+
+
+def _decimation_indexes(
+    value_series: Sequence[Sequence[object]],
+    length: int,
+    limit: int,
+    *,
+    break_before: Sequence[bool] = (),
+    step_values: Sequence[object] = (),
+) -> List[int]:
+    """Select a bounded set of timeline indexes without erasing short events.
+
+    The selector keeps the first/last point, discontinuity boundaries and short
+    step edges, then spends the remaining budget on bucket-local extrema.  The
+    first value series is treated as the primary metric; for live samples that
+    is power, while frame/refresh timelines contain only their displayed value.
+    """
+
+    if length <= 0 or limit <= 0:
+        return []
+    limit = min(length, int(limit))
+    if limit == 1:
+        return [length - 1]
+    if length <= limit:
+        return list(range(length))
+    if limit == 2:
+        return [0, length - 1]
+
+    prepared_series: List[List[Optional[float]]] = []
+    for series in value_series:
+        if len(series) != length:
+            continue
+        prepared = [_finite_timeline_value(value) for value in series]
+        if any(value is not None for value in prepared):
+            prepared_series.append(prepared)
+
+    selected = {0, length - 1}
+    break_groups = [
+        (index - 1, index)
+        for index in range(1, min(length, len(break_before)))
+        if bool(break_before[index])
+    ]
+    _add_boundary_groups(selected, break_groups, limit)
+
+    if len(step_values) == length:
+        numeric_steps = [_finite_timeline_value(value) for value in step_values]
+        step_groups = []
+        for index in range(1, length):
+            previous = numeric_steps[index - 1]
+            current = numeric_steps[index]
+            if previous is None or current is None:
+                continue
+            tolerance = max(0.01, abs(previous) * 0.0001)
+            if abs(current - previous) > tolerance:
+                step_groups.append((index - 1, index))
+        _add_boundary_groups(selected, step_groups, limit)
+
+    remaining = limit - len(selected)
+    if remaining <= 0:
+        return sorted(selected)
+
+    if not prepared_series:
+        candidates = [index for index in range(1, length - 1) if index not in selected]
+        if candidates:
+            for offset in range(remaining):
+                position = min(
+                    len(candidates) - 1,
+                    math.floor((offset + 0.5) * len(candidates) / remaining),
+                )
+                selected.add(candidates[position])
+        return sorted(selected)
+
+    global_ranges: List[tuple[float, float]] = []
+    for series in prepared_series:
+        values = [value for value in series if value is not None]
+        global_ranges.append((min(values), max(values)))
+
+    bucket_slots = min(6, max(2, len(prepared_series) * 2))
+    bucket_count = max(1, remaining // bucket_slots)
+    base_quota, extra_quota = divmod(remaining, bucket_count)
+
+    for bucket in range(bucket_count):
+        quota = base_quota + (1 if bucket < extra_quota else 0)
+        start = math.floor(bucket * length / bucket_count)
+        end = math.floor((bucket + 1) * length / bucket_count)
+        bucket_indexes = [
+            index
+            for index in range(start, end)
+            if 0 < index < length - 1 and index not in selected
+        ]
+        if not bucket_indexes or quota <= 0:
+            continue
+
+        candidates: Dict[int, tuple[int, float, int]] = {}
+        for series_index, series in enumerate(prepared_series):
+            values = [
+                (index, series[index])
+                for index in range(start, end)
+                if series[index] is not None
+            ]
+            if not values:
+                continue
+            minimum_index, minimum_value = min(values, key=lambda item: float(item[1]))
+            maximum_index, maximum_value = max(values, key=lambda item: float(item[1]))
+            local_mean = statistics.fmean(float(item[1]) for item in values)
+            global_minimum, global_maximum = global_ranges[series_index]
+            scale = max(global_maximum - global_minimum, 1e-12)
+            for candidate_index, candidate_value in {
+                minimum_index: minimum_value,
+                maximum_index: maximum_value,
+            }.items():
+                if candidate_index in selected:
+                    continue
+                local_salience = abs(float(candidate_value) - local_mean) / scale
+                priority, score, nominations = candidates.get(
+                    candidate_index,
+                    (0, 0.0, 0),
+                )
+                is_primary = int(series_index == 0)
+                candidates[candidate_index] = (
+                    max(priority, is_primary),
+                    max(score, local_salience),
+                    nominations + 1,
+                )
+
+        bucket_middle = (start + end - 1) / 2.0
+
+        def candidate_rank(index: int) -> tuple[int, float, int, float]:
+            priority, score, nominations = candidates[index]
+            return (
+                priority,
+                score,
+                nominations,
+                -abs(index - bucket_middle),
+            )
+
+        ordered_candidates = sorted(candidates, key=candidate_rank, reverse=True)
+        added = 0
+        for candidate_index in ordered_candidates:
+            if added >= quota or len(selected) >= limit:
+                break
+            selected.add(candidate_index)
+            added += 1
+
+        if added < quota and len(selected) < limit:
+            fill = [index for index in bucket_indexes if index not in selected]
+            wanted = min(quota - added, limit - len(selected), len(fill))
+            if wanted:
+                for offset in range(wanted):
+                    position = min(
+                        len(fill) - 1,
+                        math.floor((offset + 0.5) * len(fill) / wanted),
+                    )
+                    selected.add(fill[position])
+
+    if len(selected) < limit:
+        fill = [index for index in range(1, length - 1) if index not in selected]
+        wanted = min(limit - len(selected), len(fill))
+        for offset in range(wanted):
+            position = min(
+                len(fill) - 1,
+                math.floor((offset + 0.5) * len(fill) / wanted),
+            )
+            selected.add(fill[position])
+    return sorted(selected)
+
+
+def _decimate_timeline_rows(
+    rows: Sequence[Dict[str, object]],
+    *,
+    limit: int = MAX_LIVE_POINTS,
+    value_keys: Sequence[str] = ("value",),
+    preserve_steps: bool = False,
+) -> List[Dict[str, object]]:
+    if not rows or limit <= 0:
+        return []
+    value_series = [[row.get(key) for row in rows] for key in value_keys]
+    breaks = [
+        bool(
+            row.get("report_break_before")
+            or row.get("_report_break_before")
+            or row.get("break_before")
+        )
+        for row in rows
+    ]
+    step_values = (
+        next(
+            (
+                series
+                for series in value_series
+                if any(_finite_timeline_value(value) is not None for value in series)
+            ),
+            [],
+        )
+        if preserve_steps
+        else []
+    )
+    indexes = _decimation_indexes(
+        value_series,
+        len(rows),
+        limit,
+        break_before=breaks,
+        step_values=step_values,
+    )
+
+    displayed: List[Dict[str, object]] = []
+    previous_index: Optional[int] = None
+    for index in indexes:
+        row = dict(rows[index])
+        if previous_index is not None and any(breaks[previous_index + 1 : index + 1]):
+            row["report_break_before"] = True
+        displayed.append(row)
+        previous_index = index
+    return displayed
+
+
+def _sample_break_flags(samples: Sequence[Sample]) -> List[bool]:
+    breaks = [False]
+    for previous, current in zip(samples, samples[1:]):
+        breaks.append(
+            previous.power_source != current.power_source
+            or bool(getattr(current, "_report_break_before", False))
+        )
+    return breaks
+
+
 def _decimate(samples: Sequence[Sample], limit: int = MAX_LIVE_POINTS) -> List[Sample]:
+    if not samples or limit <= 0:
+        return []
     if len(samples) <= limit:
         return list(samples)
-    if limit <= 2:
-        return [samples[0], samples[-1]]
-    step = (len(samples) - 1) / float(limit - 1)
-    indexes = sorted({min(len(samples) - 1, round(index * step)) for index in range(limit)})
+    value_series: List[List[object]] = [
+        [sample.power_mw for sample in samples],
+        [sample.current_ma for sample in samples],
+        [sample.voltage_mv for sample in samples],
+        [sample.cpu_pct for sample in samples],
+        [sample.gpu_load_pct for sample in samples],
+        [sample.gpu_frequency_mhz for sample in samples],
+        [sample.memory_frequency_mhz for sample in samples],
+        [sample.battery_temperature_c for sample in samples],
+    ]
+    cluster_keys = sorted(
+        {key for sample in samples for key in sample.cluster_cpu_pct}
+    )
+    frequency_keys = sorted(
+        {key for sample in samples for key in sample.frequencies_mhz}
+    )
+    value_series.extend(
+        [sample.cluster_cpu_pct.get(key) for sample in samples]
+        for key in cluster_keys
+    )
+    value_series.extend(
+        [sample.frequencies_mhz.get(key) for sample in samples]
+        for key in frequency_keys
+    )
+    breaks = _sample_break_flags(samples)
+    indexes = _decimation_indexes(
+        value_series,
+        len(samples),
+        limit,
+        break_before=breaks,
+    )
     return [samples[index] for index in indexes]
 
 
-def _integrate_energy(samples: Sequence[Sample], max_gap_s: float) -> float:
-    energy_mwh = 0.0
+def _sample_intervals(
+    samples: Sequence[Sample],
+    max_gap_s: float,
+    *,
+    require_consumption_power: bool = False,
+) -> List[tuple[Sample, Sample, float]]:
+    intervals: List[tuple[Sample, Sample, float]] = []
     for previous, current in zip(samples, samples[1:]):
         delta = current.uptime_s - previous.uptime_s
         if delta <= 0 or delta > max_gap_s:
             continue
-        energy_mwh += (previous.power_mw + current.power_mw) * 0.5 * delta / 3600.0
-    return energy_mwh
+        if bool(getattr(current, "_report_break_before", False)):
+            continue
+        if str(previous.power_source or "") != str(current.power_source or ""):
+            continue
+        if require_consumption_power and not (
+            is_consumption_power_sample(previous)
+            and is_consumption_power_sample(current)
+        ):
+            continue
+        intervals.append((previous, current, delta))
+    return intervals
+
+
+def _interval_samples(
+    intervals: Sequence[tuple[Sample, Sample, float]],
+) -> List[Sample]:
+    rows: List[Sample] = []
+    seen: set[int] = set()
+    for previous, current, _ in intervals:
+        for sample in (previous, current):
+            identity = id(sample)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(sample)
+    return rows
+
+
+def _integrate_sample_values(
+    samples: Sequence[Sample],
+    value: Callable[[Sample], float],
+    max_gap_s: float,
+    *,
+    require_consumption_power: bool = False,
+) -> Optional[float]:
+    intervals = _sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=require_consumption_power,
+    )
+    if not intervals:
+        return None
+    return sum(
+        (float(value(previous)) + float(value(current))) * 0.5 * delta / 3600.0
+        for previous, current, delta in intervals
+    )
+
+
+def _integrate_energy(samples: Sequence[Sample], max_gap_s: float) -> Optional[float]:
+    """Integrate only explicit, continuous battery-discharge intervals."""
+
+    return _integrate_sample_values(
+        samples,
+        lambda sample: sample.power_mw,
+        max_gap_s,
+        require_consumption_power=True,
+    )
 
 
 def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
     if not values:
         return None
     ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+    index = max(
+        0,
+        min(
+            len(ordered) - 1,
+            math.ceil(len(ordered) * max(0.0, min(1.0, percentile))) - 1,
+        ),
+    )
+    return ordered[index]
+
+
+def _range_crosses_exclusion(
+    start_uptime_s: float,
+    end_uptime_s: float,
+    excluded_ranges: Sequence[tuple[float, float]],
+) -> bool:
+    return any(
+        start_uptime_s <= excluded_start and end_uptime_s >= excluded_end
+        for excluded_start, excluded_end in excluded_ranges
+    )
+
+
+def _range_numeric_statistics(
+    samples: Sequence[Sample],
+    value: Callable[[Sample], object],
+    start_uptime_s: float,
+    end_uptime_s: float,
+    max_gap_s: float,
+    excluded_ranges: Sequence[tuple[float, float]] = (),
+) -> Optional[Dict[str, object]]:
+    selected_values: List[float] = []
+    for sample in samples:
+        if sample.uptime_s < start_uptime_s or sample.uptime_s > end_uptime_s:
+            continue
+        raw_value = value(sample)
+        if isinstance(raw_value, (int, float)) and math.isfinite(float(raw_value)):
+            selected_values.append(float(raw_value))
+
+    weighted_total = 0.0
+    covered_duration_s = 0.0
+    boundary_values: List[float] = []
+    for previous, current in zip(samples, samples[1:]):
+        delta = float(current.uptime_s) - float(previous.uptime_s)
+        if delta <= 0 or delta > max_gap_s:
+            continue
+        if bool(getattr(current, "_report_break_before", False)):
+            continue
+        if _range_crosses_exclusion(
+            float(previous.uptime_s),
+            float(current.uptime_s),
+            excluded_ranges,
+        ):
+            continue
+        interval_start = max(float(previous.uptime_s), start_uptime_s)
+        interval_end = min(float(current.uptime_s), end_uptime_s)
+        if interval_end <= interval_start:
+            continue
+        previous_value = value(previous)
+        current_value = value(current)
+        if not isinstance(previous_value, (int, float)) or not isinstance(
+            current_value, (int, float)
+        ):
+            continue
+        left_value = float(previous_value)
+        right_value = float(current_value)
+        if not math.isfinite(left_value) or not math.isfinite(right_value):
+            continue
+        left_ratio = (interval_start - float(previous.uptime_s)) / delta
+        right_ratio = (interval_end - float(previous.uptime_s)) / delta
+        clipped_left = left_value + (right_value - left_value) * left_ratio
+        clipped_right = left_value + (right_value - left_value) * right_ratio
+        clipped_duration = interval_end - interval_start
+        weighted_total += (clipped_left + clipped_right) * 0.5 * clipped_duration
+        covered_duration_s += clipped_duration
+        boundary_values.extend((clipped_left, clipped_right))
+
+    observed_values = [*selected_values, *boundary_values]
+    if not observed_values:
+        return None
+    average = (
+        weighted_total / covered_duration_s
+        if covered_duration_s > 0
+        else statistics.fmean(observed_values)
+    )
+    return {
+        "average": average,
+        "minimum": min(observed_values),
+        "maximum": max(observed_values),
+        "sample_count": len(selected_values),
+        "covered_duration_s": covered_duration_s,
+        "calculation": (
+            "time_weighted_full_resolution"
+            if covered_duration_s > 0
+            else "sample_average_full_resolution"
+        ),
+    }
+
+
+def _range_scalar_statistics(
+    value: object,
+    *,
+    sample_count: object = 0,
+    calculation: str = "range_recomputed",
+) -> Optional[Dict[str, object]]:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return None
+    number = float(value)
+    return {
+        "average": number,
+        "minimum": number,
+        "maximum": number,
+        "sample_count": max(0, _integer(sample_count, 0)),
+        "covered_duration_s": None,
+        "calculation": calculation,
+    }
 
 
 def _pearson(values: Sequence[float], powers: Sequence[float]) -> Optional[float]:
@@ -753,6 +1228,10 @@ class LiveTelemetryReader:
         current_unit = str(self.metadata.get("current_unit") or "auto")
         battery_status = str(battery.get("status") or "unknown")
         sample_interval = max(0.05, _number(self.metadata.get("sample_interval_s"), 1.0))
+        legacy_power_state_format = all(
+            sample.external_power is None and sample.battery_status is None
+            for sample in self.raw_samples
+        )
         try:
             return convert_samples(
                 self.raw_samples,
@@ -763,6 +1242,11 @@ class LiveTelemetryReader:
                 current_unit,
                 battery_status,
                 max_cpu_gap_s=max(sample_interval * 3.0, sample_interval + 2.0),
+                external_power=(
+                    bool(battery.get("powered"))
+                    if legacy_power_state_format and "powered" in battery
+                    else None
+                ),
             )
         except RuntimeError:
             return [], []
@@ -781,8 +1265,183 @@ class LiveTelemetryReader:
         elapsed = latest.elapsed_s if latest else 0.0
         progress = elapsed / requested_duration if requested_duration > 0 else 0.0
         displayed = _decimate(samples)
-        powers = [sample.power_mw for sample in samples]
-        currents = [sample.current_ma for sample in samples]
+        sample_positions = {id(sample): index for index, sample in enumerate(samples)}
+        sample_breaks = _sample_break_flags(samples) if samples else []
+        displayed_break_before_ids: set[int] = set()
+        previous_displayed_index: Optional[int] = None
+        for displayed_sample in displayed:
+            displayed_index = sample_positions[id(displayed_sample)]
+            if (
+                previous_displayed_index is not None
+                and any(sample_breaks[previous_displayed_index + 1 : displayed_index + 1])
+            ):
+                displayed_break_before_ids.add(id(displayed_sample))
+            previous_displayed_index = displayed_index
+        observed_powers = [sample.power_mw for sample in samples]
+        ios_system_load_source = "ios_power_telemetry_system_load"
+        system_load_samples = [
+            sample for sample in samples if sample.power_source == ios_system_load_source
+        ]
+        system_load_powers = [sample.power_mw for sample in system_load_samples]
+        system_load_intervals = [
+            interval
+            for interval in _sample_intervals(samples, max_gap)
+            if interval[0].power_source == ios_system_load_source
+            and interval[1].power_source == ios_system_load_source
+        ]
+        system_load_consumption_intervals = [
+            interval
+            for interval in _sample_intervals(
+                samples,
+                max_gap,
+                require_consumption_power=True,
+            )
+            if interval[0].power_source == ios_system_load_source
+            and interval[1].power_source == ios_system_load_source
+        ]
+        system_load_consumption_samples = _interval_samples(
+            system_load_consumption_intervals
+        )
+        system_load_consumption_powers = [
+            sample.power_mw for sample in system_load_consumption_samples
+        ]
+        system_load_covered_duration_s = sum(
+            interval[2] for interval in system_load_intervals
+        )
+        system_load_consumption_covered_duration_s = sum(
+            interval[2] for interval in system_load_consumption_intervals
+        )
+        system_load_observed_energy_mwh = (
+            sum(
+                (previous.power_mw + current.power_mw) * 0.5 * delta / 3600.0
+                for previous, current, delta in system_load_intervals
+            )
+            if system_load_intervals
+            else None
+        )
+        system_load_consumption_energy_mwh = (
+            sum(
+                (previous.power_mw + current.power_mw) * 0.5 * delta / 3600.0
+                for previous, current, delta in system_load_consumption_intervals
+            )
+            if system_load_consumption_intervals
+            else None
+        )
+        system_load_observed_average_power_mw = (
+            system_load_observed_energy_mwh * 3600.0 / system_load_covered_duration_s
+            if system_load_observed_energy_mwh is not None
+            and system_load_covered_duration_s > 0
+            else statistics.fmean(system_load_powers) if system_load_powers else None
+        )
+        system_load_consumption_average_power_mw = (
+            system_load_consumption_energy_mwh
+            * 3600.0
+            / system_load_consumption_covered_duration_s
+            if system_load_consumption_energy_mwh is not None
+            and system_load_consumption_covered_duration_s > 0
+            else (
+                statistics.fmean(system_load_consumption_powers)
+                if system_load_consumption_powers
+                else None
+            )
+        )
+        latest_system_load = system_load_samples[-1] if system_load_samples else None
+        latest_system_load_age_s = (
+            max(0.0, (latest.uptime_s - latest_system_load.uptime_s))
+            + max(0.0, float(latest_system_load.power_sample_age_s or 0.0))
+            if latest is not None and latest_system_load is not None
+            else None
+        )
+        battery_flow_powers = [
+            sample.current_ma * sample.voltage_mv / 1000.0 for sample in samples
+        ]
+        battery_flow_currents = [sample.current_ma for sample in samples]
+        telemetry_intervals = _sample_intervals(samples, max_gap)
+        telemetry_covered_duration_s = sum(item[2] for item in telemetry_intervals)
+        consumption_intervals = _sample_intervals(
+            samples,
+            max_gap,
+            require_consumption_power=True,
+        )
+        consumption_samples = _interval_samples(consumption_intervals)
+        consumption_powers = [sample.power_mw for sample in consumption_samples]
+        consumption_covered_duration_s = sum(item[2] for item in consumption_intervals)
+        observed_power_energy_mwh = _integrate_sample_values(
+            samples,
+            lambda sample: sample.power_mw,
+            max_gap,
+        )
+        battery_flow_energy_mwh = _integrate_sample_values(
+            samples,
+            lambda sample: sample.current_ma * sample.voltage_mv / 1000.0,
+            max_gap,
+        )
+        battery_flow_charge_mah = _integrate_sample_values(
+            samples,
+            lambda sample: sample.current_ma,
+            max_gap,
+        )
+        energy_mwh = _integrate_energy(samples, max_gap)
+        discharge_mah = _integrate_sample_values(
+            samples,
+            lambda sample: sample.current_ma,
+            max_gap,
+            require_consumption_power=True,
+        )
+        average_power_mw = (
+            energy_mwh * 3600.0 / consumption_covered_duration_s
+            if energy_mwh is not None and consumption_covered_duration_s > 0
+            else None
+        )
+        average_current_ma = (
+            discharge_mah * 3600.0 / consumption_covered_duration_s
+            if discharge_mah is not None and consumption_covered_duration_s > 0
+            else None
+        )
+        observed_power_average_mw = (
+            observed_power_energy_mwh * 3600.0 / telemetry_covered_duration_s
+            if observed_power_energy_mwh is not None and telemetry_covered_duration_s > 0
+            else statistics.fmean(observed_powers) if observed_powers else None
+        )
+        battery_flow_average_power_mw = (
+            battery_flow_energy_mwh * 3600.0 / telemetry_covered_duration_s
+            if battery_flow_energy_mwh is not None and telemetry_covered_duration_s > 0
+            else statistics.fmean(battery_flow_powers) if battery_flow_powers else None
+        )
+        battery_flow_average_current_ma = (
+            battery_flow_charge_mah * 3600.0 / telemetry_covered_duration_s
+            if battery_flow_charge_mah is not None and telemetry_covered_duration_s > 0
+            else statistics.fmean(battery_flow_currents) if battery_flow_currents else None
+        )
+        session_duration_s = (
+            samples[-1].uptime_s - samples[0].uptime_s if len(samples) >= 2 else 0.0
+        )
+        power_valid_for_consumption = bool(consumption_intervals)
+        stale_system_load_observed = any(
+            sample.power_source == ios_system_load_source
+            and not is_power_sample_fresh_for_consumption(sample)
+            for sample in samples
+        )
+        external_power_observed = any(sample.external_power is True for sample in samples)
+        observed_directions = {
+            str(sample.direction or "unknown").strip().lower() for sample in samples
+        }
+        if observed_directions and observed_directions <= {"charging", "full"}:
+            power_flow_direction = "charging"
+        elif samples and all(sample.external_power is True for sample in samples):
+            power_flow_direction = "external_power"
+        elif observed_directions == {"discharging"}:
+            power_flow_direction = "discharging"
+        elif observed_directions and observed_directions <= {"idle", "unknown"}:
+            power_flow_direction = "idle"
+        elif observed_directions:
+            power_flow_direction = "mixed"
+        else:
+            power_flow_direction = str(
+                (self.metadata.get("battery_start") or {}).get("status")
+                if isinstance(self.metadata.get("battery_start"), dict)
+                else "unknown"
+            )
         cpu_values = [sample.cpu_pct for sample in samples if sample.cpu_pct is not None]
         context_map: Dict[tuple[object, ...], ContextSample] = {}
         for context in sorted(
@@ -826,10 +1485,10 @@ class LiveTelemetryReader:
         battery = self.metadata.get("battery_start", {})
         battery = battery if isinstance(battery, dict) else {}
         battery_status = str(battery.get("status") or "unknown")
-        warnings = list(conversion_warnings)
+        warnings = [localize_collection_warning(value) for value in conversion_warnings]
         raw_warnings = self.metadata.get("collection_warnings", [])
         if isinstance(raw_warnings, list):
-            warnings.extend(str(value) for value in raw_warnings)
+            warnings.extend(localize_collection_warning(value) for value in raw_warnings)
 
         latest_system = self.system_snapshots[-1] if self.system_snapshots else None
         latest_thread_system = next(
@@ -847,10 +1506,59 @@ class LiveTelemetryReader:
             if latest_system is not None
             else []
         )
+        platform = str(self.metadata.get("platform") or "android").lower()
         performance = analyze_performance_contexts(contexts, self.metadata)
+        if platform == "ios":
+            ios_stats = self.metadata.get("ios_collection_stats", {})
+            ios_stats = ios_stats if isinstance(ios_stats, dict) else {}
+            notifications_observed = (
+                ios_stats.get("application_state_notifications_observed") is True
+            )
+            current_foreground_known = bool(
+                latest_context is not None and latest_context.foreground_package
+            )
+            latest_notification_was_suspend = bool(
+                latest_context is not None
+                and latest_context.source == "ios_dvt_notifications"
+                and not latest_context.foreground_package
+            )
+            if current_foreground_known:
+                foreground_state_status = "observed"
+                foreground_state_reason = "来自测试期间实际收到的 DVT Running 通知。"
+            elif latest_notification_was_suspend:
+                foreground_state_status = "unknown"
+                foreground_state_reason = (
+                    "最近收到 DVT Suspended 通知，但接口没有提供随后当前前台应用的初始快照。"
+                )
+            elif notifications_observed:
+                foreground_state_status = "unknown"
+                foreground_state_reason = (
+                    "采集期间观察到应用状态通知，但没有获得 Running 上下文，不能确认当前前台应用。"
+                )
+            else:
+                foreground_state_status = "not_observed"
+                foreground_state_reason = (
+                    "DVT 通知流只报告测试期间发生的 Running / Suspended 变化；"
+                    "没有变化时不能据此确定采集开始时的当前前台应用。"
+                )
+            performance = {
+                **performance,
+                "frame_unavailable_reason": (
+                    "当前 iOS 后端不提供通用应用 FPS、标准 1% Low、逐帧 Core Animation "
+                    "时间戳或刷新率时间线。"
+                ),
+                "refresh_rate_unavailable_reason": str(
+                    performance.get("refresh_rate_unavailable_reason")
+                    or "当前 iOS 后端没有可验证的屏幕刷新率时间线。"
+                ),
+                "foreground_state_status": foreground_state_status,
+                "foreground_state_reason": foreground_state_reason,
+                "foreground_state_available": current_foreground_known,
+                "application_state_change_observed": notifications_observed,
+            }
         brightness_throttling = (
             analyze_brightness_throttling(samples, contexts, self.thermal_snapshots)
-            if str(self.metadata.get("platform") or "android").lower() == "android"
+            if platform == "android"
             else {
                 "available": False,
                 "timeline": [],
@@ -867,7 +1575,12 @@ class LiveTelemetryReader:
             else contexts[0].uptime_s if contexts else None
         )
 
-        def live_timeline_points(value: object) -> List[Dict[str, object]]:
+        def live_timeline_points(
+            value: object,
+            *,
+            value_keys: Sequence[str] = ("value",),
+            preserve_steps: bool = False,
+        ) -> List[Dict[str, object]]:
             rows = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
             if timeline_start_uptime is not None:
                 rows = [
@@ -881,30 +1594,54 @@ class LiveTelemetryReader:
                     for item in rows
                     if isinstance(item.get("uptime_s"), (int, float))
                 ]
-            if len(rows) > MAX_LIVE_POINTS:
-                stride = max(1, math.ceil(len(rows) / MAX_LIVE_POINTS))
-                displayed_rows = rows[::stride][:MAX_LIVE_POINTS]
-                if displayed_rows[-1] is not rows[-1]:
-                    displayed_rows = [*displayed_rows[: MAX_LIVE_POINTS - 1], rows[-1]]
-                rows = displayed_rows
-            return rows
+            return _decimate_timeline_rows(
+                rows,
+                value_keys=value_keys,
+                preserve_steps=preserve_steps,
+            )
 
+        performance = {
+            **performance,
+            "frame_rate_timeline": live_timeline_points(
+                performance.get("frame_rate_timeline", []),
+                value_keys=(
+                    "frame_rate_fps",
+                    "one_percent_low_fps",
+                    "frame_time_average_ms",
+                    "frame_time_p95_ms",
+                    "frame_time_p99_ms",
+                    "frame_issue_pct",
+                    "value",
+                ),
+            ),
+            "refresh_rate_timeline": live_timeline_points(
+                performance.get("refresh_rate_timeline", []),
+                value_keys=("value", "refresh_rate_hz"),
+                preserve_steps=True,
+            ),
+        }
         frame_flow = performance.get("frame_flow", {})
         if isinstance(frame_flow, dict):
             flow_stages = frame_flow.get("stages", [])
             if isinstance(flow_stages, list):
                 performance = {
                     **performance,
-                    "refresh_rate_timeline": live_timeline_points(
-                        performance.get("refresh_rate_timeline", [])
-                    ),
                     "frame_flow": {
                         **frame_flow,
                         "stages": [
                             {
                                 **stage,
                                 "timeline": live_timeline_points(
-                                    stage.get("timeline", [])
+                                    stage.get("timeline", []),
+                                    value_keys=(
+                                        "value",
+                                        "frame_rate_fps",
+                                        "duration_ms",
+                                        "latency_ms",
+                                    ),
+                                    preserve_steps=(
+                                        str(stage.get("key") or "") == "display_scanout"
+                                    ),
                                 ),
                             }
                             for stage in flow_stages
@@ -1022,6 +1759,7 @@ class LiveTelemetryReader:
         }
         settings_analysis = analyze_runtime_settings(self.metadata, {})
         pressure_drivers: List[Dict[str, object]] = []
+        consumption_sample_ids = {id(sample) for sample in consumption_samples}
 
         def add_pressure_driver(
             key: str,
@@ -1031,19 +1769,24 @@ class LiveTelemetryReader:
             pairs = [
                 (float(value), float(sample.power_mw))
                 for sample, value in zip(samples, values)
-                if isinstance(value, (int, float))
+                if id(sample) in consumption_sample_ids
+                and isinstance(value, (int, float))
             ]
-            if len(pairs) < 3:
+            if len(pairs) < 30 or consumption_covered_duration_s < 30.0:
+                return
+            correlation = _pearson(
+                [item[0] for item in pairs],
+                [item[1] for item in pairs],
+            )
+            if correlation is None or abs(correlation) < 0.5:
                 return
             pressure_drivers.append(
                 {
                     "key": key,
                     "label": label,
-                    "correlation": _pearson(
-                        [item[0] for item in pairs],
-                        [item[1] for item in pairs],
-                    ),
+                    "correlation": correlation,
                     "sample_count": len(pairs),
+                    "covered_duration_s": consumption_covered_duration_s,
                 }
             )
 
@@ -1085,6 +1828,12 @@ class LiveTelemetryReader:
             "available": bool(pressure_drivers or live_tasks or settings_analysis.get("available")),
             "drivers": pressure_drivers,
             "leading_driver": pressure_drivers[0] if pressure_drivers else None,
+            "power_valid_for_consumption": power_valid_for_consumption,
+            "power_unavailable_reason": (
+                None
+                if power_valid_for_consumption
+                else "采集期间没有连续且明确未接外部电源的放电区间，不生成负载与功耗相关性。"
+            ),
             "tasks": live_tasks,
             "memory": memory_analysis,
             "settings": settings_analysis,
@@ -1111,9 +1860,22 @@ class LiveTelemetryReader:
             "dominant_stage": render_pipeline.get("dominant_stage"),
             "render_threads": render_threads,
             "power_recording": {
-                "average_power_mw": statistics.fmean(powers) if powers else None,
-                "p95_power_mw": _percentile(powers, 0.95),
-                "note": "性能模式只记录整机功耗，不分析组件、UID 或第三方任务功耗来源。",
+                "power_valid_for_consumption": power_valid_for_consumption,
+                "average_power_mw": average_power_mw,
+                "p95_power_mw": _percentile(consumption_powers, 0.95),
+                "energy_mwh": energy_mwh,
+                "consumption_covered_duration_s": consumption_covered_duration_s,
+                "observed_power_average_mw": observed_power_average_mw,
+                "observed_power_p95_mw": _percentile(observed_powers, 0.95),
+                "observed_power_energy_mwh": observed_power_energy_mwh,
+                "battery_flow_average_power_mw": battery_flow_average_power_mw,
+                "battery_flow_p95_power_mw": _percentile(battery_flow_powers, 0.95),
+                "battery_flow_energy_mwh": battery_flow_energy_mwh,
+                "note": (
+                    "正式功耗统计只使用连续、明确未接外部电源的放电区间；性能模式不分析组件或 UID 功耗来源。"
+                    if power_valid_for_consumption
+                    else "当前没有连续、明确未接外部电源的放电区间；仅保留观测功率与电池流量原始统计。"
+                ),
             },
         }
 
@@ -1132,6 +1894,8 @@ class LiveTelemetryReader:
                     "signed_current_ma": latest.signed_current_ma,
                     "power_mw": latest.power_mw,
                     "direction": latest.direction,
+                    "power_valid_for_consumption": is_consumption_power_sample(latest),
+                    "external_power": latest.external_power,
                     "voltage_mv": latest.voltage_mv,
                     "cpu_pct": latest.cpu_pct,
                     "cluster_cpu_pct": dict(latest.cluster_cpu_pct),
@@ -1142,16 +1906,96 @@ class LiveTelemetryReader:
                     "memory_frequency_mhz": latest.memory_frequency_mhz,
                     "power_source": latest.power_source,
                     "power_sample_age_s": latest.power_sample_age_s,
+                    "power_sample_stale": (
+                        latest.power_source == ios_system_load_source
+                        and not is_power_sample_fresh_for_consumption(latest)
+                    ),
                     "collector_cpu_pct": latest.collector_cpu_pct,
                 }
                 if latest is not None
                 else None
             ),
             "summary": {
-                "average_power_mw": statistics.fmean(powers) if powers else None,
-                "p95_power_mw": _percentile(powers, 0.95),
-                "average_current_ma": statistics.fmean(currents) if currents else None,
-                "direction": latest.direction if latest is not None else battery_status,
+                "average_power_mw": average_power_mw,
+                "median_power_mw": (
+                    statistics.median(consumption_powers) if consumption_powers else None
+                ),
+                "p95_power_mw": _percentile(consumption_powers, 0.95),
+                "average_current_ma": average_current_ma,
+                "energy_mwh": energy_mwh,
+                "discharge_mah": discharge_mah,
+                "direction": power_flow_direction if samples else battery_status,
+                "power_flow_direction": power_flow_direction,
+                "power_valid_for_consumption": power_valid_for_consumption,
+                "power_consumption_unavailable_reason": (
+                    None
+                    if power_valid_for_consumption
+                    else (
+                        f"iOS SystemLoad 超过 {IOS_SYSTEM_LOAD_STALE_AFTER_S:.0f} 秒未刷新；"
+                        "过期区间不生成平均功耗或能量结论。"
+                        if stale_system_load_observed
+                        else "采集期间没有连续、明确未接外部电源的放电区间；不生成平均功耗、能量或相关性结论。"
+                    )
+                ),
+                "consumption_covered_duration_s": consumption_covered_duration_s,
+                "consumption_coverage_pct": (
+                    consumption_covered_duration_s / session_duration_s * 100.0
+                    if session_duration_s > 0
+                    else 0.0
+                ),
+                "external_power_observed": external_power_observed,
+                "power_sources": sorted(
+                    {sample.power_source for sample in samples if sample.power_source}
+                ),
+                "observed_power_primary_source": (
+                    ios_system_load_source
+                    if system_load_samples
+                    else latest.power_source if latest is not None else None
+                ),
+                "system_load_available": bool(system_load_samples),
+                "system_load_sample_count": len(system_load_samples),
+                "system_load_latest_power_mw": (
+                    latest_system_load.power_mw if latest_system_load is not None else None
+                ),
+                "system_load_latest_elapsed_s": (
+                    latest_system_load.elapsed_s if latest_system_load is not None else None
+                ),
+                "system_load_latest_sample_age_s": latest_system_load_age_s,
+                "system_load_observed_average_power_mw": (
+                    system_load_observed_average_power_mw
+                ),
+                "system_load_observed_p95_power_mw": _percentile(
+                    system_load_powers,
+                    0.95,
+                ),
+                "system_load_consumption_average_power_mw": (
+                    system_load_consumption_average_power_mw
+                ),
+                "system_load_consumption_p95_power_mw": _percentile(
+                    system_load_consumption_powers,
+                    0.95,
+                ),
+                "system_load_consumption_energy_mwh": (
+                    system_load_consumption_energy_mwh
+                ),
+                "system_load_consumption_covered_duration_s": (
+                    system_load_consumption_covered_duration_s
+                ),
+                "observed_power_average_mw": observed_power_average_mw,
+                "observed_power_median_mw": (
+                    statistics.median(observed_powers) if observed_powers else None
+                ),
+                "observed_power_p95_mw": _percentile(observed_powers, 0.95),
+                "observed_power_energy_mwh": observed_power_energy_mwh,
+                "battery_flow_average_power_mw": battery_flow_average_power_mw,
+                "battery_flow_median_power_mw": (
+                    statistics.median(battery_flow_powers) if battery_flow_powers else None
+                ),
+                "battery_flow_p95_power_mw": _percentile(battery_flow_powers, 0.95),
+                "battery_flow_energy_mwh": battery_flow_energy_mwh,
+                "battery_flow_charge_mah": battery_flow_charge_mah,
+                "battery_flow_average_current_ma": battery_flow_average_current_ma,
+                "covered_duration_s": telemetry_covered_duration_s,
                 "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
                 "average_collector_cpu_pct": statistics.fmean(
                     [
@@ -1162,14 +2006,21 @@ class LiveTelemetryReader:
                 )
                 if any(sample.collector_cpu_pct is not None for sample in samples)
                 else None,
-                "energy_mwh": _integrate_energy(samples, max_gap),
             },
             "series": [
                 {
                     "elapsed_s": sample.elapsed_s,
+                    "uptime_s": sample.uptime_s,
                     "power_mw": sample.power_mw,
+                    "battery_flow_power_mw": (
+                        sample.current_ma * sample.voltage_mv / 1000.0
+                    ),
                     "direction": sample.direction,
+                    "power_valid_for_consumption": is_consumption_power_sample(sample),
+                    "external_power": sample.external_power,
+                    "power_source": sample.power_source,
                     "current_ma": sample.current_ma,
+                    "signed_current_ma": sample.signed_current_ma,
                     "voltage_mv": sample.voltage_mv,
                     "cpu_pct": sample.cpu_pct,
                     "cluster_cpu_pct": dict(sample.cluster_cpu_pct),
@@ -1179,6 +2030,15 @@ class LiveTelemetryReader:
                     "gpu_load_pct": sample.gpu_load_pct,
                     "memory_frequency_mhz": sample.memory_frequency_mhz,
                     "power_sample_age_s": sample.power_sample_age_s,
+                    "power_sample_stale": (
+                        sample.power_source == ios_system_load_source
+                        and not is_power_sample_fresh_for_consumption(sample)
+                    ),
+                    "collector_cpu_pct": sample.collector_cpu_pct,
+                    "report_break_before": bool(
+                        id(sample) in displayed_break_before_ids
+                        or getattr(sample, "_report_break_before", False)
+                    ),
                 }
                 for sample in displayed
             ],
@@ -2384,10 +3244,15 @@ class DashboardManager:
             ),
             None,
         )
-        if paired is None or str(paired.get("wireless_ready") or "").lower() != "true":
+        paired_remote_ready = bool(paired) and str(
+            paired.get("remote_xpc_ready")
+            if "remote_xpc_ready" in paired
+            else paired.get("wireless_ready")
+        ).lower() == "true"
+        if paired is None or not paired_remote_ready:
             raise RuntimeError(
                 refreshed_error
-                or "RemotePairing completed, but the iPhone wireless endpoint failed validation"
+                or "RemotePairing completed, but the iPhone RemoteXPC endpoint failed validation"
             )
         result["device"] = paired
         result["devices"] = refreshed_devices
@@ -2437,6 +3302,31 @@ class DashboardManager:
         test_mode = str(payload.get("test_mode") or "power").strip().lower()
         if test_mode not in {"power", "performance"}:
             raise ValueError("test mode must be power or performance")
+        require_unplugged = bool(payload.get("require_unplugged", True))
+        if platform == "ios":
+            remote_xpc_ready = str(
+                selected.get("remote_xpc_ready")
+                if "remote_xpc_ready" in selected
+                else selected.get("wireless_ready")
+            ).strip().lower() == "true"
+            unplug_ready = str(
+                selected.get("unplug_ready")
+                if "unplug_ready" in selected
+                else selected.get("wireless_ready")
+            ).strip().lower() == "true"
+            if not remote_xpc_ready:
+                raise ValueError(
+                    "iOS 正式录制需要当前可达的 RemotePairing RemoteXPC 端点。请保持 USB 连接并解锁，"
+                    "先完成配对；性能或允许外供的测试可使用当前可达端点。"
+                )
+            if require_unplugged and not unplug_ready:
+                endpoint_scope = str(selected.get("endpoint_scope") or "unknown")
+                raise ValueError(
+                    "当前 iOS RemotePairing 端点尚未证明拔掉 USB 后仍可达"
+                    f"（链路范围：{endpoint_scope}）。169.254/16 或 IPv6 link-local 可能来自 USB-NCM，"
+                    "不能作为断电功耗测试的无线就绪证据。请拔掉 USB 后刷新设备；只有非链路本地 LAN "
+                    "端点仍在线时才能开始，或明确关闭“要求断开外部供电”。"
+                )
         capture_preset = str(payload.get("capture_preset") or "auto").strip().lower()
         if capture_preset not in set(capture_preset_names()):
             raise ValueError("unknown capture preset")
@@ -2464,16 +3354,28 @@ class DashboardManager:
                 "HarmonyOS high-performance mode requires a HarmonyOS performance test"
             )
 
+        minimum_duration = (
+            4
+            if platform == "harmony" and capture_preset == "harmony-smartperf"
+            else 8
+            if platform == "harmony"
+            else 2
+        )
         duration = _bounded_int(
             payload.get("duration"),
             "duration",
-            2,
+            minimum_duration,
             604800,
             DEFAULT_PERFORMANCE_UI_DURATION_S
             if test_mode == "performance"
             else DEFAULT_UI_DURATION_S,
         )
-        interval = _bounded_float(payload.get("interval"), "interval", 0.2, 60.0, 1.0)
+        default_interval = 5.0 if platform == "ios" and test_mode == "power" else 1.0
+        interval = _bounded_float(
+            payload.get("interval"), "interval", 0.2, 60.0, default_interval
+        )
+        if platform == "harmony" and capture_preset == "harmony-smartperf":
+            interval = 1.0
         checkpoint = _bounded_float(
             payload.get("checkpoint_interval"),
             "checkpoint interval",
@@ -2502,12 +3404,18 @@ class DashboardManager:
             1800.0,
             30.0,
         )
-        thermal_interval = _bounded_float(
-            payload.get("thermal_interval"),
-            "thermal interval",
-            2.0,
-            600.0,
-            10.0,
+        thermal_interval = (
+            5.0
+            if platform == "ios"
+            else 1.0
+            if platform == "harmony" and capture_preset == "harmony-smartperf"
+            else _bounded_float(
+                payload.get("thermal_interval"),
+                "thermal interval",
+                2.0,
+                600.0,
+                10.0,
+            )
         )
         scheduler_interval = _bounded_float(
             payload.get("scheduler_interval"),
@@ -2519,9 +3427,11 @@ class DashboardManager:
         performance_interval = _bounded_float(
             payload.get("performance_interval"),
             "performance interval",
-            1.0,
+            5.0 if platform == "harmony" else 1.0,
             60.0,
-            2.0 if test_mode == "performance" else 10.0,
+            5.0
+            if platform == "harmony" and test_mode == "performance"
+            else 2.0 if test_mode == "performance" else 10.0,
         )
         current_unit = str(payload.get("current_unit") or "auto")
         if current_unit not in {"auto", "ma", "ua"}:
@@ -2536,7 +3446,10 @@ class DashboardManager:
 
         title = str(payload.get("title") or "").strip()[:200]
         package = str(payload.get("package") or "").strip()[:200]
-        if test_mode == "performance" and not package:
+        package_required = test_mode == "performance" and (
+            platform == "android" or capture_preset == "harmony-smartperf"
+        )
+        if package_required and not package:
             raise ValueError(
                 "Performance tests require a target game or application package"
             )
@@ -2546,7 +3459,6 @@ class DashboardManager:
         start_note = str(payload.get("start_note") or "").strip()[:500]
         gpu_path = str(payload.get("gpu_frequency_path") or "").strip()[:500]
         session_mode = test_mode == "power" and bool(payload.get("session_mode", True))
-        require_unplugged = bool(payload.get("require_unplugged", False))
         no_reset = bool(payload.get("no_reset", False))
         full_history = bool(payload.get("full_history", False))
         system_monitor = bool(payload.get("system_monitor", True))
@@ -2633,6 +3545,8 @@ class DashboardManager:
             command.append("--session-mode")
         if require_unplugged:
             command.append("--require-unplugged")
+        else:
+            command.append("--allow-external-power")
         if no_reset:
             command.append("--no-reset")
         if full_history:
@@ -2752,6 +3666,305 @@ class DashboardManager:
             return None
         return candidate if candidate.exists() and candidate.is_file() else None
 
+    def range_summary(self, payload: Dict[str, object]) -> Dict[str, object]:
+        requested_run = str(payload.get("run_name") or "").strip()
+        excluded_ranges: List[tuple[float, float]] = []
+        if requested_run:
+            run_dir = self._resolve_run_dir(payload)
+            metadata = _read_json(run_dir / "metadata.json")
+            excluded_ranges = load_report_excluded_ranges(run_dir)
+            source_path = run_dir / REPORT_SOURCE_SAMPLES_FILENAME
+            if not source_path.exists():
+                source_path = run_dir / "samples.csv"
+            samples = read_samples_csv(source_path)
+            contexts = load_contexts(run_dir)
+            run_name = run_dir.name
+        else:
+            with self._lock:
+                active = self.active
+            if active is None:
+                raise RuntimeError("No active recording is available for range analysis")
+            with active.reader._lock:
+                active.reader.refresh()
+                samples, _ = active.reader._converted_samples()
+                context_map = {
+                    (float(item.uptime_s), str(item.source or "")): item
+                    for item in [
+                        *active.reader.stream_contexts,
+                        *active.reader.contexts,
+                    ]
+                }
+                contexts = sorted(
+                    context_map.values(),
+                    key=lambda item: float(item.uptime_s),
+                )
+                metadata = dict(active.reader.metadata)
+            run_name = active.output_dir.name
+
+        visible_samples = [
+            sample
+            for sample in samples
+            if not any(start <= sample.uptime_s <= end for start, end in excluded_ranges)
+        ]
+        if len(visible_samples) < 1:
+            raise RuntimeError("Run does not contain range-analyzable samples")
+        report_edits = metadata.get("report_edits", {})
+        report_edits = report_edits if isinstance(report_edits, dict) else {}
+        origin_uptime_s = _number(
+            report_edits.get("time_origin_uptime_s"),
+            float(visible_samples[0].uptime_s),
+        )
+        try:
+            if payload.get("start_uptime_s") is not None:
+                start_uptime_s = float(payload.get("start_uptime_s"))
+                end_uptime_s = float(payload.get("end_uptime_s"))
+            else:
+                start_uptime_s = origin_uptime_s + float(payload.get("start_elapsed_s"))
+                end_uptime_s = origin_uptime_s + float(payload.get("end_elapsed_s"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Range boundaries must be numbers") from exc
+        if not math.isfinite(start_uptime_s) or not math.isfinite(end_uptime_s):
+            raise ValueError("Range boundaries must be finite")
+        if end_uptime_s <= start_uptime_s:
+            raise ValueError("Range end must be greater than range start")
+
+        session_start = float(visible_samples[0].uptime_s)
+        session_end = float(visible_samples[-1].uptime_s)
+        start_uptime_s = max(session_start, start_uptime_s)
+        end_uptime_s = min(session_end, end_uptime_s)
+        if end_uptime_s <= start_uptime_s:
+            raise ValueError("Selected range does not overlap the recorded session")
+
+        sample_interval_s = max(0.05, _number(metadata.get("sample_interval_s"), 1.0))
+        max_gap_s = max(sample_interval_s * 3.0, sample_interval_s + 2.0)
+        metrics: Dict[str, Dict[str, object]] = {}
+
+        def add_sample_metric(
+            keys: Sequence[str],
+            extractor: Callable[[Sample], object],
+        ) -> None:
+            result = _range_numeric_statistics(
+                visible_samples,
+                extractor,
+                start_uptime_s,
+                end_uptime_s,
+                max_gap_s,
+                excluded_ranges,
+            )
+            if result is None:
+                return
+            for key in keys:
+                metrics[key] = dict(result)
+
+        ios_system_load_source = "ios_power_telemetry_system_load"
+        system_load_observed = any(
+            sample.power_source == ios_system_load_source for sample in visible_samples
+        )
+        add_sample_metric(
+            ("power_mw",),
+            lambda sample: (
+                sample.power_mw
+                if not system_load_observed
+                or sample.power_source == ios_system_load_source
+                else None
+            ),
+        )
+        add_sample_metric(
+            ("battery_flow_mw", "battery-flow-power"),
+            lambda sample: (
+                sample.current_ma * sample.voltage_mv / 1000.0
+                if isinstance(sample.current_ma, (int, float))
+                and isinstance(sample.voltage_mv, (int, float))
+                else None
+            ),
+        )
+        add_sample_metric(("current_ma",), lambda sample: sample.current_ma)
+        add_sample_metric(("voltage_mv",), lambda sample: sample.voltage_mv)
+        add_sample_metric(("cpu_pct",), lambda sample: sample.cpu_pct)
+        add_sample_metric(("gpu_load_pct",), lambda sample: sample.gpu_load_pct)
+        add_sample_metric(
+            ("gpu_frequency_mhz",),
+            lambda sample: sample.gpu_frequency_mhz,
+        )
+        add_sample_metric(
+            ("memory_frequency_mhz",),
+            lambda sample: sample.memory_frequency_mhz,
+        )
+        add_sample_metric(
+            ("battery_temperature_c", "temperature_c"),
+            lambda sample: sample.battery_temperature_c,
+        )
+        frequency_keys = sorted(
+            {key for sample in visible_samples for key in sample.frequencies_mhz}
+        )
+        for frequency_key in frequency_keys:
+            add_sample_metric(
+                (
+                    f"cpu_frequency:{frequency_key}",
+                    f"cpu-frequency-{frequency_key}",
+                ),
+                lambda sample, key=frequency_key: sample.frequencies_mhz.get(key),
+            )
+
+        selected_contexts = [
+            item
+            for item in contexts
+            if start_uptime_s <= float(item.uptime_s) <= end_uptime_s
+            and not any(start <= item.uptime_s <= end for start, end in excluded_ranges)
+        ]
+        for previous, current in zip(selected_contexts, selected_contexts[1:]):
+            if _range_crosses_exclusion(
+                float(previous.uptime_s),
+                float(current.uptime_s),
+                excluded_ranges,
+            ):
+                current.performance = {
+                    **current.performance,
+                    "report_break_before": True,
+                }
+                setattr(current, "_report_break_before", True)
+        performance = analyze_performance_contexts(selected_contexts, metadata)
+
+        def add_scalar_metric(
+            keys: Sequence[str],
+            value: object,
+            *,
+            sample_count: object = 0,
+            calculation: str = "range_recomputed",
+            minimum: object = None,
+            maximum: object = None,
+        ) -> None:
+            result = _range_scalar_statistics(
+                value,
+                sample_count=sample_count,
+                calculation=calculation,
+            )
+            if result is None:
+                return
+            if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
+                result["minimum"] = float(minimum)
+            if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
+                result["maximum"] = float(maximum)
+            for key in keys:
+                metrics[key] = dict(result)
+
+        frame_sample_count = performance.get("frame_sample_count", 0)
+        add_scalar_metric(
+            ("frame_rate_fps",),
+            performance.get("sampled_frame_rate_fps"),
+            sample_count=frame_sample_count,
+            calculation="frame_rate_recomputed",
+            minimum=performance.get("minimum_sampled_frame_rate_fps"),
+        )
+        add_scalar_metric(
+            ("one_percent_low_fps", "frame_rate_fps-overlay"),
+            performance.get("one_percent_low_fps"),
+            sample_count=frame_sample_count,
+            calculation="one_percent_low_recomputed",
+        )
+        add_scalar_metric(
+            ("frame_time_p95_ms", "frame-time-p95"),
+            performance.get("frame_metric_p95_ms"),
+            sample_count=frame_sample_count,
+            calculation="frame_quantile_recomputed",
+        )
+        add_scalar_metric(
+            ("frame_time_p99_ms", "frame-time-p99"),
+            performance.get("frame_metric_p99_ms"),
+            sample_count=frame_sample_count,
+            calculation="frame_quantile_recomputed",
+        )
+        add_scalar_metric(
+            ("frame_issue_pct", "frame-issue"),
+            performance.get("frame_issue_pct"),
+            sample_count=frame_sample_count,
+            calculation="frame_issue_ratio_recomputed",
+        )
+
+        refresh_rows = performance.get("refresh_residency", [])
+        refresh_rows = refresh_rows if isinstance(refresh_rows, list) else []
+        refresh_weights = [
+            (
+                float(row.get("refresh_rate_hz")),
+                float(row.get("estimated_duration_s")),
+            )
+            for row in refresh_rows
+            if isinstance(row, dict)
+            and isinstance(row.get("refresh_rate_hz"), (int, float))
+            and isinstance(row.get("estimated_duration_s"), (int, float))
+            and float(row.get("estimated_duration_s")) > 0
+        ]
+        total_refresh_duration = sum(duration for _, duration in refresh_weights)
+        if total_refresh_duration > 0:
+            refresh_rates = [rate for rate, _ in refresh_weights]
+            refresh_average = sum(
+                rate * duration for rate, duration in refresh_weights
+            ) / total_refresh_duration
+            refresh_result = {
+                "average": refresh_average,
+                "minimum": min(refresh_rates),
+                "maximum": max(refresh_rates),
+                "sample_count": len(refresh_weights),
+                "covered_duration_s": total_refresh_duration,
+                "calculation": "refresh_residency_weighted",
+            }
+            metrics["refresh_rate_hz"] = refresh_result
+
+        frame_flow = performance.get("frame_flow", {})
+        frame_flow = frame_flow if isinstance(frame_flow, dict) else {}
+        stages = frame_flow.get("stages", [])
+        stages = stages if isinstance(stages, list) else []
+        for index, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                continue
+            stage_key = str(stage.get("key") or index)
+            timeline = stage.get("timeline", [])
+            timeline = timeline if isinstance(timeline, list) else []
+            values = []
+            for row in timeline:
+                if not isinstance(row, dict):
+                    continue
+                raw_value = next(
+                    (
+                        row.get(key)
+                        for key in ("value", "frame_rate_fps", "duration_ms", "latency_ms")
+                        if isinstance(row.get(key), (int, float))
+                    ),
+                    None,
+                )
+                if isinstance(raw_value, (int, float)) and math.isfinite(float(raw_value)):
+                    values.append(float(raw_value))
+            if not values:
+                continue
+            stage_result = {
+                "average": statistics.fmean(values),
+                "minimum": min(values),
+                "maximum": max(values),
+                "sample_count": len(values),
+                "covered_duration_s": None,
+                "calculation": "frame_stage_full_resolution",
+            }
+            metrics[f"frame_stage:{stage_key}"] = dict(stage_result)
+            metrics[f"frame-flow-{stage_key}-series"] = dict(stage_result)
+
+        selected_sample_count = sum(
+            1
+            for sample in visible_samples
+            if start_uptime_s <= sample.uptime_s <= end_uptime_s
+        )
+        return {
+            "run_name": run_name,
+            "start_elapsed_s": start_uptime_s - origin_uptime_s,
+            "end_elapsed_s": end_uptime_s - origin_uptime_s,
+            "start_uptime_s": start_uptime_s,
+            "end_uptime_s": end_uptime_s,
+            "duration_s": end_uptime_s - start_uptime_s,
+            "sample_count": selected_sample_count,
+            "context_sample_count": len(selected_contexts),
+            "full_resolution": True,
+            "metrics": metrics,
+        }
+
     def regenerate_run(self, payload: Dict[str, object]) -> Dict[str, object]:
         run_dir = self._resolve_run_dir(payload)
         self._ensure_run_idle(run_dir)
@@ -2782,23 +3995,33 @@ class DashboardManager:
         samples = read_samples_csv(run_dir / "samples.csv")
         if len(samples) < 2:
             raise RuntimeError("Run does not contain enough report samples")
+        existing_ranges = load_report_excluded_ranges(run_dir)
         deleted_sample_count = sum(
             1
             for sample in samples
             if start_uptime_s <= float(sample.uptime_s) <= end_uptime_s
         )
-        if deleted_sample_count == 0:
-            raise ValueError("Selected range does not contain any report samples")
+        contexts = load_contexts(run_dir)
+        deleted_context_count = sum(
+            1
+            for context in contexts
+            if start_uptime_s <= float(context.uptime_s) <= end_uptime_s
+            and not any(
+                excluded_start <= float(context.uptime_s) <= excluded_end
+                for excluded_start, excluded_end in existing_ranges
+            )
+        )
+        if deleted_sample_count == 0 and deleted_context_count == 0:
+            raise ValueError("Selected range does not contain report samples or frame/context data")
         if len(samples) - deleted_sample_count < 2:
             raise ValueError("Deleting this range would leave fewer than two samples")
 
         edits_path = run_dir / REPORT_EDITS_FILENAME
         previous_edits = edits_path.read_bytes() if edits_path.exists() else None
-        ranges = load_report_excluded_ranges(run_dir)
         try:
             edits = write_report_excluded_ranges(
                 run_dir,
-                [*ranges, (start_uptime_s, end_uptime_s)],
+                [*existing_ranges, (start_uptime_s, end_uptime_s)],
             )
             output = self._run_cli(
                 ["report", str(run_dir)],
@@ -2815,6 +4038,7 @@ class DashboardManager:
             "report_path": str(run_dir / "report.html"),
             "report_url": self.report_url(run_dir.name),
             "deleted_sample_count": deleted_sample_count,
+            "deleted_context_count": deleted_context_count,
             "excluded_range_count": len(edits.get("excluded_ranges", [])),
             "output": output,
         }
@@ -3670,7 +4894,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # Browser polling and tab navigation can cancel a response after the
+            # headers were sent. This is a normal client disconnect, not a server
+            # failure, and should not fill the long-running UI log with tracebacks.
+            return
 
     def _send_json(self, value: object, status: int = HTTPStatus.OK) -> None:
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -3777,6 +5007,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.import_run_log(payload)
             elif path == "/api/report":
                 result = self.server.manager.regenerate_run(payload)
+            elif path == "/api/range-summary":
+                result = self.server.manager.range_summary(payload)
             elif path == "/api/report/delete-range":
                 result = self.server.manager.delete_report_range(payload)
             elif path == "/api/recover":

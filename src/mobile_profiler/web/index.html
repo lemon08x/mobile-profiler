@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-27">
-  <script src="/app.js?v=platform-ui-27" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-33">
+  <script src="/app.js?v=platform-ui-33" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -55,7 +55,7 @@
             <span class="ios-pair-hint" id="ios-pair-hint" data-platforms="ios">USB 信任后创建 RemotePairing，再拔线采集</span>
             <button class="tcpip-button" id="enable-tcpip" data-platforms="android" type="button" title="对当前设备执行 adb tcpip 5555，并自动连接 Wi-Fi IP">无线 ADB</button>
             <button class="tcpip-button" id="enable-harmony-tcpip" data-platforms="harmony" type="button" title="对当前 USB 鸿蒙设备执行 hdc tmode port 8710，并自动连接 Wi-Fi IP">鸿蒙无线</button>
-            <button class="tcpip-button" id="pair-ios" data-platforms="ios" type="button" title="通过已信任的 USB iPhone 创建 RemotePairing 并缓存无线端点">创建 iOS 无线配对</button>
+            <button class="tcpip-button" id="pair-ios" data-platforms="ios" type="button" title="通过已信任的 USB iPhone 创建 RemotePairing；拔线能力需之后单独验证">创建 iOS RemotePairing</button>
             <button class="disconnect-button" id="disconnect-wireless" data-platforms="android" type="button" title="断开当前选择的无线 ADB 设备">断开无线</button>
           </form>
           <label class="device-picker" for="device-select">
@@ -124,6 +124,22 @@
             </div>
           </div>
 
+          <section class="home-start-panel panel" id="home-start-panel" aria-labelledby="home-start-title">
+            <div class="home-start-heading">
+              <div><small>QUICK START</small><h2 id="home-start-title">开始任务</h2><p>首页只保留开测前必须确认的项目；其他采集参数继续使用“测试配置”中的当前设置。</p></div>
+              <span id="home-start-requirements">功耗模式只需确认测试时间</span>
+            </div>
+            <div class="home-start-controls">
+              <div class="home-start-duration" id="home-duration-slot"></div>
+              <div class="home-start-package" id="home-package-slot"></div>
+              <div class="home-start-actions">
+                <button class="button ghost hidden" id="home-open-apps" type="button">扫描 / 选择游戏</button>
+                <div id="home-start-slot"></div>
+                <small>设备满足采集条件后即可直接开始</small>
+              </div>
+            </div>
+          </section>
+
           <div class="session-strip" id="session-strip">
             <div class="session-status">
               <span class="record-orbit" id="record-orbit"><i></i></span>
@@ -149,14 +165,14 @@
               <form id="record-form">
                 <section class="essential-config" aria-labelledby="essential-config-title">
                   <div class="essential-config-heading">
-                    <div><strong id="essential-config-title">必要设置</strong><small>确认时长和目标应用即可开始</small></div>
-                    <span>其余参数使用模式默认值</span>
+                    <div><strong id="essential-config-title">设备与场景条件</strong><small>亮度、设备性能模式等测试环境设置</small></div>
+                    <span>开始任务入口已移至首页</span>
                   </div>
-                  <div class="form-field">
-                    <label for="duration-input">时长</label>
-                    <div class="input-with-unit"><input id="duration-input" name="duration" type="number" min="2" max="604800" step="1" value="3720"><span>秒</span></div>
+                  <div class="form-field" id="duration-field">
+                    <label for="duration-input">测试时间</label>
+                    <div class="input-with-unit"><input id="duration-input" name="duration" form="record-form" type="number" min="2" max="604800" step="1" value="3720"><span>秒</span></div>
                   </div>
-                <div class="duration-presets" aria-label="时长快捷选项">
+                <div class="duration-presets" id="duration-presets" aria-label="测试时间快捷选项">
                   <button type="button" data-duration="60">1 分钟</button>
                   <button type="button" data-duration="900">15 分钟</button>
                   <button type="button" data-duration="1800">30 分钟</button>
@@ -164,9 +180,10 @@
                   <button type="button" data-duration="3600">1 小时</button>
                   <button type="button" data-duration="3720" class="active">1 小时 + 2 分钟</button>
                 </div>
+                <div id="config-package-slot">
                 <div class="form-field target-app-field">
                   <label id="package-input-label" for="package-input">重点应用包名 <span>可选</span></label>
-                  <input id="package-input" name="package" type="text" maxlength="200" placeholder="com.example.app">
+                  <input id="package-input" name="package" form="record-form" type="text" maxlength="200" placeholder="com.example.app">
                   <section class="app-picker" data-platforms="android" aria-labelledby="app-picker-title">
                     <div class="app-picker-heading">
                       <span><strong id="app-picker-title">从当前设备扫描</strong><small>读取 Android 可启动应用；选择后自动填写左侧目标包名</small></span>
@@ -184,6 +201,7 @@
                   </section>
                   <small class="field-hint" id="package-input-hint">功耗测试可留空；填写后会保留目标应用的资源与归因上下文。</small>
                 </div>
+                </div>
                   <section class="brightness-setting" id="brightness-setting" data-platforms="android" aria-labelledby="brightness-setting-title">
                     <div class="brightness-setting-heading">
                       <span><strong id="brightness-setting-title">设备亮度</strong><small>按 Android 数值档位固定测试亮度</small></span>
@@ -197,7 +215,7 @@
                     <small class="field-hint" id="brightness-hint" aria-live="polite">选择在线 Android 设备后读取最小值、最大值和最小调整间隔；应用时会切换为手动亮度。</small>
                   </section>
                   <label class="switch-row emphasis essential-option hidden" id="harmony-high-performance-row">
-                    <span><strong>设备高性能模式</strong><small>测试期间切换到 power-shell 602，结束或异常退出时恢复原模式</small></span>
+                    <span><strong>设备高性能模式</strong><small>测试期间切换到 power-shell 602；正常结束与可捕获异常时尽力恢复，强杀后请核验当前模式</small></span>
                     <input id="harmony-high-performance-input" type="checkbox"><i aria-hidden="true"></i>
                   </label>
                 </section>
@@ -217,6 +235,7 @@
                     <div class="form-field">
                       <label for="interval-input">采样周期</label>
                       <div class="input-with-unit"><input id="interval-input" name="interval" type="number" min="0.2" max="60" step="0.1" value="1"><span>秒</span></div>
+                      <small class="field-hint" id="interval-input-hint">默认 1 秒读取电流、CPU 与频率；Android 前台应用层时间戳仍独立按 0.5 秒采集。</small>
                     </div>
                     <div class="form-row">
                       <div class="form-field">
@@ -235,7 +254,7 @@
                         <option value="power-standard">功耗标准（核心数据）</option>
                         <option value="performance-standard">性能标准（核心数据）</option>
                         <option value="low-overhead">低干扰（最少动作）</option>
-                        <option value="harmony-smartperf">Harmony SmartPerf（完整原生项）</option>
+                        <option value="harmony-smartperf">Harmony SmartPerf（设备原生约 1 秒，FPS / GPU 增强）</option>
                       </select>
                       <small class="field-hint" id="capture-preset-hint">标准预设只保留有原始曲线或有效结论的项目，仍可逐项覆盖。</small>
                     </div>
@@ -246,7 +265,7 @@
                       </label>
                       <label class="switch-row emphasis">
                         <span><strong>要求断开外部供电</strong><small>检测到 AC / USB / 无线充电时拒绝采集</small></span>
-                        <input id="unplugged-input" name="require_unplugged" type="checkbox"><i aria-hidden="true"></i>
+                        <input id="unplugged-input" name="require_unplugged" type="checkbox" checked><i aria-hidden="true"></i>
                       </label>
                     </div>
                     <input id="system-monitor-input" name="system_monitor" type="checkbox" checked hidden aria-hidden="true">
@@ -280,7 +299,7 @@
                     </div>
                     <div class="form-row monitor-intervals">
                        <div class="form-field">
-                         <label for="thermal-interval-input">温度快照</label>
+                        <label id="thermal-interval-label" for="thermal-interval-input">温度快照</label>
                         <div class="input-with-unit"><input id="thermal-interval-input" type="number" min="2" max="600" value="10"><span>秒</span></div>
                       </div>
                        <div class="form-field" data-platforms="android harmony">
@@ -290,8 +309,8 @@
                     </div>
                     <div class="form-field" data-mode-only="performance" data-platforms="android harmony">
                       <label for="performance-interval-input">帧 / 窗口采样周期</label>
-                      <div class="input-with-unit"><input id="performance-interval-input" type="number" min="1" max="60" step="0.5" value="2"><span>秒</span></div>
-                      <small class="field-hint" id="performance-interval-hint">读取前台窗口上下文；检测到游戏 BLAST 层后以 0.5 秒节奏采集呈现时间戳。</small>
+                      <div class="input-with-unit"><input id="performance-interval-input" type="number" min="1" max="60" step="0.5" value="10"><span>秒</span></div>
+                      <small class="field-hint" id="performance-interval-hint">读取前台窗口上下文；检测到 Android 前台应用渲染层后以 0.5 秒节奏采集呈现时间戳。</small>
                     </div>
                     <div class="capture-feature-section">
                       <div class="capture-feature-heading">
@@ -303,19 +322,19 @@
                           <div class="capture-group-heading"><strong>原始时间序列</strong><small>默认只启用当前页面直接展示的数据</small></div>
                           <div class="capture-feature-grid">
                             <label class="capture-feature-card"><input type="checkbox" data-capture-feature="cpu_usage" checked><span class="feature-glyph">CPU</span><span class="feature-copy"><strong>CPU 利用率</strong><small>仅展示整机整体负载</small></span><em class="feature-impact low">低</em><i></i></label>
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="cpu_frequency" checked><span class="feature-glyph">GHz</span><span class="feature-copy"><strong>CPU 频率</strong><small>按核心所属频率策略展示</small></span><em class="feature-impact low">低</em><i></i></label>
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="gpu_metrics" checked><span class="feature-glyph">GPU</span><span class="feature-copy"><strong>GPU 指标</strong><small>频率、负载与渲染器</small></span><em class="feature-impact low">低</em><i></i></label>
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="memory_frequency"><span class="feature-glyph">DDR</span><span class="feature-copy"><strong>内存频率</strong><small>默认关闭；需可读 DMC 节点</small></span><em class="feature-impact low">低</em><i></i></label>
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="thermal" checked><span class="feature-glyph">°C</span><span class="feature-copy"><strong>温度 / 热限制</strong><small>温度曲线、热状态与降亮</small></span><em class="feature-impact low">低</em><i></i></label>
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="foreground_window" checked><span class="feature-glyph">WIN</span><span class="feature-copy"><strong>前台应用 / 窗口</strong><small>场景、刷新率、亮度与渲染层</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="cpu_frequency" checked><span class="feature-glyph">GHz</span><span class="feature-copy"><strong>CPU 频率</strong><small id="cpu-frequency-feature-hint">按核心所属频率策略展示</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="gpu_metrics" checked><span class="feature-glyph">GPU</span><span class="feature-copy"><strong>GPU 指标</strong><small id="gpu-feature-hint">频率、负载与渲染器</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="memory_frequency"><span class="feature-glyph">DDR</span><span class="feature-copy"><strong>内存频率</strong><small id="memory-frequency-feature-hint">默认关闭；需可读 DMC 节点</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="thermal" checked><span class="feature-glyph">°C</span><span class="feature-copy"><strong id="thermal-feature-label">温度 / 热限制</strong><small id="thermal-feature-hint">温度曲线、热状态与降亮</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="foreground_window" checked><span class="feature-glyph">WIN</span><span class="feature-copy"><strong id="foreground-window-feature-label">前台应用 / 窗口</strong><small id="foreground-window-feature-hint">场景、刷新率、亮度与渲染层</small></span><em class="feature-impact medium">中</em><i></i></label>
                             <label class="capture-feature-card" data-mode-only="power" data-platforms="android"><input type="checkbox" data-capture-feature="runtime_settings" checked><span class="feature-glyph">SET</span><span class="feature-copy"><strong>测试条件快照</strong><small>前后核对亮度、刷新率、网络等变化</small></span><em class="feature-impact medium">中</em><i></i></label>
                           </div>
                         </section>
                         <section class="capture-feature-group" data-mode-only="performance">
-                          <div class="capture-group-heading"><strong>帧表现</strong><small>性能模式默认开启有效帧链路</small></div>
+                          <div class="capture-group-heading"><strong>帧表现</strong><small id="frame-feature-group-hint">性能模式默认开启有效帧链路</small></div>
                           <div class="capture-feature-grid">
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="frame_rate"><span class="feature-glyph">FPS</span><span class="feature-copy"><strong>帧率 / 1% Low</strong><small>BLAST / gfxinfo 帧节奏</small></span><em class="feature-impact medium">中</em><i></i></label>
-                            <label class="capture-feature-card" data-platforms="android harmony"><input type="checkbox" data-capture-feature="frame_details"><span class="feature-glyph">P99</span><span class="feature-copy"><strong>详细帧时间戳</strong><small>渲染阶段、P99 与慢帧结论</small></span><em class="feature-impact high">高</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="frame_rate"><span class="feature-glyph">FPS</span><span class="feature-copy"><strong>帧率 / 1% Low</strong><small id="frame-rate-feature-hint">前台应用层 / gfxinfo 帧节奏</small></span><em class="feature-impact medium">中</em><i></i></label>
+                            <label class="capture-feature-card" data-platforms="android harmony"><input type="checkbox" data-capture-feature="frame_details"><span class="feature-glyph">P99</span><span class="feature-copy"><strong>详细帧时间戳</strong><small id="frame-details-feature-hint">framestats 阶段、P99 与慢帧结论</small></span><em class="feature-impact high">高</em><i></i></label>
                             <label class="capture-feature-card" data-platforms="harmony"><input type="checkbox" data-capture-feature="harmony_hitches"><span class="feature-glyph">HIT</span><span class="feature-copy"><strong>Harmony hitch</strong><small>默认关闭；仅补充累计计数</small></span><em class="feature-impact medium">中</em><i></i></label>
                             <label class="capture-feature-card" data-platforms="harmony"><input type="checkbox" data-capture-feature="touch_events"><span class="feature-glyph">TAP</span><span class="feature-copy"><strong>触控事件</strong><small>默认关闭；仅统计系统已分发事件</small></span><em class="feature-impact medium">中</em><i></i></label>
                           </div>
@@ -323,7 +342,7 @@
                         <section class="capture-feature-group">
                           <div class="capture-group-heading"><strong>专项诊断</strong><small>默认关闭 · 仅在明确问题假设下开启</small></div>
                           <div class="capture-feature-grid">
-                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="target_process"><span class="feature-glyph">APP</span><span class="feature-copy"><strong>目标应用资源</strong><small>默认关闭；暂无专属时间序列结论</small></span><em class="feature-impact low">低</em><i></i></label>
+                            <label class="capture-feature-card"><input type="checkbox" data-capture-feature="target_process"><span class="feature-glyph">APP</span><span class="feature-copy"><strong>目标应用资源</strong><small>默认关闭；额外枚举进程且暂无专属时间序列结论</small></span><em class="feature-impact high">高</em><i></i></label>
                             <label class="capture-feature-card"><input type="checkbox" data-capture-feature="process_snapshots"><span class="feature-glyph">PROC</span><span class="feature-copy"><strong>全系统进程</strong><small>后台竞争专项分析；轮询开销高</small></span><em class="feature-impact high">高</em><i></i></label>
                             <label class="capture-feature-card" data-platforms="android"><input type="checkbox" data-capture-feature="hot_threads"><span class="feature-glyph">THR</span><span class="feature-copy"><strong>热点线程</strong><small>卡顿后定位渲染、内核与 GC 线程</small></span><em class="feature-impact high">高</em><i></i></label>
                             <label class="capture-feature-card" data-platforms="android harmony"><input type="checkbox" data-capture-feature="scheduler"><span class="feature-glyph">SCH</span><span class="feature-copy"><strong>调度 / ADPF</strong><small>只提供调度状态上下文，默认关闭</small></span><em class="feature-impact high">高</em><i></i></label>
@@ -344,7 +363,7 @@
                   </div>
                 </details>
 
-                <button class="button primary start-button" id="start-record" type="submit">
+                <button class="button primary start-button" id="start-record" type="submit" form="record-form">
                   <span class="button-led"></span><span>开始功耗测试</span>
                 </button>
                 <p class="control-note" id="control-note">启动前建议先在“设备能力”页执行 Probe，确认 powered 为空且电流命令可用。</p>
@@ -353,7 +372,7 @@
 
             <div class="monitoring-stack">
               <div class="metric-grid legacy-live-summary" data-mode-only="power" aria-hidden="true">
-                <article class="metric-card power-card"><div class="metric-top"><span id="metric-power-label">电池放电功率</span><i id="metric-power-tag">BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">整机电池侧</small></article>
+                <article class="metric-card power-card"><div class="metric-top"><span id="metric-power-label">当前电池放电功率</span><i id="metric-power-tag">BATTERY</i></div><strong id="metric-power">--</strong><small id="metric-power-sub">当前样本 · 窗口均值待计算</small></article>
                 <article class="metric-card"><div class="metric-top"><span id="metric-current-label">放电电流</span><i id="metric-current-tag">CURRENT</i></div><strong id="metric-current">--</strong><small id="metric-current-sub">正幅值</small></article>
                 <article class="metric-card"><div class="metric-top"><span>CPU 总负载</span><i>CPU</i></div><strong id="metric-cpu">--</strong><small id="metric-cpu-sub">全核心</small></article>
                 <article class="metric-card" id="metric-memory-card"><div class="metric-top"><span id="metric-memory-label">内存频率</span><i id="metric-memory-tag">DMC</i></div><strong id="metric-memory">--</strong><small id="metric-memory-sub">DRAM / DMC / MIF</small></article>
@@ -394,6 +413,13 @@
                   <p><b id="live-resolution-source">数据来源：--</b><em id="live-resolution-boundary">该值不等同于游戏引擎内部渲染分辨率。</em></p>
                 </div>
                 <div class="live-timeline-note"><strong>CPU 频率口径：</strong><span>按核心所属的共享 policy 展示，例如 CPU0–3 · policy0；不代表每个核心具有独立频率时钟。</span></div>
+                <div class="live-range-panel" id="live-range-panel">
+                  <div class="live-range-toolbar">
+                    <div><strong>框选时间段</strong><span id="live-range-status">在任意图表中按住并横向拖动，查看该区间的样本均值、最小值与最大值。</span></div>
+                    <button id="live-range-clear" type="button" disabled>清除框选</button>
+                  </div>
+                  <div class="live-range-statistics hidden" id="live-range-statistics" aria-live="polite"></div>
+                </div>
                 <div class="live-timeline-wrap" id="chart-wrap">
                   <svg id="live-chart" viewBox="0 0 1000 320" preserveAspectRatio="none" role="img" aria-label="统一时间轴的实时遥测图表"></svg>
                   <div class="chart-empty" id="chart-empty"><span class="empty-wave" aria-hidden="true"></span><strong>等待遥测数据</strong><small>开始采集后，曲线将在这里实时更新</small></div>
@@ -443,9 +469,9 @@
                     <div><dt>温控状态</dt><dd id="resource-thermal">--</dd></div>
                     <div><dt id="resource-window-label">前台窗口</dt><dd id="resource-window">--</dd></div>
                     <div data-platforms="android harmony"><dt>显示 / 应用节奏</dt><dd id="resource-cadence">--</dd></div>
-                    <div data-platforms="ios"><dt>采集器 CPU 开销</dt><dd id="resource-ios-overhead">--</dd></div>
-                    <div data-platforms="ios"><dt>物理功耗样本年龄</dt><dd id="resource-ios-power-age">--</dd></div>
-                    <div><dt>整机功耗记录</dt><dd id="resource-whole-power">--</dd></div>
+                    <div data-platforms="ios"><dt>观察者相关 CPU（上界）</dt><dd id="resource-ios-overhead">--</dd></div>
+                    <div data-platforms="ios"><dt>SystemLoad 样本年龄</dt><dd id="resource-ios-power-age">--</dd></div>
+                    <div><dt>当前功率通道</dt><dd id="resource-whole-power">--</dd></div>
                   </dl>
                 </section>
               </div>
@@ -487,7 +513,7 @@
                   </div>
                 </section>
                 <p class="observability-note frame-flow-note" id="frame-flow-note"><strong>判定边界：</strong>应用提交速率、SurfaceFlinger / RenderService 呈现 FPS 与屏幕刷新率的语义不同，只有绑定当前目标应用且持续产生有效增量的来源会标记为主数据。</p>
-                <div class="pipeline-summary"><div><small>主要延迟阶段</small><strong id="render-pipeline-dominant">--</strong><span id="render-pipeline-dominant-detail">等待详细帧时间戳</span></div><div><small>整机功耗</small><strong id="performance-whole-power">--</strong><span>只记录，不做来源归因</span></div></div>
+                <div class="pipeline-summary"><div><small>主要延迟阶段</small><strong id="render-pipeline-dominant">--</strong><span id="render-pipeline-dominant-detail">等待详细帧时间戳</span></div><div><small>测试窗口平均电池侧功率</small><strong id="performance-whole-power">--</strong><span>与顶部当前值同源 · 有效区间平均</span></div></div>
                 <div class="pipeline-grid">
                   <div><h3>阶段 P95</h3><div class="pipeline-list" id="render-pipeline-stage-list"><div class="empty-row">等待详细 framestats</div></div></div>
                   <div><h3>渲染 / 合成热点线程</h3><div class="pipeline-list" id="render-thread-list"><div class="empty-row">等待线程快照</div></div></div>

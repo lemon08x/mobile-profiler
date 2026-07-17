@@ -32,6 +32,7 @@ from .collector import (
     collect_system_snapshot,
     collect_text,
     collect_thermal_snapshot,
+    compact_android_performance_probe_for_metadata,
     detect_gpu_source,
     parse_context_samples,
     parse_android_runtime_settings,
@@ -43,6 +44,7 @@ from .collector import (
 )
 from .ios import (
     DEFAULT_IOS_PYTHON,
+    _endpoint_scope,
     collect_ios_session,
     ios_device_id,
     ios_udid,
@@ -53,9 +55,11 @@ from .ios import (
 )
 from .harmony import (
     DEFAULT_HDC,
+    HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
     collect_harmony_session,
     collect_harmony_smartperf_session,
     harmony_device_id,
+    harmony_native_cpu_frequency_schedule_s,
     harmony_target,
     list_harmony_devices,
     probe_harmony_device,
@@ -207,9 +211,37 @@ def print_run_summary(output_dir: Path, analysis: Dict[str, object], report_path
     print(f"Output: {output_dir.resolve()}")
     print(f"Report: {report_path.resolve()}")
     print(f"Duration: {float(summary.get('duration_s') or 0.0):.1f}s")
-    print(f"Average current: {float(summary.get('average_current_ma') or 0.0):.1f} mA (positive magnitude)")
-    print(f"Average power: {float(summary.get('average_power_mw') or 0.0) / 1000.0:.3f} W")
-    print(f"P95 power: {float(summary.get('p95_power_mw') or 0.0) / 1000.0:.3f} W")
+    if summary.get("power_valid_for_consumption") is True:
+        average_current = summary.get("average_current_ma")
+        average_power = summary.get("average_power_mw")
+        p95_power = summary.get("p95_power_mw")
+        if isinstance(average_current, (int, float)):
+            print(f"Average current: {float(average_current):.1f} mA (positive magnitude)")
+        if isinstance(average_power, (int, float)):
+            print(f"Average power: {float(average_power) / 1000.0:.3f} W")
+        if isinstance(p95_power, (int, float)):
+            print(f"P95 power: {float(p95_power) / 1000.0:.3f} W")
+    else:
+        print("Consumption power: unavailable (charging, external power, or unknown supply state)")
+        observed_power = summary.get("observed_power_average_mw")
+        if isinstance(observed_power, (int, float)):
+            sources = {
+                str(item)
+                for item in summary.get("observed_power_sources", [])
+                if str(item).strip()
+            }
+            label = (
+                "Observed iOS SystemLoad"
+                if sources == {"ios_power_telemetry_system_load"}
+                else "Observed raw power channel"
+            )
+            print(f"{label}: {float(observed_power) / 1000.0:.3f} W (raw only)")
+        battery_flow = summary.get("battery_flow_average_power_mw")
+        if isinstance(battery_flow, (int, float)):
+            print(
+                f"Battery-flow magnitude: {float(battery_flow) / 1000.0:.3f} W "
+                "(not device consumption)"
+            )
     cpu = analysis.get("cpu", {})
     if isinstance(cpu, dict) and isinstance(cpu.get("modeled_power_mw"), (int, float)):
         print(f"Modeled CPU power: {float(cpu['modeled_power_mw']):.1f} mW")
@@ -270,6 +302,31 @@ def _filter_report_observations(
     ]
 
 
+def _filter_report_contexts(
+    contexts: Sequence[ContextSample],
+    ranges: Sequence[tuple[float, float]],
+) -> list[ContextSample]:
+    filtered = list(_filter_report_observations(contexts, ranges))
+    previous: Optional[ContextSample] = None
+    result: list[ContextSample] = []
+    for context in filtered:
+        crosses_excluded = bool(
+            previous is not None
+            and any(
+                previous.uptime_s <= start and context.uptime_s >= end
+                for start, end in ranges
+            )
+        )
+        if crosses_excluded:
+            performance = dict(context.performance)
+            performance["report_break_before"] = True
+            context = replace(context, performance=performance)
+            setattr(context, "_report_break_before", True)
+        result.append(context)
+        previous = context
+    return result
+
+
 def _filter_report_events(
     events: Sequence[ExternalEvent],
     ranges: Sequence[tuple[float, float]],
@@ -314,6 +371,45 @@ def _filter_report_events(
     return filtered
 
 
+def _migrate_legacy_ios_connection_metadata(
+    metadata: Dict[str, object],
+) -> Optional[str]:
+    """Reclassify legacy link-local RemoteXPC metadata without claiming Wi-Fi."""
+    if str(metadata.get("platform") or "").strip().lower() != "ios":
+        return None
+    connection = metadata.get("connection")
+    if not isinstance(connection, dict):
+        return None
+    if str(connection.get("type") or "").strip().lower() != "wireless":
+        return None
+    host = str(connection.get("host") or "").strip()
+    if _endpoint_scope(host) != "link-local":
+        return None
+    migrated = dict(connection)
+    migrated.update(
+        {
+            "type": "remote-pairing",
+            "remote_xpc_ready": True,
+            "unplug_ready": False,
+            "wireless_ready": False,
+            "wireless_lan_candidate": False,
+            "endpoint_scope": "link-local",
+            "legacy_type": "wireless",
+        }
+    )
+    metadata["connection"] = migrated
+    migrations = metadata.get("metadata_migrations")
+    migrations = list(migrations) if isinstance(migrations, list) else []
+    entry = "legacy_ios_link_local_connection_reclassified"
+    if entry not in migrations:
+        migrations.append(entry)
+    metadata["metadata_migrations"] = migrations
+    return (
+        "历史 iOS 报告中的 169.254/16 端点已从“无线”重分类为链路本地 RemotePairing；"
+        "该记录不能证明拔掉 USB 后仍可连接。"
+    )
+
+
 def finalize_run(
     output_dir: Path,
     extra_warnings: Sequence[str] = (),
@@ -338,6 +434,9 @@ def finalize_run(
 
     samples_path = output_dir / "samples.csv"
     conversion_warnings: list[str] = []
+    connection_migration_warning = _migrate_legacy_ios_connection_metadata(metadata)
+    if connection_migration_warning:
+        conversion_warnings.append(connection_migration_warning)
     battery_start = metadata.get("battery_start", {})
     platform = str(metadata.get("platform") or "android")
     stored_battery_end = metadata.get("battery_end")
@@ -379,6 +478,11 @@ def finalize_run(
             if isinstance(battery_start, dict)
             else "unknown",
             max_cpu_gap_s=max(sample_interval * 3.0, sample_interval + 2.0),
+            external_power=(
+                bool(battery_start.get("powered"))
+                if isinstance(battery_start, dict) and "powered" in battery_start
+                else None
+            ),
         )
         conversion_warnings.extend(converted)
     elif (output_dir / REPORT_SOURCE_SAMPLES_FILENAME).exists():
@@ -429,7 +533,7 @@ def finalize_run(
                 )
             )
             previous_sample = sample
-        contexts = list(_filter_report_observations(contexts, report_excluded_ranges))
+        contexts = _filter_report_contexts(contexts, report_excluded_ranges)
         events = _filter_report_events(events, report_excluded_ranges)
         system_snapshots = list(
             _filter_report_observations(system_snapshots, report_excluded_ranges)
@@ -674,7 +778,10 @@ def run_probe(args: argparse.Namespace) -> int:
         "perfetto_android_power": "android.power" in perfetto.stdout,
         "perfetto_sysfs_power": "linux.sysfs_power" in perfetto.stdout,
         "powerstats_dump_available": bool(powerstats.stdout.strip()),
-        "foreground_package": collect_foreground_package(args.adb, device),
+        "foreground_package": android_performance.get("foreground_package"),
+        "last_known_foreground_package": android_performance.get(
+            "last_known_foreground_package"
+        ),
         "performance": android_performance.get("performance", {}),
         "touch": android_performance.get("touch", {}),
         "capabilities": capabilities,
@@ -759,7 +866,12 @@ def run_probe(args: argparse.Namespace) -> int:
         f"{info['gpu_memory_snapshot_available']} "
         f"(total={info.get('gpu_memory_total_bytes')})"
     )
-    print(f"Foreground package: {info['foreground_package'] or 'unknown'}")
+    foreground_text = info.get("foreground_package") or "none"
+    if not info.get("foreground_package") and info.get("last_known_foreground_package"):
+        foreground_text += (
+            f" (screen inactive; last known {info['last_known_foreground_package']})"
+        )
+    print(f"Foreground package: {foreground_text}")
     performance = info.get("performance", {})
     performance = performance if isinstance(performance, dict) else {}
     supported_refresh = performance.get("supported_refresh_rates_hz", [])
@@ -801,6 +913,16 @@ def run_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ios_device_flag(
+    device: Dict[str, object],
+    name: str,
+    fallback: Optional[str] = None,
+) -> bool:
+    if name in device:
+        return str(device.get(name) or "").strip().lower() == "true"
+    return bool(fallback) and str(device.get(fallback) or "").strip().lower() == "true"
+
+
 def run_ios_pair(args: argparse.Namespace) -> int:
     try:
         result = pair_ios_device(args.device, args.ios_python, args.timeout)
@@ -814,10 +936,19 @@ def run_ios_pair(args: argparse.Namespace) -> int:
         endpoint = endpoint if isinstance(endpoint, dict) else {}
         print(f"RemotePairing ready: {result.get('serial')}")
         if endpoint.get("host") and endpoint.get("port"):
-            print(f"Wi-Fi endpoint: {endpoint['host']}:{endpoint['port']}")
-            print("The USB cable can now be removed.")
+            print(f"RemoteXPC endpoint: {endpoint['host']}:{endpoint['port']}")
+            if endpoint.get("wireless_lan_candidate"):
+                print(
+                    "Disconnect USB, refresh device discovery, and verify that the endpoint remains "
+                    "reachable before starting an unplugged power test."
+                )
+            else:
+                print(
+                    "The endpoint is link-local or otherwise not a verified LAN path. It may depend "
+                    "on USB networking and must not be treated as unplug-ready."
+                )
         else:
-            print("Pairing succeeded, but no Wi-Fi endpoint was discovered; keep the phone unlocked and retry.")
+            print("Pairing succeeded, but no RemoteXPC endpoint was discovered; keep the phone unlocked and retry.")
     return 0
 
 
@@ -831,6 +962,32 @@ def run_ios_record(args: argparse.Namespace) -> int:
         return 2
     try:
         selected = select_ios_device(args.device, args.ios_python)
+        remote_xpc_ready = _ios_device_flag(
+            selected, "remote_xpc_ready", "wireless_ready"
+        )
+        unplug_ready = _ios_device_flag(selected, "unplug_ready", "wireless_ready")
+        if (
+            not remote_xpc_ready
+            or not str(selected.get("host") or "").strip()
+            or not str(selected.get("port") or "").strip()
+        ):
+            print(
+                "ERROR: iOS recording requires a currently reachable RemotePairing RemoteXPC endpoint. "
+                "Keep the iPhone unlocked and run ios-pair while USB is connected.",
+                file=sys.stderr,
+            )
+            return 6
+        if args.require_unplugged and not unplug_ready:
+            scope = str(selected.get("endpoint_scope") or "unknown")
+            print(
+                "ERROR: the current iOS RemotePairing endpoint is not verified after USB removal "
+                f"(scope={scope}). A link-local 169.254/16 or IPv6 link-local endpoint may be USB-NCM "
+                "and cannot be used as proof of an unplugged power-test path. Disconnect USB, refresh "
+                "discovery, and require a still-reachable non-link-local LAN endpoint, or explicitly "
+                "use --allow-external-power.",
+                file=sys.stderr,
+            )
+            return 6
         probe = probe_ios_device(selected["serial"], args.ios_python)
     except (RuntimeError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -846,8 +1003,10 @@ def run_ios_record(args: argparse.Namespace) -> int:
     connection = connection if isinstance(connection, dict) else {}
     target_package = args.package if args.package else None
     warnings: list[str] = [
-        "iOS whole-device PowerTelemetry is physically measured but typically refreshes about every 20 seconds; "
-        "one-second CPU/GPU and power-score rows are diagnostic evidence, not one-second physical power rails.",
+        "iOS PowerTelemetryData.SystemLoad is a whole-device raw telemetry channel that typically refreshes "
+        "about every 20 seconds; under external power it can track SystemPowerIn. It is neither battery I×V "
+        "nor an independently measured hardware rail, and one-second CPU/GPU or power-score rows must not be "
+        "treated as one-second SystemLoad measurements.",
         "iOS DVT sysmond/DTServiceHub/remotepairingdeviced add measurable collection overhead; "
         "collector_cpu_pct is retained in samples and profiler processes are tagged in system snapshots.",
     ]
@@ -858,6 +1017,17 @@ def run_ios_record(args: argparse.Namespace) -> int:
         )
         if args.require_unplugged:
             print("ERROR: iPhone is externally powered; unplug it before recording", file=sys.stderr)
+            return 4
+    elif battery_start.get("external_power_state_available") is not True:
+        warnings.append(
+            "iOS DiagnosticsService did not expose ExternalConnected, so power samples remain raw telemetry "
+            "until an explicit external-power state is available."
+        )
+        if args.require_unplugged:
+            print(
+                "ERROR: iPhone external-power state is unavailable; cannot verify an unplugged power test",
+                file=sys.stderr,
+            )
             return 4
 
     gpu_source = probe.get("gpu_source")
@@ -1046,6 +1216,15 @@ def run_harmony_record(args: argparse.Namespace) -> int:
     policies = [CpuPolicy(**item) for item in policy_rows if isinstance(item, dict)]
     frequencies = probe.get("cpu_frequencies_mhz")
     frequencies = frequencies if isinstance(frequencies, dict) else {}
+    initial_frequencies_mhz = (
+        {
+            str(name): float(value)
+            for name, value in frequencies.items()
+            if isinstance(value, (int, float))
+        }
+        if feature("cpu_frequency")
+        else {}
+    )
     foreground = probe.get("foreground_package")
     smartperf_requested = capture_configuration.get("preset") == "harmony-smartperf"
     target_package = args.package if args.session_mode else (args.package or foreground)
@@ -1063,8 +1242,19 @@ def run_harmony_record(args: argparse.Namespace) -> int:
     smartperf_probe = smartperf_probe if isinstance(smartperf_probe, dict) else {}
     smartperf_available = bool(smartperf_probe.get("available"))
     smartperf_enabled = smartperf_requested and smartperf_available
+    effective_thermal_interval_s = (
+        1.0 if smartperf_enabled and feature("thermal") else args.thermal_interval
+    )
     if smartperf_requested and not smartperf_available:
         capture_configuration["backend"] = "harmony_render_service_fallback"
+    native_cpu_frequency_schedule_s = (
+        harmony_native_cpu_frequency_schedule_s(
+            args.scheduler_interval,
+            feature("scheduler"),
+        )
+        if feature("cpu_frequency")
+        else None
+    )
     power_mode_probe = probe.get("power_mode")
     power_mode_probe = power_mode_probe if isinstance(power_mode_probe, dict) else {}
     high_performance_requested = bool(args.harmony_high_performance)
@@ -1084,13 +1274,17 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         "all samples, contexts and snapshots remain in the same device clock domain.",
         "HarmonyOS BatteryService reports whole-device battery current and voltage. Android BatteryStats, "
         "ADPF and dumpsys GPU attribution are not available and are not inferred.",
-        (
+    ]
+    if smartperf_enabled:
+        warnings.append(
             "Harmony SmartPerf uses native SP_daemon at its fixed approximately one-second cadence; "
             "enabled metrics are requested with -c/-g/-f/-t/-r/-d switches."
-            if smartperf_enabled
-            else "hidumper --cpufreq is sampled at a lower cadence than /proc/stat because a full 12-core dump is comparatively expensive."
-        ),
-    ]
+        )
+    elif feature("cpu_frequency"):
+        warnings.append(
+            "hidumper --cpufreq is sampled at a lower cadence than /proc/stat because a full 12-core dump is comparatively expensive; "
+            f"the effective refresh cadence is about {native_cpu_frequency_schedule_s:.0f} seconds and intermediate samples retain the latest value."
+        )
     if smartperf_requested and not smartperf_available:
         warnings.append(
             "SP_daemon was not available; collection fell back to RenderService, /proc/stat, top and hidumper sources."
@@ -1101,6 +1295,17 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         )
         if args.require_unplugged:
             print("ERROR: HarmonyOS device is powered; unplug it before recording", file=sys.stderr)
+            return 4
+    elif battery_start.get("plugged_state_available") is not True:
+        warnings.append(
+            "HarmonyOS BatteryService did not expose pluggedType, so external-power state is unknown. "
+            "Power samples remain raw battery flow until an explicit state is observed."
+        )
+        if args.require_unplugged:
+            print(
+                "ERROR: HarmonyOS external-power state is unavailable; cannot verify an unplugged power test",
+                file=sys.stderr,
+            )
             return 4
     if not isinstance(battery_start.get("voltage_mv"), (int, float)):
         print("ERROR: HarmonyOS BatteryService did not expose battery voltage", file=sys.stderr)
@@ -1155,17 +1360,16 @@ def run_harmony_record(args: argparse.Namespace) -> int:
             "cpu_frequency": (
                 1.0
                 if smartperf_enabled and feature("cpu_frequency")
-                else max(10.0, args.scheduler_interval)
-                if feature("cpu_frequency")
+                else native_cpu_frequency_schedule_s
+                if feature("cpu_frequency") and native_cpu_frequency_schedule_s is not None
                 else None
             ),
             "system_processes": args.process_interval if feature("process_snapshots") else None,
             "thermalservice": (
-                1.0 if smartperf_enabled and feature("thermal")
-                else args.thermal_interval if feature("thermal") else None
+                effective_thermal_interval_s if feature("thermal") else None
             ),
             "scheduler_capabilities": (
-                max(10.0, args.scheduler_interval) if feature("scheduler") else None
+                max(5.0, args.scheduler_interval) if feature("scheduler") else None
             ),
         },
         "system_monitor": {
@@ -1178,8 +1382,8 @@ def run_harmony_record(args: argparse.Namespace) -> int:
             },
             "process_interval_s": args.process_interval,
             "thread_interval_s": None,
-            "thermal_interval_s": args.thermal_interval,
-            "scheduler_interval_s": max(10.0, args.scheduler_interval),
+            "thermal_interval_s": effective_thermal_interval_s,
+            "scheduler_interval_s": max(5.0, args.scheduler_interval),
             "priority_processes": [
                 "update_service",
                 "updater",
@@ -1290,6 +1494,11 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                         process_interval_s=args.process_interval,
                         scheduler_interval_s=args.scheduler_interval,
                         context_interval_s=args.performance_interval,
+                        external_power=(
+                            bool(battery_start.get("powered"))
+                            if battery_start.get("plugged_state_available") is True
+                            else None
+                        ),
                     )
                 except RuntimeError as exc:
                     warning = (
@@ -1299,6 +1508,23 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                     journal.append_stderr_line(warning)
                     capture_configuration["backend"] = "harmony_render_service_fallback"
                     metadata["capture_configuration"] = capture_configuration
+                    metadata["sample_interval_s"] = args.interval
+                    sampling_schedule = metadata.get("sampling_schedule_s", {})
+                    if isinstance(sampling_schedule, dict):
+                        sampling_schedule.update(
+                            {
+                                "smartperf_native": None,
+                                "battery_current_proc_stat": args.interval,
+                                "cpu_frequency": native_cpu_frequency_schedule_s,
+                                "thermalservice": (
+                                    args.thermal_interval if feature("thermal") else None
+                                ),
+                            }
+                        )
+                    system_monitor = metadata.get("system_monitor", {})
+                    if isinstance(system_monitor, dict):
+                        system_monitor["thermal_interval_s"] = args.thermal_interval
+                    metadata["gpu_source"] = None
                     journal.write_metadata(metadata)
                     smartperf_enabled = False
                     collection = collect_harmony_session(
@@ -1308,11 +1534,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                         args.interval,
                         policies,
                         journal,
-                        initial_frequencies_mhz={
-                            str(name): float(value)
-                            for name, value in frequencies.items()
-                            if isinstance(value, (int, float))
-                        },
+                        initial_frequencies_mhz=initial_frequencies_mhz,
                         checkpoint_interval_s=args.checkpoint_interval,
                         reconnect_timeout_s=args.reconnect_timeout,
                         system_monitor_enabled=any(
@@ -1322,6 +1544,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                         process_interval_s=args.process_interval,
                         thermal_interval_s=args.thermal_interval,
                         scheduler_interval_s=args.scheduler_interval,
+                        cpu_frequency_interval_s=HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
                         context_enabled=feature("foreground_window") or feature("frame_rate"),
                         context_sample_interval_s=args.performance_interval,
                         foreground_enabled=feature("foreground_window"),
@@ -1341,11 +1564,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                     args.interval,
                     policies,
                     journal,
-                    initial_frequencies_mhz={
-                        str(name): float(value)
-                        for name, value in frequencies.items()
-                        if isinstance(value, (int, float))
-                    },
+                    initial_frequencies_mhz=initial_frequencies_mhz,
                     checkpoint_interval_s=args.checkpoint_interval,
                     reconnect_timeout_s=args.reconnect_timeout,
                     system_monitor_enabled=any(
@@ -1355,6 +1574,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                     process_interval_s=args.process_interval,
                     thermal_interval_s=args.thermal_interval,
                     scheduler_interval_s=args.scheduler_interval,
+                    cpu_frequency_interval_s=HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
                     context_enabled=feature("foreground_window") or feature("frame_rate"),
                     context_sample_interval_s=args.performance_interval,
                     foreground_enabled=feature("foreground_window"),
@@ -1478,6 +1698,24 @@ def run_record(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    if args.interval is None:
+        args.interval = (
+            5.0
+            if platform == "ios" and str(args.test_mode) == "power"
+            else DEFAULT_INTERVAL_S
+        )
+    if args.performance_interval is None:
+        args.performance_interval = (
+            5.0
+            if platform == "harmony" and str(args.test_mode) == "performance"
+            else 2.0 if str(args.test_mode) == "performance" else 10.0
+        )
+    if (
+        platform == "harmony"
+        and dict(getattr(args, "capture_configuration", {}) or {}).get("preset")
+        == "harmony-smartperf"
+    ):
+        args.interval = 1.0
     if bool(getattr(args, "harmony_high_performance", False)):
         if platform != "harmony":
             print("ERROR: --harmony-high-performance requires a HarmonyOS device", file=sys.stderr)
@@ -1544,7 +1782,12 @@ def run_record(args: argparse.Namespace) -> int:
         )
     )
     android_performance = (
-        probe_android_performance(args.adb, device)
+        probe_android_performance(
+            args.adb,
+            device,
+            include_frame_rate=feature("frame_rate"),
+            include_frame_details=feature("frame_details"),
+        )
         if performance_probe_enabled
         else {"performance": {}, "touch": {}, "capabilities": {}, "warnings": []}
     )
@@ -1559,8 +1802,10 @@ def run_record(args: argparse.Namespace) -> int:
         else {}
     )
     foreground = (
-        collect_foreground_package(args.adb, device)
-        if feature("foreground_window") or feature("frame_rate") or not args.package
+        android_performance.get("foreground_package")
+        if performance_probe_enabled
+        else collect_foreground_package(args.adb, device)
+        if not args.package
         else None
     )
     target_package = args.package if args.session_mode else (args.package or foreground)
@@ -1583,12 +1828,21 @@ def run_record(args: argparse.Namespace) -> int:
         for item in android_performance.get("warnings", [])
         if str(item).strip()
     )
+    sampler_uses_root = bool(gpu_source is not None and gpu_source.requires_root)
+    if sampler_uses_root:
+        warnings.append(
+            "GPU 遥测节点仅 root 可读；主采样循环会在单个只读 su 会话中运行，"
+            "避免每个样本重复提权。该会话只读取遥测，不修改设备设置。"
+        )
     if battery_before.get("powered"):
         warnings.append(
             "设备处于外部供电状态。电量计电流是电池净流量，不代表设备总输入功率。"
         )
         if args.require_unplugged:
-            print("ERROR: device is powered; unplug it or omit --require-unplugged", file=sys.stderr)
+            print(
+                "ERROR: device is powered; unplug it or pass --allow-external-power",
+                file=sys.stderr,
+            )
             return 4
 
     if feature("power_attribution") and not args.no_reset:
@@ -1705,10 +1959,23 @@ def run_record(args: argparse.Namespace) -> int:
         "cpu_policies": [asdict(item) for item in policies],
         "gpu_source": asdict(gpu_source) if gpu_source else None,
         "gpu_probe": gpu_probe,
+        "sampler_execution": {
+            "root_session": sampler_uses_root,
+            "mode": "single_read_only_su_session" if sampler_uses_root else "shell",
+            "reason": (
+                "GPU sysfs telemetry requires root; one persistent read-only root shell avoids per-sample su overhead."
+                if sampler_uses_root
+                else None
+            ),
+        },
         "memory_source": asdict(memory_source) if memory_source else None,
         "memory_probe": memory_probe,
         "runtime_settings_start": runtime_settings_start,
-        "performance_probe": android_performance.get("performance", {}),
+        "performance_probe": compact_android_performance_probe_for_metadata(
+            android_performance.get("performance", {})
+            if isinstance(android_performance.get("performance"), dict)
+            else {}
+        ),
         "touch": android_performance.get("touch", {}),
         "capabilities": android_performance.get("capabilities", {}),
         "battery_before": battery_before,
@@ -2027,6 +2294,8 @@ def build_demo_samples() -> list[Sample]:
                 gpu_frequency_mhz=gpu_freq,
                 gpu_load_pct=gpu_load,
                 battery_temperature_c=30.6 + index * 0.003,
+                power_valid_for_consumption=True,
+                external_power=False,
             )
         )
     return samples
@@ -2564,7 +2833,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--duration", type=positive_int, default=DEFAULT_DURATION_S, help="test duration in seconds"
     )
     record.add_argument(
-        "--interval", type=positive_float, default=DEFAULT_INTERVAL_S, help="sample interval in seconds"
+        "--interval",
+        type=positive_float,
+        default=None,
+        help="sample interval; defaults to 5s for iOS power mode and 1s otherwise",
     )
     record.add_argument("--package", help="target package; defaults to foreground outside session mode")
     record.add_argument(
@@ -2589,7 +2861,20 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--gpu-frequency-path", help="override readable GPU frequency sysfs path")
     record.add_argument("--no-reset", action="store_true", help="do not reset BatteryStats")
     record.add_argument("--full-history", action="store_true", help="enable detailed BatteryStats history")
-    record.add_argument("--require-unplugged", action="store_true", help="fail when external power is connected")
+    external_power = record.add_mutually_exclusive_group()
+    external_power.add_argument(
+        "--require-unplugged",
+        dest="require_unplugged",
+        action="store_true",
+        help="fail when external power is connected (default)",
+    )
+    external_power.add_argument(
+        "--allow-external-power",
+        dest="require_unplugged",
+        action="store_false",
+        help="allow recording while external power is connected; power and endurance conclusions remain unavailable",
+    )
+    record.set_defaults(require_unplugged=True)
     record.add_argument(
         "--no-system-monitor",
         action="store_true",
@@ -2622,10 +2907,11 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--performance-interval",
         type=positive_float,
-        default=2.0,
+        default=None,
         help=(
-            "foreground display/gfxinfo context interval used by performance mode; "
-            "detected BLAST layers use a separate 0.5s timestamp sampler"
+            "foreground display/frame context interval; defaults to 10s power, "
+            "2s Android performance, or 5s Harmony performance; detected Android "
+            "application layers use a separate 0.5s timestamp sampler"
         ),
     )
     record.add_argument(
@@ -2673,7 +2959,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ios_pair = subparsers.add_parser(
         "ios-pair",
-        help="create iOS RemotePairing over trusted USB and cache the Wi-Fi endpoint",
+        help="create iOS RemotePairing over trusted USB and cache the RemoteXPC endpoint",
     )
     ios_pair.add_argument("--device", help="iPhone UDID or ios:UDID; defaults to the only USB iPhone")
     ios_pair.add_argument("--timeout", type=positive_float, default=12.0)

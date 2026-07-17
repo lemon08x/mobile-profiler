@@ -35,16 +35,16 @@
   const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1";
   const liveTimelineLayoutDefinitions = [
     { key: "cpu_pct", label: "CPU 总负载", hint: "整体 CPU 使用率" },
-    { key: "cpu_frequency", label: "CPU 核心组频率", hint: "按共享 policy 展示" },
+    { key: "cpu_frequency", label: "CPU 核心组频率", hint: "按平台可验证的核心/频率分组展示" },
     { key: "frame_rate_fps", label: "渲染帧率与 1% Low", hint: "前台应用呈现帧率" },
     { key: "frame_flow", label: "渲染链路各节点", hint: "完整链路节点随时间的帧率" },
     { key: "refresh_rate_hz", label: "显示刷新率", hint: "随时间变化的屏幕档位" },
-    { key: "frame_time_ms", label: "帧耗时 P95 / P99", hint: "详细帧时间戳" },
+    { key: "frame_time_ms", label: "帧耗时 P95 / P99", hint: "逐帧呈现间隔；详细 framestats 开启时补充阶段数据" },
     { key: "frame_issue_pct", label: "异常帧占比", hint: "截止时间 / VSync 统计" },
     { key: "gpu_load_pct", label: "GPU 负载", hint: "图形处理器使用率" },
     { key: "gpu_frequency_mhz", label: "GPU 频率", hint: "GPU 当前工作频率" },
     { key: "memory_frequency_mhz", label: "内存 / DMC 频率", hint: "DRAM / DMC / MIF" },
-    { key: "power_mw", label: "整机功率", hint: "电池侧实时功率" },
+    { key: "power_mw", label: "功率通道", hint: "iOS 分开显示 SystemLoad 与电池 I×V" },
     { key: "current_ma", label: "电池电流", hint: "充放电电流幅值" },
     { key: "voltage_mv", label: "电池电压", hint: "电池端实时电压" },
     { key: "temperature_c", label: "电池温度", hint: "BatteryService / thermal" },
@@ -121,6 +121,12 @@
     brightnessRequestId: 0,
     captureFeaturesOverridden: false,
     liveTimelineLayouts: loadLiveTimelineLayouts(),
+    liveTimeRange: null,
+    liveTimeRangeDraft: null,
+    liveTimeRangePointer: null,
+    liveRangeSummary: null,
+    liveRangeSummaryRequestId: 0,
+    liveRangePresentationFrame: 0,
   };
 
   const platformProfiles = {
@@ -135,21 +141,21 @@
       packagePlaceholder: "com.example.app",
       desktopLabel: "桌面 / Launcher",
       schedulerLabel: "调度上下文",
-      performanceIntervalHint: "读取前台窗口上下文；检测到游戏 BLAST 层后以 0.5 秒节奏采集呈现时间戳。",
+      performanceIntervalHint: "读取前台窗口上下文；检测到 SurfaceView/BLAST 或普通应用 buffer 层后，以 0.5 秒节奏采集呈现时间戳。",
       probeTitle: "Android 设备能力检查",
       probeDescription: "确认电池供电、电流传感器、CPU policy、GPU 节点、gfxinfo 与 SurfaceFlinger 能力。",
       probePlaceholder: "选择在线 Android 设备后运行 Probe。该操作只读，不会开始采集或重置 BatteryStats。",
       powerDescription: "以电流功率、CPU/GPU、前台场景、热状态和测试条件为主；进程、调度与模型归因按需开启。",
-      performanceDescription: "以 SurfaceFlinger 呈现 FPS、1% Low、帧间隔、渲染阶段、CPU/GPU 与热限制为主；系统诊断按需开启。",
+      performanceDescription: "以 SurfaceFlinger 前台应用层呈现 FPS、1% Low、帧间隔、渲染阶段、CPU/GPU 与热限制为主；系统诊断按需开启。",
       powerNote: "建议先运行 Probe，确认 powered 为空、BatteryStats 和电流命令可用。",
-      performanceNote: "性能模式会读取 BLAST 呈现时间戳并提高窗口、进程和调度快照频率；建议关闭录屏、悬浮窗与其他调试工具。",
+      performanceNote: "性能模式会读取前台应用渲染层呈现时间戳并提高窗口上下文频率；建议关闭录屏、悬浮窗与其他调试工具。",
     },
     ios: {
       title: "iOS 平台",
       description: "RemoteXPC、DVT sysmond、PowerTelemetry 与事件驱动的前台应用状态",
       deviceKicker: "IOS DEVICE",
       addressLabel: "RemoteXPC",
-      addressPlaceholder: "使用 USB 信任与无线配对",
+      addressPlaceholder: "使用 USB 信任与 RemotePairing",
       connectLabel: "创建配对",
       packageLabel: "目标 Bundle ID",
       packagePlaceholder: "com.example.iosapp",
@@ -157,12 +163,12 @@
       schedulerLabel: "DVT 资源上下文",
       performanceIntervalHint: "iOS 性能数据跟随 DVT 主采样周期，不单独轮询帧窗口。",
       probeTitle: "iOS 设备能力检查",
-      probeDescription: "确认 RemoteXPC、PowerTelemetry、DVT CPU/GPU/进程数据和无线端点状态。",
+      probeDescription: "确认 RemoteXPC、PowerTelemetry、DVT CPU/GPU/进程数据，并区分 USB 网络端点与拔线后仍可达的 LAN 端点。",
       probePlaceholder: "选择已信任或已完成 RemotePairing 的 iPhone 后运行 Probe；不会修改设备设置。",
-      powerDescription: "以物理整机功耗、电流和温度为主，并记录 DVT 进程资源与观察者开销。",
-      performanceDescription: "聚焦 DVT CPU/GPU、目标进程、系统负载与观察者开销；当前不提供通用应用 FPS。",
-      powerNote: "正式物理功耗测试需完成 RemotePairing 后拔掉 USB；PowerTelemetry 通常约 20 秒更新一次。",
-      performanceNote: "iOS 性能模式记录 DVT CPU/GPU/进程资源和整机功耗，不把 powerScore 当作物理功耗。",
+      powerDescription: "以整机原始 SystemLoad、电池流量、电流和温度为主，并记录 DVT 进程资源与观察者开销。",
+      performanceDescription: "聚焦 DVT CPU/GPU、系统负载、前台应用状态与观察者相关进程 CPU；当前不提供通用应用 FPS。",
+      powerNote: "正式功耗与续航测试需在拔掉 USB 后重新刷新，并确认非链路本地 LAN RemotePairing 端点仍在线；169.254/16 可能只是 USB-NCM。DiagnosticsService 的整机原始 SystemLoad 通道通常约 20 秒更新一次。",
+      performanceNote: "iOS 性能模式记录 DVT CPU/GPU/进程资源和整机原始 SystemLoad 通道；powerScore 只作相对诊断，不转换为 mW。",
     },
     harmony: {
       title: "HarmonyOS 平台",
@@ -175,12 +181,12 @@
       packagePlaceholder: "com.example.harmonyapp",
       desktopLabel: "桌面 / Launcher",
       schedulerLabel: "CPU / 调度上下文",
-      performanceIntervalHint: "读取 RenderService/前台窗口；SmartPerf 使用设备原生约 1 秒节奏。",
+      performanceIntervalHint: "原生 RenderService/前台 Ability 建议 5 秒；SmartPerf 主数据固定使用设备原生约 1 秒节奏。",
       probeTitle: "HarmonyOS 设备能力检查",
       probeDescription: "确认 BatteryService、CPU/GPU/DDR、RenderService、SmartPerf 和 power-shell 能力。",
       probePlaceholder: "选择在线 HarmonyOS HDC 设备后运行 Probe；该操作只读，不会切换高性能模式。",
       powerDescription: "以 BatteryService 电流功率、CPU 频率、前台场景和热状态为主；原生后端无效的 GPU/DDR 与系统诊断默认关闭。",
-      performanceDescription: "以 RenderService 帧表现、CPU 频率和热状态为主；选择 SmartPerf 后再启用其原生 GPU、详细帧和目标进程数据。",
+      performanceDescription: "原生模式只展示可验证的 RenderService 合成节奏、CPU 频率和热状态；SmartPerf 提供应用 FPS、GPU 与原始帧抖动，目标进程扫描默认关闭。",
       powerNote: "正式功耗测试请使用无线 HDC 并拔掉 USB，确认 BatteryService 处于放电状态。",
       performanceNote: "SmartPerf 采集与设备 602 高性能模式相互独立；能力上限测试会明显增加功耗和温度。",
     },
@@ -205,6 +211,20 @@
   const onePercentLowValue = point => finite(point?.one_percent_low_fps)
     ? Number(point.one_percent_low_fps)
     : null;
+  const iosSystemLoadPowerSource = "ios_power_telemetry_system_load";
+  const iosSystemLoadStaleAfterS = 30;
+
+  function standardOnePercentLowAvailable(active) {
+    const performance = active?.performance || {};
+    if (performance.one_percent_low_standard === true) return true;
+    const source = String(performance.one_percent_low_source || "").toLowerCase();
+    const rows = Array.isArray(active?.performance_series) ? active.performance_series : [];
+    const detailedIntervals = rows.some(row => (
+      Array.isArray(row?.frame_intervals_ms) && row.frame_intervals_ms.length > 0
+    ));
+    const detailedSource = ["slowest 1%", "frame-time histogram", "frame-jitter"].some(token => source.includes(token));
+    return detailedIntervals || (detailedSource && !source.includes("sampled-window") && !source.includes("counter-window"));
+  }
 
   const metricDefinitions = {
     power_mw: {
@@ -250,7 +270,7 @@
       value: point => finite(point.temperature_c) ? Number(point.temperature_c) : null,
       unit: "°C",
       digits: 1,
-      axis: { minSpan: 6, padding: .04, tickDigits: 1 },
+      axis: { fixedMin: 0, minSpan: 6, padding: .04, tickDigits: 1 },
     },
     voltage_mv: {
       title: "电池电压",
@@ -259,7 +279,7 @@
       value: point => finite(point.voltage_mv) ? Number(point.voltage_mv) / 1000 : null,
       unit: "V",
       digits: 3,
-      axis: { minSpan: .3, padding: .04, tickDigits: 2 },
+      axis: { fixedMin: 0, minSpan: .3, padding: .04, tickDigits: 2 },
     },
     frame_rate_fps: {
       title: "实时帧率与 1% Low",
@@ -279,6 +299,10 @@
       },
       axis: { fixedMin: 0, minSpan: 30, padding: .08, tickDigits: 0 },
       reference: active => {
+        const observedRates = Array.isArray(active?.performance?.observed_refresh_rates_hz)
+          ? active.performance.observed_refresh_rates_hz.filter(finite).map(Number)
+          : [];
+        if (new Set(observedRates).size > 1) return null;
         const refreshRate = Number(active?.performance?.current_refresh_rate_hz);
         return finite(refreshRate)
           ? { value: refreshRate, label: `刷新率 ${formatAxisNumber(refreshRate, 0)} Hz` }
@@ -297,6 +321,10 @@
       secondaryQuantile: .99,
       axis: { fixedMin: 0, minSpan: 10, padding: .08, tickDigits: 1 },
       reference: active => {
+        const observedRates = Array.isArray(active?.performance?.observed_refresh_rates_hz)
+          ? active.performance.observed_refresh_rates_hz.filter(finite).map(Number)
+          : [];
+        if (new Set(observedRates).size > 1) return null;
         const refreshRate = Number(active?.performance?.current_refresh_rate_hz);
         return finite(refreshRate) && refreshRate > 0
           ? {
@@ -403,20 +431,6 @@
     5: "紧急",
     6: "关机",
   };
-
-  const bclSensorUnits = {
-    6: "V",
-    7: "A",
-    8: "%",
-  };
-
-  function isThermalTemperature(item) {
-    return !Object.prototype.hasOwnProperty.call(bclSensorUnits, Number(item?.type));
-  }
-
-  function thermalSensorUnit(item) {
-    return bclSensorUnits[Number(item?.type)] || "°C";
-  }
 
   function finite(value) {
     return value !== null && value !== undefined && Number.isFinite(Number(value));
@@ -540,6 +554,120 @@
     return app.platform || "android";
   }
 
+  function recommendedPerformanceInterval(platform = selectedPlatform(), mode = app.testMode) {
+    if (mode !== "performance") return 10;
+    return platform === "harmony" ? 5 : 2;
+  }
+
+  function recommendedPrimaryInterval(platform = selectedPlatform(), mode = app.testMode) {
+    return platform === "ios" && mode === "power" ? 5 : 1;
+  }
+
+  function targetPackageRequired(platform = selectedPlatform(), mode = app.testMode) {
+    if (mode !== "performance") return false;
+    if (platform === "android") return true;
+    return platform === "harmony" && effectiveCapturePreset() === "harmony-smartperf";
+  }
+
+  function deviceBooleanField(device, name, fallback = "") {
+    if (!device) return false;
+    const value = Object.prototype.hasOwnProperty.call(device, name)
+      ? device[name]
+      : fallback ? device[fallback] : false;
+    return String(value || "").toLowerCase() === "true" || value === true;
+  }
+
+  function iosRemoteXpcReady(device) {
+    return deviceBooleanField(device, "remote_xpc_ready", "wireless_ready");
+  }
+
+  function iosUnplugReady(device) {
+    return deviceBooleanField(device, "unplug_ready", "wireless_ready");
+  }
+
+  function iosEndpointScope(device) {
+    return String(device?.endpoint_scope || "unknown").toLowerCase();
+  }
+
+  function recordingDeviceReadiness(device = selectedDeviceInfo()) {
+    if (!device || device.state !== "device") {
+      return { ready: false, reason: `需要一台处于 device 状态的 ${platformLabel(selectedPlatform())} 设备。` };
+    }
+    if (devicePlatform(device) === "ios" && !iosRemoteXpcReady(device)) {
+      return {
+        ready: false,
+        reason: "iPhone 尚无可用的 RemotePairing RemoteXPC 端点。请保持 USB 连接并解锁，先点击“创建 iOS RemotePairing”。",
+      };
+    }
+    if (
+      devicePlatform(device) === "ios"
+      && $("#unplugged-input")?.checked
+      && !iosUnplugReady(device)
+    ) {
+      const scope = iosEndpointScope(device);
+      return {
+        ready: false,
+        reason: scope === "link-local"
+          ? "当前 RemoteXPC 端点是链路本地地址，可能依赖 USB-NCM，不能证明拔线后仍可用。请让电脑和 iPhone 接入同一局域网，拔掉 USB 后刷新确认。"
+          : "当前 RemotePairing 只确认了端点可连，尚未在拔掉 USB 后验证。请拔线并刷新；设备仍通过非链路本地 LAN 在线后才能开始断电测试。",
+      };
+    }
+    return { ready: true, reason: "" };
+  }
+
+  function defaultHomeRequirementsLabel() {
+    const required = targetPackageRequired(selectedPlatform(), app.testMode);
+    if (app.testMode !== "performance") return "功耗模式只需确认测试时间";
+    return required
+      ? "性能模式必须确认测试时间和目标游戏"
+      : "性能模式需确认测试时间；目标应用用于场景标记";
+  }
+
+  function recordingStartReadiness(active = app.state?.active) {
+    if (active?.running) return { ready: false, reason: "采集正在进行", shortReason: "任务进行中" };
+    const durationInput = $("#duration-input");
+    const duration = Number(durationInput?.value);
+    const minimumDuration = Number(durationInput?.min || 2);
+    const maximumDuration = Number(durationInput?.max || 604800);
+    if (!finite(duration) || duration < minimumDuration || duration > maximumDuration) {
+      return {
+        ready: false,
+        reason: `测试时间必须在 ${minimumDuration}–${maximumDuration} 秒之间。`,
+        shortReason: "请填写有效测试时间",
+      };
+    }
+    if (
+      targetPackageRequired(selectedPlatform(), app.testMode)
+      && !$("#package-input")?.value.trim()
+    ) {
+      return {
+        ready: false,
+        reason: "当前性能采集模式必须选择或填写目标游戏 / 应用包名。",
+        shortReason: "请填写性能测试游戏",
+      };
+    }
+    const deviceReadiness = recordingDeviceReadiness();
+    if (!deviceReadiness.ready) {
+      return {
+        ready: false,
+        reason: deviceReadiness.reason,
+        shortReason: "请先选择满足条件的在线设备",
+      };
+    }
+    return { ready: true, reason: "", shortReason: defaultHomeRequirementsLabel() };
+  }
+
+  function updateStartControlState(active = app.state?.active) {
+    const button = $("#start-record");
+    const requirements = $("#home-start-requirements");
+    if (!button || !requirements) return;
+    const readiness = recordingStartReadiness(active);
+    button.disabled = !readiness.ready;
+    button.title = readiness.reason;
+    requirements.textContent = readiness.shortReason;
+    requirements.classList.toggle("is-blocked", !readiness.ready && !active?.running);
+  }
+
   function applyPlatformVisibility() {
     $$('[data-platforms]').forEach(element => {
       const platforms = String(element.dataset.platforms || "").split(/\s+/).filter(Boolean);
@@ -560,9 +688,25 @@
   function updatePlatformPresentation() {
     const platform = selectedPlatform();
     const profile = platformProfiles[platform];
+    const ios = platform === "ios";
+    const harmony = platform === "harmony";
+    const performance = app.testMode === "performance";
+    const smartPerf = harmony && effectiveCapturePreset() === "harmony-smartperf";
+    const lowOverheadOption = $('#capture-preset-input option[value="low-overhead"]');
+    if (lowOverheadOption) {
+      lowOverheadOption.disabled = ios;
+      lowOverheadOption.title = ios
+        ? "当前 iOS sidecar 的基础 DVT 流不能由此预设关闭；功耗模式已通过 5 秒主周期降低干扰"
+        : "";
+      if (ios && $("#capture-preset-input")?.value === "low-overhead") {
+        $("#capture-preset-input").value = "auto";
+      }
+    }
     document.body.dataset.platform = platform;
     $("#config-app-panel-title").textContent = platform === "android" ? "扫描出的应用" : "目标应用";
-    $("#config-app-panel-source").textContent = platform === "android" ? "选择后回填左侧包名" : "请在左侧手工填写";
+    $("#config-app-panel-source").textContent = platform === "android"
+      ? performance ? "选择后回填首页目标游戏" : "选择后回填目标应用"
+      : performance ? "请在首页手工填写" : "请在测试配置中手工填写";
     $("#platform-title").textContent = profile.title;
     $("#platform-description").textContent = profile.description;
     $("#device-picker-kicker").textContent = profile.deviceKicker;
@@ -570,21 +714,87 @@
     $("#connection-address-label").textContent = profile.addressLabel;
     $("#adb-address-input").placeholder = profile.addressPlaceholder;
     $("#connect-address").textContent = profile.connectLabel;
-    const performance = app.testMode === "performance";
+    const packageRequired = targetPackageRequired(platform, app.testMode);
     const targetLabel = performance
-      ? platform === "ios" ? "目标游戏 Bundle ID" : "目标游戏 / 应用包名"
+      ? platform === "ios" ? "参考 Bundle ID" : "目标游戏 / 应用包名"
       : profile.packageLabel;
-    $("#package-input-label").innerHTML = `${targetLabel} <span>${performance ? "必填" : "可选"}</span>`;
+    $("#package-input-label").innerHTML = `${targetLabel} <span>${packageRequired ? "必填" : "可选"}</span>`;
     $("#package-input").placeholder = profile.packagePlaceholder;
-    $("#package-input").setAttribute("aria-required", performance ? "true" : "false");
+    $("#package-input").setAttribute("aria-required", packageRequired ? "true" : "false");
+    $("#package-input").required = packageRequired;
     $("#package-input-hint").textContent = performance
       ? platform === "android"
         ? "可从设备扫描结果选择；扫描失败时也可直接手工输入包名。"
-        : `性能测试必须填写目标${platform === "ios" ? "游戏 Bundle ID" : "游戏 / 应用包名"}。`
+        : platform === "ios"
+          ? "当前 iOS 后端不提供目标进程专属时间序列；Bundle ID 只作为报告标签，可留空。"
+          : packageRequired
+            ? "SmartPerf 应用 FPS 必须绑定目标包名，并会在目标不处于前台时停止采用该帧数据。"
+            : "原生 RenderService 数据是系统级合成上下文；包名只作为场景标签，选择 SmartPerf 后才必填。"
       : "功耗测试可留空；填写后会保留目标应用的资源与归因上下文。";
+    $("#home-start-requirements").textContent = performance
+      ? packageRequired
+        ? "性能模式必须确认测试时间和目标游戏"
+        : "性能模式需确认测试时间；目标应用用于场景标记"
+      : "功耗模式只需确认测试时间";
+    $("#home-open-apps").classList.toggle("hidden", !(performance && platform === "android"));
+    placeTargetPackageField();
     $("#start-context-input").querySelector('option[value="desktop"]').textContent = profile.desktopLabel;
     $("#scheduler-interval-label").textContent = profile.schedulerLabel;
     $("#performance-interval-hint").textContent = profile.performanceIntervalHint;
+    $("#thermal-interval-label").textContent = ios
+      ? "电池诊断周期（固定）"
+      : smartPerf ? "温度采样周期（固定）" : "温度快照";
+    $("#interval-input-hint").textContent = ios
+      ? performance
+        ? "性能模式 DVT CPU/GPU 主采样默认 1 秒；DiagnosticsService 的整机原始 SystemLoad 通道通常约 20 秒更新。"
+        : "功耗模式默认 5 秒读取 DVT CPU 与电池诊断，以降低观察者干扰；DiagnosticsService 的整机原始 SystemLoad 通道通常约 20 秒更新。"
+      : harmony
+        ? "原生 HDC 默认约 1 秒读取电流与 CPU 整体负载，CPU 核心组频率约 30 秒刷新；SmartPerf 主数据固定约 1 秒。"
+        : "默认 1 秒读取电流、CPU 与频率；前台应用层时间戳仍独立按 0.5 秒采集。";
+    $("#cpu-frequency-feature-hint").textContent = ios
+      ? "iOS 未公开 CPU 核心频率，当前不采集"
+      : harmony
+        ? "原生约 30 秒刷新；SmartPerf 约 1 秒。按最大频率分组的核心均值"
+        : "按核心所属频率策略展示";
+    $("#gpu-feature-hint").textContent = ios
+      ? "仅展示实际收到的 DVT GPU 利用率事件，不含频率"
+      : harmony
+        ? "SmartPerf 返回 GPU 频率/负载后才展示"
+        : "频率、负载与渲染器";
+    $("#memory-frequency-feature-hint").textContent = ios
+      ? "iOS 未公开内存频率，当前不采集"
+      : harmony
+        ? "仅 SmartPerf 验证返回 DDR 后展示"
+        : "默认关闭；需可读 DMC 节点";
+    $("#thermal-feature-label").textContent = ios
+      ? "电池温度"
+      : harmony ? "温度传感器" : "温度 / 热限制";
+    $("#thermal-feature-hint").textContent = ios
+      ? "仅电池温度；不含热严重度、热限制或热降亮"
+      : harmony
+        ? `${smartPerf ? "SmartPerf 温度随主流约 1 秒采样" : "ThermalService 温度按设置周期采样"}；不含公开热严重度、限亮档位或热降亮上限`
+        : "温度曲线、热状态与降亮";
+    $("#foreground-window-feature-label").textContent = ios
+      ? "前台应用状态"
+      : harmony ? "前台应用与显示" : "前台应用 / 窗口";
+    $("#foreground-window-feature-hint").textContent = ios
+      ? "DVT Running / Suspended；不含分辨率、亮度或刷新率"
+      : harmony
+        ? "Ability、窗口、刷新配置与 RenderService 背光原始值；原始值非 nit/热限亮"
+        : "场景、刷新率、亮度与渲染层";
+    $("#frame-feature-group-hint").textContent = ios
+      ? "当前 iOS 后端不提供通用应用帧链路"
+      : "性能模式只开启当前平台可验证的帧数据";
+    $("#frame-rate-feature-hint").textContent = ios
+      ? "当前 iOS 后端不提供通用应用 FPS"
+      : harmony
+        ? "SmartPerf 应用 FPS / RenderService 合成节奏"
+        : "前台应用层 / gfxinfo 帧节奏";
+    $("#frame-details-feature-hint").textContent = ios
+      ? "当前 iOS 后端不提供逐帧阶段时间戳"
+      : harmony
+        ? "SmartPerf 原始 jitter、P95/P99；不拆渲染阶段"
+        : "framestats 阶段、P99 与慢帧结论";
     $("#probe-view-title").textContent = profile.probeTitle;
     $("#probe-view-description").textContent = profile.probeDescription;
     $("#probe-placeholder-copy").textContent = profile.probePlaceholder;
@@ -594,21 +804,19 @@
     $("#performance-mode-subtitle").textContent = platform === "ios"
       ? "CPU / GPU / 进程"
       : platform === "harmony" ? "SmartPerf / 1% Low / 602" : "FPS / 1% Low / 渲染链路";
-    const ios = platform === "ios";
-    const harmony = platform === "harmony";
     $("#metric-fps-label").textContent = ios ? "CPU 总负载" : "实时帧率";
     $("#metric-fps-tag").textContent = ios ? "CPU" : "FPS";
     $("#metric-one-low-label").textContent = ios ? "GPU 利用率" : "1% Low";
     $("#metric-one-low-tag").textContent = ios ? "GPU" : "LOW";
-    $("#metric-frame-p99-label").textContent = ios ? "采集器开销" : "P99 帧耗时";
+    $("#metric-frame-p99-label").textContent = ios ? "观察者相关 CPU" : "P99 帧耗时";
     $("#metric-frame-p99-tag").textContent = ios ? "OVERHEAD" : "FRAME";
-    $("#metric-frame-issue-label").textContent = ios ? "整机功耗" : "异常帧";
+    $("#metric-frame-issue-label").textContent = ios ? "当前整机 SystemLoad 功率" : "异常帧";
     $("#metric-frame-issue-tag").textContent = ios ? "POWER" : "JANK";
     $("#metric-render-resolution-label").textContent = ios ? "前台应用" : "渲染分辨率";
     $("#metric-render-resolution-tag").textContent = ios ? "APP" : "RENDER";
     $("#metric-interpolation-label").textContent = ios ? "电池温度" : "插帧状态";
     $("#metric-interpolation-tag").textContent = ios ? "THERMAL" : "MEMC";
-    $("#metric-memory-label").textContent = ios ? "采集器开销" : "内存频率";
+    $("#metric-memory-label").textContent = ios ? "观察者相关 CPU" : "内存频率";
     $("#metric-memory-tag").textContent = ios ? "OVERHEAD" : "DMC";
 
     $("#cluster-panel-title").textContent = "CPU 核心频率";
@@ -617,20 +825,21 @@
     $("#resource-panel-title").textContent = ios ? "iOS 性能资源" : harmony ? "HarmonyOS 性能资源" : "性能资源状态";
     $("#resource-window-label").textContent = ios ? "前台应用" : "前台窗口";
     $("#performance-evidence-label-1").textContent = ios ? "性能数据源" : "帧率来源";
-    $("#performance-evidence-label-2").textContent = ios ? "整机功耗来源" : "Surface 缓冲区来源";
+    $("#performance-evidence-label-2").textContent = ios ? "SystemLoad 功率来源" : "Surface 缓冲区来源";
     $("#performance-evidence-label-3").textContent = ios ? "观察者开销" : "插帧判定";
     $("#power-pressure-kicker").textContent = ios ? "IOS POWER OBSERVABILITY" : harmony ? "HARMONY POWER PRESSURE" : "POWER PRESSURE";
     $("#power-pressure-title").textContent = ios ? "iOS 功耗与观察者开销" : harmony ? "HarmonyOS 功耗压力解释" : "功耗压力解释";
-    $("#power-pressure-source").textContent = ios ? "PowerTelemetry / DVT / observer" : harmony ? "CPU / GPU / DDR / 进程 / 系统状态" : "负载 / 频率 / 设置与整机功率";
-    $("#power-pressure-driver-title").textContent = ios ? "物理功耗" : "资源驱动";
+    $("#power-pressure-source").textContent = ios ? "PowerTelemetry / DVT / observer" : harmony ? "CPU / GPU / DDR / 进程 / 系统状态" : "负载 / 频率 / 设置与电池侧功率";
+    $("#power-pressure-driver-title").textContent = ios ? "原始功率通道" : "资源驱动";
     $("#power-pressure-task-title").textContent = ios ? "进程资源" : "任务负载";
     $("#power-pressure-setting-title").textContent = ios ? "采集器影响" : harmony ? "系统状态" : "设置参数";
     $("#power-pressure-note").innerHTML = ios
-      ? "<strong>边界：</strong>PowerTelemetry SystemLoad 是整机物理功耗；DVT powerScore 仅为相对诊断分数，collector_cpu_pct 用于记录工具自身开销。"
+      ? "<strong>边界：</strong>PowerTelemetry SystemLoad 是 DiagnosticsService 的整机原始通道；外供时可能接近 SystemPowerIn，但不是电池 I×V，也不是独立电源轨实测。DVT powerScore 仅为相对诊断分数。collector_cpu_pct 是 sysmond、DTServiceHub 与配对服务同期 CPU 的观察者相关上界，不等于工具造成的净增量。"
       : harmony
         ? "<strong>边界：</strong>BatteryService 电流是整机电池侧数据；CPU/GPU/DDR 与进程相关性用于解释趋势，不等于独立电源轨或 Android BatteryStats 归因。"
         : "<strong>边界：</strong>相关系数用于解释电流 / 功率和资源压力是否同步变化，不代表独立硬件电源轨，也不能把多个压力项直接相加。";
     applyPlatformVisibility();
+    updateStartControlState();
   }
 
   function setPlatform(platform, { fromRun = false, initial = false } = {}) {
@@ -641,7 +850,33 @@
       return;
     }
     const previousPlatform = app.platform;
+    const performanceInterval = $("#performance-interval-input");
+    const primaryInterval = $("#interval-input");
+    const previousRecommendedInterval = recommendedPerformanceInterval(previousPlatform, app.testMode);
+    const previousRecommendedPrimary = recommendedPrimaryInterval(previousPlatform, app.testMode);
+    const syncRecommendedInterval = Boolean(
+      performanceInterval
+      && (
+        initial
+        || previousPlatform !== nextPlatform
+          && Number(performanceInterval.value) === Number(previousRecommendedInterval)
+      )
+    );
+    const syncRecommendedPrimary = Boolean(
+      primaryInterval
+      && (
+        initial
+        || previousPlatform !== nextPlatform
+          && Number(primaryInterval.value) === Number(previousRecommendedPrimary)
+      )
+    );
     app.platform = nextPlatform;
+    if (syncRecommendedInterval) {
+      performanceInterval.value = String(recommendedPerformanceInterval(nextPlatform, app.testMode));
+    }
+    if (syncRecommendedPrimary) {
+      primaryInterval.value = String(recommendedPrimaryInterval(nextPlatform, app.testMode));
+    }
     if (previousPlatform !== nextPlatform) {
       app.brightnessRequestId += 1;
       app.brightnessDevice = "";
@@ -738,14 +973,16 @@
       "thread-interval-input": 30,
       "thermal-interval-input": 10,
       "scheduler-interval-input": 30,
+      "performance-interval-input": 10,
     },
     performance: {
       "duration-input": 1920,
-      "interval-input": .5,
+      "interval-input": 1,
       "process-interval-input": 2,
       "thread-interval-input": 5,
       "thermal-interval-input": 5,
       "scheduler-interval-input": 5,
+      "performance-interval-input": 2,
     },
   };
 
@@ -763,11 +1000,11 @@
     ]),
     "performance-standard": new Set([
       "cpu_usage", "cpu_frequency", "gpu_metrics",
-      "foreground_window", "frame_rate", "frame_details", "thermal",
+      "foreground_window", "frame_rate", "thermal",
     ]),
     "harmony-smartperf": new Set([
       "cpu_usage", "cpu_frequency", "gpu_metrics",
-      "foreground_window", "frame_rate", "frame_details", "target_process", "thermal",
+      "foreground_window", "frame_rate", "frame_details", "thermal",
     ]),
   };
 
@@ -954,6 +1191,7 @@
     const customized = app.captureFeaturesOverridden;
     const platform = selectedPlatform();
     const performance = app.testMode === "performance";
+    const smartPerf = platform === "harmony" && effectiveCapturePreset() === "harmony-smartperf";
     const smartPerfOption = $("#capture-preset-input")?.querySelector('option[value="harmony-smartperf"]');
     if (smartPerfOption) smartPerfOption.disabled = platform !== "harmony" || !performance;
     if ((!performance || platform !== "harmony") && $("#capture-preset-input")?.value === "harmony-smartperf") {
@@ -971,9 +1209,10 @@
     const forcedOff = new Set(platformUnavailableFeatures[platform] || []);
     const forcedOn = new Set(platformRequiredFeatures[platform] || []);
     if (performance) forcedOff.add("power_attribution");
-    if (platform === "harmony" && effectiveCapturePreset() !== "harmony-smartperf") {
+    if (platform === "harmony" && !smartPerf) {
       ["gpu_metrics", "memory_frequency", "frame_details", "target_process"].forEach(name => forcedOff.add(name));
     }
+    if (smartPerf) forcedOn.add("frame_details");
     const probeData = currentProbe()?.data || {};
     const memoryUnavailable = platform === "android"
       && probeData.capabilities?.memory_frequency === false;
@@ -982,10 +1221,20 @@
       && !probeData.gpu_source?.frequency_path
       && !probeData.gpu_source?.load_path;
     const smartPerfGpuUnavailable = platform === "harmony"
-      && effectiveCapturePreset() === "harmony-smartperf"
+      && smartPerf
       && probeData.capabilities?.smartperf_gpu_metrics === false;
+    const iosGpuUnavailable = platform === "ios"
+      && probeData.capabilities?.gpu_utilization === false;
+    const iosForegroundUnavailable = platform === "ios"
+      && probeData.capabilities?.application_state_notifications === false;
+    const iosThermalUnavailable = platform === "ios"
+      && Boolean(Object.keys(probeData).length)
+      && Number(probeData.system_monitor?.thermal_sensor_count || 0) === 0
+      && !finite(probeData.battery?.temperature_c);
     if (memoryUnavailable) forcedOff.add("memory_frequency");
-    if (gpuUnavailable || smartPerfGpuUnavailable) forcedOff.add("gpu_metrics");
+    if (gpuUnavailable || smartPerfGpuUnavailable || iosGpuUnavailable) forcedOff.add("gpu_metrics");
+    if (iosForegroundUnavailable) forcedOff.add("foreground_window");
+    if (iosThermalUnavailable) forcedOff.add("thermal");
     $$('[data-capture-feature]').forEach(input => {
       const name = input.dataset.captureFeature;
       const required = forcedOn.has(name);
@@ -1000,8 +1249,12 @@
         row.title = forcedOff.has(name)
           ? name === "memory_frequency" && memoryUnavailable
             ? probeData.memory_probe?.limitations || "设备未向 ADB shell 公开可读的 DMC/DRAM 实时频率"
-            : name === "gpu_metrics" && (gpuUnavailable || smartPerfGpuUnavailable)
+            : name === "gpu_metrics" && (gpuUnavailable || smartPerfGpuUnavailable || iosGpuUnavailable)
               ? probeData.gpu_probe?.reason || "当前设备没有可用的会话内 GPU 频率或负载数据源"
+            : name === "foreground_window" && iosForegroundUnavailable
+              ? "iOS Probe 明确未提供 application-state 通知；不会展示伪造的前台应用状态"
+            : name === "thermal" && iosThermalUnavailable
+              ? "iOS 电池诊断没有返回可用温度，本次不会展示温度曲线"
             : `${platformLabel(platform)} 当前采集后端不提供此项目`
           : required
             ? `${platformLabel(platform)} 基础数据流固定包含此项目，不会启动额外诊断动作`
@@ -1009,8 +1262,8 @@
         const impact = row.querySelector(".feature-impact");
         if (impact) {
           impact.dataset.defaultLabel ||= impact.textContent;
-          impact.textContent = required ? "固定" : impact.dataset.defaultLabel;
-          impact.classList.toggle("fixed", required);
+          impact.textContent = forcedOff.has(name) ? "不可用" : required ? "固定" : impact.dataset.defaultLabel;
+          impact.classList.toggle("fixed", required && !forcedOff.has(name));
         }
       }
     });
@@ -1047,12 +1300,53 @@
       const interval = $("#" + id);
       if (!interval) return;
       const enabled = Boolean(finalValues[feature]);
-      interval.disabled = running || !enabled;
-      interval.closest(".form-field")?.classList.toggle("capture-interval-disabled", !enabled);
+      const fixedIosThermal = platform === "ios" && feature === "thermal";
+      const fixedSmartPerfThermal = smartPerf && feature === "thermal";
+      if (feature === "thermal") interval.min = fixedSmartPerfThermal ? "1" : "2";
+      if (fixedIosThermal) interval.value = "5";
+      else if (fixedSmartPerfThermal) interval.value = "1";
+      else if (feature === "thermal" && interval.value === "1") {
+        interval.value = String(modeDefaults[app.testMode]?.[id] || 5);
+      }
+      interval.disabled = running || !enabled || fixedIosThermal || fixedSmartPerfThermal;
+      interval.title = fixedIosThermal
+        ? "iOS 电池诊断由 sidecar 固定约每 5 秒读取一次"
+        : fixedSmartPerfThermal
+          ? "SmartPerf 温度来自同一 SP_daemon 主流，固定约每 1 秒一条"
+          : "";
+      interval.closest(".form-field")?.classList.toggle(
+        "capture-interval-disabled",
+        !enabled || fixedIosThermal || fixedSmartPerfThermal,
+      );
     });
+    const primaryInterval = $("#interval-input");
+    if (primaryInterval) {
+      if (smartPerf) primaryInterval.value = "1";
+      primaryInterval.disabled = running || smartPerf;
+      primaryInterval.title = smartPerf ? "SmartPerf 主采样由 SP_daemon 固定为约 1 秒" : "";
+      primaryInterval.closest(".form-field")?.classList.toggle("capture-interval-disabled", smartPerf);
+    }
+    const durationInput = $("#duration-input");
+    if (durationInput) {
+      const minimumDuration = platform === "harmony" ? (smartPerf ? 4 : 8) : 2;
+      durationInput.min = String(minimumDuration);
+      if (Number(durationInput.value) < minimumDuration) {
+        durationInput.value = String(minimumDuration);
+        syncDurationPreset();
+      }
+      durationInput.title = platform === "harmony"
+        ? smartPerf
+          ? "SmartPerf 至少需要 4 秒以形成稳定的多样本时间跨度"
+          : "HarmonyOS 原生采集至少需要 8 秒以稳定获得两个以上样本"
+        : "";
+    }
     const performanceInterval = $("#performance-interval-input");
     if (performanceInterval) {
       const enabled = Boolean(finalValues.foreground_window || finalValues.frame_rate);
+      performanceInterval.min = platform === "harmony" ? "5" : "1";
+      if (platform === "harmony" && Number(performanceInterval.value) < 5) {
+        performanceInterval.value = String(recommendedPerformanceInterval(platform, app.testMode));
+      }
       performanceInterval.disabled = running || !enabled;
       performanceInterval.closest(".form-field")?.classList.toggle("capture-interval-disabled", !enabled);
     }
@@ -1081,7 +1375,7 @@
     $("#capture-feature-note").textContent = showHighPerformance
       ? "SmartPerf 采集与设备高性能模式相互独立；高性能模式会改变设备功耗和热状态。"
       : platform === "ios"
-        ? "iOS 的 CPU、GPU、前台状态与电池温度属于固定基础流；专项诊断动作默认关闭。"
+        ? `iOS 的 CPU、GPU、前台状态与电池温度属于固定基础流；专项诊断动作默认关闭，${app.testMode === "power" ? "主周期默认 5 秒" : "性能主周期默认 1 秒"}。`
         : "基础电流、电压和设备时间戳始终保留；无稳定结论的专项诊断默认关闭。";
   }
 
@@ -1090,9 +1384,18 @@
     Object.entries(modeDefaults[nextMode]).forEach(([id, nextValue]) => {
       const input = document.getElementById(id);
       if (!input) return;
-      const previousDefault = modeDefaults[previousMode]?.[id];
+      const previousDefault = id === "performance-interval-input"
+        ? recommendedPerformanceInterval(selectedPlatform(), previousMode)
+        : id === "interval-input"
+          ? recommendedPrimaryInterval(selectedPlatform(), previousMode)
+        : modeDefaults[previousMode]?.[id];
+      const effectiveNextValue = id === "performance-interval-input"
+        ? recommendedPerformanceInterval(selectedPlatform(), nextMode)
+        : id === "interval-input"
+          ? recommendedPrimaryInterval(selectedPlatform(), nextMode)
+        : nextValue;
       if (previousDefault === undefined || Number(input.value) === Number(previousDefault)) {
-        input.value = String(nextValue);
+        input.value = String(effectiveNextValue);
       }
     });
     syncDurationPreset();
@@ -1118,7 +1421,7 @@
       applyCapturePreset();
     }
 
-    $$("[data-test-mode]").forEach(button => {
+    $$(".test-mode-switch [data-test-mode]").forEach(button => {
       const selected = button.dataset.testMode === nextMode;
       button.classList.toggle("active", selected);
       button.setAttribute("aria-pressed", selected ? "true" : "false");
@@ -1195,7 +1498,6 @@
     const latest = active?.latest || {};
     const rawDirection = String(
       latest.direction
-      || active?.summary?.direction
       || active?.battery?.status
       || active?.metadata?.battery_start?.status
       || "unknown"
@@ -1210,45 +1512,162 @@
       && finite(latest.signed_current_ma)
       && Number(latest.signed_current_ma) < 0
     );
-    if (charging) {
+    const direction = charging ? "charging" : discharging ? "discharging" : "unknown";
+    const externalPower = rawDirection === "external_power"
+      || latest.external_power === true
+      || active?.summary?.external_power_observed === true;
+    const series = Array.isArray(active?.series) ? active.series : [];
+    const observedDirections = new Set(
+      series.map(point => String(point?.direction || "").toLowerCase())
+        .filter(value => value === "charging" || value === "discharging"),
+    );
+    const summaryDirection = String(
+      active?.summary?.power_flow_direction
+      || active?.summary?.direction
+      || ""
+    ).toLowerCase();
+    const sessionDirection = externalPower
+      ? "external_power"
+      : ["charging", "discharging", "mixed", "idle"].includes(summaryDirection)
+      ? summaryDirection
+      : observedDirections.size > 1
+        ? "mixed"
+        : observedDirections.size === 1 ? [...observedDirections][0] : direction;
+    const powerSources = Array.from(new Set([
+      latest.power_source,
+      active?.summary?.observed_power_primary_source,
+      ...(Array.isArray(active?.summary?.power_sources) ? active.summary.power_sources : []),
+      ...series.map(point => point?.power_source),
+    ].map(value => String(value || "")).filter(Boolean)));
+    const systemLoad = active?.summary?.system_load_available === true
+      || powerSources.includes(iosSystemLoadPowerSource);
+    const iosBatteryFlowOnly = activePlatform(active) === "ios" && !systemLoad;
+    const currentLabel = externalPower
+      ? "外供状态下电池电流"
+      : direction === "charging"
+      ? "充电电流"
+      : direction === "discharging" ? "放电电流" : "电池电流";
+    const currentTag = externalPower ? "EXTERNAL" : direction === "charging" ? "INPUT" : "CURRENT";
+    const chartCurrentTitle = sessionDirection === "external_power"
+      ? "外部供电下电池电流幅值"
+      : sessionDirection === "charging"
+      ? "充电电流"
+      : sessionDirection === "discharging"
+        ? "放电电流"
+        : sessionDirection === "mixed" ? "电池电流幅值（充放电混合）" : "电池电流幅值";
+    const energyAvailable = finite(
+      systemLoad
+        ? (active?.summary?.system_load_consumption_energy_mwh ?? active?.summary?.energy_mwh)
+        : active?.summary?.energy_mwh,
+    );
+    if (systemLoad) {
       return {
-        direction: "charging",
-        powerLabel: "电池充入功率",
-        powerTag: "CHARGE",
-        currentLabel: "充电电流",
-        currentTag: "INPUT",
-        energyLabel: "累计充入能量",
-        chartPowerTitle: "电池充入功率",
-        chartPowerLegend: "Battery charge power",
-        chartCurrentTitle: "充电电流",
-        chartCurrentLegend: "Battery charge current",
+        direction,
+        sessionDirection,
+        systemLoad: true,
+        externalPower,
+        powerLabel: "当前整机 SystemLoad 功率",
+        powerTag: "SYSTEM",
+        currentLabel,
+        currentTag,
+        energyLabel: energyAvailable ? "累计有效放电能量" : "有效耗电能量",
+        chartPowerTitle: "iOS 整机原始 SystemLoad 通道",
+        chartPowerLegend: "DiagnosticsService SystemLoad",
+        chartCurrentTitle,
+        chartCurrentLegend: "Battery current magnitude",
       };
     }
-    if (discharging) {
-      return {
-        direction: "discharging",
-        powerLabel: "电池放电功率",
-        powerTag: "BATTERY",
-        currentLabel: "放电电流",
-        currentTag: "CURRENT",
-        energyLabel: "累计放电能量",
-        chartPowerTitle: "电池放电功率",
-        chartPowerLegend: "Battery discharge power",
-        chartCurrentTitle: "放电电流",
-        chartCurrentLegend: "Battery discharge current",
-      };
-    }
+    const currentPowerLabel = iosBatteryFlowOnly
+      ? "当前电池流量功率（I×V）"
+      : externalPower
+      ? "外部供电下电池侧原始流量"
+      : direction === "charging"
+      ? "当前电池充入功率"
+      : direction === "discharging" ? "当前电池放电功率" : "当前电池侧功率";
+    const chartPowerTitle = iosBatteryFlowOnly
+      ? "iOS 电池流量功率（I×V）"
+      : sessionDirection === "external_power"
+      ? "外部供电下电池侧原始流量"
+      : sessionDirection === "charging"
+      ? "电池充入功率"
+      : sessionDirection === "discharging"
+        ? "电池放电功率"
+        : sessionDirection === "mixed" ? "电池侧原始功率（充放电混合）" : "电池侧原始功率";
     return {
-      direction: "unknown",
-      powerLabel: "电池侧功率",
-      powerTag: "BATTERY",
-      currentLabel: "电池电流",
-      currentTag: "CURRENT",
-      energyLabel: "累计电池侧能量",
-      chartPowerTitle: "电池侧功率",
-      chartPowerLegend: "Battery-side power",
-      chartCurrentTitle: "电池电流幅值",
+      direction,
+      sessionDirection,
+      systemLoad: false,
+      externalPower,
+      powerLabel: currentPowerLabel,
+      powerTag: iosBatteryFlowOnly ? "BATTERY FLOW" : externalPower ? "EXTERNAL" : direction === "charging" ? "CHARGE" : "BATTERY",
+      currentLabel,
+      currentTag,
+      energyLabel: energyAvailable ? "累计有效放电能量" : "有效耗电能量",
+      chartPowerTitle,
+      chartPowerLegend: iosBatteryFlowOnly ? "Battery current × voltage" : "Battery-side raw power",
+      chartCurrentTitle,
       chartCurrentLegend: "Battery current magnitude",
+    };
+  }
+
+  function systemLoadPowerSnapshot(active) {
+    const summary = active?.summary || {};
+    const rows = Array.isArray(active?.series) ? active.series : [];
+    const systemLoadRows = rows.filter(row => row?.power_source === iosSystemLoadPowerSource);
+    const point = systemLoadRows.at(-1) || null;
+    const summaryUsesSystemLoad = String(summary.observed_power_primary_source || "") === iosSystemLoadPowerSource
+      || systemLoadRows.length > 0;
+    const latestMw = finite(point?.power_mw)
+      ? Number(point.power_mw)
+      : finite(summary.system_load_latest_power_mw) ? Number(summary.system_load_latest_power_mw) : null;
+    const latestElapsed = finite(point?.elapsed_s)
+      ? Number(point.elapsed_s)
+      : finite(summary.system_load_latest_elapsed_s) ? Number(summary.system_load_latest_elapsed_s) : null;
+    const sampleAgeS = point && finite(point.power_sample_age_s)
+        ? Number(point.power_sample_age_s) + Math.max(0, Number(active?.elapsed_s || 0) - Number(point.elapsed_s || 0))
+        : finite(summary.system_load_latest_sample_age_s) ? Number(summary.system_load_latest_sample_age_s) : null;
+    const stale = point?.power_sample_stale === true
+      || (finite(sampleAgeS) && Number(sampleAgeS) > iosSystemLoadStaleAfterS);
+    return {
+      point,
+      latestMw,
+      latestElapsed,
+      sampleAgeS,
+      stale,
+      observedAverageMw: finite(summary.system_load_observed_average_power_mw)
+        ? Number(summary.system_load_observed_average_power_mw)
+        : summaryUsesSystemLoad && finite(summary.observed_power_average_mw)
+          ? Number(summary.observed_power_average_mw)
+          : null,
+      consumptionAverageMw: finite(summary.system_load_consumption_average_power_mw)
+        ? Number(summary.system_load_consumption_average_power_mw)
+        : summaryUsesSystemLoad && finite(summary.average_power_mw)
+          ? Number(summary.average_power_mw)
+          : null,
+      consumptionEnergyMwh: finite(summary.system_load_consumption_energy_mwh)
+        ? Number(summary.system_load_consumption_energy_mwh)
+        : summaryUsesSystemLoad && finite(summary.energy_mwh) ? Number(summary.energy_mwh) : null,
+    };
+  }
+
+  function primaryPowerSnapshot(active) {
+    const flow = powerFlowPresentation(active);
+    const latest = active?.latest || {};
+    const summary = active?.summary || {};
+    if (flow.systemLoad) return { ...systemLoadPowerSnapshot(active), systemLoad: true };
+    return {
+      point: latest,
+      latestMw: finite(latest.power_mw) ? Number(latest.power_mw) : null,
+      latestElapsed: finite(latest.elapsed_s) ? Number(latest.elapsed_s) : null,
+      sampleAgeS: finite(latest.power_sample_age_s) ? Number(latest.power_sample_age_s) : null,
+      observedAverageMw: finite(summary.observed_power_average_mw)
+        ? Number(summary.observed_power_average_mw)
+        : null,
+      consumptionAverageMw: finite(summary.average_power_mw)
+        ? Number(summary.average_power_mw)
+        : null,
+      consumptionEnergyMwh: finite(summary.energy_mwh) ? Number(summary.energy_mwh) : null,
+      systemLoad: false,
     };
   }
 
@@ -1261,7 +1680,7 @@
         ? rawSource
         : `演示数据 · 模拟 ${rawSource || "Surface 缓冲区尺寸"}`;
     } else if (rawSource === "SurfaceFlinger GraphicBuffer") {
-      source = "SurfaceFlinger · 前台 SurfaceView/BLAST GraphicBuffer（启动时快照）";
+      source = "SurfaceFlinger · 前台应用渲染层 GraphicBuffer（启动时快照）";
     }
     const boundary = performance.render_resolution_estimated
       ? "这是窗口或显示模式估算值，不等同于应用实际渲染缓冲区。"
@@ -1292,11 +1711,9 @@
       button.classList.toggle("hidden", !available);
     });
     $("#resource-gpu-row")?.classList.toggle("hidden", !available);
-    $("#performance-gpu-row")?.classList.toggle("hidden", !available);
     const iosPerformance = (active?.test_mode || app.testMode) === "performance"
       && activePlatform(active) === "ios";
     $("#metric-one-low-card")?.classList.toggle("hidden", iosPerformance && !available);
-    $("#performance-fps-stat")?.classList.toggle("hidden", iosPerformance && !available);
     if (!available && ["gpu_load_pct", "gpu_frequency_mhz"].includes(app.metric)) {
       app.metric = app.testMode === "performance" && activePlatform(active) !== "ios"
         ? "frame_rate_fps"
@@ -1338,17 +1755,24 @@
       const definition = metricDefinitions[key];
       if (!definition) return;
       const source = definition.series === "performance" ? active?.performance_series : active?.series;
-      const values = (Array.isArray(source) ? source : []).map(definition.value).filter(finite).map(Number);
+      const rows = Array.isArray(source) ? source : [];
+      const values = rows
+        .map(row => key === "power_mw" && powerFlowPresentation(active).systemLoad
+          ? row?.power_source === iosSystemLoadPowerSource ? definition.value(row) : null
+          : definition.value(row))
+        .filter(finite)
+        .map(Number);
       if (!values.length) return;
       const current = values.at(-1);
       const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-      const secondaryValues = typeof definition.secondaryValue === "function"
+      const secondaryAllowed = key !== "frame_rate_fps" || standardOnePercentLowAvailable(active);
+      const secondaryValues = secondaryAllowed && typeof definition.secondaryValue === "function"
         ? (Array.isArray(source) ? source : [])
           .map(definition.secondaryValue)
           .filter(finite)
           .map(Number)
         : [];
-      const secondary = typeof definition.secondaryValue === "function"
+      const secondary = secondaryAllowed && typeof definition.secondaryValue === "function"
         ? (secondaryValues.length ? secondaryValues.at(-1) : null)
         : percentile(values, definition.secondaryQuantile ?? .95);
       const powerFlow = powerFlowPresentation(active);
@@ -1361,11 +1785,29 @@
         <span class="live-detail-copy"><small>${escapeHtml(title)}</small><strong>${current.toFixed(definition.digits)} ${escapeHtml(definition.unit)}</strong><span>AVG ${average.toFixed(definition.digits)} · ${escapeHtml(definition.secondaryLabel || "P95")} ${secondary === null ? "--" : secondary.toFixed(definition.digits)}</span></span>
         ${sparklineMarkup(values)}
       </button>`);
+      if (key === "power_mw" && powerFlow.systemLoad) {
+        const batteryFlowValues = rows
+          .map(row => finite(row?.current_ma) && finite(row?.voltage_mv)
+            ? Number(row.current_ma) * Number(row.voltage_mv) / 1_000_000
+            : null)
+          .filter(finite)
+          .map(Number);
+        if (batteryFlowValues.length) {
+          const batteryFlowAverage = batteryFlowValues.reduce((sum, value) => sum + value, 0) / batteryFlowValues.length;
+          const batteryFlowP95 = percentile(batteryFlowValues, .95);
+          cards.push(`<button type="button" class="live-detail-card" data-live-metric="power_mw" style="--detail-color:#9e8cff">
+            <span class="live-detail-copy"><small>电池流量功率（I×V）</small><strong>${batteryFlowValues.at(-1).toFixed(3)} W</strong><span>AVG ${batteryFlowAverage.toFixed(3)} · P95 ${batteryFlowP95 === null ? "--" : batteryFlowP95.toFixed(3)}</span></span>
+            ${sparklineMarkup(batteryFlowValues)}
+          </button>`);
+        }
+      }
     });
     container.innerHTML = cards.length
       ? cards.join("")
       : '<div class="empty-row">当前尚无可展开的实时数据；未启用或不可读的项目不会显示。</div>';
-    $("#live-detail-count").textContent = cards.length ? `${cards.length} 项有效数据` : "等待数据";
+    $("#live-detail-count").textContent = cards.length
+      ? `${cards.length} 项有效数据`
+      : active?.running ? "等待数据" : "本次无有效数据";
   }
 
   function renderBrightnessThrottling(active) {
@@ -1377,7 +1819,17 @@
     if (!available) return;
     const points = Array.isArray(analysis.points) ? analysis.points : [];
     const current = analysis.current_state || {};
-    const status = String(current.status || "none");
+    const rawStatus = String(current.status || "none");
+    const vendorStateKnown = current.vendor_thermal_active === true || current.vendor_thermal_active === false;
+    const vendorActive = current.vendor_thermal_active === true;
+    const vendorLastKnown = current.vendor_thermal_last_known_active === true
+      || current.vendor_thermal_last_known_active === false;
+    const vendorLastKnownActive = current.vendor_thermal_last_known_active === true;
+    const vendorLimitDescribesActive = vendorActive
+      || (!vendorStateKnown && vendorLastKnownActive);
+    const status = vendorStateKnown
+      ? vendorActive ? "confirmed" : "none"
+      : rawStatus;
     const currentActive = status === "confirmed" || status === "suspected";
     panel.classList.toggle("active", status === "confirmed");
     panel.classList.toggle("suspected", status === "suspected");
@@ -1394,6 +1846,13 @@
       parts.push(`有效亮度 ${Number(current.effective_brightness * 100).toFixed(1)}%`);
     }
     if (finite(current.thermal_cap)) parts.push(`热上限 ${Number(current.thermal_cap * 100).toFixed(1)}%`);
+    if (vendorLimitDescribesActive && finite(current.vendor_thermal_level)) {
+      parts.push(`厂商限亮档 ${Number(current.vendor_thermal_level).toFixed(0)}`);
+    }
+    if (vendorLimitDescribesActive && finite(current.vendor_thermal_limit_nits)) {
+      parts.push(`系统标称上限 ${Number(current.vendor_thermal_limit_nits).toFixed(0)} nit（非亮度计实测）`);
+    }
+    if (finite(current.vendor_thermal_temperature_c)) parts.push(`厂商温控温度 ${Number(current.vendor_thermal_temperature_c).toFixed(1)} °C`);
     if (finite(current.lcd_backlight_cooling) && Number(current.lcd_backlight_cooling) > 0) {
       parts.push(`LCD 冷却档 ${Number(current.lcd_backlight_cooling).toFixed(0)}`);
     }
@@ -1414,6 +1873,31 @@
           );
         }
       }
+    } else if (vendorLastKnown) {
+      const age = finite(current.vendor_thermal_observed_age_s)
+        ? `${Number(current.vendor_thermal_observed_age_s).toFixed(1)} 秒前`
+        : "此前";
+      title.textContent = vendorLastKnownActive
+        ? "厂商限亮最近一次为生效，当前尚未刷新"
+        : "厂商限亮最近一次未生效";
+      detail.textContent = `${parts.join(" · ") || "厂商运行时状态"}；状态读取于 ${age}${current.vendor_thermal_state_stale ? "，已超过刷新有效期，不能代表当前状态" : "，等待下一次低频刷新"}。`;
+      badge.textContent = current.vendor_thermal_state_stale ? "STALE" : "LAST";
+    } else if (vendorStateKnown && !vendorActive) {
+      const candidateSource = analysis.vendor_thermal_candidate_caps_nits
+        || current.vendor_thermal_candidate_caps_nits;
+      const candidateCount = Array.isArray(candidateSource)
+        ? candidateSource.length
+        : candidateSource && typeof candidateSource === "object"
+          ? Object.keys(candidateSource).length
+          : 0;
+      title.textContent = candidateCount
+        ? "已识别厂商限亮候选表，当前未生效"
+        : "厂商温控限亮当前未生效";
+      const candidateText = candidateCount
+        ? `已读取 ${candidateCount} 个固件候选上限，但候选表不能证明哪些档位会在实际温控中触发。`
+        : "未读取到可确认的生效档位。";
+      detail.textContent = `${parts.length ? `${parts.join(" · ")}；` : ""}运行时 active=false，当前没有生效档位；${candidateText}只有 active=true 时才把运行时档位和标称 nit 作为限亮证据，物理亮度仍需亮度计验证。`;
+      badge.textContent = "INACTIVE";
     } else if (points.length) {
       title.textContent = `当前已恢复，历史标记 ${points.length} 个降亮点`;
       detail.textContent = parts.length ? parts.join(" · ") : "当前 DisplayManager 和 lcd-backlight 未继续限制亮度。";
@@ -1423,9 +1907,13 @@
       detail.textContent = parts.length ? parts.join(" · ") : "系统亮度与显示侧热限制状态正常。";
       badge.textContent = "CLEAR";
     }
-    source.textContent = `${points.length} points · DisplayManager / Thermal HAL`;
+    source.textContent = `${points.length} 个确认/疑似点 · DisplayManager / Thermal HAL${vendorStateKnown || vendorLastKnown ? " / Oplus runtime" : ""}`;
     pointList.innerHTML = points.length
-      ? points.slice(-40).map(point => `<span class="${escapeHtml(point.status || "suspected")}" title="${escapeHtml(point.reason || "显示侧热限制")}">${formatDuration(point.elapsed_s)} · ${point.status === "confirmed" ? "确认" : "疑似"}</span>`).join("")
+      ? points.slice(-40).map(point => {
+        const pointVendorKnown = point.vendor_thermal_active === true || point.vendor_thermal_active === false;
+        const pointConfirmed = pointVendorKnown ? point.vendor_thermal_active === true : point.status === "confirmed";
+        return `<span class="${escapeHtml(pointConfirmed ? "confirmed" : "suspected")}" title="${escapeHtml(point.reason || "显示侧热限制")}">${formatDuration(point.elapsed_s)} · ${pointConfirmed ? "确认" : "疑似"}</span>`;
+      }).join("")
       : "<span>尚无疑似降亮点</span>";
   }
 
@@ -1477,18 +1965,39 @@
     $("#server-detail").textContent = detail;
   }
 
+  function placeTargetPackageField() {
+    const field = $(".target-app-field");
+    const destination = app.testMode === "performance"
+      ? $("#home-package-slot")
+      : $("#config-package-slot");
+    if (field && destination && field.parentElement !== destination) {
+      destination.appendChild(field);
+    }
+  }
+
   function mountConfigurationView() {
     const target = $("#config-view-content");
     const formTarget = $("#config-form-column");
     const appPickerTarget = $("#config-app-picker-content");
-    const modeBar = $("#test-mode-bar");
     const controlPanel = $(".control-panel");
     const appPicker = $(".app-picker");
     const runtimeLayout = $(".runtime-layout");
-    if (!target || !formTarget || !appPickerTarget || !modeBar || !controlPanel || !appPicker || !runtimeLayout) return;
-    target.prepend(modeBar);
-    formTarget.append(controlPanel);
+    const durationField = $("#duration-field");
+    const durationPresets = $("#duration-presets");
+    const durationSlot = $("#home-duration-slot");
+    const startButton = $("#start-record");
+    const startSlot = $("#home-start-slot");
+    if (
+      !target || !formTarget || !appPickerTarget || !controlPanel || !appPicker
+      || !runtimeLayout || !durationField || !durationPresets || !durationSlot
+      || !startButton || !startSlot
+    ) return;
     appPickerTarget.append(appPicker);
+    durationSlot.append(durationField, durationPresets);
+    startButton.setAttribute("form", "record-form");
+    startSlot.append(startButton);
+    formTarget.append(controlPanel);
+    placeTargetPackageField();
     runtimeLayout.classList.add("monitoring-only");
   }
 
@@ -1693,12 +2202,17 @@
   }
 
   function deviceConnectionLabel(device) {
-    if (
-      devicePlatform(device) === "ios"
-      && deviceConnectionType(device) === "usb"
-      && String(device?.wireless_ready || "").toLowerCase() === "true"
-    ) {
-      return "USB 有线（无线已配对）";
+    if (devicePlatform(device) === "ios") {
+      if (deviceConnectionType(device) === "usb" && iosRemoteXpcReady(device)) {
+        return iosEndpointScope(device) === "link-local"
+          ? "USB 有线（RemoteXPC 经链路本地网络）"
+          : "USB 有线（RemotePairing 已建立，待拔线验证）";
+      }
+      if (deviceConnectionType(device) === "wireless") {
+        return iosUnplugReady(device)
+          ? "Wi-Fi RemotePairing"
+          : "链路本地 RemotePairing（不可作为断电证明）";
+      }
     }
     return {
       usb: "USB 有线",
@@ -1771,12 +2285,24 @@
     const chosen = devices.find(device => device.serial === select.value);
     const chosenType = deviceConnectionType(chosen);
     const chosenPlatform = chosen ? devicePlatform(chosen) : platform;
+    const recordingReadiness = recordingDeviceReadiness(chosen);
+    const iosPairingNeeded = chosenPlatform === "ios"
+      && chosen?.state === "device"
+      && !iosRemoteXpcReady(chosen);
+    const iosRemoteReady = chosenPlatform === "ios" && iosRemoteXpcReady(chosen);
+    const iosUnpluggedReady = chosenPlatform === "ios" && iosUnplugReady(chosen);
     const deviceState = $("#device-state");
     deviceState.classList.toggle("online", Boolean(chosen?.state === "device"));
     deviceState.classList.toggle("error", Boolean(platformError || (chosen && chosen.state !== "device")));
-    deviceState.title = platformError || "";
-    deviceState.querySelector("span").textContent = chosen?.state === "device" ? `${platformLabel(chosenPlatform)} · ${deviceConnectionLabel(chosen)}在线` : platformError ? `${platformLabel(platform)} 连接异常` : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
-    $("#start-record").disabled = !chosen || chosen.state !== "device" || Boolean(state.active?.running);
+    deviceState.title = platformError || (!recordingReadiness.ready ? recordingReadiness.reason : "");
+    deviceState.querySelector("span").textContent = iosPairingNeeded
+      ? "iOS · USB 在线（待 RemotePairing）"
+      : iosRemoteReady && !iosUnpluggedReady && deviceConnectionType(chosen) === "usb"
+        ? iosEndpointScope(chosen) === "link-local"
+          ? "iOS · RemoteXPC 经 USB 网络在线（拔线不可保证）"
+          : "iOS · RemotePairing 在线（请拔线刷新验证）"
+        : chosen?.state === "device" ? `${platformLabel(chosenPlatform)} · ${deviceConnectionLabel(chosen)}在线` : platformError ? `${platformLabel(platform)} 连接异常` : chosen ? `${deviceConnectionLabel(chosen)} · ${chosen.state}` : "等待设备";
+    updateStartControlState(state.active);
     $("#enable-tcpip").disabled = !chosen || chosenPlatform !== "android" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#enable-harmony-tcpip").disabled = !chosen || chosenPlatform !== "harmony" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || chosenType !== "usb" || Boolean(state.active?.running);
@@ -1798,6 +2324,7 @@
     const summary = active?.summary || {};
     const isIos = activePlatform(active) === "ios";
     const powerFlow = powerFlowPresentation(active);
+    const primaryPower = primaryPowerSnapshot(active);
     updateGpuVisibility(active);
     const memoryEnabled = captureFeatureEnabled(active, "memory_frequency");
     const memoryAvailable = isIos || (
@@ -1817,55 +2344,82 @@
     $("#metric-current-label").textContent = powerFlow.currentLabel;
     $("#metric-current-tag").textContent = powerFlow.currentTag;
     $("#metric-energy-label").textContent = powerFlow.energyLabel;
-    $("#metric-energy-tag").textContent = powerFlow.direction === "charging" ? "CHARGE" : "ENERGY";
+    $("#metric-energy-tag").textContent = finite(primaryPower.consumptionEnergyMwh) ? "ENERGY" : "N/A";
     const powerTab = $('[data-metric="power_mw"][data-mode-only="power"]');
     const currentTab = $('[data-metric="current_ma"][data-mode-only="power"]');
-    if (powerTab) powerTab.textContent = powerFlow.direction === "charging" ? "充入功率" : "放电功率";
-    if (currentTab) currentTab.textContent = powerFlow.direction === "charging" ? "充电电流" : "放电电流";
-    $("#metric-power").textContent = finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--";
+    if (powerTab) powerTab.textContent = powerFlow.systemLoad
+      ? "SystemLoad 功率"
+      : isIos ? "电池流量 I×V"
+      : powerFlow.sessionDirection === "charging"
+        ? "充入功率"
+        : powerFlow.sessionDirection === "discharging" ? "放电功率" : "原始功率";
+    if (currentTab) currentTab.textContent = powerFlow.sessionDirection === "charging"
+      ? "充电电流"
+      : powerFlow.sessionDirection === "discharging" ? "放电电流" : "电池电流";
+    $("#metric-power").textContent = finite(primaryPower.latestMw) ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W` : "--";
     $("#metric-current").textContent = formatMetric(latest.current_ma, "mA", 0);
     $("#metric-cpu").textContent = formatMetric(latest.cpu_pct, "%", 1);
     $("#metric-memory").textContent = isIos
       ? formatMetric(latest.collector_cpu_pct, "%", 2)
       : formatMetric(latest.memory_frequency_mhz, "MHz", 0);
     $("#metric-temp").textContent = formatMetric(latest.temperature_c, "°C", 1);
-    $("#metric-energy").textContent = formatMetric(summary.energy_mwh, "mWh", 2);
-    const averagePower = finite(summary.average_power_mw) ? `AVG ${(Number(summary.average_power_mw) / 1000).toFixed(3)} W` : "整机电池侧";
-    $("#metric-power-sub").textContent = powerFlow.direction === "charging"
-      ? `${averagePower} · 电池吸收功率，不代表设备自身功耗`
-      : isIos && finite(latest.power_sample_age_s)
-        ? `${averagePower} · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
-        : averagePower;
+    $("#metric-energy").textContent = formatMetric(primaryPower.consumptionEnergyMwh, "mWh", 2);
+    const averagePower = finite(primaryPower.consumptionAverageMw)
+      ? `有效放电均值 ${(Number(primaryPower.consumptionAverageMw) / 1000).toFixed(3)} W`
+      : finite(primaryPower.observedAverageMw)
+        ? `${powerFlow.systemLoad ? "SystemLoad 原始均值" : "电池流量均值"} ${(Number(primaryPower.observedAverageMw) / 1000).toFixed(3)} W · 不作耗电结论`
+        : "尚无有效功率均值";
+    $("#metric-power-sub").textContent = powerFlow.systemLoad
+      ? `${averagePower}${finite(primaryPower.sampleAgeS) ? ` · age ${Number(primaryPower.sampleAgeS).toFixed(1)} s` : ""}`
+      : powerFlow.externalPower
+        ? `${averagePower} · external_power=true，仅原始流量`
+      : powerFlow.direction === "charging"
+        ? `${averagePower} · 当前样本为电池流入方向`
+        : isIos && finite(primaryPower.sampleAgeS)
+          ? `${averagePower} · age ${Number(primaryPower.sampleAgeS).toFixed(1)} s`
+          : averagePower;
     $("#metric-current-sub").textContent = finite(summary.average_current_ma)
       ? `AVG ${Number(summary.average_current_ma).toFixed(0)} mA${powerFlow.direction === "charging" ? " · 流入电池" : ""}`
       : powerFlow.direction === "charging" ? "流入电池的正幅值" : "正幅值";
     const averageCpu = finite(summary.average_cpu_pct) ? `AVG ${Number(summary.average_cpu_pct).toFixed(1)}%` : "全核心";
     $("#metric-cpu-sub").textContent = isIos && finite(summary.average_collector_cpu_pct)
-      ? `${averageCpu} · collector ${Number(summary.average_collector_cpu_pct).toFixed(1)}%`
+      ? `${averageCpu} · 观察者相关上界 ${Number(summary.average_collector_cpu_pct).toFixed(1)}%`
       : averageCpu;
     const memory = active?.memory || {};
     $("#metric-memory-sub").textContent = isIos
       ? finite(summary.average_collector_cpu_pct)
         ? `AVG ${Number(summary.average_collector_cpu_pct).toFixed(2)}%`
-        : "observer CPU"
+        : "观察者相关进程 CPU 上界"
       : finite(memory.p95_frequency_mhz)
         ? `P95 ${Number(memory.p95_frequency_mhz).toFixed(0)} MHz · 高频 ${formatNumber(memory.high_frequency_share_pct, 1)}%`
         : memory.limitations || "DRAM / DMC / MIF";
     $("#metric-temp-sub").textContent = finite(latest.voltage_mv) ? `${(Number(latest.voltage_mv) / 1000).toFixed(3)} V` : isIos ? "DiagnosticsService" : "BatteryService";
-    $("#metric-energy-sub").textContent = active?.sample_count
-      ? `${active.sample_count} samples · ${powerFlow.direction === "charging" ? "充入能量积分" : "有效区间积分"}`
-      : powerFlow.direction === "charging" ? "充入能量积分" : "有效区间积分";
+    $("#metric-energy-sub").textContent = finite(primaryPower.consumptionEnergyMwh)
+      ? `${active?.sample_count || 0} samples · 仅有效放电区间积分`
+      : "未形成有效放电区间，不显示 0 W / 0 mWh 结论";
     const chargingNotice = $("#charging-power-notice");
-    const showChargingNotice = powerFlow.direction === "charging" && finite(latest.power_mw);
+    const showChargingNotice = (powerFlow.direction === "charging" || powerFlow.externalPower) && finite(primaryPower.latestMw);
     chargingNotice?.classList.toggle("hidden", !showChargingNotice);
     if (showChargingNotice) {
-      const watts = Number(latest.power_mw) / 1000;
+      const watts = Number(primaryPower.latestMw) / 1000;
       const amps = finite(latest.current_ma) ? Number(latest.current_ma) / 1000 : null;
       const volts = finite(latest.voltage_mv) ? Number(latest.voltage_mv) / 1000 : null;
-      $("#charging-power-title").textContent = `当前为充电状态：电池充入 ${watts.toFixed(2)} W`;
-      $("#charging-power-detail").textContent = amps !== null && volts !== null
-        ? `${amps.toFixed(2)} A × ${volts.toFixed(2)} V。黑屏只降低设备负载，不会让快充输入归零；续航测试请断开外部供电。`
-        : "该数值是电池吸收的充电功率，不等于黑屏待机功耗；续航测试请断开外部供电。";
+      if (powerFlow.systemLoad) {
+        $("#charging-power-title").textContent = `当前有外部供电：SystemLoad ${watts.toFixed(2)} W`;
+        $("#charging-power-detail").textContent = amps !== null && volts !== null
+          ? `SystemLoad 是 DiagnosticsService 的整机原始通道，外供时可能接近 SystemPowerIn；电池流量另为 ${amps.toFixed(2)} A × ${volts.toFixed(2)} V。两者不能互相改名，也都不是独立电源轨实测。`
+          : "SystemLoad 是 DiagnosticsService 的整机原始通道，不是“电池充入功率”或独立电源轨实测；当前外部供电区间不进入耗电、能量或续航结论。";
+      } else if (powerFlow.externalPower) {
+        $("#charging-power-title").textContent = `当前为外部供电：电池侧原始流量 ${watts.toFixed(2)} W`;
+        $("#charging-power-detail").textContent = amps !== null && volts !== null
+          ? `${amps.toFixed(2)} A × ${volts.toFixed(2)} V。即使电流符号为负，external_power=true 时也不能把该区间当作有效电池放电或设备耗电。`
+          : "external_power=true；这里只保留原始流量，不生成平均耗电、能量或续航结论。";
+      } else {
+        $("#charging-power-title").textContent = `当前为充电状态：电池流量 ${watts.toFixed(2)} W`;
+        $("#charging-power-detail").textContent = amps !== null && volts !== null
+          ? `${amps.toFixed(2)} A × ${volts.toFixed(2)} V。该区间只保留原始流量，不进入设备耗电结论；续航测试请断开外部供电。`
+          : "该数值是电池侧原始流量，不等于设备耗电；续航测试请断开外部供电。";
+      }
     }
   }
 
@@ -1874,6 +2428,8 @@
       $("#live-resolution-note")?.classList.add("hidden");
       const latest = active?.latest || {};
       const summary = active?.summary || {};
+      const primaryPower = primaryPowerSnapshot(active);
+      const powerFlow = powerFlowPresentation(active);
       const context = active?.context || {};
       $("#metric-fps").textContent = formatMetric(latest.cpu_pct, "%", 1);
       $("#metric-fps-sub").textContent = "DVT 进程 CPU / 逻辑核心归一化";
@@ -1883,18 +2439,26 @@
         ? latest.collector_cpu_pct
         : summary.average_collector_cpu_pct;
       $("#metric-frame-p99").textContent = formatMetric(overhead, "%", 2);
-      $("#metric-frame-p99-sub").textContent = "sysmond / DTServiceHub / pairing daemon";
-      $("#metric-frame-issue").textContent = finite(latest.power_mw)
-        ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W`
+      $("#metric-frame-p99-sub").textContent = "sysmond / DTServiceHub / pairing daemon 同期 CPU 上界";
+      $("#metric-frame-issue").textContent = finite(primaryPower.latestMw)
+        ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W`
         : "--";
-      $("#metric-frame-issue-sub").textContent = finite(latest.power_sample_age_s)
-        ? `PowerTelemetry · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
-        : "PowerTelemetry SystemLoad";
+      $("#metric-frame-issue-label").textContent = powerFlow.systemLoad
+        ? "当前整机原始 SystemLoad"
+        : "当前电池流量 I×V";
+      $("#metric-frame-issue-tag").textContent = powerFlow.systemLoad ? "SYSTEM" : "BATTERY";
+      $("#metric-frame-issue-sub").textContent = powerFlow.systemLoad
+        ? primaryPower.stale
+          ? `DiagnosticsService SystemLoad 已超过 ${iosSystemLoadStaleAfterS} 秒未刷新，仅保留原始展示`
+          : finite(primaryPower.sampleAgeS)
+            ? `DiagnosticsService SystemLoad · age ${Number(primaryPower.sampleAgeS).toFixed(1)} s`
+          : "DiagnosticsService SystemLoad"
+        : "电池电流幅值 × 电池电压";
       $("#metric-render-resolution").textContent = context.foreground_package
-        || active?.metadata?.target_package
-        || "--";
+        || "未确认";
       $("#metric-render-resolution-sub").textContent = context.foreground_activity
-        || "事件驱动的 application state";
+        || performance.foreground_state_reason
+        || "仅使用测试期间实际收到的 DVT application-state 变化";
       $("#metric-render-resolution-card")?.classList.remove("hidden");
       $("#metric-interpolation-card")?.classList.remove("hidden");
       $("#performance-render-evidence")?.classList.remove("hidden");
@@ -1912,7 +2476,7 @@
       : finite(performance.sampled_compositor_fps)
         ? Number(performance.sampled_compositor_fps)
         : null;
-    const oneLow = finite(performance.one_percent_low_fps)
+    const oneLow = standardOnePercentLowAvailable(active) && finite(performance.one_percent_low_fps)
       ? Number(performance.one_percent_low_fps)
       : null;
     const p99 = finite(performance.frame_metric_p99_ms)
@@ -1925,11 +2489,15 @@
         : null;
 
     $("#metric-fps").textContent = fps === null ? "--" : fps.toFixed(1) + " FPS";
-    $("#metric-fps-sub").textContent = finite(performance.current_refresh_rate_hz)
-      ? "显示 " + Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz · " + Number(performance.frame_sample_count || 0).toLocaleString("zh-CN") + " 帧"
-      : performance.frame_unavailable_reason || "等待前台窗口帧计数";
+    $("#metric-fps-sub").textContent = fps === null
+      ? performance.frame_unavailable_reason || (active?.running ? "等待前台窗口帧计数" : "本次没有有效帧数据")
+      : finite(performance.current_refresh_rate_hz)
+        ? "显示 " + Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz · " + Number(performance.frame_sample_count || 0).toLocaleString("zh-CN") + " 帧"
+        : `${Number(performance.frame_sample_count || 0).toLocaleString("zh-CN")} 帧`;
     $("#metric-one-low").textContent = oneLow === null ? "--" : oneLow.toFixed(1) + " FPS";
-    $("#metric-one-low-sub").textContent = performance.one_percent_low_source || "最慢 1% 帧换算";
+    $("#metric-one-low-sub").textContent = oneLow === null
+      ? "只有逐帧间隔或详细帧直方图时才生成标准 1% Low"
+      : performance.one_percent_low_source || "最慢 1% 帧换算";
     $("#metric-frame-p99").textContent = p99 === null ? "--" : p99.toFixed(2) + " ms";
     $("#metric-frame-p99-sub").textContent = finite(performance.frame_metric_p95_ms)
       ? "P95 " + Number(performance.frame_metric_p95_ms).toFixed(2) + " ms"
@@ -1983,8 +2551,13 @@
   function renderPerformanceResources(active) {
     if (activePlatform(active) === "ios") {
       const latest = active?.latest || {};
+      const primaryPower = primaryPowerSnapshot(active);
+      const powerFlow = powerFlowPresentation(active);
+      const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");
       const context = active?.context || {};
       const monitor = active?.system_monitor || {};
+      const gpuObserved = finite(latest.gpu_load_pct)
+        || (Array.isArray(active?.series) && active.series.some(row => finite(row?.gpu_load_pct)));
       $("#resource-gpu").textContent = finite(latest.gpu_load_pct)
         ? `${Number(latest.gpu_load_pct).toFixed(1)}%`
         : "--";
@@ -1992,32 +2565,45 @@
         ? `${Number(latest.temperature_c).toFixed(1)} °C`
         : "--";
       $("#resource-window").textContent = context.foreground_package
-        || active?.metadata?.target_package
         || "--";
       $("#resource-ios-overhead").textContent = finite(latest.collector_cpu_pct)
         ? `${Number(latest.collector_cpu_pct).toFixed(2)}%`
         : finite(active?.summary?.average_collector_cpu_pct)
           ? `${Number(active.summary.average_collector_cpu_pct).toFixed(2)}% AVG`
           : "--";
-      $("#resource-ios-power-age").textContent = finite(latest.power_sample_age_s)
-        ? `${Number(latest.power_sample_age_s).toFixed(1)} s`
+      $("#resource-ios-power-age")?.closest("div")?.classList.toggle("hidden", !powerFlow.systemLoad);
+      $("#resource-ios-power-age").textContent = powerFlow.systemLoad && finite(primaryPower.sampleAgeS)
+        ? `${Number(primaryPower.sampleAgeS).toFixed(1)} s`
         : "--";
-      $("#resource-whole-power").textContent = finite(latest.power_mw)
-        ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W · 物理整机`
+      $("#resource-whole-power").textContent = finite(primaryPower.latestMw)
+        ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W · ${powerFlow.systemLoad ? "SystemLoad 当前样本" : "电池流量 I×V"}`
         : "--";
       $("#resource-snapshot-source").textContent = Number(monitor.system_snapshot_count || 0)
         ? `${Number(monitor.system_snapshot_count)} DVT snapshots`
         : "DVT sysmond";
-      $("#performance-frame-source").textContent = "iOS DVT sysmond / GPU counters";
-      $("#performance-frame-confidence").textContent = "CPU、GPU 和进程资源为诊断遥测，不包含通用应用 FPS";
-      $("#performance-render-source").textContent = "PowerTelemetryData.SystemLoad";
-      $("#performance-render-scale").textContent = finite(latest.power_sample_age_s)
-        ? `物理功耗样本年龄 ${Number(latest.power_sample_age_s).toFixed(1)} s`
-        : "物理功耗通常约 20 秒更新一次";
-      $("#performance-interpolation-source").textContent = "collector_cpu_pct";
+      $("#performance-frame-source").textContent = gpuObserved
+        ? "iOS DVT sysmond / GPU counters"
+        : "iOS DVT sysmond";
+      $("#performance-frame-confidence").textContent = gpuObserved
+        ? "CPU、GPU 和进程资源为诊断遥测，不包含通用应用 FPS"
+        : "本次只收到 CPU / 进程诊断遥测；未收到 GPU 数据，也不包含通用应用 FPS";
+      $("#performance-evidence-label-2").textContent = powerFlow.systemLoad
+        ? "SystemLoad 通道来源"
+        : "电池流量来源";
+      $("#performance-render-source").textContent = powerFlow.systemLoad
+        ? "DiagnosticsService PowerTelemetryData.SystemLoad"
+        : "电池电流幅值 × 电池电压";
+      $("#performance-render-scale").textContent = powerFlow.systemLoad
+        ? primaryPower.stale
+          ? `SystemLoad 已超过 ${iosSystemLoadStaleAfterS} 秒未刷新；曲线断开且不进入耗电积分`
+          : finite(primaryPower.sampleAgeS)
+            ? `SystemLoad 样本年龄 ${Number(primaryPower.sampleAgeS).toFixed(1)} s`
+          : "DiagnosticsService 的整机原始 SystemLoad 通道通常约 20 秒更新一次"
+        : "当前未收到 SystemLoad；只展示电池端流量，不能冒充整机原始 SystemLoad 通道。";
+      $("#performance-interpolation-source").textContent = "观察者相关进程 CPU（上界）";
       $("#performance-interpolation-evidence").textContent = finite(latest.collector_cpu_pct)
-        ? `当前归一化采集器 CPU ${Number(latest.collector_cpu_pct).toFixed(2)}%`
-        : "报告保留 sysmond、DTServiceHub 与配对服务的观察者开销";
+        ? `当前 sysmond、DTServiceHub 与配对服务同期归一化 CPU 合计 ${Number(latest.collector_cpu_pct).toFixed(2)}%；包含本底活动，不能当作工具净增量`
+        : "报告保留观察者相关进程 CPU 作为干扰上界，不推断净增量";
       return;
     }
     const platform = activePlatform(active);
@@ -2036,9 +2622,14 @@
     const thermal = monitor.thermal || {};
     const brightnessDim = active?.brightness_throttling || {};
     const brightnessState = brightnessDim.current_state || {};
-    const brightnessStatus = String(brightnessState.status || "none");
+    const brightnessVendorKnown = brightnessState.vendor_thermal_active === true || brightnessState.vendor_thermal_active === false;
+    const brightnessStatus = brightnessVendorKnown
+      ? brightnessState.vendor_thermal_active === true ? "confirmed" : "none"
+      : String(brightnessState.status || "none");
     $("#resource-thermal").textContent = brightnessStatus === "confirmed"
-      ? `热降亮 · 上限 ${finite(brightnessState.thermal_cap) ? Number(brightnessState.thermal_cap * 100).toFixed(1) + "%" : "已限制"}`
+      ? `热降亮 · ${finite(brightnessState.vendor_thermal_limit_nits)
+        ? `系统标称上限 ${Number(brightnessState.vendor_thermal_limit_nits).toFixed(0)} nit（非实测）`
+        : finite(brightnessState.thermal_cap) ? `上限 ${Number(brightnessState.thermal_cap * 100).toFixed(1)}%` : "已限制"}`
       : brightnessStatus === "suspected"
         ? "疑似热降亮"
         : finite(thermal.status)
@@ -2047,21 +2638,36 @@
     $("#resource-window").textContent = performance.foreground_window_name || context.foreground_activity || "--";
 
     const cadenceParts = [];
-    if (finite(performance.current_refresh_rate_hz)) cadenceParts.push(Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz");
+    const resourceScreenState = String(context.screen_state || "").trim().toLowerCase();
+    const harmonyDisplayInactive = platform === "harmony" && resourceScreenState
+      && !["awake", "on"].includes(resourceScreenState);
+    if (finite(performance.current_refresh_rate_hz)) {
+      cadenceParts.push(harmonyDisplayInactive
+        ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz（熄屏保留配置，非当前输出）`
+        : Number(performance.current_refresh_rate_hz).toFixed(0) + " Hz");
+    }
     if (finite(performance.sampled_frame_rate_fps)) cadenceParts.push(Number(performance.sampled_frame_rate_fps).toFixed(1) + " FPS");
     if (finite(performance.cadence_multiplier)) cadenceParts.push("约 " + Number(performance.cadence_multiplier).toFixed(0) + "×");
     $("#resource-cadence").textContent = cadenceParts.join(" / ") || "--";
     $("#resource-whole-power").textContent = finite(latest.power_mw)
-      ? (Number(latest.power_mw) / 1000).toFixed(3) + " W · 只记录整机"
+      ? (Number(latest.power_mw) / 1000).toFixed(3) + " W · 当前样本"
       : "--";
+    const captureBackend = String(
+      active?.capture_configuration?.backend
+      || active?.metadata?.capture_configuration?.backend
+      || active?.config?.capture_configuration?.backend
+      || ""
+    );
     $("#resource-snapshot-source").textContent = platform === "harmony"
-      ? "SmartPerf / thermal"
+      ? captureBackend === "harmony_smartperf"
+        ? "SmartPerf / ThermalService"
+        : "HDC / ThermalService"
       : "sampler / thermal";
 
     $("#performance-frame-source").textContent = performance.frame_source || "平台窗口 / 合成器计数";
     $("#performance-frame-confidence").textContent = performance.one_percent_low_confidence
       ? "1% Low 置信度：" + performance.one_percent_low_confidence
-      : performance.frame_unavailable_reason || "等待有效帧计数";
+      : performance.frame_unavailable_reason || (active?.running ? "等待有效帧计数" : "本次没有有效帧计数");
     const renderPresentation = renderResolutionPresentation(active, performance);
     $("#performance-render-source").textContent = `数据来源：${renderPresentation.source}`;
     $("#performance-render-scale").textContent = finite(performance.render_scale_pct)
@@ -2080,23 +2686,39 @@
     if (activePlatform(active) === "ios") {
       const latest = active?.latest || {};
       const summary = active?.summary || {};
+      const primaryPower = primaryPowerSnapshot(active);
+      const powerFlow = powerFlowPresentation(active);
       const processes = Array.isArray(active?.system_monitor?.processes)
         ? active.system_monitor.processes
         : [];
-      const physicalRows = [
-        ["当前整机功耗", finite(latest.power_mw) ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W` : "--", "PowerTelemetry SystemLoad"],
-        ["平均整机功耗", finite(summary.average_power_mw) ? `${(Number(summary.average_power_mw) / 1000).toFixed(3)} W` : "--", "有效物理样本"],
-        ["物理样本年龄", finite(latest.power_sample_age_s) ? `${Number(latest.power_sample_age_s).toFixed(1)} s` : "--", "通常约 20 秒刷新"],
-      ];
+      const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");
+      const physicalRows = powerFlow.systemLoad
+        ? [
+            ["当前整机原始 SystemLoad", finite(primaryPower.latestMw) ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W` : "--", "DiagnosticsService SystemLoad"],
+            ["有效放电区间 SystemLoad 均值", finite(primaryPower.consumptionAverageMw) ? `${(Number(primaryPower.consumptionAverageMw) / 1000).toFixed(3)} W` : "--", finite(primaryPower.consumptionAverageMw) ? "只使用 SystemLoad 样本" : "外部供电/充电时不生成 0 W 结论"],
+            ["原始 SystemLoad 均值", finite(primaryPower.observedAverageMw) ? `${(Number(primaryPower.observedAverageMw) / 1000).toFixed(3)} W` : "--", "与电池 I×V 分域，不是独立电源轨实测"],
+            ["电池流量 I×V 均值", finite(summary.battery_flow_average_power_mw) ? `${(Number(summary.battery_flow_average_power_mw) / 1000).toFixed(3)} W` : "--", "电池电流幅值 × 电池电压"],
+            ["SystemLoad 样本年龄", finite(primaryPower.sampleAgeS) ? `${Number(primaryPower.sampleAgeS).toFixed(1)} s` : "--", primaryPower.stale ? "已过期，仅原始展示，不进入耗电积分" : "通常约 20 秒刷新"],
+          ]
+        : [
+            ["当前电池流量 I×V", finite(primaryPower.latestMw) ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W` : "--", "ios_battery_current_voltage"],
+            ["有效放电区间电池流量均值", finite(primaryPower.consumptionAverageMw) ? `${(Number(primaryPower.consumptionAverageMw) / 1000).toFixed(3)} W` : "--", "只表示电池端流量"],
+            ["原始电池流量 I×V 均值", finite(summary.battery_flow_average_power_mw) ? `${(Number(summary.battery_flow_average_power_mw) / 1000).toFixed(3)} W` : "--", "电池电流幅值 × 电池电压"],
+          ];
+      $("#power-pressure-note").innerHTML = powerFlow.systemLoad
+        ? "<strong>通道边界：</strong>SystemLoad 与电池 I×V 分域展示；外供时 SystemLoad 可能接近 SystemPowerIn，但两者都不是独立电源轨实测。"
+        : "<strong>当前能力：</strong>尚未收到 DiagnosticsService SystemLoad；这里只展示电池 I×V 流量，不把它改名为整机 SystemLoad。";
       $("#power-pressure-driver-list").innerHTML = physicalRows.map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item[0])}</strong><small>${escapeHtml(item[2])}</small></div><b>${escapeHtml(item[1])}</b></div>`).join("");
-      $("#power-pressure-task-list").innerHTML = processes.length ? processes.slice(0, 7).map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item.name || item.command || "process")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${formatBytes(item.resident_bytes)}</small></div><b>${formatNumber(item.cpu_pct, 1)}%</b></div>`).join("") : '<div class="empty-row">等待 DVT 进程快照</div>';
+      $("#power-pressure-task-list").innerHTML = processes.length
+        ? processes.slice(0, 7).map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item.name || item.command || "process")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${formatBytes(item.resident_bytes)}</small></div><b>${formatNumber(item.cpu_pct, 1)}%</b></div>`).join("")
+        : `<div class="empty-row">${processSnapshotsEnabled ? active?.running ? "等待 DVT 进程快照" : "本次没有 DVT 进程快照" : "进程快照未启用"}</div>`;
       const overhead = finite(latest.collector_cpu_pct)
         ? Number(latest.collector_cpu_pct)
         : finite(summary.average_collector_cpu_pct) ? Number(summary.average_collector_cpu_pct) : null;
       $("#power-pressure-setting-list").innerHTML = [
         ["collector_cpu_pct", overhead === null ? "--" : `${overhead.toFixed(2)}%`, "sysmond / DTServiceHub / pairing daemon"],
         ["GPU utilization", finite(latest.gpu_load_pct) ? `${Number(latest.gpu_load_pct).toFixed(1)}%` : "--", "DVT 诊断遥测"],
-        ["相对 powerScore", "仅旁证", "不转换为 mW 或应用物理功耗"],
+        ["相对 powerScore", "仅旁证", "不转换为 mW 或应用功耗"],
       ].map(item => `<div class="pressure-row compact"><div><strong>${escapeHtml(item[0])}</strong><small>${escapeHtml(item[2])}</small></div><b>${escapeHtml(item[1])}</b></div>`).join("");
       return;
     }
@@ -2107,8 +2729,14 @@
     const settingRows = Array.isArray(settings.rows) ? settings.rows : [];
     const platform = activePlatform(active);
     const powerFlow = powerFlowPresentation(active);
-    $("#power-pressure-note").innerHTML = powerFlow.direction === "charging"
-      ? "<strong>当前为充电状态：</strong>资源变化与这里显示的电池充入功率相关，不等于续航功耗，也不应用于组件或任务耗电归因；请断开外部供电后进行功耗测试。"
+    $("#power-pressure-note").innerHTML = powerFlow.externalPower
+      ? powerFlow.systemLoad
+        ? "<strong>当前为外部供电：</strong>iOS SystemLoad 是 DiagnosticsService 的整机原始通道，外供时可能接近 SystemPowerIn；电池 I×V 是另一条电池流量通道。两者都不是独立电源轨实测，也不用于本次续航归因。"
+        : "<strong>当前为外部供电：</strong>即使电流符号为负，该区间也只保留电池侧原始流量，不进入平均耗电、能量、续航或任务归因。"
+      : powerFlow.direction === "charging"
+      ? powerFlow.systemLoad
+        ? "<strong>当前为外部供电：</strong>iOS SystemLoad 是 DiagnosticsService 的整机原始通道，电池 I×V 是另一条电池流量通道；两者不因方向而互相改名，也都不是独立电源轨实测。"
+        : "<strong>当前为充电状态：</strong>这里只保留电池侧原始流量，不等于续航功耗，也不应用于组件或任务耗电归因；请断开外部供电后进行功耗测试。"
       : platform === "harmony"
         ? "<strong>边界：</strong>BatteryService 电流是整机电池侧数据；CPU/GPU/DDR 与进程相关性用于解释趋势，不等于独立电源轨或 Android BatteryStats 归因。"
         : "<strong>边界：</strong>相关系数用于解释电流 / 功率和资源压力是否同步变化，不代表独立硬件电源轨，也不能把多个压力项直接相加。";
@@ -2380,18 +3008,20 @@
         <p class="frame-flow-detail">${escapeHtml(item.detail || "暂无判定说明")}</p>
         ${sampleText ? `<footer>${sampleText}</footer>` : ""}
       </article>`;
-    }).join("") : '<div class="empty-row">等待应用、渲染、合成与显示阶段帧数据</div>';
+    }).join("") : `<div class="empty-row">${active?.running ? "等待应用、渲染、合成与显示阶段帧数据" : "本次没有形成可验证的渲染链路节点"}</div>`;
     $("#render-pipeline-dominant").textContent = dominant.label || "--";
     $("#render-pipeline-dominant-detail").textContent = finite(dominant.p95_ms)
       ? `P95 ${Number(dominant.p95_ms).toFixed(2)} ms · P99 ${formatNumber(dominant.p99_ms, 2)} ms`
       : pipeline.limitations || (platform === "harmony"
         ? "HarmonyOS 量产接口提供帧抖动与合成节奏，不提供 Android framestats 阶段时间戳"
-        : "等待详细帧时间戳");
-    const averageWholePower = finite(power.average_power_mw) ? power.average_power_mw : active?.summary?.average_power_mw;
+        : active?.running ? "等待详细帧时间戳" : "本次没有可解析的详细帧时间戳");
+    const averageWholePower = platform === "ios"
+      ? primaryPowerSnapshot(active).consumptionAverageMw
+      : finite(power.average_power_mw) ? power.average_power_mw : active?.summary?.average_power_mw;
     $("#performance-whole-power").textContent = finite(averageWholePower)
       ? `${(Number(averageWholePower) / 1000).toFixed(3)} W`
       : "--";
-    $("#render-pipeline-stage-list").innerHTML = stages.length ? stages.slice(0, 10).map(item => `<div class="pipeline-row"><div><strong>${escapeHtml(item.label || item.key)}</strong><small>${Number(item.sample_count || 0)} frames</small></div><div class="pipeline-track"><span style="width:${clamp(Number(item.p95_ms || 0) / Math.max(16.67, ...stages.map(stage => Number(stage.p95_ms || 0))) * 100, 0, 100).toFixed(1)}%"></span></div><b>${formatNumber(item.p95_ms, 2)} ms</b></div>`).join("") : `<div class="empty-row">${platform === "harmony" ? "当前仅提供帧抖动与合成节奏，不拆分 Android 渲染阶段" : "等待详细 framestats"}</div>`;
+    $("#render-pipeline-stage-list").innerHTML = stages.length ? stages.slice(0, 10).map(item => `<div class="pipeline-row"><div><strong>${escapeHtml(item.label || item.key)}</strong><small>${Number(item.sample_count || 0)} frames</small></div><div class="pipeline-track"><span style="width:${clamp(Number(item.p95_ms || 0) / Math.max(16.67, ...stages.map(stage => Number(stage.p95_ms || 0))) * 100, 0, 100).toFixed(1)}%"></span></div><b>${formatNumber(item.p95_ms, 2)} ms</b></div>`).join("") : `<div class="empty-row">${platform === "harmony" ? "当前仅提供帧抖动与合成节奏，不拆分 Android 渲染阶段" : active?.running ? "等待详细 framestats" : "本次没有可解析的 framestats 阶段数据"}</div>`;
     $("#render-thread-list").innerHTML = threads.length ? threads.slice(0, 10).map(item => {
       const cpu = finite(item.cpu_pct) ? item.cpu_pct : finite(item.average_when_visible_cpu_pct) ? item.average_when_visible_cpu_pct : item.maximum_cpu_pct;
       return `<div class="pipeline-row compact"><div><strong>${escapeHtml(item.name || "thread")}</strong><small>${escapeHtml(item.process || "--")} · ${escapeHtml(item.pid ?? "--")}/${escapeHtml(item.tid ?? "--")}</small></div><b>${formatNumber(cpu, 1)}%</b></div>`;
@@ -2428,15 +3058,15 @@
     reportLink.classList.toggle("hidden", !active?.report_ready);
     $("#run-probe").disabled = running;
     if (active?.report_url) reportLink.href = active.report_url;
-    $$("#record-form input, #record-form select, #record-form button").forEach(control => {
+    $$("#record-form input, #record-form select, #record-form button, #home-start-panel input, #home-start-panel select, #home-start-panel button").forEach(control => {
       if (control.id === "start-record") return;
       control.disabled = running;
     });
-    $("#start-record").disabled = running || !selectedDevice();
+    updateStartControlState(active);
     $("#start-record").querySelector("span:last-child").textContent = running
       ? "采集中"
       : app.testMode === "performance" ? "开始性能测试" : "开始功耗测试";
-    $$("[data-test-mode]").forEach(button => { button.disabled = running; });
+    $$(".test-mode-switch [data-test-mode]").forEach(button => { button.disabled = running; });
     $$(".platform-switch [data-platform]").forEach(button => { button.disabled = running; });
     $("#system-monitor-input").disabled = running;
     updateAppScannerAvailability();
@@ -2451,7 +3081,7 @@
     }
     const clusters = orderedCpuClusters(active);
     if (!clusters.length) {
-      container.innerHTML = '<div class="empty-row">等待 CPU 频率数据</div>';
+      container.innerHTML = `<div class="empty-row">${active?.running ? "等待 CPU 频率数据" : "本次没有 CPU 频率数据"}</div>`;
       return;
     }
     container.innerHTML = clusters.map((cluster, index) => {
@@ -2459,7 +3089,7 @@
       const maximum = finite(cluster.maximum_mhz) ? Number(cluster.maximum_mhz) : null;
       const displayName = cpuClusterDisplayName(cluster, index, clusters);
       return `<div class="cluster-row">
-        <div class="cluster-name"><strong>${escapeHtml(cpuCoreGroupLabel(cluster))}</strong><small>${escapeHtml(displayName)} · ${escapeHtml(cluster.name || "policy")} 共享频率</small></div>
+        <div class="cluster-name"><strong>${escapeHtml(cpuCoreGroupLabel(cluster))}</strong><small>${escapeHtml(displayName)} · ${activePlatform(active) === "harmony" ? `${escapeHtml(cluster.name || "group")} 按最大频率分组均值` : `${escapeHtml(cluster.name || "policy")} 共享频率`}</small></div>
         <div class="cluster-frequency"><span>${frequency === null ? "--" : `${frequency.toFixed(0)} MHz`}</span><small>${maximum === null ? "等待频率上限" : `上限 ${maximum.toFixed(0)} MHz`}</small></div>
       </div>`;
     }).join("");
@@ -2478,6 +3108,12 @@
     $("#context-screen").textContent = context.screen_state || "--";
     if (activePlatform(active) === "ios") {
       const latest = active?.latest || {};
+      const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");
+      if (!context.foreground_package) {
+        $("#context-package").textContent = "当前前台未知";
+        $("#context-activity").textContent = performance.foreground_state_reason
+          || "DVT 未提供采集开始时的前台应用快照";
+      }
       $("#context-display-settings").textContent = "当前 sidecar 不采集亮度 / 刷新率设置";
       $("#context-pressure-driver").textContent = finite(latest.gpu_load_pct)
         ? `GPU ${Number(latest.gpu_load_pct).toFixed(1)}%`
@@ -2486,22 +3122,37 @@
       const leading = processes.length ? [...processes].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0] : null;
       $("#context-pressure-task").textContent = leading
         ? `${leading.name || "process"} · ${formatNumber(leading.cpu_pct, 1)}% CPU`
-        : "等待 DVT 进程快照";
+        : processSnapshotsEnabled ? "等待 DVT 进程快照" : "进程快照未启用";
       $("#context-power-scheduler").textContent = "iOS 不公开 Android cpuset / Governor / ADPF";
       const voltage = finite(latest.voltage_mv) ? `${(Number(latest.voltage_mv) / 1000).toFixed(3)} V` : "--";
       const level = finite(battery.level_pct) ? `${Number(battery.level_pct).toFixed(0)}%` : "--";
       $("#context-battery").textContent = `${voltage} / ${level}`;
       $("#context-reconnect").textContent = String(active?.checkpoint?.reconnect_count ?? active?.metadata?.reconnect_count ?? 0);
-      $("#context-source").textContent = context.source || "iOS DVT application state";
+      $("#context-source").textContent = context.source
+        || (performance.foreground_state_status === "observed"
+          ? "iOS DVT application state"
+          : "iOS DVT 状态变化流 · 当前前台未确认");
       return;
     }
     const startSettings = settings.start || {};
-    const refresh = finite(performance.current_refresh_rate_hz)
-      ? `${Number(performance.current_refresh_rate_hz).toFixed(0)} Hz`
-      : finite(context.refresh_rate_hz) ? `${Number(context.refresh_rate_hz).toFixed(0)} Hz` : "--";
+    const contextPlatform = activePlatform(active);
+    const contextScreenState = String(context.screen_state || "").trim().toLowerCase();
+    const contextDisplayInactive = contextPlatform === "harmony" && contextScreenState
+      && !["awake", "on"].includes(contextScreenState);
+    const refreshValue = finite(performance.current_refresh_rate_hz)
+      ? Number(performance.current_refresh_rate_hz)
+      : finite(context.refresh_rate_hz) ? Number(context.refresh_rate_hz) : null;
+    const refresh = refreshValue === null
+      ? "--"
+      : contextDisplayInactive
+        ? `${refreshValue.toFixed(0)} Hz（熄屏保留配置，非当前输出）`
+        : `${refreshValue.toFixed(0)} Hz`;
     const brightness = startSettings["system.screen_brightness"] ?? performance.brightness_raw ?? "--";
+    const brightnessContext = contextPlatform === "harmony"
+      ? `RenderService 背光原始值 ${brightness}（非 nit、非热限亮${contextDisplayInactive ? "，熄屏保留" : ""}）`
+      : `${brightness} brightness`;
     const lowPower = String(startSettings["global.low_power"] ?? "--") === "1" ? "省电开" : "省电关";
-    $("#context-display-settings").textContent = `${brightness} brightness / ${refresh} / ${lowPower}`;
+    $("#context-display-settings").textContent = `${brightnessContext} / ${refresh} / ${lowPower}`;
     const leadingDriver = pressure.leading_driver || {};
     $("#context-pressure-driver").textContent = leadingDriver.label
       ? `${leadingDriver.label} · r=${formatNumber(leadingDriver.correlation, 2)}`
@@ -2522,39 +3173,48 @@
     $("#context-source").textContent = context.source || "sampler";
   }
 
-  function renderIosPerformanceSystem(active, monitor, processes, priority, hottest) {
+  /* Legacy performance-context and scheduler panels were removed from the UI.
     const latest = active?.latest || {};
+    const primaryPower = primaryPowerSnapshot(active);
+    const powerFlow = powerFlowPresentation(active);
     const context = active?.context || {};
     const systemCount = Number(monitor.system_snapshot_count || 0);
+    const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");
     $("#performance-snapshot-status").textContent = systemCount
       ? `${systemCount} 个 DVT 进程快照`
-      : active?.running ? "等待首个 DVT 性能样本" : "尚无 DVT 性能样本";
+      : processSnapshotsEnabled
+        ? active?.running ? "等待首个 DVT 进程快照" : "尚无 DVT 进程快照"
+        : "进程快照未启用 · 基础 DVT CPU/GPU 仍独立采集";
     $("#performance-refresh-value").textContent = formatMetric(latest.cpu_pct, "%", 1);
     $("#performance-refresh-label").textContent = "DVT 进程 CPU 归一化";
     $("#performance-fps-value").textContent = formatMetric(latest.gpu_load_pct, "%", 1);
     $("#performance-fps-label").textContent = "DVT GPU utilization";
-    $("#performance-frame-value").textContent = finite(latest.power_mw)
-      ? `${(Number(latest.power_mw) / 1000).toFixed(3)} W`
+    $("#performance-frame-value").textContent = finite(primaryPower.latestMw)
+      ? `${(Number(primaryPower.latestMw) / 1000).toFixed(3)} W`
       : "--";
-    $("#performance-frame-label").textContent = finite(latest.power_sample_age_s)
-      ? `PowerTelemetry · age ${Number(latest.power_sample_age_s).toFixed(1)} s`
-      : "PowerTelemetry SystemLoad";
+    $("#performance-frame-label").textContent = powerFlow.systemLoad
+      ? finite(primaryPower.sampleAgeS)
+        ? `DiagnosticsService SystemLoad · age ${Number(primaryPower.sampleAgeS).toFixed(1)} s`
+        : "DiagnosticsService SystemLoad"
+      : "电池流量 I×V · 当前无 SystemLoad";
     $("#performance-touch-value").textContent = formatMetric(latest.collector_cpu_pct, "%", 2);
-    $("#performance-touch-label").textContent = "归一化采集器 CPU 开销";
+    $("#performance-touch-label").textContent = "观察者相关进程 CPU（上界）";
 
     const resourceRows = [
       { label: "CPU", value: latest.cpu_pct, unit: "%", scale: 100 },
       { label: "GPU", value: latest.gpu_load_pct, unit: "%", scale: 100 },
       { label: "Observer", value: latest.collector_cpu_pct, unit: "%", scale: 25 },
     ].filter(item => item.label !== "GPU" || finite(item.value));
-    $("#performance-residency-source").textContent = "DVT / PowerTelemetry";
+    $("#performance-residency-source").textContent = powerFlow.systemLoad
+      ? "DVT / DiagnosticsService SystemLoad"
+      : "DVT / battery current × voltage";
     $("#performance-residency-list").innerHTML = resourceRows.map(item => {
       const value = finite(item.value) ? Number(item.value) : null;
       const share = value === null ? 0 : clamp(value / item.scale * 100, 0, 100);
       return `<div class="performance-residency-row"><div><strong>${escapeHtml(item.label)}</strong><small>${value === null ? "--" : `${value.toFixed(item.label === "Observer" ? 2 : 1)} ${item.unit}`}</small></div><div class="performance-residency-track"><span style="width:${share.toFixed(1)}%"></span></div><b>${value === null ? "--" : value.toFixed(1)}</b></div>`;
     }).join("");
 
-    $("#performance-window-value").textContent = context.foreground_package || active?.metadata?.target_package || "--";
+    $("#performance-window-value").textContent = context.foreground_package || "--";
     $("#performance-display-value").textContent = "iOS 显示参数未由当前 sidecar 采集";
     $("#performance-gpu-value").textContent = finite(latest.gpu_load_pct)
       ? `${Number(latest.gpu_load_pct).toFixed(1)}% utilization`
@@ -2578,21 +3238,25 @@
       $("#system-priority-detail").textContent = `${leading.name || leading.watch_name || "后台进程"} 当前 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
       $("#system-priority-badge").textContent = "ACTIVE";
     } else if (overhead >= 10) {
-      $("#system-priority-title").textContent = "采集器开销偏高";
-      $("#system-priority-detail").textContent = `collector_cpu_pct 为 ${overhead.toFixed(2)}%，建议关闭进程快照或提高采样周期。`;
+      $("#system-priority-title").textContent = "观察者相关进程 CPU 较高";
+      $("#system-priority-detail").textContent = `sysmond、DTServiceHub 与配对服务同期 CPU 合计为 ${overhead.toFixed(2)}%；这只是干扰上界。功耗测试优先提高 iOS 主采样周期后复测；进程快照开关不会关闭基础 DVT/sysmond。`;
       $("#system-priority-badge").textContent = "OBSERVER";
     } else if (thermalStatus > 0) {
       $("#system-priority-title").textContent = `检测到热状态 ${thermalStatus}`;
       $("#system-priority-detail").textContent = "请结合 DVT CPU/GPU 与电池温度判断持续性能下降。";
       $("#system-priority-badge").textContent = "THERMAL";
+    } else if (!processSnapshotsEnabled) {
+      $("#system-priority-title").textContent = "后台进程分析未启用";
+      $("#system-priority-detail").textContent = "当前只依据基础 DVT CPU/GPU、温度和观察者相关 CPU 展示原始状态；未采集周期进程快照，不能判断后台进程是否异常。";
+      $("#system-priority-badge").textContent = "OFF";
     } else {
       $("#system-priority-title").textContent = "未检测到明显 iOS 性能干扰";
-      $("#system-priority-detail").textContent = "DVT 进程、GPU、温度和观察者开销均未触发异常阈值。";
+      $("#system-priority-detail").textContent = "DVT 进程、GPU、温度和观察者相关进程 CPU 均未触发当前提示阈值。";
       $("#system-priority-badge").textContent = "CLEAR";
     }
 
-    $("#watched-process-body").innerHTML = priority.length ? priority.map(item => `<tr class="priority-row"><td><span class="process-identity"><strong>${escapeHtml(item.watch_label || item.watch_name || item.name || "unknown")}</strong><small>${escapeHtml(item.command || item.name || "--")}</small></span></td><td>${escapeHtml(item.pid ?? "--")}</td><td>${finite(item.cpu_pct) ? `${Number(item.cpu_pct).toFixed(1)}%` : "--"}</td><td><span class="activity-pill active">ACTIVE</span></td></tr>`).join("") : '<tr><td colspan="4" class="table-empty">未检测到明显 iOS 后台异常。</td></tr>';
-    $("#system-process-body").innerHTML = processes.length ? processes.slice(0, 5).map(item => `<tr><td><span class="process-identity"><strong>${escapeHtml(item.name || item.command || "unknown")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${escapeHtml(item.user || "--")}</small></span></td><td><strong class="cpu-value">${formatNumber(item.cpu_pct, 1)}%</strong></td><td>${finite(item.mem_pct) ? `${formatNumber(item.mem_pct, 1)}%` : formatBytes(item.resident_bytes)}</td><td>${escapeHtml(item.state || "--")}</td></tr>`).join("") : '<tr><td colspan="4" class="table-empty">暂无 DVT 进程快照。</td></tr>';
+    $("#watched-process-body").innerHTML = priority.length ? priority.map(item => `<tr class="priority-row"><td><span class="process-identity"><strong>${escapeHtml(item.watch_label || item.watch_name || item.name || "unknown")}</strong><small>${escapeHtml(item.command || item.name || "--")}</small></span></td><td>${escapeHtml(item.pid ?? "--")}</td><td>${finite(item.cpu_pct) ? `${Number(item.cpu_pct).toFixed(1)}%` : "--"}</td><td><span class="activity-pill active">ACTIVE</span></td></tr>`).join("") : `<tr><td colspan="4" class="table-empty">${processSnapshotsEnabled ? "未检测到明显 iOS 后台异常。" : "未采集后台进程快照，不能判断是否异常。"}</td></tr>`;
+    $("#system-process-body").innerHTML = processes.length ? processes.slice(0, 5).map(item => `<tr><td><span class="process-identity"><strong>${escapeHtml(item.name || item.command || "unknown")}</strong><small>PID ${escapeHtml(item.pid ?? "--")} · ${escapeHtml(item.user || "--")}</small></span></td><td><strong class="cpu-value">${formatNumber(item.cpu_pct, 1)}%</strong></td><td>${finite(item.mem_pct) ? `${formatNumber(item.mem_pct, 1)}%` : formatBytes(item.resident_bytes)}</td><td>${escapeHtml(item.state || "--")}</td></tr>`).join("") : `<tr><td colspan="4" class="table-empty">${processSnapshotsEnabled ? "暂无 DVT 进程快照。" : "进程快照未启用。"}</td></tr>`;
   }
 
   function renderSystem(active) {
@@ -2605,7 +3269,10 @@
     const priority = Array.isArray(monitor.active_priority) ? monitor.active_priority : [];
     const thermal = monitor.thermal || {};
     const brightnessState = active?.brightness_throttling?.current_state || {};
-    const brightnessStatus = String(brightnessState.status || "none");
+    const brightnessVendorKnown = brightnessState.vendor_thermal_active === true || brightnessState.vendor_thermal_active === false;
+    const brightnessStatus = brightnessVendorKnown
+      ? brightnessState.vendor_thermal_active === true ? "confirmed" : "none"
+      : String(brightnessState.status || "none");
     const temperatures = Array.isArray(thermal.temperatures) ? thermal.temperatures : [];
     const thermalTemperatures = temperatures.filter(isThermalTemperature);
     const hottest = thermalTemperatures.length ? [...thermalTemperatures].sort((a, b) => Number(b.value_c || 0) - Number(a.value_c || 0))[0] : null;
@@ -2621,8 +3288,13 @@
 
     const currentRefresh = finite(performance.current_refresh_rate_hz) ? Number(performance.current_refresh_rate_hz) : null;
     const peakRefresh = finite(performance.peak_refresh_rate_hz) ? Number(performance.peak_refresh_rate_hz) : null;
+    const currentScreenState = String(active?.context?.screen_state || "").trim().toLowerCase();
+    const displayInactive = isHarmony && currentScreenState
+      && !["awake", "on"].includes(currentScreenState);
     $("#performance-refresh-value").textContent = currentRefresh === null ? "--" : `${currentRefresh.toFixed(0)} Hz`;
-    $("#performance-refresh-label").textContent = peakRefresh === null ? "当前显示档位" : `设备最高 ${peakRefresh.toFixed(0)} Hz`;
+    $("#performance-refresh-label").textContent = displayInactive && currentRefresh !== null
+      ? "熄屏保留配置，非当前输出"
+      : peakRefresh === null ? "当前显示档位" : `设备最高 ${peakRefresh.toFixed(0)} Hz`;
     const sampledFrameRate = finite(performance.sampled_frame_rate_fps) ? performance.sampled_frame_rate_fps : performance.sampled_compositor_fps;
     const minimumFrameRate = finite(performance.minimum_sampled_frame_rate_fps) ? performance.minimum_sampled_frame_rate_fps : performance.minimum_sampled_compositor_fps;
     const frameRateUnit = performance.frame_rate_unit || "FPS";
@@ -2654,11 +3326,14 @@
     const effectiveBrightness = finite(brightnessState.effective_raw_estimate)
       ? ` → 有效约 ${Number(brightnessState.effective_raw_estimate).toFixed(0)}`
       : "";
+    const brightnessDisplay = isHarmony
+      ? `背光原始值 ${brightness}（非 nit、非热限亮${displayInactive ? "，熄屏保留" : ""}）`
+      : `${brightness}${effectiveBrightness}`;
     const displaySource = isHarmony
-      ? "HarmonyOS RenderService activeMode"
+      ? "HarmonyOS RenderService screen"
       : "Android dumpsys display 活动模式";
     $("#performance-window-value").textContent = performance.foreground_window_name ? `${performance.foreground_window_name}${finite(performance.foreground_window_id) ? ` · #${performance.foreground_window_id}` : ""}` : "--";
-    $("#performance-display-value").textContent = `${resolution} / ${brightness}${effectiveBrightness} · ${displaySource}`;
+    $("#performance-display-value").textContent = `${resolution} / ${brightnessDisplay} · ${displaySource}`;
     $("#performance-gpu-value").textContent = performance.gpu_renderer || "--";
     $("#performance-temperature-value").textContent = hottest && finite(hottest.value_c) ? `${Number(hottest.value_c).toFixed(1)} °C · ${hottest.name || "sensor"}` : finite(active?.latest?.temperature_c) ? `${Number(active.latest.temperature_c).toFixed(1)} °C · battery` : "--";
     $("#performance-switch-value").textContent = `${Number(performance.refresh_switch_count || 0)} 次`;
@@ -2674,7 +3349,7 @@
     banner.classList.toggle("idle", !hasIssue);
     if (brightnessIssue) {
       $("#system-priority-title").textContent = brightnessStatus === "confirmed" ? "检测到屏幕热降亮" : "检测到疑似屏幕热降亮";
-      $("#system-priority-detail").textContent = `${brightnessState.reason || "显示侧热限制已触发"}；系统设定亮度 ${finite(brightnessState.setting_raw) ? Number(brightnessState.setting_raw).toFixed(0) : "未知"}。`;
+      $("#system-priority-detail").textContent = `${brightnessState.reason || "显示侧热限制已触发"}；${finite(brightnessState.vendor_thermal_limit_nits) ? `系统标称上限 ${Number(brightnessState.vendor_thermal_limit_nits).toFixed(0)} nit（非实测）` : `系统设定亮度 ${finite(brightnessState.setting_raw) ? Number(brightnessState.setting_raw).toFixed(0) : "未知"}`}。`;
       $("#system-priority-badge").textContent = brightnessStatus === "confirmed" ? "DIM" : "SUSPECT";
     } else if (priority.length) {
       const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
@@ -2811,6 +3486,7 @@
     });
   }
 
+  */
   function renderConsole(active) {
     const container = $("#console-output");
     let logs = Array.isArray(active?.logs) ? active.logs : [];
@@ -2875,6 +3551,41 @@
     return key.startsWith("frame-flow-") ? "frame_flow" : key;
   }
 
+  function liveTimelineDefinitionSupported(active, key) {
+    const platform = activePlatform(active);
+    switch (String(key || "")) {
+      case "cpu_pct":
+        return captureFeatureEnabled(active, "cpu_usage");
+      case "cpu_frequency":
+        return platform !== "ios" && captureFeatureEnabled(active, "cpu_frequency");
+      case "frame_rate_fps":
+      case "frame_flow":
+        return platform !== "ios" && captureFeatureEnabled(active, "frame_rate");
+      case "refresh_rate_hz":
+        return platform !== "ios" && (
+          captureFeatureEnabled(active, "foreground_window")
+          || captureFeatureEnabled(active, "frame_rate")
+        );
+      case "frame_time_ms":
+      case "frame_issue_pct":
+        return platform !== "ios" && captureFeatureEnabled(active, "frame_rate");
+      case "gpu_load_pct":
+        return captureFeatureEnabled(active, "gpu_metrics");
+      case "gpu_frequency_mhz":
+        return platform !== "ios" && captureFeatureEnabled(active, "gpu_metrics");
+      case "memory_frequency_mhz":
+        return platform !== "ios" && captureFeatureEnabled(active, "memory_frequency");
+      case "temperature_c":
+        return captureFeatureEnabled(active, "thermal");
+      case "power_mw":
+      case "current_ma":
+      case "voltage_mv":
+        return true;
+      default:
+        return false;
+    }
+  }
+
   function applyLiveTimelineLayout(active, lanes) {
     const layout = currentLiveTimelineLayout(active);
     const rank = new Map(layout.order.map((key, index) => [key, index]));
@@ -2897,7 +3608,7 @@
     const layout = currentLiveTimelineLayout(active);
     const definitions = layout.order
       .map(key => liveTimelineLayoutDefinitionMap.get(key))
-      .filter(Boolean);
+      .filter(definition => definition && liveTimelineDefinitionSupported(active, definition.key));
     const lanesByGroup = new Map();
     (Array.isArray(availableLanes) ? availableLanes : []).forEach(lane => {
       const group = liveTimelineGroupKey(lane);
@@ -2925,7 +3636,9 @@
         ? definition.key === "frame_flow"
           ? `${groupedLanes.length} 个链路节点有数据`
           : `有数据 · ${groupedLanes[0].source}`
-        : "等待有效数据";
+        : active
+          ? active.running ? "等待有效数据" : "本次没有有效数据"
+          : "尚未开始采集";
       return `<div class="live-timeline-config-row${hidden ? " is-hidden" : ""}" data-live-timeline-row="${escapeHtml(definition.key)}">
         <label class="live-timeline-config-toggle">
           <input type="checkbox" data-live-timeline-toggle="${escapeHtml(definition.key)}"${hidden ? "" : " checked"} aria-label="显示 ${escapeHtml(definition.label)}">
@@ -2940,7 +3653,7 @@
   }
 
   function setLiveTimelineVisibility(active, key, visible) {
-    if (!liveTimelineLayoutKeys.has(key)) return false;
+    if (!liveTimelineLayoutKeys.has(key) || !liveTimelineDefinitionSupported(active, key)) return false;
     const layout = currentLiveTimelineLayout(active);
     if (visible) layout.hidden.delete(key);
     else layout.hidden.add(key);
@@ -2949,48 +3662,231 @@
   }
 
   function moveLiveTimelineLayoutItem(active, key, direction) {
-    if (!liveTimelineLayoutKeys.has(key)) return false;
+    if (!liveTimelineLayoutKeys.has(key) || !liveTimelineDefinitionSupported(active, key)) return false;
     const layout = currentLiveTimelineLayout(active);
+    const supportedOrder = layout.order.filter(item => liveTimelineDefinitionSupported(active, item));
+    const supportedIndex = supportedOrder.indexOf(key);
+    const targetSupportedIndex = supportedIndex + Number(direction);
+    if (supportedIndex < 0 || targetSupportedIndex < 0 || targetSupportedIndex >= supportedOrder.length) return false;
+    const targetKey = supportedOrder[targetSupportedIndex];
     const index = layout.order.indexOf(key);
-    const target = index + Number(direction);
-    if (index < 0 || target < 0 || target >= layout.order.length) return false;
+    const target = layout.order.indexOf(targetKey);
+    if (index < 0 || target < 0) return false;
     [layout.order[index], layout.order[target]] = [layout.order[target], layout.order[index]];
     saveLiveTimelineLayouts();
     return true;
   }
 
-  function downsampleTimelinePoints(points, limit = 900) {
-    if (points.length <= limit) return points;
-    const lastIndex = points.length - 1;
-    return Array.from({ length: limit }, (_, index) => (
-      points[Math.round(index / (limit - 1) * lastIndex)]
-    ));
+  function distributedTimelinePositions(size) {
+    if (size <= 0) return [];
+    const positions = [];
+    const pending = [[0, size]];
+    let cursor = 0;
+    while (cursor < pending.length) {
+      const [start, end] = pending[cursor];
+      cursor += 1;
+      if (start >= end) continue;
+      const middle = Math.floor((start + end) / 2);
+      positions.push(middle);
+      pending.push([start, middle], [middle + 1, end]);
+    }
+    return positions;
   }
 
-  function timelinePoints(source, value, { positive = false } = {}) {
-    const points = (Array.isArray(source) ? source : [])
-      .map((raw, index) => ({
-        elapsed: finite(raw?.elapsed_s) ? Number(raw.elapsed_s) : Number(index),
-        value: value(raw),
+  function addTimelineBoundaryGroups(selected, groups, limit, pointCount) {
+    if (!groups.length || selected.size >= limit) return;
+    const allIndexes = new Set(groups.flatMap(group => (
+      group.filter(index => index >= 0 && index < pointCount)
+    )));
+    if (new Set([...selected, ...allIndexes]).size <= limit) {
+      allIndexes.forEach(index => selected.add(index));
+      return;
+    }
+    distributedTimelinePositions(groups.length).forEach(position => {
+      const group = new Set(groups[position].filter(index => index >= 0 && index < pointCount));
+      const cost = [...group].filter(index => !selected.has(index)).length;
+      if (cost <= limit - selected.size) group.forEach(index => selected.add(index));
+    });
+  }
+
+  function timelineValuesDiffer(previous, current) {
+    if (!finite(previous) || !finite(current)) return false;
+    const tolerance = Math.max(.01, Math.abs(Number(previous)) * .0001);
+    return Math.abs(Number(current) - Number(previous)) > tolerance;
+  }
+
+  function downsampleTimelinePoints(points, limit = 900, { preserveSteps = false } = {}) {
+    const boundedLimit = Math.max(0, Math.min(points.length, Math.floor(Number(limit) || 0)));
+    if (!boundedLimit) return [];
+    if (points.length <= boundedLimit) return points;
+    if (boundedLimit === 1) return [points.at(-1)];
+    if (boundedLimit === 2) return [points[0], points.at(-1)];
+
+    const selected = new Set([0, points.length - 1]);
+    const breakBoundaryGroups = [];
+    const stepBoundaryGroups = [];
+    points.forEach((point, index) => {
+      if (index > 0 && point.breakBefore) breakBoundaryGroups.push([index - 1, index]);
+      if (
+        preserveSteps
+        && index > 0
+        && timelineValuesDiffer(points[index - 1]?.value, point?.value)
+      ) {
+        stepBoundaryGroups.push([index - 1, index]);
+      }
+    });
+    addTimelineBoundaryGroups(selected, breakBoundaryGroups, boundedLimit, points.length);
+    addTimelineBoundaryGroups(selected, stepBoundaryGroups, boundedLimit, points.length);
+
+    const remaining = boundedLimit - selected.size;
+    if (remaining > 0) {
+      const bucketSlots = 2;
+      const bucketCount = Math.max(1, Math.floor(remaining / bucketSlots));
+      const baseQuota = Math.floor(remaining / bucketCount);
+      const extraQuota = remaining % bucketCount;
+      for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+        const quota = baseQuota + (bucket < extraQuota ? 1 : 0);
+        const start = Math.floor(bucket * points.length / bucketCount);
+        const end = Math.floor((bucket + 1) * points.length / bucketCount);
+        const bucketIndexes = [];
+        for (let index = start; index < end; index += 1) {
+          if (
+            index > 0
+            && index < points.length - 1
+            && !selected.has(index)
+            && finite(points[index]?.value)
+          ) bucketIndexes.push(index);
+        }
+        if (!bucketIndexes.length || quota <= 0) continue;
+
+        const minimumIndex = bucketIndexes.reduce((best, index) => (
+          Number(points[index].value) < Number(points[best].value) ? index : best
+        ));
+        const maximumIndex = bucketIndexes.reduce((best, index) => (
+          Number(points[index].value) > Number(points[best].value) ? index : best
+        ));
+        const mean = bucketIndexes.reduce((sum, index) => sum + Number(points[index].value), 0)
+          / bucketIndexes.length;
+        const bucketExtrema = [...new Set([minimumIndex, maximumIndex])].sort((left, right) => (
+          Math.abs(Number(points[right].value) - mean)
+          - Math.abs(Number(points[left].value) - mean)
+        ));
+        let added = 0;
+        bucketExtrema.forEach(index => {
+          if (added >= quota || selected.size >= boundedLimit) return;
+          selected.add(index);
+          added += 1;
+        });
+
+        if (added < quota && selected.size < boundedLimit) {
+          const fill = bucketIndexes.filter(index => !selected.has(index));
+          const wanted = Math.min(quota - added, boundedLimit - selected.size, fill.length);
+          for (let offset = 0; offset < wanted; offset += 1) {
+            const position = Math.min(
+              fill.length - 1,
+              Math.floor((offset + .5) * fill.length / wanted),
+            );
+            selected.add(fill[position]);
+          }
+        }
+      }
+    }
+
+    if (selected.size < boundedLimit) {
+      const fill = points.map((_, index) => index).filter(index => !selected.has(index));
+      const wanted = Math.min(boundedLimit - selected.size, fill.length);
+      for (let offset = 0; offset < wanted; offset += 1) {
+        const position = Math.min(
+          fill.length - 1,
+          Math.floor((offset + .5) * fill.length / wanted),
+        );
+        selected.add(fill[position]);
+      }
+    }
+
+    const indexes = [...selected].sort((left, right) => left - right);
+    return indexes.map((sourceIndex, outputIndex) => {
+      if (!outputIndex) return points[sourceIndex];
+      const previousSourceIndex = indexes[outputIndex - 1];
+      const skippedBreak = points.slice(previousSourceIndex + 1, sourceIndex + 1)
+        .find(point => point.breakBefore);
+      if (!skippedBreak || points[sourceIndex].breakBefore) return points[sourceIndex];
+      return {
+        ...points[sourceIndex],
+        breakBefore: true,
+        breakElapsed: finite(skippedBreak.breakElapsed)
+          ? Number(skippedBreak.breakElapsed)
+          : Number(skippedBreak.elapsed),
+      };
+    });
+  }
+
+  function timelinePoints(
+    source,
+    value,
+    {
+      positive = false,
+      preserveSteps = false,
+      elapsed = null,
+      collapseSteps = false,
+    } = {},
+  ) {
+    const points = [];
+    let breakPending = false;
+    let breakElapsed = null;
+    (Array.isArray(source) ? source : []).forEach((raw, index) => {
+      const observedElapsed = finite(raw?.elapsed_s) ? Number(raw.elapsed_s) : Number(index);
+      const pointElapsed = typeof elapsed === "function"
+        ? elapsed(raw, observedElapsed)
+        : observedElapsed;
+      const next = value(raw);
+      const explicitBreak = Boolean(raw?.report_break_before || raw?._report_break_before || raw?.break_before);
+      const stale = raw?.stale === true || raw?.gpu_sample_stale === true || raw?.power_sample_stale === true;
+      const validValue = finite(next) && (!positive || Number(next) > 0);
+      if (explicitBreak || stale || !validValue) {
+        breakPending = true;
+        if (breakElapsed == null && finite(observedElapsed)) breakElapsed = observedElapsed;
+        if (!validValue || stale) return;
+      }
+      const previousPoint = points.at(-1);
+      if (
+        collapseSteps
+        && previousPoint
+        && !breakPending
+        && !explicitBreak
+        && !timelineValuesDiffer(previousPoint.value, next)
+      ) return;
+      points.push({
+        elapsed: finite(pointElapsed) ? Math.max(0, Number(pointElapsed)) : observedElapsed,
+        value: Number(next),
         raw,
-      }))
-      .filter(point => finite(point.elapsed) && finite(point.value))
-      .filter(point => !positive || Number(point.value) > 0)
-      .map(point => ({ ...point, value: Number(point.value) }));
-    return downsampleTimelinePoints(points);
+        breakBefore: breakPending || explicitBreak,
+        breakElapsed: breakPending ? breakElapsed : null,
+      });
+      breakPending = false;
+      breakElapsed = null;
+    });
+    if (breakPending && points.length && breakElapsed != null) {
+      points.at(-1).breakAfterElapsed = breakElapsed;
+    }
+    return downsampleTimelinePoints(points, 900, { preserveSteps });
   }
 
   function liveMetricSource(active, key) {
     const platform = activePlatform(active);
     const performance = active?.performance || {};
+    const powerFlow = powerFlowPresentation(active);
     const labels = {
-      power_mw: active?.latest?.power_source || (platform === "ios" ? "PowerTelemetryData.SystemLoad" : platform === "harmony" ? "HarmonyOS BatteryService" : "Android fuel gauge / BatteryService"),
+      power_mw: powerFlow.systemLoad
+        ? "DiagnosticsService 的整机原始 SystemLoad 通道；外供时可能接近 SystemPowerIn，非电池 I×V / 非独立电源轨实测"
+        : active?.latest?.power_source || (platform === "harmony" ? "HarmonyOS BatteryService" : "Android fuel gauge / BatteryService"),
       current_ma: platform === "harmony" ? "HarmonyOS BatteryService" : platform === "ios" ? "PowerTelemetry / battery diagnostics" : "Android fuel gauge current_now",
       voltage_mv: platform === "harmony" ? "HarmonyOS BatteryService" : "Battery voltage sensor",
       cpu_pct: platform === "ios" ? "DVT sysmond" : "累计 /proc/stat",
       frame_rate_fps: performance.frame_source || (platform === "harmony" ? "SmartPerf / RenderService" : "前台窗口 / SurfaceFlinger"),
-      refresh_rate_hz: platform === "harmony" ? "RenderService screen activeMode" : "SurfaceFlinger / display context",
-      frame_time_ms: performance.render_pipeline?.frame_metric_source || performance.frame_source || "详细帧时间戳",
+      refresh_rate_hz: performance.refresh_rate_timeline_source
+        || (platform === "harmony" ? "RenderService screen activeMode" : "DisplayManager active display mode"),
+      frame_time_ms: performance.render_pipeline?.frame_metric_source || performance.frame_source || "逐帧呈现间隔 / framestats",
       gpu_load_pct: platform === "ios" ? "DVT graphics" : platform === "harmony" ? "SmartPerf GPU" : "GPU sysfs / driver",
       gpu_frequency_mhz: platform === "harmony" ? "SmartPerf GPU" : "GPU devfreq / sysfs",
       memory_frequency_mhz: platform === "harmony" ? "SmartPerf DDR" : "DMC / MIF devfreq",
@@ -3014,7 +3910,23 @@
     const definition = metricDefinitions[key];
     if (!definition) return null;
     const rows = source || (definition.series === "performance" ? active?.performance_series : active?.series);
-    const points = timelinePoints(rows, definition.value, { positive });
+    const systemLoadPower = key === "power_mw" && powerFlowPresentation(active).systemLoad;
+    const metricValue = systemLoadPower
+      ? row => row?.power_source === iosSystemLoadPowerSource
+        && (!finite(row?.power_sample_age_s) || Number(row.power_sample_age_s) <= iosSystemLoadStaleAfterS)
+        ? definition.value(row)
+        : null
+      : definition.value;
+    const points = timelinePoints(rows, metricValue, {
+      positive,
+      preserveSteps: step,
+      collapseSteps: systemLoadPower,
+      elapsed: systemLoadPower
+        ? (row, observedElapsed) => finite(row?.power_sample_age_s)
+          ? observedElapsed - Math.max(0, Number(row.power_sample_age_s))
+          : observedElapsed
+        : null,
+    });
     if (!points.length) return null;
     const series = [{
       key,
@@ -3023,17 +3935,45 @@
       points,
       step,
     }];
-    const overlay = definition.overlay && typeof definition.overlay.value === "function"
+    const overlay = definition.overlay
+      && typeof definition.overlay.value === "function"
+      && (key !== "frame_rate_fps" || standardOnePercentLowAvailable(active))
       ? definition.overlay
       : null;
     if (overlay) {
-      const overlayPoints = timelinePoints(rows, overlay.value, { positive });
+      const overlayPoints = timelinePoints(rows, overlay.value, {
+        positive,
+        preserveSteps: step,
+      });
       if (overlayPoints.length) {
         series.push({
           key: `${key}-overlay`,
-          label: overlay.legend || "Secondary",
+          label: key === "frame_rate_fps"
+            ? performance.one_percent_low_timeline_label || overlay.legend || "Secondary"
+            : overlay.legend || "Secondary",
           color: overlay.color || "#f1d267",
           points: overlayPoints,
+          dashed: true,
+          step,
+        });
+      }
+    }
+    if (key === "power_mw" && powerFlowPresentation(active).systemLoad) {
+      const batteryFlowPoints = timelinePoints(
+        rows,
+        row => (
+          finite(row?.current_ma) && finite(row?.voltage_mv)
+            ? Number(row.current_ma) * Number(row.voltage_mv) / 1_000
+            : null
+        ),
+        { preserveSteps: step },
+      );
+      if (batteryFlowPoints.length) {
+        series.push({
+          key: "battery-flow-power",
+          label: "电池流量 I×V",
+          color: "#9e8cff",
+          points: batteryFlowPoints,
           dashed: true,
           step,
         });
@@ -3082,10 +4022,17 @@
     }).filter(item => item.points.length);
     if (!series.length) return null;
     const maximum = Math.max(0, ...clusters.map(cluster => Number(cluster.maximum_mhz || 0)));
+    const frequencyCadence = Number(
+      active?.metadata?.sampling_schedule_s?.cpu_frequency
+      || active?.sampling_schedule_s?.cpu_frequency
+      || 0
+    );
     return {
       key: "cpu_frequency",
       title: "CPU 核心组频率",
-      source: activePlatform(active) === "harmony" ? "hidumper --cpufreq · policy 共享频率" : "cpufreq policy 共享频率",
+      source: activePlatform(active) === "harmony"
+        ? `hidumper --cpufreq · 按最大频率分组均值${frequencyCadence > 1.5 ? ` · 约 ${frequencyCadence.toFixed(0)} 秒刷新，中间点保持最近值` : ""}`
+        : "cpufreq policy 共享频率",
       unit: "MHz",
       digits: 0,
       axis: maximum > 0
@@ -3097,7 +4044,7 @@
   }
 
   function frameTimingTimelineLane(active) {
-    if (!captureFeatureEnabled(active, "frame_details")) return null;
+    if (!captureFeatureEnabled(active, "frame_rate")) return null;
     const rows = Array.isArray(active?.performance_series) ? active.performance_series : [];
     const series = [
       {
@@ -3128,7 +4075,7 @@
   }
 
   function frameIssueTimelineLane(active) {
-    if (!captureFeatureEnabled(active, "frame_details")) return null;
+    if (!captureFeatureEnabled(active, "frame_rate")) return null;
     const rows = Array.isArray(active?.performance_series) ? active.performance_series : [];
     const points = timelinePoints(rows, row => finite(row?.frame_issue_pct) ? Number(row.frame_issue_pct) : null);
     if (!points.length) return null;
@@ -3219,19 +4166,23 @@
     ].filter(Boolean);
   }
 
-  function timelinePath(coordinates, step = false) {
-    if (!coordinates.length) return "";
+  function timelineGapLimit(coordinates) {
     const intervals = coordinates.slice(1)
       .map((point, index) => point.elapsed - coordinates[index].elapsed)
       .filter(value => value > 0)
       .sort((left, right) => left - right);
     const medianInterval = intervals.length ? intervals[Math.floor(intervals.length / 2)] : 0;
-    const gapLimit = Math.max(10, medianInterval * 5);
+    return Math.max(3, medianInterval * 5);
+  }
+
+  function timelinePath(coordinates, step = false) {
+    if (!coordinates.length) return "";
+    const gapLimit = timelineGapLimit(coordinates);
     let path = `M${coordinates[0].x.toFixed(2)},${coordinates[0].y.toFixed(2)}`;
     for (let index = 1; index < coordinates.length; index += 1) {
       const point = coordinates[index];
       const previous = coordinates[index - 1];
-      if (point.elapsed - previous.elapsed > gapLimit) {
+      if (point.breakBefore || point.elapsed - previous.elapsed > gapLimit) {
         path += ` M${point.x.toFixed(2)},${point.y.toFixed(2)}`;
       } else if (step) {
         path += ` H${point.x.toFixed(2)} V${point.y.toFixed(2)}`;
@@ -3256,6 +4207,221 @@
     return text.length > length ? `${text.slice(0, Math.max(1, length - 1))}…` : text;
   }
 
+  function normalizeLiveTimeRange(value, maximumTime = app.chartGeometry?.maxTime) {
+    if (!Array.isArray(value) || value.length < 2 || !finite(maximumTime)) return null;
+    const limit = Math.max(0, Number(maximumTime));
+    const start = clamp(Math.min(Number(value[0]), Number(value[1])), 0, limit);
+    const end = clamp(Math.max(Number(value[0]), Number(value[1])), 0, limit);
+    return finite(start) && finite(end) && end > start ? [start, end] : null;
+  }
+
+  function activeLiveTimeRange() {
+    return normalizeLiveTimeRange(
+      app.liveTimeRangeDraft || app.liveTimeRange,
+      app.chartGeometry?.maxTime,
+    );
+  }
+
+  function liveSeriesRangeStatistics(series, start, end) {
+    const points = (Array.isArray(series?.points) ? series.points : [])
+      .filter(point => finite(point.elapsed) && finite(point.value))
+      .sort((left, right) => Number(left.elapsed) - Number(right.elapsed));
+    const values = points
+      .filter(point => point.elapsed >= start && point.elapsed <= end && finite(point.value))
+      .map(point => Number(point.value));
+    let weightedTotal = 0;
+    let coveredDuration = 0;
+    const boundaryValues = [];
+    const gapLimit = timelineGapLimit(points);
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const previous = points[index];
+      const current = points[index + 1];
+      const delta = current.elapsed - previous.elapsed;
+      if (
+        delta <= 0
+        || delta > gapLimit
+        || current.breakBefore
+        || (finite(previous.breakAfterElapsed) && Number(previous.breakAfterElapsed) <= current.elapsed)
+      ) continue;
+      const overlapStart = Math.max(start, previous.elapsed);
+      const overlapEnd = Math.min(end, current.elapsed);
+      if (overlapEnd <= overlapStart) continue;
+      const duration = overlapEnd - overlapStart;
+      let leftValue = Number(previous.value);
+      let rightValue = Number(previous.value);
+      if (!series.step) {
+        const leftRatio = (overlapStart - previous.elapsed) / delta;
+        const rightRatio = (overlapEnd - previous.elapsed) / delta;
+        leftValue += (Number(current.value) - Number(previous.value)) * leftRatio;
+        rightValue += (Number(current.value) - Number(previous.value)) * rightRatio;
+      }
+      weightedTotal += (leftValue + rightValue) * .5 * duration;
+      coveredDuration += duration;
+      boundaryValues.push(leftValue, rightValue);
+    }
+    const latest = points.at(-1);
+    if (
+      series.step
+      && latest
+      && latest.elapsed < end
+      && !finite(latest.breakAfterElapsed)
+    ) {
+      const overlapStart = Math.max(start, latest.elapsed);
+      if (end > overlapStart) {
+        const duration = end - overlapStart;
+        weightedTotal += Number(latest.value) * duration;
+        coveredDuration += duration;
+        boundaryValues.push(Number(latest.value));
+      }
+    }
+    const observedValues = [...values, ...boundaryValues];
+    if (!observedValues.length) return null;
+    return {
+      count: values.length,
+      average: coveredDuration > 0
+        ? weightedTotal / coveredDuration
+        : observedValues.reduce((sum, value) => sum + value, 0) / observedValues.length,
+      minimum: Math.min(...observedValues),
+      maximum: Math.max(...observedValues),
+      coveredDuration,
+      calculation: coveredDuration > 0 ? "preview_time_weighted" : "preview_sample_average",
+    };
+  }
+
+  function liveRangeCalculationLabel(summary) {
+    const labels = {
+      time_weighted_full_resolution: "完整数据时间加权均值",
+      sample_average_full_resolution: "完整数据样本均值",
+      frame_rate_recomputed: "选区帧率重算",
+      one_percent_low_recomputed: "选区 1% Low 重算",
+      frame_quantile_recomputed: "选区分位值重算",
+      frame_issue_ratio_recomputed: "选区异常比例重算",
+      refresh_residency_weighted: "选区驻留时间加权",
+      frame_stage_full_resolution: "完整链路样本均值",
+      preview_time_weighted: "拖动预览 · 时间加权",
+      preview_sample_average: "拖动预览 · 样本均值",
+    };
+    return labels[String(summary?.calculation || "")] || "区间均值";
+  }
+
+  function exactLiveRangeSummary(series, range) {
+    const summary = app.liveRangeSummary;
+    if (!summary?.full_resolution || !Array.isArray(range)) return null;
+    const tolerance = Math.max(.02, (range[1] - range[0]) * .0001);
+    if (
+      Math.abs(Number(summary.start_elapsed_s) - range[0]) > tolerance
+      || Math.abs(Number(summary.end_elapsed_s) - range[1]) > tolerance
+    ) return null;
+    return summary.metrics?.[series.key] || null;
+  }
+
+  function scheduleLiveTimeRangePresentation() {
+    if (app.liveRangePresentationFrame) return;
+    app.liveRangePresentationFrame = window.requestAnimationFrame(() => {
+      app.liveRangePresentationFrame = 0;
+      renderLiveTimeRangePresentation();
+    });
+  }
+
+  async function loadLiveRangeSummary(range) {
+    const normalized = normalizeLiveTimeRange(range, app.chartGeometry?.maxTime);
+    if (!normalized) return;
+    const requestId = ++app.liveRangeSummaryRequestId;
+    app.liveRangeSummary = null;
+    renderLiveTimeRangePresentation();
+    try {
+      const result = await api("/api/range-summary", {
+        method: "POST",
+        body: JSON.stringify({
+          start_elapsed_s: normalized[0],
+          end_elapsed_s: normalized[1],
+        }),
+      });
+      if (requestId !== app.liveRangeSummaryRequestId) return;
+      app.liveRangeSummary = result;
+    } catch (_error) {
+      if (requestId !== app.liveRangeSummaryRequestId) return;
+      app.liveRangeSummary = null;
+    }
+    renderLiveTimeRangePresentation();
+  }
+
+  function renderLiveTimeRangePresentation() {
+    const geometry = app.chartGeometry;
+    const range = activeLiveTimeRange();
+    const status = $("#live-range-status");
+    const statistics = $("#live-range-statistics");
+    const clearButton = $("#live-range-clear");
+    if (!status || !statistics || !clearButton) return;
+
+    const selectionNodes = geometry?.selectionNodes;
+    if (!geometry || !range) {
+      selectionNodes?.window.setAttribute("opacity", "0");
+      selectionNodes?.start.setAttribute("opacity", "0");
+      selectionNodes?.end.setAttribute("opacity", "0");
+      clearButton.disabled = true;
+      statistics.classList.add("hidden");
+      statistics.replaceChildren();
+      status.textContent = geometry
+        ? "在任意图表中按住并横向拖动，查看该区间的样本均值、最小值与最大值。"
+        : "等待有效时间序列后即可框选分析。";
+      return;
+    }
+
+    const [start, end] = range;
+    const startX = geometry.xFor(start);
+    const endX = geometry.xFor(end);
+    selectionNodes.window.setAttribute("x", String(startX));
+    selectionNodes.window.setAttribute("width", String(Math.max(1, endX - startX)));
+    selectionNodes.window.setAttribute("opacity", "1");
+    selectionNodes.start.setAttribute("x1", String(startX));
+    selectionNodes.start.setAttribute("x2", String(startX));
+    selectionNodes.start.setAttribute("opacity", "1");
+    selectionNodes.end.setAttribute("x1", String(endX));
+    selectionNodes.end.setAttribute("x2", String(endX));
+    selectionNodes.end.setAttribute("opacity", "1");
+    clearButton.disabled = false;
+    const exactAvailable = geometry.lanes.some(lane => (
+      lane.series.some(series => exactLiveRangeSummary(series, range))
+    ));
+    status.textContent = `${formatDuration(start)} – ${formatDuration(end)} · ${formatDuration(end - start)} · ${exactAvailable ? "完整采集数据统计" : app.liveTimeRangeDraft ? "拖动预览" : "正在计算完整数据，当前显示图表预览"}`;
+
+    const cards = geometry.lanes.map(lane => {
+      const rows = lane.series.map(series => ({
+        series,
+        summary: exactLiveRangeSummary(series, range)
+          || liveSeriesRangeStatistics(series, start, end),
+      })).filter(item => item.summary);
+      if (!rows.length) return "";
+      return `<article><strong>${escapeHtml(lane.title)}</strong>${rows.map(({ series, summary }) => (
+        `<span><em>${escapeHtml(series.label)} · ${escapeHtml(liveRangeCalculationLabel(summary))}</em><b>${Number(summary.average).toFixed(lane.digits)} ${escapeHtml(lane.unit)}</b></span>`
+        + `<small>${Number(summary.sample_count ?? summary.count ?? 0).toLocaleString("zh-CN")} 点${finite(summary.covered_duration_s ?? summary.coveredDuration) ? ` · 覆盖 ${formatDuration(Number(summary.covered_duration_s ?? summary.coveredDuration))}` : ""} · ${Number(summary.minimum).toFixed(lane.digits)}–${Number(summary.maximum).toFixed(lane.digits)} ${escapeHtml(lane.unit)}</small>`
+      )).join("")}</article>`;
+    }).filter(Boolean);
+    statistics.innerHTML = cards.length
+      ? cards.join("")
+      : '<article><strong>选中区间暂无有效样本</strong><small>尝试扩大框选范围，或确认对应采集项已经产生数据。</small></article>';
+    statistics.classList.remove("hidden");
+  }
+
+  function liveElapsedForPointer(event, geometry = app.chartGeometry, allowOutside = true) {
+    const wrap = $("#chart-wrap");
+    if (!wrap || !geometry) return null;
+    const rect = wrap.getBoundingClientRect();
+    if (!rect.width) return null;
+    const viewX = ((event.clientX - rect.left) / rect.width) * geometry.width;
+    if (
+      !allowOutside
+      && (viewX < geometry.margins.left || viewX > geometry.width - geometry.margins.right)
+    ) return null;
+    const plotX = clamp(viewX, geometry.margins.left, geometry.width - geometry.margins.right);
+    return clamp(
+      (plotX - geometry.margins.left) / Math.max(1, geometry.plotWidth) * geometry.maxTime,
+      geometry.minTime,
+      geometry.maxTime,
+    );
+  }
+
   function renderChart() {
     const svg = $("#live-chart");
     const empty = $("#chart-empty");
@@ -3269,16 +4435,21 @@
       svg.setAttribute("viewBox", "0 0 1000 260");
       empty.classList.remove("hidden");
       const allHidden = availableLanes.length > 0;
-      empty.querySelector("strong").textContent = allHidden ? "已隐藏所有图表" : "等待遥测数据";
+      empty.querySelector("strong").textContent = allHidden
+        ? "已隐藏所有图表"
+        : active ? active.running ? "等待遥测数据" : "本次没有有效时间序列" : "等待遥测数据";
       empty.querySelector("small").textContent = allHidden
         ? "在“显示内容与顺序”中重新打开需要的数据"
-        : "开始采集后，已开启且有效的曲线将在这里实时更新";
+        : active && !active.running
+          ? "只展示本次实际采到的数据；空曲线不会占位"
+          : "开始采集后，已开启且有效的曲线将在这里实时更新";
       $("#live-timeline-source").textContent = allHidden
         ? `0 / ${availableLanes.length} 条数据泳道正在显示`
         : active
-          ? "已开启项目尚无有效时间序列"
+          ? active.running ? "已开启项目尚无有效时间序列" : "本次没有有效时间序列"
           : "等待采集配置与时间序列";
       app.chartGeometry = null;
+      renderLiveTimeRangePresentation();
       return;
     }
 
@@ -3389,7 +4560,22 @@
       let legendX = margins.left + 5;
       lane.series.forEach((item, index) => {
         const latest = item.points.at(-1);
-        const legend = `${item.label} ${Number(latest.value).toFixed(lane.digits)} ${lane.unit}`;
+        const configuredFreshLimit = Math.max(
+          3,
+          Number(active?.metadata?.sample_interval_s || active?.config?.interval_s || 1) * 4,
+        );
+        const current = latest && (
+          !(finite(latest.breakAfterElapsed) && maxTime >= Number(latest.breakAfterElapsed))
+          && (
+            item.step
+            || maxTime - latest.elapsed <= Math.min(timelineGapLimit(item.points), configuredFreshLimit)
+          )
+        )
+          ? latest
+          : null;
+        const legend = current
+          ? `${item.label} ${Number(current.value).toFixed(lane.digits)} ${lane.unit}`
+          : `${item.label} 当前无新鲜样本`;
         const estimatedWidth = 24 + legend.length * (compact ? 5.2 : 5.8);
         if (legendX + estimatedWidth > width - margins.right && index > 0) return;
         laneGroup.appendChild(svgNode("line", {
@@ -3462,7 +4648,10 @@
     dimPoints.forEach(point => {
       const elapsed = Number(point.elapsed_s || 0);
       if (!finite(elapsed) || elapsed < minTime || elapsed > maxTime) return;
-      const status = String(point.status || "suspected");
+      const vendorKnown = point.vendor_thermal_active === true || point.vendor_thermal_active === false;
+      const status = vendorKnown
+        ? point.vendor_thermal_active === true ? "confirmed" : "suspected"
+        : String(point.status || "suspected");
       const x = xFor(elapsed);
       const marker = svgNode("line", {
         x1: x,
@@ -3474,6 +4663,32 @@
       marker.appendChild(svgNode("title", {}, `${formatDuration(elapsed)} · ${status === "confirmed" ? "确认热降亮" : "疑似热降亮"} · ${point.reason || "显示侧热限制"}`));
       svg.appendChild(marker);
     });
+
+    const selectionWindow = svgNode("rect", {
+      x: margins.left,
+      y: margins.top,
+      width: 0,
+      height: height - margins.top - margins.bottom,
+      class: "timeline-range-window",
+      opacity: 0,
+    });
+    const selectionStart = svgNode("line", {
+      x1: margins.left,
+      y1: margins.top,
+      x2: margins.left,
+      y2: height - margins.bottom,
+      class: "timeline-range-boundary",
+      opacity: 0,
+    });
+    const selectionEnd = svgNode("line", {
+      x1: margins.left,
+      y1: margins.top,
+      x2: margins.left,
+      y2: height - margins.bottom,
+      class: "timeline-range-boundary",
+      opacity: 0,
+    });
+    svg.append(selectionWindow, selectionStart, selectionEnd);
 
     const hoverLine = svgNode("line", {
       x1: margins.left,
@@ -3492,8 +4707,15 @@
       minTime,
       maxTime,
       plotWidth,
+      xFor,
       hoverLine,
+      selectionNodes: {
+        window: selectionWindow,
+        start: selectionStart,
+        end: selectionEnd,
+      },
     };
+    renderLiveTimeRangePresentation();
   }
 
   function renderActive(active) {
@@ -3503,6 +4725,11 @@
       app.consoleClearedAt = 0;
       app.notifiedWarnings.clear();
       app.notifiedBrightnessPoints.clear();
+      app.liveTimeRange = null;
+      app.liveTimeRangeDraft = null;
+      app.liveTimeRangePointer = null;
+      app.liveRangeSummary = null;
+      app.liveRangeSummaryRequestId += 1;
     }
     if (active && (isNewRun || active.running)) {
       if (active.running) {
@@ -3609,7 +4836,9 @@
     const platform = String(data.platform || (device.ios ? "ios" : "android"));
     const battery = data.battery || {};
     const powered = Array.isArray(battery.powered) ? battery.powered : battery.powered ? [battery.powered] : [];
-    const isUnplugged = powered.length === 0;
+    const pluggedStateAvailable = battery.plugged_state_available !== false
+      && (platform !== "ios" || battery.external_power_state_available === true);
+    const isUnplugged = pluggedStateAvailable && powered.length === 0;
     $("#probe-device-name").textContent = [device.brand, device.model].filter(Boolean).join(" ") || "Unknown device";
     $("#probe-device-detail").textContent = platform === "ios"
       ? `${device.product_type || device.device || "iPhone"} · ${device.hardware || "--"} · iOS ${device.ios || "--"} · ${device.cpu_count || "--"} CPU`
@@ -3617,10 +4846,14 @@
         ? `${device.soc_model || device.hardware || "Unknown SoC"} · ${device.hardware || "--"} · HarmonyOS ${device.harmony || device.openharmony || "--"}`.trim()
         : `${device.soc_manufacturer || ""} ${device.soc_model || device.hardware || "Unknown SoC"} · ${device.hardware || "--"}/${device.board_platform || "--"} · Android ${device.android || "--"}`.trim();
     $("#probe-serial").textContent = data.device?.serial || entry.device || "--";
-    $("#probe-power-state").textContent = isUnplugged ? "电池供电" : `外部供电：${powered.join(", ")}`;
+    $("#probe-power-state").textContent = !pluggedStateAvailable
+      ? "外部供电状态无法确认"
+      : isUnplugged ? "电池供电" : `外部供电：${powered.join(", ")}`;
     $("#probe-current-state").textContent = `Current command: ${data.current_command || "unavailable"} · ${battery.voltage_mv ? `${battery.voltage_mv} mV` : "voltage n/a"}`;
     const powerBadge = $("#probe-power-badge");
-    powerBadge.textContent = isUnplugged && data.current_command_ok ? "READY" : "CHECK POWER";
+    powerBadge.textContent = !pluggedStateAvailable
+      ? "STATE UNKNOWN"
+      : isUnplugged && data.current_command_ok ? "READY" : "CHECK POWER";
     powerBadge.className = `probe-badge ${isUnplugged && data.current_command_ok ? "" : "bad"}`;
     const gpuFrequencyAvailable = Boolean(data.gpu_source?.frequency_path);
     const gpuLoadAvailable = Boolean(data.gpu_source?.load_path);
@@ -3632,7 +4865,18 @@
     const gpuBadge = $("#probe-gpu-badge");
     gpuBadge.textContent = gpuFrequencyAvailable ? "DIRECT" : gpuLoadAvailable ? "LOAD" : data.gpu_work_duration_available ? "FALLBACK" : gpuRendererAvailable ? "RENDERER" : "UNAVAILABLE";
     gpuBadge.className = `probe-badge ${gpuAvailable || gpuRendererAvailable ? "" : "neutral"}`;
-    $("#probe-foreground").textContent = data.foreground_package || "Unknown";
+    const probeScreenState = String(
+      data.screen_state || data.performance?.screen_state || ""
+    ).toLowerCase();
+    const probeScreenInactive = probeScreenState === "asleep"
+      || probeScreenState === "off"
+      || probeScreenState.startsWith("doze");
+    const lastKnownForeground = data.last_known_foreground_package
+      || data.performance?.last_known_foreground_package;
+    $("#probe-foreground").textContent = data.foreground_package
+      || (probeScreenInactive && lastKnownForeground
+        ? `无当前前台 · 最近 ${lastKnownForeground}`
+        : probeScreenInactive ? "无当前前台 · 屏幕未亮" : "Unknown");
 
     const policies = Array.isArray(data.cpu_policies) ? data.cpu_policies : [];
     $("#probe-cpu-table").innerHTML = policies.length ? policies.map(policy => `<div class="capability-row">
@@ -3642,13 +4886,44 @@
       <span>${finite(policy.max_khz) ? `${(Number(policy.max_khz) / 1000).toFixed(0)} MHz max` : "max n/a"}</span>
     </div>`).join("") : '<div class="empty-row">未识别到 cpufreq policy</div>';
 
+    const iosAppStateStatus = String(data.capabilities?.application_state_notifications_status || "");
+    const iosAppStateAvailable = data.capabilities?.application_state_notifications === true
+      ? true
+      : data.capabilities?.application_state_notifications === false
+        ? false
+        : null;
+    const iosProbeDevice = data.selected_device || data.device || {};
+    const iosRemoteReady = iosRemoteXpcReady(iosProbeDevice)
+      && Boolean(data.connection?.host)
+      && finite(data.connection?.port);
+    const iosUnpluggedReady = iosUnplugReady(iosProbeDevice) && iosRemoteReady;
+    const iosProbeEndpointScope = String(
+      data.connection?.endpoint_scope
+      || iosProbeDevice.endpoint_scope
+      || "unknown"
+    );
+    const harmonyScreenState = String(
+      data.power_state?.screen_state
+      || data.display?.screen_state
+      || data.display?.display_power_state
+      || ""
+    ).toLowerCase();
+    const harmonyDisplayActive = harmonyScreenState === "on" || harmonyScreenState === "awake";
+    const harmonyCompositorAvailable = harmonyDisplayActive && finite(data.performance?.compositor_fps);
     const features = platform === "ios" ? [
-      ["Battery power", "IORegistry PowerTelemetryData.SystemLoad", Boolean(data.power_telemetry_available)],
-      ["Process CPU / power score", "DVT sysmontap", Boolean(data.capabilities?.process_cpu)],
-      ["GPU utilization", "DVT graphics", Boolean(data.capabilities?.gpu_utilization)],
-      ["App state timeline", "DVT Running / Suspended notifications", Boolean(data.capabilities?.application_state_notifications)],
-      ["Wireless RemoteXPC", `${data.connection?.host || "USB"}:${data.connection?.port || "--"}`, Boolean(data.capabilities?.remote_xpc)],
-      ["Battery temperature", `${data.system_monitor?.thermal_sensor_count || 0} sensor`, Boolean(data.system_monitor?.thermalservice_available)],
+      ["整机原始 SystemLoad", "DiagnosticsService 原始通道；外供时可能接近 SystemPowerIn，非电池 I×V", Boolean(data.power_telemetry_available)],
+      ["进程 CPU / 相对功耗分数", "DVT sysmontap；powerScore 不换算为 mW", Boolean(data.capabilities?.process_cpu)],
+      ["GPU 利用率", "仅 DVT Graphics 利用率事件，不含 GPU 频率", Boolean(data.capabilities?.gpu_utilization)],
+      ["前台应用状态", iosAppStateStatus === "not_probed" ? "采集期间确认 DVT Running / Suspended；不含显示参数" : "DVT Running / Suspended；不含分辨率、亮度和刷新率", iosAppStateAvailable],
+      ["RemoteXPC telemetry", iosRemoteReady
+        ? `${data.connection.host}:${data.connection.port}`
+        : "当前仅 USB Probe；正式录制需可达的 RemotePairing 端点", Boolean(data.capabilities?.remote_xpc && iosRemoteReady)],
+      ["Unplugged power-test link", iosUnpluggedReady
+        ? `${data.connection.host}:${data.connection.port} · 拔线后 LAN 在线`
+        : iosRemoteReady
+          ? `${iosProbeEndpointScope} · 当前端点不能证明拔掉 USB 后仍可达`
+          : "未验证", iosUnpluggedReady],
+      ["电池温度", `${data.system_monitor?.thermal_sensor_count || 0} 个温度源；不含热严重度、热限制或热降亮`, Boolean(data.system_monitor?.thermalservice_available)],
     ] : platform === "harmony" ? [
       ["Battery current / voltage", "HarmonyOS BatteryService", Boolean(data.capabilities?.battery_service && data.current_command_ok)],
       ["CPU utilization", "persistent HDC /proc/stat", Boolean(data.capabilities?.proc_stat)],
@@ -3656,8 +4931,9 @@
       ["SmartPerf native capture", data.smartperf?.command || "SP_daemon", Boolean(data.capabilities?.smartperf_daemon)],
       ["Device high-performance mode", `current ${data.power_mode?.current_mode || "--"} · power-shell 602`, Boolean(data.capabilities?.performance_power_mode)],
       ["Foreground Ability", data.foreground_package || "AbilityManager", Boolean(data.capabilities?.ability_manager)],
-      ["Display refresh modes", `${data.display?.refresh_rate_hz || "--"} Hz · ${(data.display?.supported_refresh_rates_hz || []).join("/") || "modes n/a"}`, Boolean(data.capabilities?.display_modes)],
-      ["Compositor frame pacing", `${formatNumber(data.performance?.compositor_fps, 1)} FPS sampled`, Boolean(data.capabilities?.render_service_fps)],
+      ["Display power state", harmonyScreenState || "unknown", harmonyDisplayActive],
+      ["Display refresh modes", `${data.display?.refresh_rate_hz || "--"} Hz · ${(data.display?.supported_refresh_rates_hz || []).join("/") || "modes n/a"}（亮屏时才作为当前扫描节奏）`, Boolean(data.capabilities?.display_modes)],
+      ["Compositor frame pacing", harmonyDisplayActive ? `${formatNumber(data.performance?.compositor_fps, 1)} FPS sampled` : "屏幕未亮；不采用历史 RenderService 计数作为当前 FPS", harmonyCompositorAvailable],
       ["Foreground window", data.performance?.foreground_window_name || "WindowManagerService", Boolean(data.capabilities?.window_manager)],
       ["Touch devices", `${data.performance?.touch_device_count || 0} devices · axes/events`, Boolean(data.capabilities?.touch_devices)],
       ["Touch hardware sampling rate", data.touch?.sampling_rate_reason || "not exposed", false],
@@ -3665,6 +4941,8 @@
       ["Temperature sensors", `${data.system_monitor?.thermal_sensor_count || 0} sensors`, Boolean(data.capabilities?.thermal_service)],
       ["Background interference", "HarmonyOS top + ps", Boolean(data.capabilities?.process_top)],
       ["GPU frequency / load", data.gpu_probe?.reason || "HDC permission restricted", Boolean(data.capabilities?.smartperf_gpu_metrics)],
+      ["DDR frequency", data.capabilities?.smartperf_ddr_frequency_reason
+        || "SmartPerf -d；只有实际返回 ddrFrequency 后才确认并进入曲线", Boolean(data.capabilities?.smartperf_ddr_frequency)],
     ] : [
       ["Fuel-gauge current", "cmd battery current_now", Boolean(data.current_command_ok)],
       ["GPU frequency", `${gpuModel} · ${data.gpu_probe?.provider || "OEM sysfs"}`, gpuFrequencyAvailable],
@@ -3675,13 +4953,17 @@
       ["Perfetto android.power", "registered data source", Boolean(data.perfetto_android_power)],
       ["Perfetto sysfs power", "linux.sysfs_power", Boolean(data.perfetto_sysfs_power)],
       ["PowerStats dump", "dumpsys powerstats", Boolean(data.powerstats_dump_available)],
-      ["Foreground frame rate", data.performance?.surface_layer_name ? "SurfaceFlinger BLAST present timestamps" : "gfxinfo foreground-window counters", Boolean(data.capabilities?.frame_rate)],
+      ["Foreground frame rate interface", probeScreenInactive
+        ? "屏幕未亮；仅确认接口能力，不采用历史累计计数作为当前 FPS"
+        : data.performance?.surface_layer_name
+          ? "SurfaceFlinger foreground application-layer present timestamps"
+          : "gfxinfo foreground-window counters", Boolean(data.capabilities?.frame_rate)],
       ["System process monitor", "top + ps for apps/services/kernel", Boolean(data.system_monitor?.process_top_available)],
       ["ThermalService history", `${data.system_monitor?.thermal_sensor_count || 0} sensors / ${data.system_monitor?.thermal_threshold_count || 0} thresholds`, Boolean(data.system_monitor?.thermalservice_available)],
       ["cpuset / ADPF", `${Object.keys(data.system_monitor?.cpusets || {}).length} cpusets / ${data.system_monitor?.adpf_active_session_count || 0} active sessions`, Boolean(data.system_monitor?.adpf_available)],
       ["WALT / core_ctl", `${(data.system_monitor?.cpu_policies || []).map(item => item.governor).filter(Boolean).join(", ") || "governor n/a"} / ${(data.system_monitor?.cpu_policies || []).filter(item => item.core_ctl_min_cpus != null).length} policies`, (data.system_monitor?.cpu_policies || []).some(item => item.governor === "walt" || item.core_ctl_min_cpus != null)],
     ];
-    $("#probe-feature-list").innerHTML = features.map(([name, detail, available]) => `<div class="feature-row"><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(detail)}</small></span><i class="feature-state ${available ? "good" : "warn"}"></i></div>`).join("");
+    $("#probe-feature-list").innerHTML = features.map(([name, detail, available]) => `<div class="feature-row"><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(detail)}</small></span><i class="feature-state ${available === true ? "good" : available === false ? "warn" : ""}"></i></div>`).join("");
     $("#probe-json").textContent = JSON.stringify(data, null, 2);
   }
 
@@ -3861,7 +5143,10 @@
       versionBadge.title = `Mobile Profiler ${version}`;
     }
     setServerState(true, state.demo_mode ? "Demo preview enabled" : "Local dashboard");
-    if (state.active?.running) {
+    const activeIsNewRun = Boolean(
+      state.active && state.active.run_name !== app.currentRunName
+    );
+    if (state.active && (state.active.running || activeIsNewRun)) {
       setPlatform(state.active.platform || state.active.metadata?.platform || selectedPlatform(), {
         fromRun: true,
         initial: true,
@@ -3904,7 +5189,7 @@
       platform: selectedPlatform(),
       test_mode: app.testMode,
       capture_preset: $("#capture-preset-input").value,
-      capture_features: captureFeatures,
+      capture_features: app.captureFeaturesOverridden ? captureFeatures : {},
       harmony_high_performance: $("#harmony-high-performance-input").checked,
       title: $("#title-input").value.trim(),
       run_name: $("#run-name-input").value.trim(),
@@ -3935,7 +5220,7 @@
     $$(".platform-switch [data-platform]").forEach(button => button.addEventListener("click", () => {
       setPlatform(button.dataset.platform);
     }));
-    $$("[data-test-mode]").forEach(button => button.addEventListener("click", () => {
+    $$(".test-mode-switch [data-test-mode]").forEach(button => button.addEventListener("click", () => {
       setTestMode(button.dataset.testMode);
     }));
     window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
@@ -3958,6 +5243,9 @@
       renderProbe(app.state);
       updateCaptureFeatureControls();
     });
+    $("#unplugged-input").addEventListener("change", () => {
+      if (app.state) renderDevices(app.state);
+    });
 
     $("#brightness-refresh").addEventListener("click", () => {
       void refreshBrightnessCapability({ force: true, notifyFailure: true });
@@ -3971,7 +5259,10 @@
       void applyBrightnessValue();
     });
 
-    $("#capture-preset-input").addEventListener("change", () => applyCapturePreset());
+    $("#capture-preset-input").addEventListener("change", () => {
+      applyCapturePreset();
+      updatePlatformPresentation();
+    });
     $$('[data-capture-feature]').forEach(input => {
       const card = input.closest(".capture-feature-card");
       let pointerChecked = null;
@@ -4023,7 +5314,7 @@
     $("#harmony-high-performance-input").addEventListener("change", event => {
       if (!event.target.checked) return;
       const confirmed = confirm(
-        "设备高性能模式会在测试期间切换到 HarmonyOS power-shell 602，显著增加功耗和温度。\n\n程序会在正常结束、停止或异常退出时恢复原模式。是否启用？"
+        "设备高性能模式会在测试期间切换到 HarmonyOS power-shell 602，显著增加功耗和温度。\n\n程序会在正常结束及可捕获异常时尽力恢复；若进程被强杀或电脑断电，请手工核验 current mode。是否启用？"
       );
       if (!confirmed) event.target.checked = false;
     });
@@ -4134,7 +5425,7 @@
         notify("请选择 USB iPhone", "创建或修复无线连接时，iPhone 必须通过 USB 连接并保持解锁。", "error");
         return;
       }
-      if (!confirm("将为当前 iPhone 创建 RemotePairing 并缓存 Wi-Fi 端点。配对完成后可拔掉 USB，是否继续？")) return;
+      if (!confirm("将为当前 iPhone 创建 RemotePairing 并缓存 RemoteXPC 端点。完成后仍需拔掉 USB 并刷新，确认 LAN 端点继续在线，是否继续？")) return;
       setBusy(true, "正在创建 iOS RemotePairing...");
       try {
         const result = await api("/api/ios/pair", {
@@ -4143,18 +5434,26 @@
         });
         const endpoint = result.endpoint || {};
         if (!result.connected || !endpoint.host || !endpoint.port) {
-          throw new Error(result.connection_error || "RemotePairing 未返回可用的 Wi-Fi 端点");
+          throw new Error(result.connection_error || "RemotePairing 未返回可用的 RemoteXPC 端点");
         }
+        const pairedDevice = result.device || {};
+        const linkLocal = String(endpoint.scope || pairedDevice.endpoint_scope || "") === "link-local";
+        const lanCandidate = Boolean(endpoint.wireless_lan_candidate)
+          || deviceBooleanField(pairedDevice, "wireless_lan_candidate", "wireless_ready");
         notify(
-          "iOS 无线配对完成",
-          `${endpoint.host}:${endpoint.port} 已验证，现在可以拔掉 USB。`,
-          "success",
-          10000,
+          "iOS RemotePairing 已建立",
+          linkLocal
+            ? `${endpoint.host}:${endpoint.port} 当前可连，但它是链路本地端点，可能依赖 USB-NCM；不能作为拔线功耗测试的无线证明。`
+            : lanCandidate
+              ? `${endpoint.host}:${endpoint.port} 是 LAN 候选。请拔掉 USB 后刷新；只有设备仍在线时才算断电采集就绪。`
+              : `${endpoint.host}:${endpoint.port} 当前可连，但链路类型无法确认；请勿直接视为拔线就绪。`,
+          linkLocal ? "error" : "success",
+          12000,
         );
         await refreshState();
       } catch (error) {
         const reason = String(error?.message || "未知连接错误").replace(/^ERROR:\s*/i, "");
-        notify("iOS 无线配对失败", reason, "error", 0);
+        notify("iOS RemotePairing 失败", reason, "error", 0);
       } finally {
         setBusy(false);
       }
@@ -4262,6 +5561,7 @@
       $("#package-input").value = packageName;
       app.selectedScannedPackage = packageName;
       renderAppOptions();
+      updateStartControlState();
     });
     $("#app-result-list").addEventListener("click", event => {
       const option = event.target.closest("[data-app-package]");
@@ -4271,6 +5571,7 @@
       $("#package-input").value = packageName;
       app.selectedScannedPackage = packageName;
       renderAppOptions();
+      updateStartControlState();
     });
     $("#package-input").addEventListener("input", event => {
       const packageName = event.target.value.trim();
@@ -4278,14 +5579,26 @@
         ? packageName
         : "";
       renderAppOptions();
+      updateStartControlState();
     });
 
     $$("[data-duration]").forEach(button => button.addEventListener("click", () => {
       $("#duration-input").value = button.dataset.duration;
       syncDurationPreset();
+      updateStartControlState();
     }));
 
-    $("#duration-input").addEventListener("input", syncDurationPreset);
+    $("#duration-input").addEventListener("input", () => {
+      syncDurationPreset();
+      updateStartControlState();
+    });
+    $("#home-open-apps").addEventListener("click", () => {
+      switchView("config");
+      window.requestAnimationFrame(() => {
+        const scanButton = $("#scan-apps");
+        if (scanButton && !scanButton.disabled) scanButton.focus();
+      });
+    });
 
     $$("[data-metric]").forEach(button => button.addEventListener("click", () => {
       app.metric = button.dataset.metric;
@@ -4307,8 +5620,16 @@
         notify("请选择设备", `需要一台处于 device 状态的 ${platformLabel(selectedPlatform())} 设备。`, "error");
         return;
       }
-      if (payload.test_mode === "performance" && !payload.package) {
-        notify("请填写目标游戏 / 应用包名", "性能测试必须绑定具体包名；Android 可先扫描手机应用后选择。", "error", 8000);
+      const recordingReadiness = recordingDeviceReadiness();
+      if (!recordingReadiness.ready) {
+        notify("设备尚未满足采集条件", recordingReadiness.reason, "error", 9000);
+        return;
+      }
+      if (targetPackageRequired(payload.platform, payload.test_mode) && !payload.package) {
+        const detail = payload.platform === "harmony"
+          ? "Harmony SmartPerf 应用 FPS 必须绑定目标包名。"
+          : "Android 性能测试必须绑定具体包名；可先扫描手机应用后选择。";
+        notify("请填写目标游戏 / 应用包名", detail, "error", 8000);
         $("#package-input").focus();
         return;
       }
@@ -4377,9 +5698,16 @@
         app.state.probes = { ...(app.state.probes || {}), [device]: entry };
         renderProbe(app.state);
         updateCaptureFeatureControls();
+        const platform = String(entry.data?.platform || (entry.data?.device?.ios ? "ios" : selectedPlatform()));
         const powered = entry.data?.battery?.powered;
-        const unplugged = !powered || (Array.isArray(powered) && powered.length === 0);
-        notify(unplugged ? "Probe 完成，设备可测试" : "Probe 完成，检测到外部供电", unplugged ? "电流与 CPU 数据源已检查。" : `powered: ${Array.isArray(powered) ? powered.join(", ") : powered}`, unplugged ? "success" : "error", 7000);
+        const pluggedStateAvailable = entry.data?.battery?.plugged_state_available !== false
+          && (platform !== "ios" || entry.data?.battery?.external_power_state_available === true);
+        const unplugged = pluggedStateAvailable && (!powered || (Array.isArray(powered) && powered.length === 0));
+        if (!pluggedStateAvailable) {
+          notify("Probe 完成，外供状态无法确认", "BatteryService 未返回可靠的 plugged 状态；不能把 powered=[] 当作已拔电，请在正式功耗测试前人工确认外部供电已断开。", "error", 9000);
+        } else {
+          notify(unplugged ? "Probe 完成，设备可测试" : "Probe 完成，检测到外部供电", unplugged ? "电流与 CPU 数据源已检查。" : `powered: ${Array.isArray(powered) ? powered.join(", ") : powered}`, unplugged ? "success" : "error", 7000);
+        }
       } catch (error) {
         notify("Probe 失败", error.message, "error", 8000);
       } finally {
@@ -4535,10 +5863,48 @@
       if (moveLiveTimelineLayoutItem(app.state?.active, key, direction)) renderChart();
     });
 
+    $("#live-range-clear").addEventListener("click", () => {
+      app.liveTimeRange = null;
+      app.liveTimeRangeDraft = null;
+      app.liveTimeRangePointer = null;
+      app.liveRangeSummary = null;
+      app.liveRangeSummaryRequestId += 1;
+      renderLiveTimeRangePresentation();
+    });
+
     const chartWrap = $("#chart-wrap");
-    chartWrap.addEventListener("mousemove", event => {
+    chartWrap.addEventListener("pointerdown", event => {
+      const geometry = app.chartGeometry;
+      if (!geometry?.lanes?.length || event.button !== 0) return;
+      const elapsed = liveElapsedForPointer(event, geometry, false);
+      if (!finite(elapsed)) return;
+      app.liveTimeRangePointer = {
+        pointerId: event.pointerId,
+        startElapsed: Number(elapsed),
+        startClientX: event.clientX,
+        moved: false,
+        previousRange: app.liveTimeRange,
+      };
+      app.liveTimeRangeDraft = [Number(elapsed), Number(elapsed)];
+      chartWrap.classList.add("is-selecting");
+      chartWrap.setPointerCapture?.(event.pointerId);
+      $("#chart-tooltip").classList.add("hidden");
+      geometry.hoverLine.setAttribute("opacity", "0");
+      event.preventDefault();
+    });
+    chartWrap.addEventListener("pointermove", event => {
       const geometry = app.chartGeometry;
       if (!geometry?.lanes?.length) return;
+      const pointer = app.liveTimeRangePointer;
+      if (pointer && pointer.pointerId === event.pointerId) {
+        const elapsed = liveElapsedForPointer(event, geometry);
+        if (!finite(elapsed)) return;
+        pointer.moved = pointer.moved || Math.abs(event.clientX - pointer.startClientX) >= 4;
+        app.liveTimeRangeDraft = [pointer.startElapsed, Number(elapsed)];
+        scheduleLiveTimeRangePresentation();
+        event.preventDefault();
+        return;
+      }
       const rect = chartWrap.getBoundingClientRect();
       const viewX = ((event.clientX - rect.left) / rect.width) * geometry.width;
       const plotX = clamp(
@@ -4577,7 +5943,30 @@
       tooltip.style.left = `${tooltipX}px`;
       tooltip.style.top = `${tooltipY}px`;
     });
+    const finishLiveTimeRange = (event, commit) => {
+      const pointer = app.liveTimeRangePointer;
+      if (!pointer || (event && pointer.pointerId !== event.pointerId)) return;
+      const selected = pointer.moved && commit
+        ? normalizeLiveTimeRange(app.liveTimeRangeDraft, app.chartGeometry?.maxTime)
+        : null;
+      app.liveTimeRange = selected || pointer.previousRange || null;
+      app.liveTimeRangeDraft = null;
+      app.liveTimeRangePointer = null;
+      if (selected) {
+        app.liveRangeSummary = null;
+        app.liveRangeSummaryRequestId += 1;
+      }
+      chartWrap.classList.remove("is-selecting");
+      if (event && chartWrap.hasPointerCapture?.(event.pointerId)) {
+        chartWrap.releasePointerCapture(event.pointerId);
+      }
+      renderLiveTimeRangePresentation();
+      if (selected) loadLiveRangeSummary(selected);
+    };
+    chartWrap.addEventListener("pointerup", event => finishLiveTimeRange(event, true));
+    chartWrap.addEventListener("pointercancel", event => finishLiveTimeRange(event, false));
     chartWrap.addEventListener("mouseleave", () => {
+      if (app.liveTimeRangePointer) return;
       $("#chart-tooltip").classList.add("hidden");
       if (app.chartGeometry?.hoverLine) app.chartGeometry.hoverLine.setAttribute("opacity", "0");
     });

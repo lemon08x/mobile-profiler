@@ -6,12 +6,12 @@ from typing import Dict, Iterable, Mapping, Sequence
 CAPTURE_FEATURES: Dict[str, Dict[str, str]] = {
     "cpu_usage": {
         "label": "CPU 利用率",
-        "description": "记录整机与可用的逐核/集群 CPU 负载。",
+        "description": "记录整机 CPU 整体负载；不重复展示逐核负载。",
         "overhead": "low",
     },
     "cpu_frequency": {
         "label": "CPU 频率",
-        "description": "读取 CPU 集群频率与频率上限。",
+        "description": "记录 CPU 频率策略或核心组的共享/分组频率，并标明共享关系。",
         "overhead": "low",
     },
     "gpu_metrics": {
@@ -55,8 +55,8 @@ CAPTURE_FEATURES: Dict[str, Dict[str, str]] = {
     "target_process": {
         "label": "目标应用资源",
         "description": "在支持的后端记录目标游戏进程的 CPU 与内存快照。",
-        "overhead": "low",
-        "default_off_reason": "当前报告没有目标进程 CPU/内存时间序列或独立结论，专项排查时开启",
+        "overhead": "high",
+        "default_off_reason": "需要额外枚举并读取目标进程；当前报告没有专属时间序列或独立结论，专项排查时开启",
     },
     "process_snapshots": {
         "label": "全系统进程快照",
@@ -134,9 +134,58 @@ PLATFORM_UNAVAILABLE_FEATURES: Dict[str, Dict[str, str]] = {
 PLATFORM_REQUIRED_FEATURES: Dict[str, Dict[str, str]] = {
     "ios": {
         "cpu_usage": "iOS DVT 基础流固定包含 CPU 使用率",
-        "gpu_metrics": "iOS DVT 基础流固定包含 Graphics 利用率",
-        "foreground_window": "iOS application-state 基础流固定包含前台应用状态",
-        "thermal": "iOS 电池诊断基础流固定包含电池温度",
+        "gpu_metrics": "iOS DVT 基础流会尝试 Graphics；只有实际收到事件后才视为可用",
+        "foreground_window": "iOS application-state 监听随基础流启动；只记录期间变化，无初始快照时当前前台保持未知",
+        "thermal": "iOS 电池诊断会尝试读取温度；只有返回有效数值后才展示",
+    },
+}
+
+
+PLATFORM_FEATURE_PRESENTATION: Dict[str, Dict[str, Dict[str, str]]] = {
+    "harmony": {
+        "foreground_window": {
+            "label": "前台应用与显示",
+            "description": (
+                "跟踪前台 Ability、窗口、分辨率、刷新配置和 RenderService 背光原始值；"
+                "背光原始值不是 nit 或热限亮上限。"
+            ),
+        },
+        "thermal": {
+            "label": "温度传感器",
+            "description": (
+                "记录 ThermalService 或 SmartPerf 温度；当前量产接口不提供可验证的热严重度、"
+                "亮度冷却档位或热降亮上限。"
+            ),
+        },
+    },
+    "ios": {
+        "cpu_frequency": {
+            "description": "iOS 未公开可可靠使用的 CPU 核心或集群频率，当前不采集。",
+        },
+        "gpu_metrics": {
+            "label": "GPU 利用率",
+            "description": "仅记录实际收到的 DVT Graphics 利用率事件，不含 GPU 频率。",
+        },
+        "memory_frequency": {
+            "description": "iOS 未公开 DRAM / 内存控制器频率，当前不采集。",
+        },
+        "foreground_window": {
+            "label": "前台应用状态",
+            "description": (
+                "记录测试期间 DVT Running / Suspended 状态变化；无初始快照时当前前台保持未知，"
+                "不包含分辨率、亮度或刷新率。"
+            ),
+        },
+        "frame_rate": {
+            "description": "当前 iOS 后端不提供通用应用 FPS、1% Low 或刷新率时间线。",
+        },
+        "frame_details": {
+            "description": "当前 iOS 后端不提供逐帧 Core Animation 或渲染阶段时间戳。",
+        },
+        "thermal": {
+            "label": "电池温度",
+            "description": "记录电池诊断温度；不包含热严重度、热限制或热降亮。",
+        },
     },
 }
 
@@ -164,7 +213,6 @@ _PERFORMANCE_STANDARD = _feature_map(
         "gpu_metrics",
         "foreground_window",
         "frame_rate",
-        "frame_details",
         "thermal",
     }
 )
@@ -177,7 +225,6 @@ _HARMONY_SMARTPERF = _feature_map(
         "foreground_window",
         "frame_rate",
         "frame_details",
-        "target_process",
         "thermal",
     }
 )
@@ -306,17 +353,22 @@ def resolve_capture_configuration(
         if effective_preset == "harmony-smartperf"
         else "platform_native"
     )
-    rows = [
-        {
-            "key": name,
-            "label": definition["label"],
-            "description": definition["description"],
-            "overhead": definition["overhead"],
-            "enabled": bool(features[name]),
-            "reason": reasons[name],
-        }
-        for name, definition in CAPTURE_FEATURES.items()
-    ]
+    platform_presentation = PLATFORM_FEATURE_PRESENTATION.get(platform_name, {})
+    rows = []
+    for name, definition in CAPTURE_FEATURES.items():
+        presentation = platform_presentation.get(name, {})
+        rows.append(
+            {
+                "key": name,
+                "label": presentation.get("label", definition["label"]),
+                "description": presentation.get(
+                    "description", definition["description"]
+                ),
+                "overhead": definition["overhead"],
+                "enabled": bool(features[name]),
+                "reason": reasons[name],
+            }
+        )
     return {
         "requested_preset": preset,
         "preset": effective_preset,

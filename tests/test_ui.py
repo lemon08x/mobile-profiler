@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -16,10 +18,34 @@ from mobile_profiler.cli import (
     install_console_interrupt_handlers,
     requested_platform,
 )
+from mobile_profiler.collector import (
+    _brightness_tracking_required,
+    _sampler_shell_command,
+    build_sampler_script,
+    parse_sampler_line,
+)
+from mobile_profiler.harmony import (
+    HarmonySmartPerfParser,
+    _smartperf_command,
+    build_harmony_sample,
+    build_harmony_smartperf_sample,
+)
+from mobile_profiler.ios_bridge import _battery_payload
+from mobile_profiler.models import (
+    ContextSample,
+    GpuSource,
+    RawSample,
+    Sample,
+    ThermalSnapshot,
+)
 from mobile_profiler.ui import (
+    DashboardHandler,
     DashboardHTTPServer,
     DashboardManager,
     LiveTelemetryReader,
+    _decimate,
+    _decimate_timeline_rows,
+    _percentile,
     _parse_android_brightness_capability,
     android_icon_data_uri,
     parse_android_apk_icon_candidates,
@@ -33,6 +59,162 @@ from mobile_profiler import __version__
 
 
 class LiveTelemetryTests(unittest.TestCase):
+    @staticmethod
+    def _timeline_sample(
+        index: int,
+        *,
+        power_mw: float = 400.0,
+        cpu_pct: float = 50.0,
+    ) -> Sample:
+        return Sample(
+            index=index,
+            elapsed_s=float(index),
+            uptime_s=100.0 + index,
+            current_ma=100.0,
+            signed_current_ma=-100.0,
+            voltage_mv=4000.0,
+            power_mw=power_mw,
+            direction="discharging",
+            cpu_pct=cpu_pct,
+            power_source="battery_current_voltage",
+            power_valid_for_consumption=True,
+            external_power=False,
+        )
+
+    def test_live_decimation_preserves_long_session_extrema_and_bound(self) -> None:
+        samples = [
+            self._timeline_sample(
+                index,
+                power_mw=4200.0 if index == 1877 else 400.0,
+                cpu_pct=2.0 if index == 2133 else 50.0,
+            )
+            for index in range(62 * 60 + 1)
+        ]
+
+        displayed = _decimate(samples, limit=900)
+        displayed_indexes = [sample.index for sample in displayed]
+
+        self.assertEqual(len(displayed), 900)
+        self.assertEqual(displayed_indexes[0], 0)
+        self.assertEqual(displayed_indexes[-1], 62 * 60)
+        self.assertIn(1877, displayed_indexes)
+        self.assertIn(2133, displayed_indexes)
+
+    def test_live_timeline_decimation_keeps_short_steps_and_fps_drops(self) -> None:
+        refresh_rows = [
+            {
+                "uptime_s": float(index),
+                "elapsed_s": float(index),
+                "value": 60.0 if index == 1877 else 120.0,
+            }
+            for index in range(62 * 60 + 1)
+        ]
+        fps_rows = [
+            {
+                "uptime_s": float(index),
+                "elapsed_s": float(index),
+                "value": 7.0 if index == 1499 else 60.0,
+            }
+            for index in range(32 * 60 + 1)
+        ]
+
+        refresh = _decimate_timeline_rows(
+            refresh_rows,
+            limit=900,
+            preserve_steps=True,
+        )
+        fps = _decimate_timeline_rows(fps_rows, limit=900)
+        refresh_indexes = [int(row["uptime_s"]) for row in refresh]
+        fps_indexes = [int(row["uptime_s"]) for row in fps]
+
+        self.assertEqual(len(refresh), 900)
+        self.assertEqual(len(fps), 900)
+        self.assertTrue({1876, 1877, 1878}.issubset(refresh_indexes))
+        self.assertIn(1499, fps_indexes)
+
+    def test_timeline_decimation_remains_bounded_with_many_breaks(self) -> None:
+        rows = [
+            {
+                "elapsed_s": float(index),
+                "value": float(index % 5),
+                "report_break_before": index > 0 and index % 2 == 0,
+            }
+            for index in range(200)
+        ]
+
+        displayed = _decimate_timeline_rows(rows, limit=17)
+
+        self.assertEqual(len(displayed), 17)
+        self.assertEqual(displayed[0]["elapsed_s"], 0.0)
+        self.assertEqual(displayed[-1]["elapsed_s"], 199.0)
+        self.assertTrue(any(row.get("report_break_before") for row in displayed[1:]))
+
+    def test_frontend_timeline_downsampler_has_shape_preservation_contract(self) -> None:
+        javascript = (
+            Path(__file__).parents[1]
+            / "src"
+            / "mobile_profiler"
+            / "web"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        start = javascript.index("function downsampleTimelinePoints")
+        end = javascript.index("function timelinePoints", start)
+        block = javascript[start:end]
+
+        self.assertIn("boundedLimit", block)
+        self.assertIn("breakBoundaryGroups", block)
+        self.assertIn("stepBoundaryGroups", block)
+        self.assertIn("bucketExtrema", block)
+        self.assertIn("skippedBreak", block)
+        self.assertNotIn("const step = candidates.length / remaining", block)
+
+    def test_inactive_vendor_brightness_does_not_present_candidate_gear_as_effective(self) -> None:
+        javascript = (
+            Path(__file__).parents[1]
+            / "src"
+            / "mobile_profiler"
+            / "web"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        start = javascript.index("function renderBrightnessThrottling")
+        end = javascript.index("function svgNode", start)
+        block = javascript[start:end]
+
+        self.assertIn("const vendorLimitDescribesActive = vendorActive", block)
+        self.assertIn("运行时 active=false，当前没有生效档位", block)
+        self.assertIn("候选表不能证明哪些档位会在实际温控中触发", block)
+        self.assertIn("只有 active=true 时才把运行时档位和标称 nit 作为限亮证据", block)
+
+    def test_live_decimation_preserves_power_source_switch_boundaries(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index),
+                uptime_s=100.0 + index,
+                current_ma=10.0,
+                signed_current_ma=-10.0,
+                voltage_mv=4000.0,
+                power_mw=40.0 if index < 10 else 600.0,
+                direction="discharging",
+                cpu_pct=10.0,
+                power_source=(
+                    "ios_battery_current_voltage"
+                    if index < 10
+                    else "ios_power_telemetry_system_load"
+                ),
+                power_valid_for_consumption=True,
+                external_power=False,
+            )
+            for index in range(20)
+        ]
+
+        displayed = _decimate(samples, limit=5)
+
+        displayed_indexes = [sample.index for sample in displayed]
+        self.assertIn(9, displayed_indexes)
+        self.assertIn(10, displayed_indexes)
+        self.assertLess(displayed_indexes.index(9), displayed_indexes.index(10))
+
     def test_reader_keeps_charging_direction_before_samples_arrive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -59,6 +241,397 @@ class LiveTelemetryTests(unittest.TestCase):
             self.assertIsNone(snapshot["latest"])
             self.assertEqual(snapshot["summary"]["direction"], "charging")
             self.assertEqual(snapshot["battery"]["powered"], ["AC"])
+
+    def test_reader_separates_raw_power_from_consumption_valid_intervals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "test_mode": "performance",
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {
+                            "voltage_mv": 4000.0,
+                            "status": "discharging",
+                            "powered": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows = []
+            for index, state in enumerate(("D", "D", "C", "C", "D", "D")):
+                discharging = state == "D"
+                power_mw = 1000.0 if discharging else 10000.0
+                current_ma = power_mw / 4.0
+                rows.append(
+                    {
+                        "index": index,
+                        "elapsed_s": float(index),
+                        "uptime_s": 100.0 + index,
+                        "current_ma": current_ma,
+                        "signed_current_ma": -current_ma if discharging else current_ma,
+                        "voltage_mv": 4000.0,
+                        "power_mw": power_mw,
+                        "direction": "discharging" if discharging else "charging",
+                        "cpu_pct": float(index * 10),
+                        "power_source": "ios_power_telemetry_system_load",
+                        "power_sample_age_s": float(index),
+                        "power_valid_for_consumption": discharging,
+                        "external_power": not discharging,
+                    }
+                )
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "\n".join(f"N|{json.dumps(row)}" for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            summary = snapshot["summary"]
+            self.assertTrue(summary["power_valid_for_consumption"])
+            self.assertEqual(summary["power_flow_direction"], "mixed")
+            self.assertAlmostEqual(summary["average_power_mw"], 1000.0)
+            self.assertAlmostEqual(summary["p95_power_mw"], 1000.0)
+            self.assertAlmostEqual(summary["energy_mwh"], 2.0 * 1000.0 / 3600.0)
+            self.assertAlmostEqual(summary["observed_power_average_mw"], 4600.0)
+            self.assertAlmostEqual(
+                summary["observed_power_energy_mwh"],
+                23000.0 / 3600.0,
+            )
+            self.assertEqual(summary["consumption_covered_duration_s"], 2.0)
+            self.assertEqual(snapshot["power_pressure"]["drivers"], [])
+            self.assertAlmostEqual(
+                snapshot["render_performance"]["power_recording"]["average_power_mw"],
+                1000.0,
+            )
+            self.assertFalse(snapshot["series"][2]["power_valid_for_consumption"])
+            self.assertTrue(snapshot["series"][2]["external_power"])
+            self.assertEqual(
+                snapshot["series"][2]["power_source"],
+                "ios_power_telemetry_system_load",
+            )
+            self.assertIn("collector_cpu_pct", snapshot["series"][2])
+
+    def test_reader_keeps_mixed_ios_system_load_statistics_out_of_battery_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "platform": "ios",
+                        "test_mode": "power",
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {
+                            "voltage_mv": 4000.0,
+                            "status": "discharging",
+                            "powered": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows = []
+            for index, (power_mw, current_ma, power_source) in enumerate(
+                (
+                    (100.0, 25.0, "ios_battery_current_voltage"),
+                    (200.0, 50.0, "ios_battery_current_voltage"),
+                    (1000.0, 75.0, "ios_power_telemetry_system_load"),
+                    (1200.0, 100.0, "ios_power_telemetry_system_load"),
+                )
+            ):
+                rows.append(
+                    {
+                        "index": index,
+                        "elapsed_s": float(index),
+                        "uptime_s": 100.0 + index,
+                        "current_ma": current_ma,
+                        "signed_current_ma": -current_ma,
+                        "voltage_mv": 4000.0,
+                        "power_mw": power_mw,
+                        "direction": "discharging",
+                        "cpu_pct": 20.0,
+                        "power_source": power_source,
+                        "power_sample_age_s": (
+                            float(index - 2)
+                            if power_source == "ios_power_telemetry_system_load"
+                            else None
+                        ),
+                        "power_valid_for_consumption": True,
+                        "external_power": False,
+                    }
+                )
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "\n".join(f"N|{json.dumps(row)}" for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            summary = snapshot["summary"]
+            self.assertEqual(
+                summary["power_sources"],
+                [
+                    "ios_battery_current_voltage",
+                    "ios_power_telemetry_system_load",
+                ],
+            )
+            self.assertTrue(summary["system_load_available"])
+            self.assertEqual(summary["system_load_sample_count"], 2)
+            self.assertEqual(summary["system_load_latest_power_mw"], 1200.0)
+            self.assertAlmostEqual(
+                summary["system_load_observed_average_power_mw"],
+                1100.0,
+            )
+            self.assertAlmostEqual(
+                summary["system_load_consumption_average_power_mw"],
+                1100.0,
+            )
+            self.assertAlmostEqual(summary["battery_flow_average_power_mw"], 250.0)
+            self.assertNotAlmostEqual(
+                summary["observed_power_average_mw"],
+                summary["system_load_observed_average_power_mw"],
+            )
+            self.assertEqual(
+                [point["power_source"] for point in snapshot["series"]],
+                [row["power_source"] for row in rows],
+            )
+
+    def test_reader_marks_stale_ios_system_load_as_raw_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "platform": "ios",
+                        "test_mode": "power",
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 5.0,
+                        "battery_start": {
+                            "voltage_mv": 4000.0,
+                            "status": "discharging",
+                            "powered": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows = [
+                {
+                    "index": index,
+                    "elapsed_s": float(index * 5),
+                    "uptime_s": 100.0 + index * 5,
+                    "current_ma": 250.0,
+                    "signed_current_ma": -250.0,
+                    "voltage_mv": 4000.0,
+                    "power_mw": 1000.0,
+                    "direction": "discharging",
+                    "cpu_pct": 10.0,
+                    "power_source": "ios_power_telemetry_system_load",
+                    "power_sample_age_s": 31.0 + index,
+                    "power_valid_for_consumption": True,
+                    "external_power": False,
+                }
+                for index in range(2)
+            ]
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "\n".join(f"N|{json.dumps(row)}" for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            self.assertFalse(snapshot["summary"]["power_valid_for_consumption"])
+            self.assertIsNone(snapshot["summary"]["average_power_mw"])
+            self.assertIn("超过 30 秒未刷新", snapshot["summary"]["power_consumption_unavailable_reason"])
+            self.assertTrue(
+                all(not point["power_valid_for_consumption"] for point in snapshot["series"])
+            )
+            self.assertTrue(all(point["power_sample_stale"] for point in snapshot["series"]))
+
+    def test_reader_exposes_ios_live_capability_boundaries_without_inventing_foreground(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "platform": "ios",
+                        "test_mode": "performance",
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {"status": "external_power", "powered": ["USB"]},
+                        "ios_collection_stats": {
+                            "application_state_notifications_observed": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "raw" / "sampler-stream.txt").write_text("", encoding="utf-8")
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            performance = snapshot["performance"]
+            self.assertIn("不提供通用应用 FPS", performance["frame_unavailable_reason"])
+            self.assertIn("标准 1% Low", performance["frame_unavailable_reason"])
+            self.assertIn("逐帧 Core Animation 时间戳", performance["frame_unavailable_reason"])
+            self.assertIn("没有可验证的屏幕刷新率", performance["refresh_rate_unavailable_reason"])
+            self.assertEqual(
+                performance["foreground_state_status"],
+                "unknown",
+            )
+            self.assertFalse(performance["foreground_state_available"])
+            self.assertTrue(performance["application_state_change_observed"])
+            self.assertIn("不能确认当前前台", performance["foreground_state_reason"])
+            self.assertIsNone(snapshot["context"])
+
+    def test_reader_distinguishes_ios_running_and_suspended_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            metadata = {
+                "platform": "ios",
+                "test_mode": "performance",
+                "requested_duration_s": 60,
+                "sample_interval_s": 1.0,
+                "battery_start": {"status": "external_power", "powered": ["USB"]},
+                "ios_collection_stats": {
+                    "application_state_notifications_observed": True,
+                },
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (root / "raw" / "sampler-stream.txt").write_text("", encoding="utf-8")
+            context_path = root / "contexts.jsonl"
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "uptime_s": 100.0,
+                        "foreground_package": "com.example.game",
+                        "foreground_activity": "Running",
+                        "source": "ios_dvt_notifications",
+                        "performance": {"platform": "ios"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            running = LiveTelemetryReader(root).snapshot()["performance"]
+            self.assertEqual(running["foreground_state_status"], "observed")
+            self.assertTrue(running["foreground_state_available"])
+            self.assertTrue(running["application_state_change_observed"])
+
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "uptime_s": 101.0,
+                        "foreground_package": None,
+                        "foreground_activity": "Suspended",
+                        "source": "ios_dvt_notifications",
+                        "performance": {"platform": "ios"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            suspended = LiveTelemetryReader(root).snapshot()["performance"]
+            self.assertEqual(suspended["foreground_state_status"], "unknown")
+            self.assertFalse(suspended["foreground_state_available"])
+            self.assertTrue(suspended["application_state_change_observed"])
+            self.assertIn("Suspended", suspended["foreground_state_reason"])
+
+    def test_reader_does_not_publish_zero_consumption_for_charging_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "requested_duration_s": 60,
+                        "sample_interval_s": 1.0,
+                        "battery_start": {
+                            "voltage_mv": 4000.0,
+                            "status": "charging",
+                            "powered": ["USB"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows = [
+                {
+                    "index": index,
+                    "elapsed_s": float(index),
+                    "uptime_s": 100.0 + index,
+                    "current_ma": 500.0,
+                    "signed_current_ma": 500.0,
+                    "voltage_mv": 4000.0,
+                    "power_mw": 5000.0,
+                    "direction": "charging",
+                    "cpu_pct": 20.0,
+                    "power_source": "ios_power_telemetry_system_load",
+                    "power_valid_for_consumption": False,
+                    "external_power": True,
+                }
+                for index in range(2)
+            ]
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "\n".join(f"N|{json.dumps(row)}" for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            summary = snapshot["summary"]
+            self.assertFalse(summary["power_valid_for_consumption"])
+            self.assertEqual(summary["direction"], "charging")
+            self.assertIsNone(summary["average_power_mw"])
+            self.assertIsNone(summary["average_current_ma"])
+            self.assertIsNone(summary["energy_mwh"])
+            self.assertEqual(summary["observed_power_average_mw"], 5000.0)
+            self.assertEqual(summary["battery_flow_average_power_mw"], 2000.0)
+            self.assertIsNone(
+                snapshot["render_performance"]["power_recording"]["average_power_mw"]
+            )
+
+    def test_reader_does_not_backfill_unknown_new_format_power_state_from_session_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "raw").mkdir()
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 9,
+                        "sample_interval_s": 1.0,
+                        "current_unit": "auto",
+                        "battery_start": {
+                            "voltage_mv": 4000.0,
+                            "status": "discharging",
+                            "powered": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "raw" / "sampler-stream.txt").write_text(
+                "S|0|100.0|-250000|4000|300|-1|3|100|0|50|850|0|0|0|0\n"
+                "S|1|101.0|-250000|4000|300|-1|3|120|0|60|920|0|0|0|0\n",
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(root).snapshot()
+
+            self.assertFalse(snapshot["summary"]["power_valid_for_consumption"])
+            self.assertIsNone(snapshot["summary"]["average_power_mw"])
+            self.assertIsNone(snapshot["summary"]["energy_mwh"])
+            self.assertIsNone(snapshot["series"][0]["external_power"])
+            self.assertFalse(snapshot["series"][0]["power_valid_for_consumption"])
 
     def test_reader_exposes_cpu_cluster_history_for_live_details(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -396,7 +969,231 @@ class LiveTelemetryTests(unittest.TestCase):
             )
 
 
+class PlatformTelemetrySemanticsTests(unittest.TestCase):
+    def test_live_percentile_matches_final_nearest_rank_analysis(self) -> None:
+        self.assertEqual(
+            _percentile([100, 200, 300, 400, 500, 600, 700, 1800], 0.95),
+            1800,
+        )
+
+    def test_android_sampler_drops_missed_deadlines_instead_of_catch_up_bursts(self) -> None:
+        script = build_sampler_script(5, 1.0, [], None)
+
+        self.assertIn("due = sample + step", script)
+        self.assertIn("due = now + step; delay = step", script)
+        self.assertNotIn("due = now; delay = 0", script)
+
+    def test_root_only_gpu_uses_one_read_only_sampler_su_session(self) -> None:
+        source = GpuSource(
+            name="Adreno",
+            frequency_path="/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+            load_path="/sys/class/kgsl/kgsl-3d0/gpubusy",
+            load_format="busy_total",
+            requires_root=True,
+        )
+        script = build_sampler_script(
+            5,
+            1.0,
+            [],
+            source,
+            session_has_root=True,
+        )
+        remote_command = _sampler_shell_command(script, True)
+
+        self.assertNotIn("su -c", script)
+        self.assertIn("cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", script)
+        self.assertIn("cat /sys/class/kgsl/kgsl-3d0/gpubusy", script)
+        self.assertTrue(remote_command.startswith("su -c "))
+        self.assertEqual(remote_command.count("su -c"), 1)
+
+    def test_android_sampler_parser_tracks_mid_session_external_power(self) -> None:
+        unplugged = parse_sampler_line(
+            "S|0|100.0|-250000|4000|300|0|3|100|0|50|850|0|0|0|0",
+            [],
+            None,
+        )
+        plugged = parse_sampler_line(
+            "S|1|101.0|-250000|4000|300|1|4|120|0|60|920|0|0|0|0",
+            [],
+            None,
+        )
+        unknown = parse_sampler_line(
+            "S|2|102.0|-250000|4000|300|-1|-1|140|0|70|990|0|0|0|0",
+            [],
+            None,
+        )
+
+        self.assertIsInstance(unplugged, RawSample)
+        self.assertIsInstance(plugged, RawSample)
+        self.assertIsInstance(unknown, RawSample)
+        assert isinstance(unplugged, RawSample)
+        assert isinstance(plugged, RawSample)
+        assert isinstance(unknown, RawSample)
+        self.assertFalse(unplugged.external_power)
+        self.assertEqual(unplugged.battery_status, "discharging")
+        self.assertTrue(plugged.external_power)
+        self.assertEqual(plugged.battery_status, "not_charging")
+        self.assertIsNone(unknown.external_power)
+        self.assertIsNone(unknown.battery_status)
+        self.assertIn("else print -1", build_sampler_script(5, 1.0, [], None))
+
+    def test_harmony_native_and_smartperf_reject_external_negative_current(self) -> None:
+        native, _ = build_harmony_sample(
+            0,
+            100.0,
+            "pluggedType: 2\nchargingStatus: 0\nvoltage: 4000000\n"
+            "nowCurrent: -100\ntemperature: 280\n",
+            "cpu 100 0 50 850 0 0 0 0\n",
+            None,
+            [],
+            {},
+        )
+        smartperf = build_harmony_smartperf_sample(
+            {
+                "timestamp": "1783934231000",
+                "currentNow": "-100000",
+                "voltageNow": "4000000",
+            },
+            0,
+            [],
+            external_power=True,
+        )
+
+        self.assertIsNotNone(native)
+        self.assertIsNotNone(smartperf)
+        assert native is not None
+        assert smartperf is not None
+        for sample in (native, smartperf):
+            self.assertTrue(sample.external_power)
+            self.assertFalse(sample.power_valid_for_consumption)
+            self.assertEqual(sample.direction, "external_power")
+
+        unknown_native, _ = build_harmony_sample(
+            1,
+            101.0,
+            "chargingStatus: 0\nvoltage: 4000000\nnowCurrent: -100\n",
+            "cpu 120 0 60 920 0 0 0 0\n",
+            None,
+            [],
+            {},
+        )
+        unknown_smartperf = build_harmony_smartperf_sample(
+            {
+                "timestamp": "1783934232000",
+                "currentNow": "-100000",
+                "voltageNow": "4000000",
+            },
+            1,
+            [],
+            external_power=None,
+        )
+        self.assertIsNotNone(unknown_native)
+        self.assertIsNotNone(unknown_smartperf)
+        assert unknown_native is not None
+        assert unknown_smartperf is not None
+        for sample in (unknown_native, unknown_smartperf):
+            self.assertIsNone(sample.external_power)
+            self.assertFalse(sample.power_valid_for_consumption)
+            self.assertEqual(sample.direction, "discharging")
+
+    def test_smartperf_requests_full_sample_span_and_ignores_terminal_summary(self) -> None:
+        command = _smartperf_command(7, "com.example.game", {"cpu_usage": True})
+        self.assertIn("-N 7", command)
+
+        parser = HarmonySmartPerfParser()
+        self.assertIsNone(parser.feed_line("order:0 Battery=28"))
+        self.assertIsNone(parser.feed_line("order:1 timestamp=1784200000000"))
+        self.assertIsNone(parser.feed_line("order:2 currentNow=-100"))
+        self.assertIsNone(parser.feed_line("order:3 voltageNow=4400000"))
+        complete = parser.feed_line("order:0 Battery=28")
+        self.assertIsNotNone(complete)
+        self.assertEqual(complete["timestamp"], "1784200000000")
+        self.assertIsNone(parser.feed_line("order:1 summary=done"))
+        self.assertIsNone(parser.feed_line("command exec finished"))
+        self.assertIsNone(parser.finish())
+
+    def test_ios_normalized_parser_preserves_explicit_power_validity(self) -> None:
+        parsed = parse_sampler_line(
+            'N|{"index":0,"uptime_s":100.0,"current_ma":200.0,'
+            '"signed_current_ma":-200.0,"voltage_mv":4000.0,"power_mw":1500.0,'
+            '"direction":"discharging","power_source":"ios_power_telemetry_system_load",'
+            '"power_valid_for_consumption":false,"external_power":true}',
+            [],
+            None,
+        )
+
+        self.assertIsInstance(parsed, Sample)
+        assert isinstance(parsed, Sample)
+        self.assertFalse(parsed.power_valid_for_consumption)
+        self.assertTrue(parsed.external_power)
+        self.assertEqual(parsed.power_source, "ios_power_telemetry_system_load")
+
+    def test_ios_missing_external_connected_state_is_not_treated_as_unplugged(self) -> None:
+        unknown = _battery_payload(
+            {
+                "InstantAmperage": -200,
+                "Voltage": 4000,
+                "PowerTelemetryData": {"SystemLoad": 1500},
+            }
+        )
+        unplugged = _battery_payload(
+            {
+                "ExternalConnected": False,
+                "InstantAmperage": -200,
+                "Voltage": 4000,
+            }
+        )
+
+        self.assertFalse(unknown["external_power_state_available"])
+        self.assertIsNone(unknown["external_connected"])
+        self.assertEqual(unknown["powered"], [])
+        self.assertTrue(unplugged["external_power_state_available"])
+        self.assertFalse(unplugged["external_connected"])
+
+    def test_vendor_brightness_table_does_not_activate_tracking_without_runtime_flag(self) -> None:
+        inactive = ThermalSnapshot(
+            uptime_s=1.0,
+            host_epoch_s=1.0,
+            display_brightness={
+                "vendor_thermal_active": False,
+                "vendor_thermal_level": 0,
+                "vendor_thermal_limit_nits": 9999.0,
+                "vendor_thermal_nit_table": [700, 600, 500],
+            },
+        )
+        active = ThermalSnapshot(
+            uptime_s=2.0,
+            host_epoch_s=2.0,
+            display_brightness={
+                "vendor_thermal_active": True,
+                "vendor_thermal_level": 4,
+                "vendor_thermal_limit_nits": 450.0,
+            },
+        )
+
+        self.assertFalse(_brightness_tracking_required(inactive))
+        self.assertTrue(_brightness_tracking_required(active))
+
+
 class UiServerTests(unittest.TestCase):
+    def test_response_write_ignores_normal_client_disconnects(self) -> None:
+        for error in (
+            BrokenPipeError(),
+            ConnectionAbortedError(),
+            ConnectionResetError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                handler = DashboardHandler.__new__(DashboardHandler)
+                handler.send_response = Mock()
+                handler.send_header = Mock()
+                handler.end_headers = Mock()
+                handler.wfile = Mock()
+                handler.wfile.write.side_effect = error
+
+                handler._send_bytes(b"payload", "text/plain")
+
+                handler.wfile.write.assert_called_once_with(b"payload")
+
     def test_android_brightness_capability_reports_range_and_step(self) -> None:
         capability = _parse_android_brightness_capability(
             "101\n",
@@ -679,6 +1476,7 @@ class UiServerTests(unittest.TestCase):
                                 "state": "device",
                                 "platform": "ios",
                                 "connection_type": "wireless",
+                                "wireless_ready": "true",
                             }
                         ],
                         None,
@@ -734,6 +1532,145 @@ class UiServerTests(unittest.TestCase):
         harmony.assert_not_called()
         ios.assert_called_once_with("ios-python")
 
+    def test_usb_iphone_can_be_probed_but_cannot_start_without_remote_pairing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            usb = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "usb",
+                "transports": "usb",
+                "wireless_ready": "false",
+            }
+            completed = Mock(
+                returncode=0,
+                stdout=json.dumps({"device": {"model": "iPhone 16"}}),
+                stderr="",
+            )
+            with (
+                patch.object(manager, "devices", return_value=([usb], None)),
+                patch("mobile_profiler.ui.subprocess.run", return_value=completed) as run,
+            ):
+                probe = manager.probe({"device": "ios:IPHONE", "platform": "ios"})
+
+            self.assertEqual(probe["data"]["device"]["model"], "iPhone 16")
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--platform") + 1], "ios")
+            self.assertEqual(command[command.index("--device") + 1], "ios:IPHONE")
+
+            with (
+                patch.object(manager, "devices", return_value=([usb], None)),
+                patch("mobile_profiler.ui.subprocess.Popen") as popen,
+            ):
+                with self.assertRaisesRegex(ValueError, "RemotePairing"):
+                    manager.start_record(
+                        {
+                            "device": "ios:IPHONE",
+                            "platform": "ios",
+                            "test_mode": "performance",
+                            "run_name": "iOS without Wi-Fi",
+                        }
+                    )
+            popen.assert_not_called()
+
+    def test_ios_link_local_remote_xpc_requires_external_power_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            link_local = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "usb",
+                "transports": "usb,remote-xpc",
+                "remote_xpc_ready": "true",
+                "wireless_ready": "false",
+                "unplug_ready": "false",
+                "endpoint_scope": "link-local",
+                "host": "169.254.47.225",
+                "port": "49152",
+            }
+            with (
+                patch.object(manager, "devices", return_value=([link_local], None)),
+                patch("mobile_profiler.ui.subprocess.Popen") as popen,
+            ):
+                with self.assertRaisesRegex(ValueError, "USB-NCM"):
+                    manager.start_record(
+                        {
+                            "device": "ios:IPHONE",
+                            "platform": "ios",
+                            "test_mode": "performance",
+                            "require_unplugged": True,
+                            "run_name": "iOS link local blocked",
+                        }
+                    )
+            popen.assert_not_called()
+
+            fake_active = Mock()
+            fake_active.running = True
+            fake_active.snapshot.return_value = {"running": True, "status": "starting"}
+            with (
+                patch.object(manager, "devices", return_value=([link_local], None)),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
+            ):
+                manager.start_record(
+                    {
+                        "device": "ios:IPHONE",
+                        "platform": "ios",
+                        "test_mode": "performance",
+                        "require_unplugged": False,
+                        "run_name": "iOS link local external power",
+                    }
+                )
+            self.assertIn("--allow-external-power", popen.call_args.args[0])
+
+    def test_ios_pair_accepts_remote_xpc_but_does_not_claim_unplug_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            usb = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "usb",
+            }
+            paired = {
+                **usb,
+                "transports": "usb,remote-xpc",
+                "remote_xpc_ready": "true",
+                "wireless_ready": "false",
+                "unplug_ready": "false",
+                "endpoint_scope": "link-local",
+            }
+            with (
+                patch.object(
+                    manager,
+                    "devices",
+                    side_effect=[([usb], None), ([paired], None)],
+                ),
+                patch(
+                    "mobile_profiler.ui.pair_ios_device",
+                    return_value={
+                        "serial": "ios:IPHONE",
+                        "connected": True,
+                        "endpoint": {
+                            "host": "169.254.47.225",
+                            "port": 49152,
+                            "scope": "link-local",
+                            "remote_xpc_ready": True,
+                            "unplug_ready": False,
+                        },
+                    },
+                ),
+            ):
+                result = manager.pair_ios({"device": "ios:IPHONE"})
+
+            self.assertEqual(result["device"]["remote_xpc_ready"], "true")
+            self.assertEqual(result["device"]["unplug_ready"], "false")
+
     def test_ios_pair_requires_a_usb_device_and_preserves_failure_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
@@ -777,9 +1714,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-27", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-33", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-27", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-33", timeout=5) as response:
                     javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -800,25 +1737,106 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("ADB IP", html)
             self.assertIn("无线 ADB", html)
             self.assertIn("鸿蒙无线", html)
-            self.assertIn("iOS 无线", html)
+            self.assertIn("iOS RemotePairing", html)
             self.assertIn("断开无线", html)
             self.assertNotIn('data-view="system"', html)
             self.assertNotIn('data-panel="system"', html)
             self.assertIn("功耗测试模式", html)
             self.assertIn("FPS / 1% Low / 渲染链路", html)
-            self.assertIn("必要设置", html)
+            self.assertIn("开始任务", html)
+            self.assertIn("设备与场景条件", html)
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn("platform-ui-27", html)
+            self.assertIn("platform-ui-33", html)
+            self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
+            self.assertIn("当前电池放电功率", html)
+            self.assertIn("当前功率通道", html)
+            self.assertIn("测试窗口平均电池侧功率", html)
+            self.assertIn("与顶部当前值同源 · 有效区间平均", html)
+            self.assertNotIn("<dt>整机功耗记录</dt>", html)
             self.assertIn("屏幕热降亮监控", html)
             self.assertNotIn('<details class="advanced-settings" open', html)
             self.assertIn(".capture-feature-card input", css)
             self.assertIn("pointer-events: auto", css)
             self.assertIn("captureFeaturesOverridden", javascript)
+            self.assertIn('powerLabel: "当前整机 SystemLoad 功率"', javascript)
+            self.assertNotIn("以物理整机功耗", javascript)
+            self.assertIn("以整机原始 SystemLoad、电池流量", javascript)
+            self.assertIn('"当前电池放电功率"', javascript)
+            self.assertIn('["有效放电区间 SystemLoad 均值"', javascript)
+            self.assertIn('["原始 SystemLoad 均值"', javascript)
+            self.assertIn("powerSources.includes(iosSystemLoadPowerSource)", javascript)
+            self.assertIn("RenderService 背光原始值 ${brightness}（非 nit、非热限亮", javascript)
+            self.assertIn("背光原始值 ${brightness}（非 nit、非热限亮", javascript)
+            self.assertIn('harmony ? "温度传感器" : "温度 / 热限制"', javascript)
+            self.assertIn("不含公开热严重度、限亮档位或热降亮上限", javascript)
+            self.assertIn(
+                'function frameTimingTimelineLane(active) {\n    if (!captureFeatureEnabled(active, "frame_rate"))',
+                javascript,
+            )
+            self.assertIn(
+                'function frameIssueTimelineLane(active) {\n    if (!captureFeatureEnabled(active, "frame_rate"))',
+                javascript,
+            )
+            self.assertIn("逐帧呈现间隔；详细 framestats 开启时补充阶段数据", javascript)
+            self.assertIn("温度采样周期（固定）", javascript)
+            self.assertIn("SmartPerf 温度来自同一 SP_daemon 主流，固定约每 1 秒一条", javascript)
+            self.assertNotIn("powerSources.every(source => source ===", javascript)
+            self.assertIn(
+                "row?.power_source === iosSystemLoadPowerSource ? definition.value(row) : null",
+                javascript,
+            )
+            self.assertIn("system_load_observed_average_power_mw", javascript)
+            self.assertIn("外供时可能接近 SystemPowerIn", javascript)
+            render_context = javascript[
+                javascript.index("function renderContext(active)") :
+                javascript.index(
+                    "/* Legacy performance-context",
+                    javascript.index("function renderContext(active)"),
+                )
+            ]
+            self.assertIn(
+                'const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");',
+                render_context,
+            )
+            self.assertLess(
+                render_context.index("const processSnapshotsEnabled"),
+                render_context.index('processSnapshotsEnabled ? "等待 DVT 进程快照"'),
+            )
+            self.assertIn(
+                'powerFlow.systemLoad ? "SystemLoad 当前样本" : "电池流量 I×V"',
+                javascript,
+            )
+            self.assertIn(
+                "当前未收到 SystemLoad；只展示电池端流量",
+                javascript,
+            )
+            self.assertIn(
+                'classList.toggle("hidden", !powerFlow.systemLoad)',
+                javascript,
+            )
+            self.assertIn("const gpuObserved = finite(latest.gpu_load_pct)", javascript)
+            self.assertIn('gpuObserved\n        ? "iOS DVT sysmond / GPU counters"', javascript)
+            self.assertIn("本次只收到 CPU / 进程诊断遥测；未收到 GPU 数据", javascript)
+            self.assertIn(
+                "entry.data?.battery?.external_power_state_available === true",
+                javascript,
+            )
+            mode_defaults_start = javascript.index("const modeDefaults = {")
+            mode_defaults_end = javascript.index("const captureFeatureNames", mode_defaults_start)
+            mode_defaults = javascript[mode_defaults_start:mode_defaults_end]
+            self.assertEqual(mode_defaults.count('"interval-input": 1'), 2)
+            self.assertNotIn('"interval-input": .5', mode_defaults)
             self.assertIn("原始时间序列", html)
             self.assertIn("手机采集内容", html)
             self.assertIn("默认只开启有原始曲线或有效结论的项目", html)
+            self.assertIn(
+                "Harmony SmartPerf（设备原生约 1 秒，FPS / GPU 增强）",
+                html,
+            )
+            self.assertNotIn("Harmony SmartPerf（约 1 秒，高开销）", html)
+            self.assertIn("CPU 核心组频率约 30 秒刷新", javascript)
             self.assertIn("专项诊断", html)
             self.assertIn("默认关闭 · 仅在明确问题假设下开启", html)
             self.assertIn("保留现有 BatteryStats（--no-reset）", html)
@@ -842,7 +1860,10 @@ class UiServerTests(unittest.TestCase):
                 self.assertNotIn(f'data-capture-feature="{feature}" checked', html)
             self.assertIn("const platformRequiredFeatures", javascript)
             self.assertIn('android: new Set(["harmony_hitches", "touch_events"])', javascript)
-            self.assertIn('effectiveCapturePreset() !== "harmony-smartperf"', javascript)
+            self.assertIn(
+                'const smartPerf = platform === "harmony" && effectiveCapturePreset() === "harmony-smartperf"',
+                javascript,
+            )
             self.assertIn('["gpu_metrics", "memory_frequency", "frame_details", "target_process"]', javascript)
             self.assertIn("capture-interval-disabled", javascript)
             self.assertIn(".capture-interval-disabled", css)
@@ -857,7 +1878,7 @@ class UiServerTests(unittest.TestCase):
             performance_preset_end = javascript.index("]),", performance_preset_start)
             performance_preset = javascript[performance_preset_start:performance_preset_end]
             self.assertIn('"frame_rate"', performance_preset)
-            self.assertIn('"frame_details"', performance_preset)
+            self.assertNotIn('"frame_details"', performance_preset)
             self.assertNotIn('"target_process"', performance_preset)
             self.assertNotIn('"scheduler"', performance_preset)
             self.assertIn("function defaultMarkerName", javascript)
@@ -887,6 +1908,11 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="live-timeline-config"', html)
             self.assertIn('id="live-timeline-config-list"', html)
             self.assertIn('id="live-timeline-config-count"', html)
+            self.assertIn('id="live-range-panel"', html)
+            self.assertIn('id="live-range-status"', html)
+            self.assertIn('id="live-range-clear"', html)
+            self.assertIn('id="live-range-statistics"', html)
+            self.assertIn("在任意图表中按住并横向拖动", html)
             self.assertIn("仅控制实时图表，不影响采集数据和测试报告", html)
             self.assertIn('id="live-resolution-note"', html)
             self.assertIn("实时数据时间轴", html)
@@ -897,6 +1923,15 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("function loadLiveTimelineLayouts", javascript)
             self.assertIn("function saveLiveTimelineLayouts", javascript)
             self.assertIn("function applyLiveTimelineLayout", javascript)
+            self.assertIn("function liveTimelineDefinitionSupported", javascript)
+            self.assertIn("本次没有有效数据", javascript)
+            self.assertIn("熄屏保留配置，非当前输出", javascript)
+            self.assertIn(
+                "capture_features: app.captureFeaturesOverridden ? captureFeatures : {}",
+                javascript,
+            )
+            self.assertIn("当前 iOS 后端不提供通用应用帧链路", javascript)
+            self.assertIn("已超过 ${iosSystemLoadStaleAfterS} 秒未刷新", javascript)
             self.assertIn("function renderLiveTimelineConfiguration", javascript)
             self.assertIn("function moveLiveTimelineLayoutItem", javascript)
             self.assertIn('return `${platform}:${mode}`', javascript)
@@ -939,13 +1974,32 @@ class UiServerTests(unittest.TestCase):
             )
             self.assertIn("timeline-series-line", css)
             self.assertIn("timeline-hover-line", css)
+            self.assertIn(".live-range-panel", css)
+            self.assertIn(".live-range-statistics", css)
+            self.assertIn("#live-chart .timeline-range-window", css)
+            self.assertIn("#live-chart .timeline-range-boundary", css)
             self.assertIn(".live-timeline-config-row", css)
             self.assertIn(".live-timeline-config-toggle", css)
             self.assertIn(".live-timeline-order-button", css)
             self.assertIn(".live-timeline-config-copy small { white-space: normal; }", css)
             self.assertIn("one_percent_low_fps", javascript)
+            self.assertIn("function normalizeLiveTimeRange", javascript)
+            self.assertIn("function liveSeriesRangeStatistics", javascript)
+            self.assertIn("function exactLiveRangeSummary", javascript)
+            self.assertIn('api("/api/range-summary"', javascript)
+            self.assertIn('full_resolution', javascript)
+            self.assertIn("完整数据时间加权均值", javascript)
+            self.assertIn('class: "timeline-range-window"', javascript)
+            self.assertIn('class: "timeline-range-boundary"', javascript)
+            self.assertIn('chartWrap.addEventListener("pointerdown"', javascript)
+            self.assertIn('chartWrap.addEventListener("pointermove"', javascript)
+            self.assertIn('chartWrap.addEventListener("pointerup"', javascript)
+            self.assertIn("chartWrap.setPointerCapture", javascript)
+            self.assertIn("chartWrap.releasePointerCapture", javascript)
+            self.assertIn("geometry.lanes.map", javascript)
+            self.assertIn("完整采集数据统计", javascript)
             self.assertIn("step: true", javascript)
-            self.assertIn("SurfaceFlinger · 前台 SurfaceView/BLAST GraphicBuffer", javascript)
+            self.assertIn("SurfaceFlinger · 前台应用渲染层 GraphicBuffer（启动时快照）", javascript)
             self.assertIn("不等同于游戏引擎内部渲染分辨率", html)
             self.assertIn("扫描手机应用", html)
             self.assertIn("扫描出的应用", html)
@@ -959,6 +2013,54 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('$("#app-result-details").open = true', javascript)
             self.assertIn('title="${escapeHtml(packageName)}"', javascript)
             self.assertIn("overflow-wrap: anywhere", css)
+            html_ids = re.findall(r'\bid="([A-Za-z0-9_-]+)"', html)
+            duplicate_ids = sorted(
+                name for name, count in Counter(html_ids).items() if count > 1
+            )
+            executable_javascript = re.sub(
+                r"/\*.*?\*/",
+                "",
+                javascript,
+                flags=re.S,
+            )
+            executable_javascript = re.sub(
+                r"(?m)^\s*//.*$",
+                "",
+                executable_javascript,
+            )
+            static_id_refs = set(
+                re.findall(
+                    r'\$\(\s*["\']#([A-Za-z0-9_-]+)["\']\s*\)',
+                    executable_javascript,
+                )
+            )
+            static_id_refs.update(
+                re.findall(
+                    r'getElementById\(\s*["\']([A-Za-z0-9_-]+)["\']\s*\)',
+                    executable_javascript,
+                )
+            )
+            label_targets = set(
+                re.findall(r'<label\b[^>]*\bfor="([A-Za-z0-9_-]+)"', html)
+            )
+            aria_targets = {
+                target
+                for values in re.findall(
+                    r'\baria-(?:controls|labelledby|describedby)="([^"]+)"',
+                    html,
+                )
+                for target in values.split()
+            }
+            self.assertEqual(duplicate_ids, [])
+            self.assertEqual(sorted(static_id_refs - set(html_ids)), [])
+            self.assertEqual(sorted(label_targets - set(html_ids)), [])
+            self.assertEqual(sorted(aria_targets - set(html_ids)), [])
+            self.assertNotIn("function renderSystem(active)", executable_javascript)
+            self.assertNotIn("function renderSchedulerHistory(active)", executable_javascript)
+            self.assertIn("function iosRemoteXpcReady", javascript)
+            self.assertIn("function iosUnplugReady", javascript)
+            self.assertIn("169.254/16 可能只是 USB-NCM", javascript)
+            self.assertIn("state.active && (state.active.running || activeIsNewRun)", javascript)
             self.assertIn("32 分钟", html)
             self.assertIn("性能资源状态", html)
             self.assertNotIn('id="resource-top-app-cpuset"', html)
@@ -982,11 +2084,34 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="config-app-picker-content"', html)
             self.assertIn("formTarget.append(controlPanel)", javascript)
             self.assertIn("appPickerTarget.append(appPicker)", javascript)
+            self.assertNotIn("target.prepend(modeBar)", javascript)
+            self.assertIn('id="home-start-panel"', html)
+            self.assertIn('id="home-duration-slot"', html)
+            self.assertIn('id="home-package-slot"', html)
+            self.assertIn('id="home-start-slot"', html)
+            self.assertIn("durationSlot.append(durationField, durationPresets)", javascript)
+            self.assertIn("startSlot.append(startButton)", javascript)
+            self.assertIn("function placeTargetPackageField", javascript)
+            self.assertIn('app.testMode === "performance"', javascript)
+            self.assertIn('startButton.setAttribute("form", "record-form")', javascript)
+            self.assertIn("function updateStartControlState", javascript)
+            self.assertIn("const minimumDuration = Number(durationInput?.min || 2)", javascript)
+            self.assertIn('.test-mode-switch [data-test-mode]', javascript)
             self.assertIn(".config-view-columns", css)
             self.assertIn("grid-template-columns: minmax(0, 1.35fr) minmax(360px, .85fr)", css)
             self.assertIn('body:not([data-platform="android"]) .config-app-placeholder', css)
             self.assertEqual(html.count('id="package-input"'), 1)
+            self.assertEqual(html.count('id="duration-input"'), 1)
+            self.assertEqual(html.count('id="start-record"'), 1)
+            self.assertEqual(html.count('id="record-form"'), 1)
             self.assertEqual(html.count('id="scan-apps"'), 1)
+            self.assertIn('id="duration-input" name="duration" form="record-form"', html)
+            self.assertIn('id="package-input" name="package" form="record-form"', html)
+            self.assertIn('id="start-record" type="submit" form="record-form"', html)
+            self.assertIn('$("#package-input").required = packageRequired', javascript)
+            self.assertIn("targetPackageRequired(payload.platform, payload.test_mode) && !payload.package", javascript)
+            self.assertIn("#home-start-panel input", javascript)
+            self.assertIn(".home-start-panel", css)
             self.assertIn('const legacyTools = view === "tools"', javascript)
             self.assertIn('const legacySystem = view === "system" || view === "thermal"', javascript)
             self.assertIn('const target = ["live", "config", "device", "history"].includes(requested)', javascript)
@@ -1077,6 +2202,21 @@ class UiServerTests(unittest.TestCase):
             manager.regenerate_run = Mock(
                 return_value={"run_name": "phone-a", "report_url": "/runs/phone-a/report.html"}
             )
+            manager.range_summary = Mock(
+                return_value={
+                    "run_name": "phone-a",
+                    "start_elapsed_s": 1.25,
+                    "end_elapsed_s": 3.75,
+                    "full_resolution": True,
+                    "metrics": {
+                        "power_mw": {
+                            "average": 1234.0,
+                            "minimum": 1200.0,
+                            "maximum": 1300.0,
+                        }
+                    },
+                }
+            )
             manager.delete_report_range = Mock(
                 return_value={
                     "run_name": "phone-a",
@@ -1119,6 +2259,19 @@ class UiServerTests(unittest.TestCase):
                 )
                 with urlopen(request, timeout=5) as response:
                     api_result = json.loads(response.read().decode("utf-8"))
+                range_summary_payload = {
+                    "run_name": "phone-a",
+                    "start_elapsed_s": 1.25,
+                    "end_elapsed_s": 3.75,
+                }
+                range_summary_request = Request(
+                    base + "/api/range-summary",
+                    data=json.dumps(range_summary_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(range_summary_request, timeout=5) as response:
+                    range_summary_result = json.loads(response.read().decode("utf-8"))
                 delete_range_payload = {
                     "run_name": "phone-a",
                     "start_uptime_s": 101.0,
@@ -1167,12 +2320,18 @@ class UiServerTests(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertEqual(api_result["run_name"], "phone-a")
+            self.assertTrue(range_summary_result["full_resolution"])
+            self.assertEqual(
+                range_summary_result["metrics"]["power_mw"]["average"],
+                1234.0,
+            )
             self.assertEqual(delete_range_result["deleted_sample_count"], 3)
             self.assertTrue(tcpip_result["tcpip_enabled"])
             self.assertTrue(disconnect_result["disconnected"])
             self.assertEqual(apps_result["apps"][0]["package"], "com.example.game")
             self.assertIn("comparison", comparison_html)
             manager.regenerate_run.assert_called_once_with({"run_name": "phone-a"})
+            manager.range_summary.assert_called_once_with(range_summary_payload)
             manager.delete_report_range.assert_called_once_with(delete_range_payload)
             manager.enable_tcpip.assert_called_once_with({"device": "USB123", "port": 5555})
             manager.disconnect_device.assert_called_once_with(
@@ -1201,6 +2360,7 @@ class UiServerTests(unittest.TestCase):
                         "device": "SERIAL",
                         "platform": "android",
                         "interval": 1,
+                        "duration": 900,
                         "run_name": "UI smoke",
                         "session_mode": True,
                         "require_unplugged": True,
@@ -1233,7 +2393,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("--thread-interval", command)
             self.assertNotIn("--no-system-monitor", command)
             duration_index = command.index("--duration")
-            self.assertEqual(command[duration_index + 1], "1920")
+            self.assertEqual(command[duration_index + 1], "900")
             self.assertTrue(any(Path(value).name == "UI-smoke" for value in command))
             self.assertEqual(result["status"], "starting")
 
@@ -1328,15 +2488,18 @@ class UiServerTests(unittest.TestCase):
 
                 manager.start_record(payload)
 
-            self.assertEqual(active_run.call_args.args[1], root / "retry-run")
+            self.assertEqual(
+                active_run.call_args.args[1].resolve(),
+                (root / "retry-run").resolve(),
+            )
             self.assertTrue((root / "retry-run").is_dir())
 
-    def test_ui_defaults_optional_power_disconnect_off_in_both_modes(self) -> None:
+    def test_ui_defaults_require_unplugged_in_both_test_modes(self) -> None:
         cases = (
-            ("power", "", True),
-            ("performance", "com.example.game", False),
+            ("power", "", True, True),
+            ("performance", "com.example.game", False, True),
         )
-        for test_mode, package, expects_session_mode in cases:
+        for test_mode, package, expects_session_mode, expects_require_unplugged in cases:
             with self.subTest(test_mode=test_mode), tempfile.TemporaryDirectory() as directory:
                 manager = DashboardManager("custom-adb", Path(directory))
                 fake_active = Mock()
@@ -1362,7 +2525,37 @@ class UiServerTests(unittest.TestCase):
 
                 command = popen.call_args.args[0]
                 self.assertEqual("--session-mode" in command, expects_session_mode)
-                self.assertNotIn("--require-unplugged", command)
+                self.assertEqual(
+                    "--require-unplugged" in command,
+                    expects_require_unplugged,
+                )
+
+    def test_ui_explicitly_allows_external_power(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            fake_active = Mock()
+            fake_active.running = True
+            fake_active.snapshot.return_value = {"running": True, "status": "starting"}
+            with (
+                patch(
+                    "mobile_profiler.ui.list_adb_devices",
+                    return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                ),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active),
+            ):
+                manager.start_record(
+                    {
+                        "device": "SERIAL",
+                        "platform": "android",
+                        "run_name": "allow external power",
+                        "require_unplugged": False,
+                    }
+                )
+
+            command = popen.call_args.args[0]
+            self.assertIn("--allow-external-power", command)
+            self.assertNotIn("--require-unplugged", command)
 
     def test_performance_ui_requires_target_application(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1428,6 +2621,40 @@ class UiServerTests(unittest.TestCase):
                     )
             popen.assert_not_called()
 
+    def test_harmony_ui_rejects_durations_too_short_for_each_backend(self) -> None:
+        cases = (
+            ("auto", 7, ""),
+            ("harmony-smartperf", 3, "com.example.game"),
+        )
+        for preset, duration, package in cases:
+            with self.subTest(preset=preset), tempfile.TemporaryDirectory() as directory:
+                manager = DashboardManager("custom-adb", Path(directory), hdc="custom-hdc")
+                with (
+                    patch("mobile_profiler.ui.list_adb_devices", return_value=([], None)),
+                    patch(
+                        "mobile_profiler.ui.list_harmony_devices",
+                        return_value=([{
+                            "serial": "harmony:PHONE",
+                            "hdc_target": "PHONE",
+                            "state": "device",
+                            "platform": "harmony",
+                        }], None),
+                    ),
+                    patch("mobile_profiler.ui.list_ios_devices", return_value=([], None)),
+                    patch("mobile_profiler.ui.subprocess.Popen") as popen,
+                ):
+                    with self.assertRaisesRegex(ValueError, "duration"):
+                        manager.start_record({
+                            "device": "harmony:PHONE",
+                            "platform": "harmony",
+                            "test_mode": "performance",
+                            "capture_preset": preset,
+                            "duration": duration,
+                            "package": package,
+                            "run_name": f"short-{preset}",
+                        })
+                popen.assert_not_called()
+
     def test_harmony_ui_passes_capture_switches_and_high_performance_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory), hdc="custom-hdc")
@@ -1478,6 +2705,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("--harmony-high-performance", command)
             self.assertIn("--enable-feature", command)
             self.assertIn("--disable-feature", command)
+            self.assertEqual(command[command.index("--thermal-interval") + 1], "1.0")
             touch_index = command.index("touch_events")
             self.assertEqual(command[touch_index - 1], "--disable-feature")
 
@@ -1504,6 +2732,7 @@ class UiServerTests(unittest.TestCase):
                                 "state": "device",
                                 "platform": "ios",
                                 "connection_type": "wireless",
+                                "wireless_ready": "true",
                             }
                         ],
                         None,
@@ -1723,6 +2952,58 @@ class UiServerTests(unittest.TestCase):
         self.assertEqual(stored["source"], "runtime_ui")
         self.assertEqual(stored["metadata"]["foreground_package"], "com.example")
 
+    def test_range_summary_uses_full_resolution_samples_for_time_weighted_statistics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "phone-a"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(
+                json.dumps({"sample_interval_s": 1.0}),
+                encoding="utf-8",
+            )
+            samples = [
+                Sample(
+                    index=index,
+                    elapsed_s=float(index),
+                    uptime_s=100.0 + index,
+                    current_ma=250.0,
+                    signed_current_ma=-250.0,
+                    voltage_mv=4000.0,
+                    power_mw=1000.0 + 2.0 * index,
+                    direction="discharging",
+                    cpu_pct=20.0,
+                    power_valid_for_consumption=True,
+                    external_power=False,
+                )
+                for index in range(1501)
+            ]
+            self.assertEqual(len(_decimate(samples)), 900)
+            manager = DashboardManager("adb", root)
+            with (
+                patch("mobile_profiler.ui.read_samples_csv", return_value=samples),
+                patch("mobile_profiler.ui.load_contexts", return_value=[]),
+            ):
+                result = manager.range_summary(
+                    {
+                        "run_name": "phone-a",
+                        "start_elapsed_s": 0.25,
+                        "end_elapsed_s": 1499.75,
+                    }
+                )
+
+        power = result["metrics"]["power_mw"]
+        self.assertTrue(result["full_resolution"])
+        self.assertEqual(result["sample_count"], 1499)
+        self.assertAlmostEqual(result["duration_s"], 1499.5)
+        self.assertEqual(power["calculation"], "time_weighted_full_resolution")
+        self.assertEqual(power["sample_count"], 1499)
+        self.assertAlmostEqual(power["covered_duration_s"], 1499.5)
+        self.assertAlmostEqual(power["average"], 2500.0)
+        self.assertAlmostEqual(power["minimum"], 1000.5)
+        self.assertAlmostEqual(power["maximum"], 3999.5)
+
     def test_report_range_delete_persists_edit_and_regenerates_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1749,6 +3030,48 @@ class UiServerTests(unittest.TestCase):
         self.assertEqual(
             edits["excluded_ranges"],
             [{"start_uptime_s": 101.0, "end_uptime_s": 103.0}],
+        )
+        run_cli.assert_called_once_with(
+            ["report", str(run_dir.resolve())],
+            "Deleting report range for phone-a",
+        )
+
+    def test_report_range_delete_allows_context_only_range_and_regenerates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "phone-a"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            manager = DashboardManager("adb", root)
+            samples = [Mock(uptime_s=float(value)) for value in range(100, 103)]
+            contexts = [
+                ContextSample(
+                    uptime_s=110.25,
+                    foreground_package="com.example.game",
+                    performance={"frame_rate_fps": 60.0},
+                )
+            ]
+            with (
+                patch("mobile_profiler.ui.read_samples_csv", return_value=samples),
+                patch("mobile_profiler.ui.load_contexts", return_value=contexts),
+                patch.object(manager, "_run_cli", return_value="ok") as run_cli,
+            ):
+                result = manager.delete_report_range(
+                    {
+                        "run_name": "phone-a",
+                        "start_uptime_s": 110.0,
+                        "end_uptime_s": 111.0,
+                    }
+                )
+            edits = json.loads(
+                (run_dir / "report-edits.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["deleted_sample_count"], 0)
+        self.assertEqual(result["deleted_context_count"], 1)
+        self.assertEqual(
+            edits["excluded_ranges"],
+            [{"start_uptime_s": 110.0, "end_uptime_s": 111.0}],
         )
         run_cli.assert_called_once_with(
             ["report", str(run_dir.resolve())],
@@ -1835,7 +3158,7 @@ class UiServerTests(unittest.TestCase):
         self.assertEqual(commands[2][-2:], ["--match", "phone_key=phone1"])
         self.assertEqual(report["report_url"], "/runs/phone-a/report.html")
         self.assertEqual(recovered["run_name"], "phone-a")
-        self.assertEqual(imported["log_path"], str(log_path))
+        self.assertEqual(Path(imported["log_path"]).resolve(), log_path.resolve())
 
     def test_ui_archive_accepts_external_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1912,7 +3235,10 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("-SkipAdb", command)
             self.assertIn("-PythonVersion", command)
             self.assertEqual(result["version"], __version__)
-            self.assertEqual(result["zip_path"], f"{output_dir}.zip")
+            self.assertEqual(
+                Path(result["zip_path"]).resolve(),
+                Path(f"{output_dir}.zip").resolve(),
+            )
             with self.assertRaises(ValueError):
                 manager.build_portable_bundle(
                     {"output_directory": str(source / "unsafe-output")}
@@ -1994,6 +3320,13 @@ class UiConfigurationTests(unittest.TestCase):
         self.assertEqual(performance.thread_interval, 5.0)
         self.assertEqual(performance.thermal_interval, 5.0)
         self.assertEqual(performance.scheduler_interval, 5.0)
+
+    def test_cli_defaults_to_requiring_unplugged_power(self) -> None:
+        default = build_parser().parse_args(["record"])
+        allowed = build_parser().parse_args(["record", "--allow-external-power"])
+
+        self.assertTrue(default.require_unplugged)
+        self.assertFalse(allowed.require_unplugged)
 
     def test_cli_rejects_multi_app_session_in_performance_mode(self) -> None:
         args = build_parser().parse_args(

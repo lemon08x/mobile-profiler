@@ -3,20 +3,30 @@ from __future__ import annotations
 import copy
 import html
 import json
+import math
+import statistics
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from .features import CAPTURE_FEATURES, PLATFORM_FEATURE_PRESENTATION
+from .messages import localize_collection_warning
 from .models import APP_NAME
 
 
 SOURCE_KIND_LABELS = {
     "measured": "实测",
     "measured counters": "实测计数器",
+    "measured context": "实测上下文",
     "counter": "计数器",
     "driver": "驱动",
     "model": "模型",
     "context": "上下文",
     "diagnostic score": "诊断分数",
+    "measured low-rate telemetry": "低频实测遥测",
+    "event context": "事件上下文",
+    "interference context, not net overhead": "干扰上界，非净开销",
+    "system compositor context": "系统合成上下文",
+    "battery flow; consumption-valid only while discharging": "电池流量；仅放电区间可用于耗电",
     "low": "正常",
     "medium": "中等",
     "high": "高",
@@ -68,15 +78,19 @@ ACTIVITY_KIND_LABELS = {
 }
 INTERFERENCE_LABELS = {"low": "低", "medium": "中", "high": "高", "unknown": "未知"}
 METRIC_LABELS = {
-    "Whole-device battery power": "整机电池功率",
+    "Whole-device raw SystemLoad power": "iOS 整机原始 SystemLoad 通道",
+    "Whole-device battery power": "iOS 整机原始 SystemLoad 通道",
     "Battery current and voltage": "电池电流与电压",
     "CPU and process activity": "CPU 与进程活动",
     "Relative process power score": "进程相对功耗分数",
-    "System processes and collector overhead": "系统进程与采集器开销",
+    "System processes and collector overhead": "系统进程与观察者相关进程 CPU",
     "Battery temperature": "电池温度",
     "Battery current, voltage and temperature": "电池电流、电压与温度",
     "CPU utilization": "CPU 利用率",
     "CPU frequency": "CPU 频率",
+    "Display refresh rate": "屏幕刷新率",
+    "Target process resources": "目标进程资源",
+    "Delivered touch interactions": "系统已分发触控事件",
     "Foreground application and screen state": "前台应用与屏幕状态",
     "System processes": "系统进程",
     "Thermal sensors": "热传感器",
@@ -85,6 +99,7 @@ METRIC_LABELS = {
     "Battery voltage": "电池电压",
     "CPU utilization/frequency": "CPU 利用率 / 频率",
     "CPU frequency impact": "CPU 频率影响",
+    "Memory frequency pressure": "内存频率",
     "GPU activity": "GPU 活动",
     "Component/app attribution": "组件 / 应用归因",
     "Foreground application": "前台应用",
@@ -98,8 +113,16 @@ METRIC_LABELS = {
     "CPU, GPU and memory frequency context": "CPU / GPU / 内存频率上下文",
     "Render and compositor thread activity": "渲染与合成线程活动",
     "Scheduler and thermal context": "调度与热状态上下文",
-    "Whole-device power recording": "整机功耗记录",
+    "Scheduler context": "调度上下文",
+    "Thermal context": "热状态上下文",
+    "Whole-device power recording": "电池侧功率记录",
     "Brightness thermal limiting": "屏幕热降亮",
+    "iOS CPU and GPU performance context": "iOS CPU / GPU 性能上下文",
+    "Foreground application state": "前台应用状态",
+    "Observer-related process CPU upper bound": "观察者相关进程 CPU 上界",
+    "HarmonyOS application frame pacing": "HarmonyOS 应用帧节奏",
+    "HarmonyOS compositor cadence context": "HarmonyOS 系统合成节奏上下文",
+    "HarmonyOS CPU/GPU/DDR and thermal context": "HarmonyOS CPU / GPU / DDR 与温度上下文",
 }
 SOURCE_LABELS = {
     "iOS DiagnosticsService PowerTelemetryData.SystemLoad": "iOS DiagnosticsService · PowerTelemetryData.SystemLoad",
@@ -118,6 +141,11 @@ SOURCE_LABELS = {
     "BatteryStats model": "BatteryStats 模型",
     "Power Profile brightness estimate": "Power Profile 亮度估算",
     "OEM devfreq/KGSL when readable; dumpsys gpu UID work and memory otherwise": "可读时使用 OEM devfreq/KGSL，否则使用 dumpsys gpu UID 工作和内存快照",
+    "Android /proc/stat utilization deltas": "Android /proc/stat 利用率增量",
+    "Android cpufreq core-group counters": "Android cpufreq 核心组频率计数器",
+    "Android DisplayManager context sampler": "Android DisplayManager 上下文采样",
+    "Readable Android KGSL/OEM GPU frequency and load counters": "可读的 Android KGSL / OEM GPU 频率与负载计数器",
+    "Readable DRAM/DMC/MIF devfreq clock": "可读的 DRAM / DMC / MIF devfreq 时钟",
     "ActivityManager context sampler": "ActivityManager 上下文采样",
     "Imported timestamped logs aligned by /proc/uptime": "按 /proc/uptime 对齐的外部时间戳日志",
     "Whole-device telemetry + aligned process/thread/thermal snapshots": "整机遥测 + 对齐后的进程 / 线程 / 热状态快照",
@@ -131,12 +159,28 @@ SOURCE_LABELS = {
     "HarmonyOS top + ps over HDC": "HarmonyOS top + ps · HDC",
     "HarmonyOS ThermalService via hidumper": "HarmonyOS ThermalService · hidumper",
     "HarmonyOS PowerManagerService + cpufreq capability snapshots": "HarmonyOS PowerManagerService + cpufreq 能力快照",
+    "HarmonyOS /proc/stat + hidumper --cpufreq": "HarmonyOS /proc/stat + hidumper --cpufreq",
+    "HarmonyOS SmartPerf SP_daemon GPU fields": "HarmonyOS SmartPerf · GPU 字段",
+    "HarmonyOS SmartPerf SP_daemon DDR fields": "HarmonyOS SmartPerf · DDR 字段",
+    "HarmonyOS SmartPerf SP_daemon temperature fields": "HarmonyOS SmartPerf · 温度字段",
+    "HarmonyOS SmartPerf SP_daemon target process fields": "HarmonyOS SmartPerf · 目标进程字段",
+    "HarmonyOS SmartPerf SP_daemon current and voltage fields": "HarmonyOS SmartPerf · 电流与电压字段",
+    "HarmonyOS AbilityManager + WindowManager": "HarmonyOS AbilityManager + WindowManager",
+    "HarmonyOS RenderService screen refresh-rate counters": "HarmonyOS RenderService · 屏幕刷新率计数器",
+    "HarmonyOS MultimodalInput delivered touch events": "HarmonyOS MultimodalInput · 系统已分发触控事件",
     "Imported timestamped logs aligned to HarmonyOS device realtime": "按 HarmonyOS 设备实时时钟对齐的外部日志",
-    "Android SurfaceFlinger BLAST present timestamps with gfxinfo fallback and detailed framestats": "Android SurfaceFlinger BLAST 呈现时间戳 + gfxinfo / framestats 回退",
+    "Android SurfaceFlinger foreground application-layer present timestamps with gfxinfo fallback and detailed framestats": "Android SurfaceFlinger 前台应用层呈现时间戳 + gfxinfo / framestats 回退",
     "Platform utilization, cpufreq and readable devfreq counters": "平台利用率、cpufreq 与可读 devfreq 计数器",
     "Periodic toybox top/ps thread snapshots": "周期性 toybox top / ps 线程快照",
     "Battery current and voltage telemetry": "电池电流与电压遥测",
     "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight": "DisplayManager 热亮度限制 + Thermal HAL lcd-backlight",
+    "iOS DVT sysmontap + Graphics utilization when events are observed": "iOS DVT sysmontap + 实际收到的 Graphics 事件",
+    "iOS DVT application-state notifications when observed": "iOS DVT 实际收到的应用状态通知",
+    "sysmond + DTServiceHub + remotepairingdeviced concurrent CPU": "sysmond + DTServiceHub + remotepairingdeviced 同期 CPU",
+    "HarmonyOS SmartPerf SP_daemon target-foreground FPS and raw frame jitter": "HarmonyOS SmartPerf · 目标前台 FPS 与原始 jitter",
+    "HarmonyOS RenderService fresh active-screen compositor timestamps": "HarmonyOS RenderService · 亮屏新鲜合成时间戳",
+    "SmartPerf fields when verified; otherwise HDC /proc/stat, cpufreq and ThermalService": "验证可用时使用 SmartPerf；否则使用 HDC /proc/stat、cpufreq 与 ThermalService",
+    "HarmonyOS BatteryService current and voltage telemetry": "HarmonyOS BatteryService 电流与电压遥测",
 }
 COMPONENT_LABELS = {
     "screen": "屏幕",
@@ -192,18 +236,43 @@ def _json_for_script(value: object) -> str:
 def _summary_cards(summary: Dict[str, object]) -> str:
     power_sources = summary.get("power_sources")
     power_sources = power_sources if isinstance(power_sources, list) else []
-    power_context = f"P95 {float(summary.get('p95_power_mw') or 0.0) / 1000.0:.3f} W"
+    has_system_load = any(
+        str(item) == "ios_power_telemetry_system_load" for item in power_sources
+    )
+    valid_consumption = bool(summary.get("power_valid_for_consumption"))
+    average_power = summary.get("average_power_mw")
+    p95_power = summary.get("p95_power_mw")
+    observed_average = summary.get("observed_power_average_mw")
+    if valid_consumption and isinstance(p95_power, (int, float)):
+        power_context = f"有效放电区间 P95 {float(p95_power) / 1000.0:.3f} W"
+    elif isinstance(observed_average, (int, float)):
+        source_label = (
+            "iOS SystemLoad 原始均值"
+            if has_system_load
+            else "原始功率通道均值"
+        )
+        power_context = (
+            f"{source_label} {float(observed_average) / 1000.0:.3f} W；"
+            "无有效放电区间，不作耗电结论"
+        )
+    else:
+        power_context = "无有效放电区间，不生成平均耗电结论"
     if any(str(item).startswith("ios_") for item in power_sources):
         maximum_age = summary.get("maximum_power_sample_age_s")
         power_context += (
             f" · 最大样本年龄 {_number(maximum_age)} s"
             if isinstance(maximum_age, (int, float))
-            else " · iOS 物理功率低频刷新"
+            else " · iOS SystemLoad 低频刷新"
         )
-    cpu_context = f"峰值 {float(summary.get('maximum_cpu_pct') or 0.0):.1f}%"
+    maximum_cpu = summary.get("maximum_cpu_pct")
+    cpu_context = (
+        f"峰值 {float(maximum_cpu):.1f}%"
+        if isinstance(maximum_cpu, (int, float))
+        else "本次没有有效 CPU 负载样本"
+    )
     collector_cpu = summary.get("average_collector_cpu_pct")
     if isinstance(collector_cpu, (int, float)):
-        cpu_context += f" · 采集器 {float(collector_cpu):.1f}%"
+        cpu_context += f" · 观察者相关进程上界 {float(collector_cpu):.1f}%"
     signed_current = summary.get("average_signed_current_ma")
     current_context = (
         "充电电流正幅值"
@@ -214,29 +283,41 @@ def _summary_cards(summary: Dict[str, object]) -> str:
     )
     cards = [
         (
-            "平均功率",
-            f"{float(summary.get('average_power_mw') or 0.0) / 1000.0:.3f}",
+            "有效平均耗电功率",
+            (
+                f"{float(average_power) / 1000.0:.3f}"
+                if valid_consumption and isinstance(average_power, (int, float))
+                else "—"
+            ),
             "W",
             power_context,
             "measured",
         ),
         (
             "电池电流",
-            f"{float(summary.get('average_current_ma') or 0.0):.1f}",
+            _number(summary.get("average_current_ma"), 1),
             "mA",
             current_context,
             "measured",
         ),
         (
             "电池电压",
-            f"{float(summary.get('average_voltage_mv') or 0.0) / 1000.0:.3f}",
+            (
+                f"{float(summary['average_voltage_mv']) / 1000.0:.3f}"
+                if isinstance(summary.get("average_voltage_mv"), (int, float))
+                else "—"
+            ),
             "V",
-            f"{float(summary.get('energy_per_minute_mwh') or 0.0):.2f} mWh/min",
+            (
+                f"有效放电区间 {float(summary['energy_per_minute_mwh']):.2f} mWh/min"
+                if isinstance(summary.get("energy_per_minute_mwh"), (int, float))
+                else "原始电池电压通道"
+            ),
             "measured",
         ),
         (
             "CPU 利用率",
-            f"{float(summary.get('average_cpu_pct') or 0.0):.1f}",
+            _number(summary.get("average_cpu_pct"), 1),
             "%",
             cpu_context,
             "counter",
@@ -255,6 +336,8 @@ def _summary_cards(summary: Dict[str, object]) -> str:
 def _performance_cards(analysis: Dict[str, object]) -> str:
     performance = analysis.get("performance", {})
     performance = performance if isinstance(performance, dict) else {}
+    frame_timeline = performance.get("frame_rate_timeline", [])
+    frame_timeline = frame_timeline if isinstance(frame_timeline, list) else []
 
     def shown(value: object, digits: int = 1) -> str:
         return _number(value, digits) if isinstance(value, (int, float)) else "—"
@@ -277,6 +360,28 @@ def _performance_cards(analysis: Dict[str, object]) -> str:
     frame_unavailable_reason = str(performance.get("frame_unavailable_reason") or "")
     one_percent_low = performance.get("one_percent_low_fps")
     one_percent_low_source = str(performance.get("one_percent_low_source") or "")
+    detailed_one_percent_low = (
+        isinstance(one_percent_low, (int, float))
+        and (
+            any(
+                isinstance(item, dict)
+                and isinstance(item.get("frame_intervals_ms"), list)
+                and bool(item.get("frame_intervals_ms"))
+                for item in frame_timeline
+            )
+            or (
+                any(
+                    token in one_percent_low_source.lower()
+                    for token in ("slowest 1%", "frame-time histogram", "frame-jitter")
+                )
+                and "sampled-window" not in one_percent_low_source.lower()
+                and "counter-window" not in one_percent_low_source.lower()
+            )
+        )
+    )
+    if not detailed_one_percent_low:
+        one_percent_low = None
+        one_percent_low_source = "仅有采样窗口 FPS 时不生成标准 1% Low"
     cards = [
         (
             "当前刷新率",
@@ -349,6 +454,7 @@ def _refresh_residency_rows(analysis: Dict[str, object]) -> str:
 
 
 def _performance_context_rows(analysis: Dict[str, object]) -> str:
+    platform = str(analysis.get("platform") or "android").strip().lower()
     performance = analysis.get("performance", {})
     performance = performance if isinstance(performance, dict) else {}
     thermal = analysis.get("thermal", {})
@@ -387,9 +493,15 @@ def _performance_context_rows(analysis: Dict[str, object]) -> str:
     interpolation_label = str(
         performance.get("frame_interpolation_label") or "系统未公开可验证的插帧开关"
     )
+    brightness_raw = performance.get("brightness_raw")
+    brightness_detail = (
+        f"RenderService 背光原始值 {_number(brightness_raw, 0)}（非 nit、非热限亮）"
+        if platform == "harmony"
+        else f"亮度原始值 {_number(brightness_raw, 0)}"
+    )
     rows = [
         ("前台窗口", performance.get("foreground_window_name") or "—", f"Window #{performance.get('foreground_window_id') or '—'}"),
-        ("显示", resolution, f"亮度原始值 {_number(performance.get('brightness_raw'), 0)}"),
+        ("显示", resolution, brightness_detail),
     ]
     if render_available:
         rows.append((
@@ -626,6 +738,29 @@ def _frame_flow_stages(analysis: Dict[str, object]) -> List[Dict[str, object]]:
     return [item for item in stages if isinstance(item, dict)] if isinstance(stages, list) else []
 
 
+def _frame_flow_has_valid_timeline(analysis: Dict[str, object]) -> bool:
+    for stage in _frame_flow_stages(analysis):
+        if str(stage.get("status") or "unavailable") in {"invalid", "unavailable"}:
+            continue
+        timeline = stage.get("timeline", [])
+        if not isinstance(timeline, list):
+            continue
+        for point in timeline:
+            if not isinstance(point, dict):
+                continue
+            value = point.get(
+                "value",
+                point.get("frame_rate_fps", point.get("refresh_rate_hz")),
+            )
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) > 0
+            ):
+                return True
+    return False
+
+
 def _frame_status_label(status: object) -> str:
     return {
         "primary": "主数据",
@@ -700,17 +835,19 @@ def _frame_flow_visual(analysis: Dict[str, object]) -> str:
 
 
 def _frame_flow_history_section(analysis: Dict[str, object]) -> str:
-    stages = _frame_flow_stages(analysis)
-    if not stages:
+    if not _frame_flow_has_valid_timeline(analysis):
         return ""
     return (
-        '<div class="frame-flow-history-report">'
+        '<section class="analysis-section frame-flow-history-report">'
         '<div class="chart-toolbar"><div><h2>完整链路节点帧率趋势</h2>'
         '<p class="section-copy">在同一时间轴上分别展示应用提交、合成器呈现与显示刷新率。'
         '平台未公开独立帧计数的节点保留为空轨，不使用阶段延迟冒充 FPS。</p></div></div>'
-        '<div class="chart-surface frame-flow-history-surface">'
+        + _frame_flow_visual(analysis)
+        + '<div class="chart-surface frame-flow-history-surface">'
         '<svg id="frame-flow-history-chart" role="img" aria-label="完整渲染链路节点帧率与刷新率趋势"></svg>'
-        '</div></div>'
+        '</div>'
+        + _frame_flow_evidence(analysis)
+        + '</section>'
     )
 
 
@@ -760,58 +897,119 @@ def _percentile_value(values: List[float], quantile: float) -> float | None:
 def _frame_budget_ms(analysis: Dict[str, object]) -> float | None:
     performance = analysis.get("performance", {})
     performance = performance if isinstance(performance, dict) else {}
-    refresh = performance.get("current_refresh_rate_hz")
-    if isinstance(refresh, (int, float)) and not isinstance(refresh, bool) and float(refresh) > 0:
-        return 1000.0 / float(refresh)
     timeline = performance.get("frame_rate_timeline", [])
     timeline = timeline if isinstance(timeline, list) else []
-    refresh_values = [
+    refresh_values = {
         float(item.get("refresh_rate_hz"))
         for item in timeline
         if isinstance(item, dict)
+        and isinstance(item.get("frame_intervals_ms"), list)
+        and bool(item.get("frame_intervals_ms"))
         and isinstance(item.get("refresh_rate_hz"), (int, float))
         and not isinstance(item.get("refresh_rate_hz"), bool)
         and float(item.get("refresh_rate_hz")) > 0
-    ]
-    refresh_value = _percentile_value(refresh_values, 0.5)
-    return 1000.0 / refresh_value if refresh_value else None
+    }
+    if len(refresh_values) != 1:
+        return None
+    return 1000.0 / next(iter(refresh_values))
+
+
+def _frame_interval_budget_pairs(
+    analysis: Dict[str, object],
+) -> List[tuple[float, float, float]]:
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    timeline = performance.get("frame_rate_timeline", [])
+    timeline = timeline if isinstance(timeline, list) else []
+    pairs: List[tuple[float, float, float]] = []
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        refresh = item.get("refresh_rate_hz")
+        if (
+            not isinstance(refresh, (int, float))
+            or isinstance(refresh, bool)
+            or float(refresh) <= 0
+        ):
+            continue
+        budget = 1000.0 / float(refresh)
+        intervals = item.get("frame_intervals_ms", [])
+        intervals = intervals if isinstance(intervals, list) else []
+        for value in intervals:
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and 0 < float(value) < 10_000
+            ):
+                pairs.append((float(value), budget, float(refresh)))
+    return pairs
 
 
 def _frame_stability_section(analysis: Dict[str, object]) -> str:
     values = _frame_interval_values(analysis)
     if not values:
         return ""
+    budget_pairs = _frame_interval_budget_pairs(analysis)
     budget = _frame_budget_ms(analysis)
-    within_count = sum(1 for value in values if budget is not None and value <= budget)
-    within_pct = within_count / len(values) * 100.0 if budget is not None else None
-    issue_threshold = budget * 1.5 if budget is not None else None
-    issue_count = sum(
-        1 for value in values
-        if issue_threshold is not None and value > issue_threshold
+    within_count = sum(1 for value, item_budget, _ in budget_pairs if value <= item_budget)
+    within_pct = (
+        within_count / len(budget_pairs) * 100.0 if budget_pairs else None
     )
-    issue_pct = issue_count / len(values) * 100.0 if issue_threshold is not None else None
+    issue_count = sum(
+        1 for value, item_budget, _ in budget_pairs if value > item_budget * 1.5
+    )
+    issue_pct = issue_count / len(budget_pairs) * 100.0 if budget_pairs else None
+    issue_threshold = budget * 1.5 if budget is not None else None
     p99 = _percentile_value(values, 0.99)
     maximum = max(values)
-    budget_label = f"{budget:.2f} ms" if budget is not None else "不可用"
+    refresh_budgets = sorted(
+        {(refresh, item_budget) for _, item_budget, refresh in budget_pairs},
+        key=lambda item: item[0],
+    )
+    if len(refresh_budgets) == 1:
+        budget_label = f"{refresh_budgets[0][1]:.2f} ms（{refresh_budgets[0][0]:.0f} Hz）"
+    elif refresh_budgets:
+        budget_label = "按窗口动态（" + " / ".join(
+            f"{refresh:.0f} Hz {item_budget:.2f} ms"
+            for refresh, item_budget in refresh_budgets
+        ) + "）"
+    else:
+        budget_label = "未能与逐窗口刷新率对齐"
     budget_attr = f'{budget:.8f}' if budget is not None else ""
     issue_attr = f'{issue_threshold:.8f}' if issue_threshold is not None else ""
+    budget_lines_attr = _escape(
+        json.dumps(
+            [
+                {"refresh_hz": refresh, "budget_ms": item_budget}
+                for refresh, item_budget in refresh_budgets
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    )
     within_label = f"{within_pct:.2f}%" if within_pct is not None else "—"
     issue_label = f"{issue_pct:.2f}%" if issue_pct is not None else "—"
+    aligned_label = (
+        f"{len(budget_pairs):,} / {len(values):,} 帧已对齐刷新率"
+        if budget_pairs
+        else "没有逐帧刷新率对齐证据"
+    )
     return (
         '<section class="analysis-section frame-stability-section">'
         '<div class="chart-toolbar"><div><h2>帧间隔分布</h2>'
-        '<p class="section-copy">按实际呈现帧间隔展示帧预算线和慢帧尾部；预算至 1.5× 预算之间标为边缘抖动，不计入跨预算异常，最后一个柱汇总长尾样本。</p>'
+        '<p class="section-copy">每个帧窗口按该窗口自己的刷新率换算预算；动态刷新会分别使用 60/90/120 Hz 等对应预算，无法逐窗口对齐的帧只进入分布，不参与跨预算比例结论。</p>'
         '</div><div class="legend-row"><span><i class="legend-swatch histogram-normal"></i>单周期内</span>'
         '<span><i class="legend-swatch histogram-edge"></i>预算边缘</span>'
-        '<span><i class="legend-swatch histogram-tail"></i>跨预算 / 长尾</span></div></div>'
+        '<span><i class="legend-swatch histogram-tail"></i>长帧（&gt;1.5×预算）</span></div></div>'
         '<div class="stability-metrics">'
         f'<div><span>帧间隔样本</span><strong>{len(values):,}</strong></div>'
         f'<div><span>帧预算</span><strong>{_escape(budget_label)}</strong></div>'
-        f'<div><span>单周期内 / 跨预算异常</span><strong>{_escape(within_label)} / {_escape(issue_label)}</strong></div>'
+        f'<div><span>单周期内 / 长帧（&gt;1.5×预算）</span><strong>{_escape(within_label)} / {_escape(issue_label)}</strong></div>'
         f'<div><span>P99 / 最大</span><strong>{_number(p99, 2)} / {_number(maximum, 2)} ms</strong></div>'
         '</div>'
+        f'<p class="section-copy">{_escape(aligned_label)}。长帧比例由逐帧间隔按 1.5×刷新预算重新计算；它与 SurfaceFlinger / 平台计数器报告的截止时间未命中或异常帧不是同一口径，数值不要求相等。</p>'
         '<div class="chart-surface frame-interval-surface">'
-        f'<svg id="frame-interval-chart" data-budget-ms="{_escape(budget_attr)}" data-issue-ms="{_escape(issue_attr)}" role="img" aria-label="帧间隔直方图"></svg>'
+        f'<svg id="frame-interval-chart" data-budget-ms="{_escape(budget_attr)}" data-issue-ms="{_escape(issue_attr)}" data-budget-lines="{budget_lines_attr}" role="img" aria-label="帧间隔直方图"></svg>'
         '</div></section>'
     )
 
@@ -1137,18 +1335,37 @@ def _report_warning_items(analysis: Dict[str, object], test_mode: str) -> List[s
     warnings = analysis.get("warnings", [])
     warnings = warnings if isinstance(warnings, list) else []
     gpu_available = _gpu_report_available(analysis, test_mode)
+    findings = analysis.get("findings", [])
+    findings = findings if isinstance(findings, list) else []
+    has_observer_finding = any(
+        isinstance(item, dict)
+        and str(item.get("title") or "") == "观察者相关进程 CPU 上界"
+        for item in findings
+    )
+    has_observer_average_warning = any(
+        str(item or "").startswith("Average normalized iOS collector CPU overhead was ")
+        for item in warnings
+    )
     rows = []
     for item in warnings:
         warning = str(item or "").strip()
         if not warning:
             continue
+        if warning.startswith(
+            "iOS DVT sysmond/DTServiceHub/remotepairingdeviced add measurable collection overhead;"
+        ) and (has_observer_average_warning or has_observer_finding):
+            continue
+        if has_observer_finding and warning.startswith(
+            "Average normalized iOS collector CPU overhead was "
+        ):
+            continue
         if not gpu_available and "gpu" in warning.lower() and (
             "回退证据" in warning
-            or "dumpsys gpu" in warning.lower()
+            or "报告将使用可用的 gpu 负载" in warning.lower()
             or "generic_sysfs" in warning.lower()
         ):
             continue
-        rows.append(warning)
+        rows.append(localize_collection_warning(warning))
     return rows
 
 
@@ -1160,31 +1377,88 @@ def _analysis_coverage_section(
     rows: List[Tuple[str, str, str, str]] = []
     gpu = analysis.get("gpu", {})
     gpu = gpu if isinstance(gpu, dict) else {}
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    capture_configuration = analysis.get("capture_configuration", {})
+    capture_configuration = (
+        capture_configuration if isinstance(capture_configuration, dict) else {}
+    )
+    features = capture_configuration.get("features", {})
+    features = features if isinstance(features, dict) else {}
+    backend = str(capture_configuration.get("backend") or "")
+    platform = str(
+        analysis.get("platform")
+        or ("harmony" if backend.startswith("harmony") else "android")
+    ).lower()
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    frame_unavailable_reason = str(performance.get("frame_unavailable_reason") or "")
+    if "display is inactive" in frame_unavailable_reason.lower():
+        frame_unavailable_reason = "屏幕未处于活动状态；保留的刷新配置不代表当前帧输出。"
+
+    def feature_enabled(name: str) -> bool:
+        return bool(features.get(name)) if features else True
+
+    def memory_frequency_unavailable_reason() -> str:
+        if backend == "harmony_smartperf":
+            return "本次 SmartPerf SP_daemon -d 未返回可用的 DDR 频率字段，因此不能生成内存频率时间线或压力结论。"
+        return str(
+            memory.get("reason")
+            or memory.get("limitations")
+            or "设备未暴露可读内存频率节点，或该采集项已关闭。"
+        )
+
     if test_mode == "performance":
+        frame_stages = _frame_flow_stages(analysis)
         invalid_stages = [
-            item for item in _frame_flow_stages(analysis)
+            item for item in frame_stages
             if str(item.get("status") or "unavailable") in {"invalid", "unavailable"}
         ]
-        if invalid_stages:
+        if invalid_stages and feature_enabled("frame_rate"):
             labels = "、".join(str(item.get("phase") or item.get("label") or "阶段") for item in invalid_stages)
+            usable_stage_count = sum(
+                1
+                for item in frame_stages
+                if str(item.get("status") or "unavailable")
+                in {"primary", "valid", "reference"}
+            )
             rows.append((
                 "帧数据源有效性",
-                "部分可用",
-                "无效来源不参与主 FPS",
+                "部分可用" if usable_stage_count else "未覆盖",
+                "无效来源不参与主 FPS" if usable_stage_count else "空图表已省略",
                 f"{labels} 未形成有效增量；保留在渲染链路证据明细中说明原因。",
             ))
         pipeline = _render_pipeline_data(analysis)
         stages = pipeline.get("stages", [])
-        if not isinstance(stages, list) or not stages:
-            rows.append((
-                "详细渲染阶段 / 慢帧",
-                "未覆盖",
-                "空表已省略",
-                "目标窗口没有产生可解析的 framestats 阶段时间戳，不能定位引擎内部、RenderThread 或 HWC 分段时延。",
-            ))
+        if feature_enabled("frame_details") and (not isinstance(stages, list) or not stages):
+            if platform == "harmony":
+                jitter_available = isinstance(
+                    performance.get("frame_metric_p95_ms"), (int, float)
+                )
+                rows.append((
+                    "详细渲染阶段 / 慢帧",
+                    "仅帧抖动" if jitter_available else "未覆盖",
+                    "fpsJitters" if jitter_available else "空表已省略",
+                    (
+                        "SmartPerf fpsJitters 可用于 P95/P99 与慢帧统计，但量产接口不提供 "
+                        "RenderThread、BufferQueue、GPU 或 HWC 阶段时间戳。"
+                        if jitter_available
+                        else "本次 SmartPerf 未获得可用 fpsJitters；量产接口即使返回帧抖动，"
+                        "也不能拆分 RenderThread、BufferQueue、GPU 或 HWC 阶段。"
+                    ),
+                ))
+            else:
+                rows.append((
+                    "详细渲染阶段 / 慢帧",
+                    "未覆盖",
+                    "空表已省略",
+                    "目标窗口没有产生可解析的 framestats 阶段时间戳，不能定位引擎内部、RenderThread 或 HWC 分段时延。",
+                ))
         render = analysis.get("render_performance", {})
         render = render if isinstance(render, dict) else {}
-        if not render.get("render_threads"):
+        if (
+            feature_enabled("hot_threads") or feature_enabled("process_snapshots")
+        ) and not render.get("render_threads"):
             rows.append((
                 "渲染 / 合成线程热点",
                 "未覆盖",
@@ -1193,64 +1467,89 @@ def _analysis_coverage_section(
             ))
         system = analysis.get("system", {})
         system = system if isinstance(system, dict) else {}
-        if not system.get("top_processes"):
+        if feature_enabled("process_snapshots") and not system.get("top_processes"):
             rows.append((
                 "进程调度热点",
                 "未覆盖",
                 "空表已省略",
                 "本次没有周期进程快照；不能据此判断后台进程调度竞争。",
             ))
-        if not _frame_interval_values(analysis):
-            performance = analysis.get("performance", {})
-            performance = performance if isinstance(performance, dict) else {}
+        if feature_enabled("frame_rate") and not _frame_interval_values(analysis):
             rows.append((
                 "帧间隔分布",
                 "未覆盖",
                 "图表已省略",
-                str(performance.get("frame_unavailable_reason") or "帧数据源没有返回逐帧间隔样本。"),
+                frame_unavailable_reason or "帧数据源没有返回逐帧间隔样本。",
             ))
-        if not _refresh_residency_available(analysis):
+        if (
+            feature_enabled("foreground_window") or feature_enabled("frame_rate")
+        ) and not _refresh_residency_available(analysis):
+            refresh_reason = str(
+                performance.get("refresh_rate_unavailable_reason")
+                or frame_unavailable_reason
+                or "平台没有提供会话内可计算的刷新档位计数变化。"
+            )
             rows.append((
                 "刷新档位驻留",
                 "未覆盖",
                 "空模块已省略",
-                "平台没有提供会话内可计算的刷新档位计数变化。",
+                refresh_reason,
             ))
-        if not gpu_report_available:
+        if (
+            feature_enabled("foreground_window")
+            and performance.get("render_resolution_available") is False
+        ):
+            rows.append((
+                "游戏内部渲染分辨率",
+                "未覆盖",
+                "不展示推测值",
+                "当前只能验证显示尺寸或前台 Surface 缓冲区；公开接口没有提供可确认的游戏引擎内部渲染分辨率，因此不会把显示分辨率或估算缩放值冒充实测。",
+            ))
+        if feature_enabled("gpu_metrics") and not gpu_report_available:
             rows.append((
                 "GPU 实时遥测",
                 "未覆盖",
                 "GPU 页面已省略",
                 _gpu_unavailable_display_reason(gpu),
             ))
+        if feature_enabled("memory_frequency") and not memory.get("available"):
+            rows.append((
+                "内存频率",
+                "未覆盖",
+                "时间线与分析模块已省略",
+                memory_frequency_unavailable_reason(),
+            ))
     else:
         pressure = analysis.get("power_pressure", {})
         pressure = pressure if isinstance(pressure, dict) else {}
-        memory = analysis.get("memory", {})
-        memory = memory if isinstance(memory, dict) else {}
         settings = analysis.get("runtime_settings", {})
         settings = settings if isinstance(settings, dict) else {}
-        if not pressure.get("drivers"):
+        if any(
+            feature_enabled(name)
+            for name in ("cpu_usage", "cpu_frequency", "gpu_metrics", "thermal")
+        ) and not pressure.get("drivers"):
             rows.append(("资源功率相关性", "未覆盖", "图表已省略", "相关采集项已关闭，或有效时间样本不足。"))
-        if not pressure.get("tasks"):
+        if any(
+            feature_enabled(name) for name in ("target_process", "process_snapshots")
+        ) and not pressure.get("tasks"):
             rows.append(("任务负载压力", "未覆盖", "空表已省略", "没有可用的周期任务快照。"))
-        if not memory.get("available"):
+        if feature_enabled("memory_frequency") and not memory.get("available"):
             rows.append((
                 "内存频率压力",
                 "未覆盖",
                 "空模块已省略",
-                str(memory.get("reason") or memory.get("limitations") or "设备未暴露可读内存频率节点，或该采集项已关闭。"),
+                memory_frequency_unavailable_reason(),
             ))
-        if not settings.get("rows"):
+        if feature_enabled("runtime_settings") and not settings.get("rows"):
             rows.append(("系统设置变化", "未覆盖", "空表已省略", "未恢复到可比较的测试前后系统设置快照。"))
-        if not gpu_report_available:
+        if feature_enabled("gpu_metrics") and not gpu_report_available:
             rows.append((
                 "GPU 证据",
                 "未覆盖",
                 "GPU 页面已省略",
                 _gpu_unavailable_display_reason(gpu),
             ))
-    if not analysis.get("processes"):
+    if feature_enabled("process_snapshots") and not analysis.get("processes"):
         rows.append(("进程 CPU 快照", "未覆盖", "空表已省略", "采样中没有可用的进程 CPU 明细。"))
     if not rows:
         return ""
@@ -1296,10 +1595,13 @@ def _performance_interference_status(analysis: Dict[str, object]) -> str:
         pipeline = _render_pipeline_data(analysis)
         pipeline_available = bool(pipeline.get("available") or pipeline.get("stages"))
         if has_frame_issue:
+            frame_issue_label = str(
+                performance.get("frame_issue_label") or "超出帧预算或截止时间"
+            )
             return (
                 '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
                 '<strong>检测到帧节奏异常，但尚未定位到具体渲染阶段</strong>'
-                f'<span>{_number(frame_issue_pct, 2)}% 帧跨越预算或截止时间。'
+                f'<span>{_number(frame_issue_pct, 2)}% 帧{_escape(frame_issue_label)}。'
                 + (
                     "详细阶段时间戳可用，但尚未形成稳定的主导瓶颈。"
                     if pipeline_available
@@ -1370,7 +1672,71 @@ def _performance_memory_frequency_available(analysis: Dict[str, object]) -> bool
     )
 
 
+def _performance_test_item_is_substantive(item: Dict[str, object]) -> bool:
+    frame_evidence = any(
+        isinstance(item.get(key), (int, float))
+        and not isinstance(item.get(key), bool)
+        and float(item.get(key) or 0.0) > 0
+        for key in (
+            "frame_sample_count",
+            "frame_count",
+            "average_fps",
+            "one_percent_low_fps",
+            "frame_p95_ms",
+            "frame_p99_ms",
+            "frame_issue_count",
+            "frame_issue_pct",
+        )
+    )
+    dominant = item.get("dominant_stage", {})
+    dominant = dominant if isinstance(dominant, dict) else {}
+    explicit_conclusion = bool(
+        item.get("throttling_observed") is True
+        or item.get("conclusion")
+        or item.get("finding")
+        or (
+            dominant.get("label")
+            and isinstance(dominant.get("p95_ms"), (int, float))
+            and float(dominant.get("p95_ms") or 0.0) > 0
+        )
+    )
+    return frame_evidence or explicit_conclusion
+
+
+def _performance_test_item_report_rows(
+    analysis: Dict[str, object],
+) -> List[Dict[str, object]]:
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    raw_rows = test_items.get("rows", [])
+    return [
+        item
+        for item in raw_rows
+        if isinstance(item, dict) and _performance_test_item_is_substantive(item)
+    ] if isinstance(raw_rows, list) else []
+
+
+def _performance_test_item_optional_columns(
+    analysis: Dict[str, object],
+) -> Tuple[bool, bool]:
+    rows = _performance_test_item_report_rows(analysis)
+    show_dominant_stage = any(
+        isinstance(item.get("dominant_stage"), dict)
+        and bool(item["dominant_stage"].get("label"))
+        and isinstance(item["dominant_stage"].get("p95_ms"), (int, float))
+        for item in rows
+    )
+    show_thermal = any(
+        isinstance(item.get("maximum_temperature_c"), (int, float))
+        or isinstance(item.get("maximum_thermal_status"), (int, float))
+        and float(item.get("maximum_thermal_status") or 0.0) > 0
+        for item in rows
+    )
+    return show_dominant_stage, show_thermal
+
+
 def _performance_test_item_headers(analysis: Dict[str, object]) -> str:
+    show_dominant_stage, show_thermal = _performance_test_item_optional_columns(analysis)
     labels = [
         "测试项",
         "时长",
@@ -1378,36 +1744,68 @@ def _performance_test_item_headers(analysis: Dict[str, object]) -> str:
         "1% Low",
         "P95 / P99",
         "异常帧",
-        "主要延迟阶段",
         "CPU 平均 / 峰值",
         "GPU 平均 / 峰值",
     ]
+    if show_dominant_stage:
+        labels.insert(6, "主要延迟阶段")
     if _performance_memory_frequency_available(analysis):
         labels.append("内存频率 平均 / P95")
-    labels.extend(["热限制", "整机功耗记录", "置信度"])
+    if show_thermal:
+        labels.append("热限制")
+    labels.extend(["测试窗口平均电池侧功率", "置信度"])
     return "".join(f"<th>{_escape(label)}</th>" for label in labels)
 
 
 def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
-    test_items = analysis.get("test_items", {})
-    test_items = test_items if isinstance(test_items, dict) else {}
     show_memory_frequency = _performance_memory_frequency_available(analysis)
+    show_dominant_stage, show_thermal = _performance_test_item_optional_columns(analysis)
     rows = []
-    for item in test_items.get("rows", []) if isinstance(test_items.get("rows"), list) else []:
-        if not isinstance(item, dict):
-            continue
+    for item in _performance_test_item_report_rows(analysis):
         windows = item.get("windows", [])
         windows = windows if isinstance(windows, list) else []
         first_start = windows[0].get("start_elapsed_s") if windows and isinstance(windows[0], dict) else 0
         last_end = windows[-1].get("end_elapsed_s") if windows and isinstance(windows[-1], dict) else first_start
         dominant = item.get("dominant_stage", {})
         dominant = dominant if isinstance(dominant, dict) else {}
+        dominant_available = bool(dominant.get("label")) and isinstance(
+            dominant.get("p95_ms"), (int, float)
+        )
+        dominant_cell = (
+            (
+                f'<td>{_escape(dominant.get("label"))}'
+                f'<span class="cell-sub">P95 {_number(dominant.get("p95_ms"), 2)} ms</span></td>'
+                if dominant_available
+                else '<td>—</td>'
+            )
+            if show_dominant_stage
+            else ""
+        )
         memory_cell = (
             f'<td>{_number(item.get("average_memory_frequency_mhz"), 0)} / '
             f'{_number(item.get("p95_memory_frequency_mhz"), 0)} MHz</td>'
             if show_memory_frequency
             else ""
         )
+        thermal_cell = ""
+        if show_thermal:
+            temperature = item.get("maximum_temperature_c")
+            thermal_status = item.get("maximum_thermal_status")
+            thermal_evidence = isinstance(temperature, (int, float)) or (
+                isinstance(thermal_status, (int, float))
+                and float(thermal_status) > 0
+            )
+            temperature_detail = (
+                f'<span class="cell-sub">最高 {_number(temperature)} °C</span>'
+                if isinstance(temperature, (int, float))
+                else ""
+            )
+            thermal_cell = (
+                f'<td>{"是" if item.get("throttling_observed") else "否"}'
+                f'{temperature_detail}</td>'
+                if thermal_evidence
+                else '<td>—</td>'
+            )
         rows.append(
             f'<tr class="test-item-row" data-test-start="{_number(first_start, 3, "0")}" data-test-end="{_number(last_end, 3, "0")}">'
             f'<td><strong>{_escape(item.get("name"))}</strong><span class="cell-sub">{_escape(item.get("phase"))} · {int(item.get("occurrence_count") or 0)} 次</span></td>'
@@ -1416,11 +1814,11 @@ def _performance_test_item_rows(analysis: Dict[str, object]) -> str:
             f'<td>{_number(item.get("one_percent_low_fps"), 1)} FPS</td>'
             f'<td>{_number(item.get("frame_p95_ms"), 2)} / {_number(item.get("frame_p99_ms"), 2)} ms</td>'
             f'<td>{_number(item.get("frame_issue_pct"), 2)}%<span class="cell-sub">{int(item.get("frame_issue_count") or 0)} 帧</span></td>'
-            f'<td>{_escape(dominant.get("label") or "—")}<span class="cell-sub">P95 {_number(dominant.get("p95_ms"), 2)} ms</span></td>'
+            f'{dominant_cell}'
             f'<td>{_number(item.get("average_cpu_pct"))}% / {_number(item.get("maximum_cpu_pct"))}%</td>'
             f'<td>{_number(item.get("average_gpu_load_pct"))}% / {_number(item.get("maximum_gpu_load_pct"))}%</td>'
             f'{memory_cell}'
-            f'<td>{"是" if item.get("throttling_observed") else "否"}<span class="cell-sub">{_number(item.get("maximum_temperature_c"))} °C</span></td>'
+            f'{thermal_cell}'
             f'<td>{_number(item.get("average_whole_device_power_mw"), 0)} mW<span class="cell-sub">只记录整机</span></td>'
             f'<td>{_escape(_display_label(item.get("confidence"), CONFIDENCE_LABELS))}</td>'
             "</tr>"
@@ -1434,7 +1832,7 @@ def _performance_test_item_span_rows(analysis: Dict[str, object]) -> str:
     test_items = test_items if isinstance(test_items, dict) else {}
     rows = []
     for item in test_items.get("spans", []) if isinstance(test_items.get("spans"), list) else []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _performance_test_item_is_substantive(item):
             continue
         rows.append(
             f'<tr class="test-item-row" data-test-start="{_number(item.get("start_elapsed_s"), 3, "0")}" data-test-end="{_number(item.get("end_elapsed_s"), 3, "0")}">'
@@ -1466,17 +1864,11 @@ def _cpu_rows(analysis: Dict[str, object]) -> Tuple[str, str, str]:
             f'data-cpu-cluster="{_escape(name)}">{_escape(label)}</button>'
         )
         cores = ", ".join(str(value) for value in cluster.get("cores", [])) or "—"
-        premium = cluster.get("frequency_premium_mw")
-        correlation = cluster.get("measured_power_correlation")
         table_rows.append(
             "<tr>"
             f'<td><strong>{_escape(label)}</strong><span class="cell-sub">CPU { _escape(cores) }</span></td>'
-            f'<td>{_number(cluster.get("average_load_pct"))}%</td>'
             f'<td>{_number(cluster.get("load_weighted_mhz"), 0)} MHz</td>'
             f'<td>{_number(cluster.get("maximum_mhz"), 0)} / {_number(cluster.get("hardware_max_mhz"), 0)} MHz</td>'
-            f'<td>{_number(cluster.get("modeled_power_mw"))} mW</td>'
-            f'<td>{_number(premium)} mW</td>'
-            f'<td>{_number(correlation, 2)}</td>'
             "</tr>"
         )
         residency = {item.get("band"): item for item in cluster.get("residency", [])}
@@ -1496,7 +1888,7 @@ def _cpu_rows(analysis: Dict[str, object]) -> Tuple[str, str, str]:
             "</div>"
         )
     if not table_rows:
-        table_rows.append('<tr><td colspan="7" class="empty-cell">CPU 集群数据不可用。</td></tr>')
+        table_rows.append('<tr><td colspan="3" class="empty-cell">CPU 核心组频率数据不可用。</td></tr>')
     return "".join(table_rows), "".join(residency_rows), "".join(selector_buttons)
 
 
@@ -1512,12 +1904,11 @@ def _performance_cpu_rows(analysis: Dict[str, object]) -> str:
         rows.append(
             "<tr>"
             f'<td><strong>{_escape(label)}</strong><span class="cell-sub">CPU {_escape(cores)}</span></td>'
-            f'<td>{_number(cluster.get("average_load_pct"))}%</td>'
             f'<td>{_number(cluster.get("load_weighted_mhz"), 0)} MHz</td>'
             f'<td>{_number(cluster.get("maximum_mhz"), 0)} / {_number(cluster.get("hardware_max_mhz"), 0)} MHz</td>'
             "</tr>"
         )
-    return "".join(rows) or '<tr><td colspan="4" class="empty-cell">CPU 集群数据不可用。</td></tr>'
+    return "".join(rows) or '<tr><td colspan="3" class="empty-cell">CPU 核心组频率数据不可用。</td></tr>'
 
 
 def _process_rows(analysis: Dict[str, object]) -> str:
@@ -1590,7 +1981,7 @@ def _priority_activity_content(analysis: Dict[str, object], platform: str) -> Tu
             status = (
                 '<div class="priority-callout"><span class="status-dot good"></span><div>'
                 '<strong>未检测到 CPU 可见的重点系统或采集器活动</strong>'
-                f'<span>已观察到 {len(monitored)} 个受监控进程；相对功耗分数与整机物理功率分开解释。</span>'
+                f'<span>已观察到 {len(monitored)} 个受监控进程；相对功耗分数与整机原始 SystemLoad 通道分开解释。</span>'
                 "</div></div>"
             )
         elif platform == "harmony":
@@ -1822,19 +2213,65 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
         return ""
     points = brightness.get("points", [])
     points = points if isinstance(points, list) else []
+    current_state = brightness.get("current_state", {})
+    current_state = current_state if isinstance(current_state, dict) else {}
     if not points:
+        vendor_known = isinstance(current_state.get("vendor_thermal_active"), bool)
+        vendor_active = current_state.get("vendor_thermal_active") is True
+        vendor_last_known = isinstance(
+            current_state.get("vendor_thermal_last_known_active"), bool
+        )
+        vendor_last_known_active = (
+            current_state.get("vendor_thermal_last_known_active") is True
+        )
+        candidates = current_state.get("vendor_thermal_candidate_caps_nits", [])
+        candidate_count = (
+            len(candidates) if isinstance(candidates, (list, dict)) else 0
+        )
+        age_s = current_state.get("vendor_thermal_observed_age_s")
+        vendor_note = None
+        if vendor_last_known:
+            age_text = (
+                f"{_number(age_s, 1)} 秒前"
+                if isinstance(age_s, (int, float))
+                else "此前"
+            )
+            freshness = (
+                "已超过低频刷新有效期，不能代表当前状态。"
+                if current_state.get("vendor_thermal_state_stale")
+                else "尚未到下一次低频刷新。"
+            )
+            vendor_note = (
+                "厂商温控限亮最近一次运行时状态为 "
+                f"active={'true' if vendor_last_known_active else 'false'}（{age_text}）；"
+                f"{freshness}候选 nit 仍只是固件标称上限，不是亮度计实测。"
+            )
+        vendor_note = (
+            "已识别厂商温控限亮运行时字段与候选上限表，但当前 active=false；"
+            "候选 nit 只表示固件标称上限，不能证明当前档位已生效，也不能建立温度到档位的映射。"
+            if vendor_note is None and vendor_known and not vendor_active and candidate_count
+            else vendor_note
+            or "系统亮度、DisplayManager 热亮度上限和 lcd-backlight 冷却档位未形成降亮证据。"
+        )
         return (
             '<section class="analysis-section brightness-dim-section">'
             '<div class="priority-callout"><span class="status-dot good"></span><div>'
-            '<strong>未观察到疑似屏幕热降亮</strong>'
-            '<span>系统亮度、DisplayManager 热亮度上限和 lcd-backlight 冷却档位未形成降亮证据。</span>'
+            '<strong>未观察到已生效的屏幕热降亮</strong>'
+            f'<span>{_escape(vendor_note)}</span>'
             '</div></div></section>'
         )
     rows = []
     for item in points:
         if not isinstance(item, dict):
             continue
-        status = str(item.get("status") or "suspected")
+        vendor_known = isinstance(item.get("vendor_thermal_active"), bool)
+        status = (
+            "confirmed"
+            if vendor_known and item.get("vendor_thermal_active") is True
+            else "suspected"
+            if vendor_known
+            else str(item.get("status") or "suspected")
+        )
         tag = "high" if status == "confirmed" else "medium"
         label = "确认" if status == "confirmed" else "疑似"
         requested = item.get("requested_brightness")
@@ -1849,12 +2286,24 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
         )
         if isinstance(effective_raw, (int, float)):
             display_text += f'<span class="cell-sub">折算档位约 {_number(effective_raw, 0)}</span>'
+        vendor_level = item.get("vendor_thermal_level")
+        if item.get("vendor_thermal_active") is True and isinstance(vendor_level, (int, float)):
+            display_text += f'<span class="cell-sub">厂商运行时档位 {_number(vendor_level, 0)}</span>'
+        vendor_limit_nits = item.get("vendor_thermal_limit_nits")
         cap_text = (
-            f'{_number(float(cap) * 100.0, 1)}%'
+            f'系统标称上限 {_number(vendor_limit_nits, 0)} nit'
+            '<span class="cell-sub">非亮度计实测</span>'
+            if item.get("vendor_thermal_active") is True
+            and isinstance(vendor_limit_nits, (int, float))
+            else f'{_number(float(cap) * 100.0, 1)}%'
             if isinstance(cap, (int, float))
             else "—"
         )
-        temperature = item.get("skin_temperature_c")
+        temperature = (
+            item.get("vendor_thermal_temperature_c")
+            if isinstance(item.get("vendor_thermal_temperature_c"), (int, float))
+            else item.get("skin_temperature_c")
+        )
         rows.append(
             f'<tr class="brightness-point-row" data-brightness-time="{_number(item.get("elapsed_s"), 3, "0")}">'
             f'<td>{_number(item.get("elapsed_s"), 1)} s</td>'
@@ -1864,7 +2313,8 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
             f'<td>{display_text}</td>'
             f'<td>{cap_text}</td>'
             f'<td>{_number(item.get("lcd_backlight_cooling"), 0)}</td>'
-            f'<td>{_number(temperature, 1)} °C</td>'
+            f'<td>{_number(temperature, 1)} °C'
+            f'<span class="cell-sub">{"厂商运行时" if isinstance(item.get("vendor_thermal_temperature_c"), (int, float)) else "SKIN"}</span></td>'
             f'<td>{_escape(item.get("foreground_package") or "—")}</td>'
             f'<td>{_escape(item.get("reason") or "—")}</td>'
             '</tr>'
@@ -1879,15 +2329,15 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
         f'{int(brightness.get("point_count") or 0)} 点 / {int(brightness.get("event_count") or 0)} 段</span></div>'
         '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
         f'<strong>{_escape(title)}</strong>'
-        '<span>DisplayManager 热亮度上限、有效亮度和 Thermal HAL lcd-backlight 冷却状态已联合判定。</span>'
+        '<span>只有厂商运行时 active=true，或独立的 DisplayManager / Thermal HAL 明确限制证据，才标记为确认；候选表存在本身不构成确认。</span>'
         '</div></div>'
         '<div class="data-table-wrap"><table><thead><tr>'
         '<th>时间</th><th>判定</th><th>系统设定</th><th>显示侧亮度</th><th>热上限</th>'
         '<th>LCD 冷却档</th><th>SKIN</th><th>前台应用</th><th>证据</th>'
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
         '<div class="availability-note"><strong>测量边界</strong><span>'
-        '这里能确认 Android Framework / Thermal HAL 侧的限亮并估算有效档位；厂商若在面板底层执行不可见策略，'
-        'ADB 无法给出绝对物理亮度，精确 nits 仍需外部亮度计。</span></div>'
+        '这里能确认 Android Framework / Thermal HAL 或厂商运行时侧的限亮状态。厂商档位与 nit 是系统标称值，'
+        '不等于亮度计实测，也不能仅凭候选表推导温度→档位关系；精确面板亮度仍需外部亮度计。</span></div>'
         '</section>'
     )
 
@@ -2146,11 +2596,13 @@ def _test_item_conclusion_section(
         item
         for item in test_items.get("rows", [])
         if isinstance(item, dict)
+        and (test_mode != "performance" or _performance_test_item_is_substantive(item))
     ] if isinstance(test_items.get("rows"), list) else []
     spans = [
         item
         for item in test_items.get("spans", [])
         if isinstance(item, dict)
+        and (test_mode != "performance" or _performance_test_item_is_substantive(item))
     ] if isinstance(test_items.get("spans"), list) else []
     if not rows and not spans:
         return ""
@@ -2167,7 +2619,7 @@ def _test_item_conclusion_section(
         details = (
             '<div class="data-table-wrap"><table><thead><tr><th>开始时间</th><th>测试项</th>'
             '<th>时长</th><th>平均 FPS</th><th>1% Low</th><th>P95 / P99</th>'
-            '<th>异常帧</th><th>整机功耗</th><th>置信度</th></tr></thead><tbody>'
+            '<th>异常帧</th><th>平均电池侧功率</th><th>置信度</th></tr></thead><tbody>'
             + _performance_test_item_span_rows(analysis)
             + '</tbody></table></div>'
             if spans
@@ -2210,31 +2662,68 @@ def _analysis_conclusion_sections(
 ) -> str:
     findings = analysis.get("findings", [])
     findings = [item for item in findings if isinstance(item, dict)] if isinstance(findings, list) else []
+    summary = analysis.get("summary", {})
+    summary = summary if isinstance(summary, dict) else {}
+    consumption_unavailable = (
+        test_mode == "power"
+        and summary.get("power_valid_for_consumption") is not True
+    )
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    has_frame_evidence = test_mode == "performance" and (
+        performance.get("frame_evidence_available") is True
+        or bool(render.get("bottlenecks"))
+        or bool(_frame_interval_values(analysis))
+        or (
+            isinstance(performance.get("frame_sample_count"), (int, float))
+            and float(performance.get("frame_sample_count") or 0.0) > 0
+        )
+    )
+    sections = []
+    if consumption_unavailable:
+        reason = str(
+            summary.get("power_consumption_unavailable_reason")
+            or "本次没有连续、明确未接外部电源的放电区间。"
+        )
+        sections.append(
+            '<section class="analysis-section"><div class="priority-callout active">'
+            '<span class="status-dot warning"></span><div>'
+            '<strong>本次无法评价耗电或续航</strong>'
+            f'<span>{_escape(reason)} 原始通道仍可查看，但不能把“没有异常结论”理解为功耗正常。</span>'
+            '</div></div></section>'
+        )
+    if test_mode == "performance" and not has_frame_evidence:
+        reason = str(
+            performance.get("frame_unavailable_reason")
+            or render.get("reason")
+            or "本次没有取得可验证的应用帧率、逐帧间隔或渲染阶段数据。"
+        )
+        sections.append(
+            '<section class="analysis-section"><div class="priority-callout active">'
+            '<span class="status-dot warning"></span><div>'
+            '<strong>本次无法评价帧表现</strong>'
+            f'<span>{_escape(reason)} 原始资源数据仍可查看，但不能据此判断流畅度正常或异常。</span>'
+            '</div></div></section>'
+        )
     if findings:
-        sections = [
+        sections.append(
             '<section class="analysis-section"><h2>结论摘要</h2>'
             '<div class="finding-list">' + _finding_rows(analysis) + '</div></section>'
-        ]
-    else:
-        sections = [
+        )
+    elif not consumption_unavailable and not (
+        test_mode == "performance" and not has_frame_evidence
+    ):
+        sections.append(
             '<section class="analysis-section"><div class="priority-callout">'
             '<span class="status-dot good"></span><div>'
             '<strong>本次没有形成可独立陈述的异常结论</strong>'
             '<span>分析模块只保留证据充分的判断；请以原始数据页中的完整时间序列为准。</span>'
             '</div></div></section>'
-        ]
+        )
 
     if test_mode == "performance":
-        render = analysis.get("render_performance", {})
-        render = render if isinstance(render, dict) else {}
-        performance = analysis.get("performance", {})
-        performance = performance if isinstance(performance, dict) else {}
-        has_frame_evidence = bool(render.get("bottlenecks")) or bool(
-            _frame_interval_values(analysis)
-        ) or (
-            isinstance(performance.get("frame_sample_count"), (int, float))
-            and float(performance.get("frame_sample_count") or 0.0) > 0
-        )
         if has_frame_evidence:
             sections.append(
                 '<section class="analysis-section"><h2>帧表现判断</h2>'
@@ -2292,7 +2781,11 @@ def _analysis_conclusion_sections(
     return "".join(sections)
 
 
-def _source_rows(analysis: Dict[str, object]) -> str:
+def _source_rows(
+    analysis: Dict[str, object],
+    samples: Sequence[object] = (),
+    contexts: Sequence[object] = (),
+) -> str:
     render = analysis.get("render_performance", {})
     render = render if isinstance(render, dict) else {}
     pipeline = render.get("pipeline", {})
@@ -2307,6 +2800,345 @@ def _source_rows(analysis: Dict[str, object]) -> str:
     brightness = brightness if isinstance(brightness, dict) else {}
     gpu = analysis.get("gpu", {})
     gpu = gpu if isinstance(gpu, dict) else {}
+    cpu = analysis.get("cpu", {})
+    cpu = cpu if isinstance(cpu, dict) else {}
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    summary = analysis.get("summary", {})
+    summary = summary if isinstance(summary, dict) else {}
+    applications = analysis.get("applications", {})
+    applications = applications if isinstance(applications, dict) else {}
+    external = analysis.get("external_events", {})
+    external = external if isinstance(external, dict) else {}
+    system = analysis.get("system", {})
+    system = system if isinstance(system, dict) else {}
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+    runtime_settings = analysis.get("runtime_settings", {})
+    runtime_settings = runtime_settings if isinstance(runtime_settings, dict) else {}
+    battery_usage = analysis.get("battery_usage", {})
+    battery_usage = battery_usage if isinstance(battery_usage, dict) else {}
+    power_sources = summary.get("power_sources", [])
+    power_sources = power_sources if isinstance(power_sources, list) else []
+    sample_rows = [item for item in samples if isinstance(item, dict)]
+    context_rows = [item for item in contexts if isinstance(item, dict)]
+
+    def numeric(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def sample_has(key: str) -> bool:
+        return any(numeric(item.get(key)) for item in sample_rows)
+
+    def known_foreground(value: object) -> bool:
+        text = str(value or "").strip().lower()
+        return bool(text and text not in {"unknown", "none", "null", "--", "-"})
+
+    if not power_sources:
+        power_sources = sorted(
+            {
+                str(item.get("power_source"))
+                for item in sample_rows
+                if item.get("power_source")
+            }
+        )
+
+    def rows_present(value: object, *keys: str) -> bool:
+        if not isinstance(value, dict):
+            return False
+        return any(isinstance(value.get(key), list) and bool(value.get(key)) for key in keys)
+
+    process_rows = (
+        system.get("top_processes", [])
+        if isinstance(system.get("top_processes"), list)
+        else []
+    )
+    thread_rows = (
+        system.get("hot_threads", [])
+        if isinstance(system.get("hot_threads"), list)
+        else []
+    )
+    app_rows = (
+        applications.get("rows", [])
+        if isinstance(applications.get("rows"), list)
+        else []
+    )
+    app_transitions = (
+        applications.get("transitions", [])
+        if isinstance(applications.get("transitions"), list)
+        else []
+    )
+    foreground_observed = bool(
+        any(
+            isinstance(item, dict) and known_foreground(item.get("package"))
+            for item in [*app_rows, *app_transitions]
+        )
+        or known_foreground(performance.get("foreground_window_name"))
+        or any(known_foreground(item.get("foreground_package")) for item in context_rows)
+    )
+    frame_observed = bool(
+        performance.get("frame_sample_count")
+        or numeric(performance.get("sampled_frame_rate_fps"))
+        or numeric(performance.get("sampled_compositor_fps"))
+        or performance.get("frame_rate_timeline")
+    )
+    refresh_observed = bool(
+        numeric(performance.get("current_refresh_rate_hz"))
+        or rows_present(performance, "refresh_rate_timeline", "refresh_residency")
+        or sample_has("refresh_rate_hz")
+        or any(numeric(item.get("refresh_rate_hz")) for item in context_rows)
+    )
+    cpu_usage_observed = bool(
+        numeric(summary.get("average_cpu_pct")) or sample_has("cpu_pct")
+    )
+    cpu_frequency_observed = bool(
+        any(
+            isinstance(item, dict)
+            and any(
+                numeric(item.get(key))
+                for key in ("average_mhz", "maximum_mhz", "load_weighted_mhz")
+            )
+            for item in (
+                cpu.get("clusters", [])
+                if isinstance(cpu.get("clusters"), list)
+                else []
+            )
+        )
+        or any(
+            isinstance(item.get("frequencies_mhz"), dict)
+            and any(
+                numeric(value)
+                for value in item.get("frequencies_mhz", {}).values()
+            )
+            for item in sample_rows
+        )
+    )
+    cpu_model_observed = any(
+        isinstance(item, dict)
+        and (
+            item.get("model_available") is True
+            or numeric(item.get("modeled_power_mw"))
+            or numeric(item.get("frequency_premium_mw"))
+        )
+        for item in (cpu.get("clusters", []) if isinstance(cpu.get("clusters"), list) else [])
+    )
+    gpu_observed = bool(
+        gpu.get("frequency_available")
+        or gpu.get("load_available")
+        or gpu.get("work_by_uid")
+        or (isinstance(gpu.get("memory"), dict) and gpu.get("memory", {}).get("available"))
+        or sample_has("gpu_load_pct")
+        or sample_has("gpu_frequency_mhz")
+    )
+    memory_observed = bool(
+        memory.get("available")
+        or memory.get("timeline")
+        or sample_has("memory_frequency_mhz")
+    )
+    target_process_observed = any(
+        isinstance(item, dict)
+        and (
+            str(item.get("source") or "") == "harmony_smartperf_target"
+            or str(item.get("watch_name") or "") == "target_app"
+        )
+        for item in process_rows
+    )
+    system_process_observed = bool(
+        thread_rows
+        or any(
+            isinstance(item, dict)
+            and str(item.get("source") or "") != "harmony_smartperf_target"
+            for item in process_rows
+        )
+    )
+    relative_power_score_observed = any(
+        isinstance(item, dict)
+        and any(
+            numeric(item.get(key))
+            for key in ("average_relative_power_score", "maximum_relative_power_score")
+        )
+        for item in process_rows
+    )
+    battery_channels_observed = bool(
+        (
+            (
+                numeric(summary.get("observed_average_current_ma"))
+                or numeric(summary.get("average_current_ma"))
+            )
+            and numeric(summary.get("average_voltage_mv"))
+        )
+        or (sample_has("current_ma") and sample_has("voltage_mv"))
+    )
+    power_observed = bool(
+        power_sources
+        or any(
+            numeric(summary.get(key))
+            for key in (
+                "observed_power_average_mw",
+                "battery_flow_average_power_mw",
+                "average_power_mw",
+            )
+        )
+        or sample_has("power_mw")
+    )
+    thermal_observed = bool(
+        thermal.get("available")
+        or thermal.get("sensors")
+        or thermal.get("timeline")
+        or numeric(thermal.get("maximum_status"))
+        or sample_has("battery_temperature_c")
+    )
+    battery_temperature_observed = bool(
+        sample_has("battery_temperature_c")
+        or any(
+            isinstance(item, dict)
+            and "battery" in str(item.get("name") or "").lower()
+            and any(numeric(item.get(key)) for key in ("value_c", "maximum_c", "average_c"))
+            for item in (
+                thermal.get("sensors", [])
+                if isinstance(thermal.get("sensors"), list)
+                else []
+            )
+        )
+    )
+    scheduler_observed = any(
+        scheduler.get(key)
+        for key in ("cpusets", "cpu_policies", "hint_sessions", "process_states", "timeline")
+    )
+    observer_cpu_observed = bool(
+        numeric(summary.get("average_collector_cpu_pct"))
+        or sample_has("collector_cpu_pct")
+    )
+    touch_observed = numeric(performance.get("touch_interaction_count"))
+    runtime_settings_observed = bool(
+        runtime_settings.get("available") or rows_present(runtime_settings, "rows")
+    )
+    attribution_observed = bool(
+        battery_usage.get("available")
+        or rows_present(battery_usage, "components", "uids")
+        or analysis.get("components")
+    )
+    test_items_observed = bool(
+        test_items.get("available") or rows_present(test_items, "rows", "spans", "timeline")
+    )
+    external_observed = bool(
+        external.get("event_count") or rows_present(external, "rows", "spans")
+    )
+    ios_system_load_observed = (
+        "ios_power_telemetry_system_load" in {str(item) for item in power_sources}
+    )
+
+    def source_observed(metric: str) -> bool:
+        if metric in {
+            "Whole-device raw SystemLoad power",
+            "Whole-device battery power",
+        }:
+            return ios_system_load_observed
+        if metric == "Whole-device power recording":
+            return power_observed
+        if metric in {
+            "Battery current and voltage",
+            "Battery current, voltage and temperature",
+            "Battery current",
+            "Battery voltage",
+        }:
+            return battery_channels_observed
+        if metric == "CPU utilization":
+            return cpu_usage_observed
+        if metric == "CPU frequency":
+            return cpu_frequency_observed
+        if metric == "CPU frequency impact":
+            return cpu_model_observed
+        if metric == "Memory frequency pressure":
+            return memory_observed
+        if metric == "GPU activity":
+            return gpu_observed
+        if metric in {
+            "Foreground application",
+            "Foreground application state",
+            "Foreground application and screen state",
+        }:
+            return foreground_observed
+        if metric == "Display refresh rate":
+            return refresh_observed
+        if metric == "Observer-related process CPU upper bound":
+            return observer_cpu_observed
+        if metric == "Relative process power score":
+            return relative_power_score_observed
+        if metric in {"System processes", "System processes and hot threads"}:
+            return system_process_observed
+        if metric == "Target process resources":
+            return target_process_observed
+        if metric == "Render and compositor thread activity":
+            return bool(render.get("render_threads") or thread_rows)
+        if metric == "Battery temperature":
+            return battery_temperature_observed
+        if metric == "Test phases and actions":
+            return external_observed
+        if metric in {
+            "Frame rate, 1% Low and frame latency",
+            "HarmonyOS application frame pacing",
+            "HarmonyOS compositor cadence context",
+            "Application FPS and frame jitter",
+        }:
+            return frame_observed
+        if metric == "Render pipeline stages":
+            return bool(pipeline.get("stages") or render.get("stages"))
+        if metric in {"Scheduler context", "Scheduler and thermal context"}:
+            return scheduler_observed
+        if metric in {
+            "Thermal context",
+            "Thermal sensors",
+            "Thermal severity, sensors and cooling devices",
+        }:
+            return thermal_observed
+        if metric == "Brightness thermal limiting":
+            return bool(brightness.get("available"))
+        if metric == "Runtime settings pressure":
+            return runtime_settings_observed
+        if metric == "Component/app attribution":
+            return attribution_observed
+        if metric == "Per-test power and system interference":
+            return test_items_observed
+        if metric == "Delivered touch interactions":
+            return touch_observed
+
+        if metric == "iOS CPU and GPU performance context":
+            return cpu_usage_observed and gpu_observed
+        if metric == "CPU and process activity":
+            return cpu_usage_observed and system_process_observed
+        if metric == "System processes and collector overhead":
+            return system_process_observed and observer_cpu_observed
+        if metric == "HarmonyOS CPU/GPU/DDR and thermal context":
+            return (
+                cpu_usage_observed
+                and cpu_frequency_observed
+                and gpu_observed
+                and memory_observed
+                and thermal_observed
+            )
+        if metric == "CPU/GPU/DDR and target process resources":
+            return (
+                cpu_usage_observed
+                and cpu_frequency_observed
+                and gpu_observed
+                and memory_observed
+                and target_process_observed
+            )
+        if metric == "CPU utilization/frequency":
+            return cpu_usage_observed and cpu_frequency_observed
+        if metric == "Refresh-rate residency and sampled compositor frame pacing":
+            return refresh_observed and frame_observed
+        if metric == "Foreground window and display context":
+            return foreground_observed and refresh_observed
+        if metric == "Foreground window and delivered touch interactions":
+            return foreground_observed and touch_observed
+        if metric in {"Power and scheduler context", "cpuset, process state and ADPF hints"}:
+            return scheduler_observed
+        return False
     rows = []
     data_sources = analysis.get("data_sources", [])
     data_sources = data_sources if isinstance(data_sources, list) else []
@@ -2314,30 +3146,7 @@ def _source_rows(analysis: Dict[str, object]) -> str:
         if not isinstance(item, dict):
             continue
         metric = str(item.get("metric") or "")
-        if metric == "Frame rate, 1% Low and frame latency" and not (
-            performance.get("frame_sample_count")
-            or isinstance(performance.get("sampled_frame_rate_fps"), (int, float))
-            or isinstance(performance.get("sampled_compositor_fps"), (int, float))
-        ):
-            continue
-        if metric == "Render pipeline stages" and not pipeline.get("stages"):
-            continue
-        if metric == "Render and compositor thread activity" and not render.get("render_threads"):
-            continue
-        if metric == "Scheduler and thermal context" and not (
-            any(scheduler.get(key) for key in ("cpusets", "cpu_policies", "hint_sessions", "process_states", "timeline"))
-            or any(thermal.get(key) for key in ("sensors", "cooling_devices", "timeline", "hottest_sensor"))
-            or isinstance(thermal.get("maximum_status"), (int, float))
-        ):
-            continue
-        if metric == "GPU activity" and not (
-            gpu.get("frequency_available")
-            or gpu.get("load_available")
-            or gpu.get("work_by_uid")
-            or (isinstance(gpu.get("memory"), dict) and gpu.get("memory", {}).get("available"))
-        ):
-            continue
-        if metric == "Brightness thermal limiting" and not brightness.get("available"):
+        if not source_observed(metric):
             continue
         rows.append(
             "<tr>"
@@ -2350,6 +3159,7 @@ def _source_rows(analysis: Dict[str, object]) -> str:
 
 
 def _capture_configuration_rows(metadata: Dict[str, object]) -> str:
+    platform = str(metadata.get("platform") or "android").strip().lower()
     configuration = metadata.get("capture_configuration", {})
     configuration = configuration if isinstance(configuration, dict) else {}
     rows = []
@@ -2368,14 +3178,30 @@ def _capture_configuration_rows(metadata: Dict[str, object]) -> str:
         for item in feature_rows:
             if not isinstance(item, dict):
                 continue
+            key = str(item.get("key") or "")
+            definition = CAPTURE_FEATURES.get(key, {})
+            presentation = PLATFORM_FEATURE_PRESENTATION.get(platform, {}).get(key, {})
+            label = (
+                presentation.get("label")
+                or definition.get("label")
+                or item.get("label")
+                or key
+            )
+            description = (
+                presentation.get("description")
+                or definition.get("description")
+                or item.get("description")
+                or ""
+            )
+            overhead = definition.get("overhead") or item.get("overhead") or "--"
             enabled = bool(item.get("enabled"))
             rows.append(
                 "<tr>"
-                f"<td><strong>{_escape(item.get('label') or item.get('key'))}</strong>"
-                f"<span class=\"cell-sub\">{_escape(item.get('description') or '')}</span></td>"
+                f"<td><strong>{_escape(label)}</strong>"
+                f"<span class=\"cell-sub\">{_escape(description)}</span></td>"
                 f"<td><span class=\"source-tag {'measured' if enabled else 'context'}\">"
                 f"{'启用' if enabled else '关闭'}</span></td>"
-                f"<td>{_escape(overhead_labels.get(str(item.get('overhead')), item.get('overhead') or '--'))}</td>"
+                f"<td>{_escape(overhead_labels.get(str(overhead), overhead))}</td>"
                 f"<td>{_escape(item.get('reason') or '')}</td>"
                 "</tr>"
             )
@@ -2482,50 +3308,248 @@ def _window_rows(analysis: Dict[str, object]) -> str:
     return "".join(rows) or '<tr><td colspan="5" class="empty-cell">没有可用的五分钟窗口。</td></tr>'
 
 
-def _lttb_indices(samples: List[Dict[str, object]], threshold: int) -> List[int]:
-    count = len(samples)
+def _finite_number(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _sample_metric_extractors(
+    samples: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    ios_system_load_source = "ios_power_telemetry_system_load"
+    has_system_load = any(
+        str(item.get("power_source") or "") == ios_system_load_source
+        for item in samples
+    )
+    extractors: Dict[str, object] = {
+        "power_mw": lambda item: (
+            item.get("power_mw")
+            if not has_system_load
+            or str(item.get("power_source") or "") == ios_system_load_source
+            else None
+        ),
+        "battery_flow_mw": lambda item: (
+            float(item["current_ma"]) * float(item["voltage_mv"]) / 1000.0
+            if _finite_number(item.get("current_ma")) is not None
+            and _finite_number(item.get("voltage_mv")) is not None
+            else None
+        ),
+        "current_ma": lambda item: item.get("current_ma"),
+        "voltage_mv": lambda item: item.get("voltage_mv"),
+        "cpu_pct": lambda item: item.get("cpu_pct"),
+        "gpu_load_pct": lambda item: item.get("gpu_load_pct"),
+        "gpu_frequency_mhz": lambda item: item.get("gpu_frequency_mhz"),
+        "memory_frequency_mhz": lambda item: item.get("memory_frequency_mhz"),
+        "battery_temperature_c": lambda item: item.get("battery_temperature_c"),
+        "collector_cpu_pct": lambda item: item.get("collector_cpu_pct"),
+        "power_sample_age_s": lambda item: item.get("power_sample_age_s"),
+    }
+    frequency_names = sorted(
+        {
+            str(name)
+            for item in samples
+            if isinstance(item.get("frequencies_mhz"), dict)
+            for name in item.get("frequencies_mhz", {})
+        }
+    )
+    for name in frequency_names:
+        extractors[f"cpu_frequency:{name}"] = (
+            lambda item, frequency_name=name: (
+                item.get("frequencies_mhz", {}).get(frequency_name)
+                if isinstance(item.get("frequencies_mhz"), dict)
+                else None
+            )
+        )
+    return extractors
+
+
+def _lttb_series_indices(
+    points: Sequence[tuple[int, float, float]],
+    threshold: int,
+) -> List[int]:
+    count = len(points)
     if threshold >= count or threshold < 3:
-        return list(range(count))
+        return [item[0] for item in points]
     every = (count - 2) / (threshold - 2)
-    selected = [0]
+    selected = [points[0][0]]
     anchor = 0
     for bucket in range(threshold - 2):
         average_start = int((bucket + 1) * every) + 1
         average_end = min(int((bucket + 2) * every) + 1, count)
         if average_start >= count:
             average_start = count - 1
-        average_range = samples[average_start:average_end] or [samples[-1]]
-        average_x = sum(float(item.get("elapsed_s") or 0.0) for item in average_range) / len(average_range)
-        average_y = sum(float(item.get("power_mw") or 0.0) for item in average_range) / len(average_range)
+        average_range = points[average_start:average_end] or [points[-1]]
+        average_x = sum(item[1] for item in average_range) / len(average_range)
+        average_y = sum(item[2] for item in average_range) / len(average_range)
         range_start = int(bucket * every) + 1
         range_end = min(int((bucket + 1) * every) + 1, count - 1)
-        anchor_x = float(samples[anchor].get("elapsed_s") or 0.0)
-        anchor_y = float(samples[anchor].get("power_mw") or 0.0)
+        anchor_x = points[anchor][1]
+        anchor_y = points[anchor][2]
         maximum_area = -1.0
         next_anchor = range_start
-        for index in range(range_start, max(range_start + 1, range_end)):
-            point_x = float(samples[index].get("elapsed_s") or 0.0)
-            point_y = float(samples[index].get("power_mw") or 0.0)
+        for point_index in range(range_start, max(range_start + 1, range_end)):
+            _, point_x, point_y = points[point_index]
             area = abs(
                 (anchor_x - average_x) * (point_y - anchor_y)
                 - (anchor_x - point_x) * (average_y - anchor_y)
             )
             if area > maximum_area:
                 maximum_area = area
-                next_anchor = index
-        selected.append(next_anchor)
+                next_anchor = point_index
+        selected.append(points[next_anchor][0])
         anchor = next_anchor
-    selected.append(count - 1)
+    selected.append(points[-1][0])
     return selected
+
+
+def _report_transition_indices(
+    samples: Sequence[Dict[str, object]],
+    extractors: Dict[str, object],
+) -> set[int]:
+    if not samples:
+        return set()
+    selected = {0, len(samples) - 1}
+
+    def signature(item: Dict[str, object]) -> tuple[object, ...]:
+        channel = (
+            item.get("direction"),
+            item.get("power_source"),
+            item.get("power_valid_for_consumption"),
+            item.get("external_power"),
+        )
+        availability = tuple(
+            _finite_number(extractor(item)) is not None
+            for extractor in extractors.values()
+        )
+        return channel + availability
+
+    previous_signature = signature(samples[0])
+    previous_elapsed = _finite_number(samples[0].get("elapsed_s")) or 0.0
+    positive_intervals = [
+        float(current.get("elapsed_s") or 0.0) - float(previous.get("elapsed_s") or 0.0)
+        for previous, current in zip(samples, samples[1:])
+        if _finite_number(current.get("elapsed_s")) is not None
+        and _finite_number(previous.get("elapsed_s")) is not None
+        and float(current.get("elapsed_s") or 0.0) > float(previous.get("elapsed_s") or 0.0)
+    ]
+    expected_interval = statistics.median(positive_intervals) if positive_intervals else 0.0
+    gap_limit = max(10.0, expected_interval * 5.0)
+    for index, item in enumerate(samples[1:], start=1):
+        current_signature = signature(item)
+        elapsed = _finite_number(item.get("elapsed_s"))
+        if current_signature != previous_signature:
+            selected.update({index - 1, index})
+        if elapsed is not None and elapsed - previous_elapsed > gap_limit:
+            selected.update({index - 1, index})
+        previous_signature = current_signature
+        if elapsed is not None:
+            previous_elapsed = elapsed
+    return selected
+
+
+def _multi_metric_report_indices(
+    samples: List[Dict[str, object]],
+    threshold: int,
+) -> tuple[List[int], List[str]]:
+    count = len(samples)
+    if threshold >= count or threshold < 3:
+        return list(range(count)), []
+    extractors = _sample_metric_extractors(samples)
+    series: Dict[str, List[tuple[int, float, float]]] = {}
+    for key, extractor in extractors.items():
+        points = []
+        for index, item in enumerate(samples):
+            elapsed = _finite_number(item.get("elapsed_s"))
+            value = _finite_number(extractor(item))
+            if elapsed is not None and value is not None:
+                points.append((index, elapsed, value))
+        if len(points) >= 2:
+            series[key] = points
+    mandatory = _report_transition_indices(samples, extractors)
+    if not series:
+        step = (count - 1) / float(threshold - 1)
+        return sorted({round(index * step) for index in range(threshold)} | mandatory), []
+    remaining_budget = max(3 * len(series), threshold - len(mandatory))
+    quota = max(3, remaining_budget // len(series))
+    selected = set(mandatory)
+    for points in series.values():
+        selected.update(_lttb_series_indices(points, min(quota, len(points))))
+    if len(selected) < threshold:
+        fill_count = threshold - len(selected)
+        candidates = [index for index in range(count) if index not in selected]
+        if fill_count > 0 and candidates:
+            selected.update(
+                candidates[
+                    min(
+                        len(candidates) - 1,
+                        int((index + 0.5) * len(candidates) / fill_count),
+                    )
+                ]
+                for index in range(fill_count)
+            )
+    return sorted(selected), list(series)
+
+
+def _report_metric_statistics(
+    samples: Sequence[Dict[str, object]],
+) -> Dict[str, Dict[str, object]]:
+    result: Dict[str, Dict[str, object]] = {}
+    for key, extractor in _sample_metric_extractors(samples).items():
+        values = [
+            value
+            for item in samples
+            if (value := _finite_number(extractor(item))) is not None
+        ]
+        if not values:
+            continue
+        result[key] = {
+            "sample_count": len(values),
+            "average": statistics.fmean(values),
+            "minimum": min(values),
+            "maximum": max(values),
+        }
+    return result
 
 
 def _report_bundle(bundle: Dict[str, object], threshold: int = 1200) -> Dict[str, object]:
     prepared = copy.deepcopy(bundle)
     samples = prepared.get("samples", [])
     indices: Optional[List[int]] = None
+    sampled_metrics: List[str] = []
+    original_samples = samples if isinstance(samples, list) else []
+    metric_statistics = (
+        _report_metric_statistics(original_samples) if original_samples else {}
+    )
     if isinstance(samples, list) and len(samples) > threshold:
-        indices = _lttb_indices(samples, threshold)
-        prepared["samples"] = [samples[index] for index in indices]
+        indices, sampled_metrics = _multi_metric_report_indices(samples, threshold)
+        original_intervals = [
+            float(current.get("elapsed_s") or 0.0) - float(previous.get("elapsed_s") or 0.0)
+            for previous, current in zip(samples, samples[1:])
+            if isinstance(previous, dict)
+            and isinstance(current, dict)
+            and _finite_number(previous.get("elapsed_s")) is not None
+            and _finite_number(current.get("elapsed_s")) is not None
+            and float(current.get("elapsed_s") or 0.0) > float(previous.get("elapsed_s") or 0.0)
+        ]
+        expected_interval = statistics.median(original_intervals) if original_intervals else 0.0
+        gap_limit = max(10.0, expected_interval * 5.0)
+        display_samples: List[Dict[str, object]] = []
+        for index in indices:
+            item = dict(samples[index])
+            if index > 0:
+                previous_elapsed = _finite_number(samples[index - 1].get("elapsed_s"))
+                current_elapsed = _finite_number(samples[index].get("elapsed_s"))
+                if (
+                    previous_elapsed is not None
+                    and current_elapsed is not None
+                    and current_elapsed - previous_elapsed > gap_limit
+                ):
+                    item["report_break_before"] = True
+            display_samples.append(item)
+        prepared["samples"] = display_samples
     analysis = prepared.get("analysis", {})
     if isinstance(analysis, dict):
         cpu = analysis.get("cpu", {})
@@ -2545,20 +3569,43 @@ def _report_bundle(bundle: Dict[str, object], threshold: int = 1200) -> Dict[str
                         timeline = stage.get("timeline", [])
                         if not isinstance(timeline, list) or len(timeline) <= threshold:
                             continue
-                        step = (len(timeline) - 1) / float(threshold - 1)
-                        selected = sorted(
-                            {
-                                min(len(timeline) - 1, round(index * step))
-                                for index in range(threshold)
-                            }
+                        stage_points = []
+                        for index, item in enumerate(timeline):
+                            if not isinstance(item, dict):
+                                continue
+                            elapsed = _finite_number(item.get("elapsed_s"))
+                            if elapsed is None:
+                                elapsed = _finite_number(item.get("uptime_s"))
+                            value = next(
+                                (
+                                    numeric
+                                    for key in ("value", "frame_rate_fps", "refresh_rate_hz")
+                                    if (numeric := _finite_number(item.get(key))) is not None
+                                ),
+                                None,
+                            )
+                            if elapsed is not None and value is not None:
+                                stage_points.append((index, elapsed, value))
+                        selected = (
+                            _lttb_series_indices(stage_points, threshold)
+                            if len(stage_points) > threshold
+                            else list(range(len(timeline)))
                         )
                         stage["timeline"] = [timeline[index] for index in selected]
-        if indices is not None:
-            analysis["report_payload"] = {
-                "raw_sample_count": len(samples),
-                "display_sample_count": len(indices),
-                "downsample_method": "largest-triangle-three-buckets on measured power",
-            }
+        analysis["report_payload"] = {
+            "raw_sample_count": len(original_samples),
+            "display_sample_count": (
+                len(indices) if indices is not None else len(original_samples)
+            ),
+            "downsampled": indices is not None,
+            "downsample_method": (
+                "multi-metric stratified LTTB with source, validity, null and gap boundaries preserved"
+                if indices is not None
+                else "full-resolution samples"
+            ),
+            "sampled_metrics": sampled_metrics,
+            "metric_statistics": metric_statistics,
+        }
     return prepared
 
 
@@ -2692,10 +3739,15 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .raw-grid-line { stroke: var(--app-border); stroke-width: 1; }
   #mobile-profiler .raw-axis-text { fill: var(--app-muted); font-size: 10px; }
   #mobile-profiler .raw-series-line { fill: none; stroke-width: 1.8; }
+  #mobile-profiler .raw-series-line.raw-only { stroke-dasharray: 6 4; opacity: .72; }
+  #mobile-profiler .raw-series-line.secondary { stroke-dasharray: 5 3; stroke-width: 1.5; }
   #mobile-profiler .raw-selected-line { stroke: var(--app-muted); stroke-width: 1; }
   #mobile-profiler .raw-selected-dot { fill: var(--app-bg); stroke-width: 2; }
   #mobile-profiler .raw-excluded-window { fill: var(--series-3); opacity: .08; }
-  #mobile-profiler .raw-delete-window { fill: var(--series-4); opacity: .16; }
+  #mobile-profiler .raw-delete-window { fill: var(--series-4); opacity: .16; pointer-events: none; }
+  #mobile-profiler .report-range-window { fill: var(--series-1); opacity: .16; pointer-events: none; }
+  #mobile-profiler .report-range-edge { stroke: var(--series-1); stroke-width: 1; stroke-dasharray: 4 3; pointer-events: none; }
+  #mobile-profiler .time-range-brush { cursor: crosshair; touch-action: none; }
   #mobile-profiler .raw-empty { padding: 42px 16px; border: 1px solid var(--app-border); color: var(--app-muted); text-align: center; }
   #mobile-profiler .raw-sample-surface .sample-control { border-top: 0; }
   #mobile-profiler .report-range-editor { display: grid; gap: 10px; padding: 12px; border-top: 1px solid var(--app-border); }
@@ -2703,10 +3755,19 @@ REPORT_FRAGMENT = r"""
   #mobile-profiler .report-range-field { display: grid; gap: 6px; color: var(--app-muted); font-size: 11px; }
   #mobile-profiler .report-range-field > span { display: flex; justify-content: space-between; gap: 10px; }
   #mobile-profiler .report-range-field strong { color: var(--app-text); font-weight: 500; font-variant-numeric: tabular-nums; }
-  #mobile-profiler .report-range-field input { width: 100%; accent-color: var(--series-4); }
+  #mobile-profiler .report-range-field input { width: 100%; accent-color: var(--series-1); }
   #mobile-profiler .report-range-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
   #mobile-profiler .report-range-status { color: var(--app-muted); font-size: 11px; }
   #mobile-profiler .report-range-status[data-state="error"] { color: var(--series-4); }
+  #mobile-profiler .report-range-summary { display: grid; gap: 9px; padding: 10px; border: 1px solid var(--app-border); border-radius: 5px; background: color-mix(in srgb, var(--app-surface) 88%, transparent); }
+  #mobile-profiler .report-range-summary[hidden] { display: none; }
+  #mobile-profiler .report-range-summary-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  #mobile-profiler .report-range-summary-heading strong { font-size: 12px; font-weight: 500; }
+  #mobile-profiler .report-range-summary-heading span, #mobile-profiler .report-range-summary-note { color: var(--app-muted); font-size: 10px; }
+  #mobile-profiler .report-range-statistics { display: grid; grid-template-columns: minmax(150px, 1.4fr) repeat(4, minmax(72px, .7fr)); gap: 1px; overflow: auto; border: 1px solid var(--app-border); border-radius: 4px; background: var(--app-border); }
+  #mobile-profiler .report-range-statistics > span { min-width: 0; padding: 6px 7px; background: var(--app-surface); color: var(--app-muted); font-size: 10px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  #mobile-profiler .report-range-statistics > span:nth-child(-n + 5) { color: var(--app-text); font-weight: 500; }
+  #mobile-profiler .report-range-statistics .range-stat-name { color: var(--app-text); }
   #mobile-profiler .delete-report-range {
     border: 1px solid color-mix(in srgb, var(--series-4) 58%, var(--app-border));
     border-radius: 5px;
@@ -2944,20 +4005,27 @@ REPORT_FRAGMENT = r"""
     <main class="app-content">
       <section class="app-view" data-panel="raw">
         <div class="view-heading"><div><h1>原始数据随时间变化</h1><p>只展示本次已启用并实际采到有效样本的指标；所有图表共享同一时间轴并同时呈现。</p></div><span class="source-tag measured" id="raw-metric-count">等待数据</span></div>
+        <div class="availability-note" id="raw-sampling-note" hidden><strong>图表显示经过保峰抽样</strong><span></span></div>
         <div class="chart-surface raw-sample-surface">
           <div class="sample-control">
             <input id="overview-slider" type="range" min="0" max="@@SLIDER_MAX@@" value="0" aria-label="选择所有原始图表的同一时间点">
             <div class="sample-detail" id="sample-detail" aria-live="polite"></div>
           </div>
-          <div class="report-range-editor" aria-label="删除报告时间段">
+          <div class="report-range-editor" aria-label="查看或删除报告时间段">
             <div class="report-range-fields">
-              <label class="report-range-field" for="report-range-start"><span>删除起点 <strong id="report-range-start-value">--</strong></span><input id="report-range-start" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
-              <label class="report-range-field" for="report-range-end"><span>删除终点 <strong id="report-range-end-value">--</strong></span><input id="report-range-end" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
+              <label class="report-range-field" for="report-range-start"><span>选区起点（滑块微调） <strong id="report-range-start-value">--</strong></span><input id="report-range-start" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
+              <label class="report-range-field" for="report-range-end"><span>选区终点（滑块微调） <strong id="report-range-end-value">--</strong></span><input id="report-range-end" type="range" min="0" max="@@SLIDER_MAX@@" value="0"></label>
             </div>
-            <div class="report-range-actions"><span class="report-range-status" id="report-range-status" aria-live="polite">拖动起点和终点选择要删除的时间段。</span><button class="delete-report-range" id="delete-report-range" type="button" disabled>删除选中时间段记录</button></div>
+            <div class="report-range-summary" id="report-range-summary" hidden>
+              <div class="report-range-summary-heading"><strong id="report-range-summary-title">选区统计</strong><span id="report-range-summary-time">--</span></div>
+              <div class="report-range-statistics" id="report-range-statistics" aria-live="polite"></div>
+              <p class="report-range-summary-note" id="report-range-summary-note"></p>
+            </div>
+            <div class="report-range-actions"><span class="report-range-status" id="report-range-status" aria-live="polite">在任意时间图上横向拖动框选，也可用上方滑块微调。</span><button class="delete-report-range" id="delete-report-range" type="button" disabled>删除选中时间段记录</button></div>
           </div>
         </div>
         <div class="raw-metric-grid" id="raw-metric-grid" aria-live="polite"></div>
+        @@FRAME_FLOW_HISTORY_SECTION@@
         <details class="evidence-details"><summary>查看采集配置与数据来源</summary>
           <div class="data-table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>干扰等级</th><th>原因 / 恢复状态</th></tr></thead><tbody>@@CAPTURE_CONFIGURATION_ROWS@@</tbody></table></div>
           <div class="data-table-wrap"><table><thead><tr><th>指标</th><th>来源</th><th>类型</th></tr></thead><tbody>@@SOURCE_ROWS@@</tbody></table></div>
@@ -2968,6 +4036,7 @@ REPORT_FRAGMENT = r"""
       <section class="app-view" data-panel="analysis" hidden>
         <div class="view-heading"><div><h1>分析结论</h1><p>只展示能够由本次有效数据支持的判断与必要证据；无数据或证据不足的模块不会占用页面。</p></div><span class="source-tag counter">证据驱动</span></div>
         @@ANALYSIS_CONCLUSION_SECTIONS@@
+        @@ANALYSIS_COVERAGE_SECTION@@
       </section>
     </main>
   </div>
@@ -2981,6 +4050,9 @@ REPORT_FRAGMENT = r"""
   const contexts = (bundle.contexts || []).slice().sort((a, b) => Number(a.uptime_s) - Number(b.uptime_s));
   const events = (bundle.events || []).slice().sort((a, b) => Number(a.device_uptime_s) - Number(b.device_uptime_s));
   const analysis = bundle.analysis || {};
+  const summary = analysis.summary || {};
+  const reportPayload = analysis.report_payload || {};
+  const reportMetricStatistics = reportPayload.metric_statistics || {};
   const cpu = analysis.cpu || { clusters: [], timeline: [] };
   const gpu = analysis.gpu || {};
   const performance = analysis.performance || {};
@@ -2995,6 +4067,23 @@ REPORT_FRAGMENT = r"""
   const refreshTimeline = (performance.refresh_rate_timeline || []).slice().sort((a, b) => Number(a.uptime_s || a.elapsed_s) - Number(b.uptime_s || b.elapsed_s));
   const captureConfiguration = metadata.capture_configuration || {};
   const captureFeatures = captureConfiguration.features || {};
+  const reportPlatform = String(metadata.platform || "").toLowerCase();
+  const reportBackend = String(captureConfiguration.backend || "");
+  const smartPerfThermal = reportPlatform === "harmony" && reportBackend === "harmony_smartperf";
+  const thermalTelemetrySource = smartPerfThermal
+    ? "HarmonyOS SmartPerf SP_daemon 温度字段"
+    : reportPlatform === "harmony"
+      ? "HarmonyOS ThermalService · hidumper"
+      : reportPlatform === "ios"
+        ? "iOS DiagnosticsService"
+        : "Android ThermalService / Thermal HAL";
+  const batteryTemperatureSource = smartPerfThermal
+    ? "HarmonyOS SmartPerf SP_daemon 温度字段"
+    : reportPlatform === "harmony"
+      ? "HarmonyOS BatteryService · hidumper"
+      : reportPlatform === "ios"
+        ? "iOS DiagnosticsService"
+        : "Android BatteryService";
   const testItems = analysis.test_items || { rows: [], spans: [], instant_events: [] };
   const reportEdits = metadata.report_edits || {};
   const reportExcludedRanges = Array.isArray(reportEdits.excluded_ranges) ? reportEdits.excluded_ranges : [];
@@ -3009,8 +4098,13 @@ REPORT_FRAGMENT = r"""
   let testRange = null;
   let rawMetrics = [];
   let reportRangeTouched = false;
-  let reportRangeStartIndex = 0;
-  let reportRangeEndIndex = 0;
+  let reportRangeStartElapsed = 0;
+  let reportRangeEndElapsed = 0;
+  let reportRangeSourceKey = "";
+  let reportRangeFullSummary = null;
+  let reportRangeSummaryError = "";
+  let reportRangeSummaryTimer = null;
+  let reportRangeSummaryRequestId = 0;
 
   function svgNode(name, attrs = {}, text = "") {
     const node = document.createElementNS("http://www.w3.org/2000/svg", name);
@@ -3046,6 +4140,17 @@ REPORT_FRAGMENT = r"""
     const minutes = Math.floor((seconds % 3600) / 60);
     const remaining = Math.floor(seconds % 60);
     return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}` : `${minutes}:${String(remaining).padStart(2, "0")}`;
+  }
+  function formatExactTime(value) {
+    const seconds = Math.max(0, Number(value) || 0);
+    if (seconds < 120) return `${seconds.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}s`;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = seconds % 60;
+    const tail = remaining.toFixed(1).padStart(4, "0");
+    return hours
+      ? `${hours}:${String(minutes).padStart(2, "0")}:${tail}`
+      : `${minutes}:${tail}`;
   }
   function chartWidth(svg) {
     return Math.max(360, Math.round(svg.getBoundingClientRect().width || 1080));
@@ -3091,15 +4196,18 @@ REPORT_FRAGMENT = r"""
     ));
   }
   function selectedReportRange() {
-    if (!reportRangeTouched || !samples.length) return null;
-    const start = samples[Math.min(reportRangeStartIndex, reportRangeEndIndex)];
-    const end = samples[Math.max(reportRangeStartIndex, reportRangeEndIndex)];
-    if (!start || !end) return null;
+    if (!reportRangeTouched) return null;
+    const startElapsed = Math.min(reportRangeStartElapsed, reportRangeEndElapsed);
+    const endElapsed = Math.max(reportRangeStartElapsed, reportRangeEndElapsed);
+    if (!finite(startElapsed) || !finite(endElapsed) || endElapsed <= startElapsed) return null;
+    const origin = sessionStartUptime();
     return {
-      start,
-      end,
-      startIndex: Math.min(reportRangeStartIndex, reportRangeEndIndex),
-      endIndex: Math.max(reportRangeStartIndex, reportRangeEndIndex),
+      startElapsed,
+      endElapsed,
+      startUptime: origin + startElapsed,
+      endUptime: origin + endElapsed,
+      duration: endElapsed - startElapsed,
+      sourceKey: reportRangeSourceKey,
     };
   }
   function contextForUptime(uptime) {
@@ -3127,15 +4235,137 @@ REPORT_FRAGMENT = r"""
     if (finite(point && point.uptime_s)) return Math.max(0, Number(point.uptime_s) - sessionStartUptime());
     return null;
   }
-  function metricPoints(rows, value) {
-    return (Array.isArray(rows) ? rows : [])
-      .map(row => {
-        const elapsed = elapsedForPoint(row);
-        const next = value(row);
-        return elapsed == null || !finite(next) ? null : { elapsed, value: Number(next) };
+  function metricPoints(rows, value, {
+    pointMeta = null,
+    stale = null,
+    elapsed = null,
+    collapseSteps = false,
+  } = {}) {
+    const ordered = (Array.isArray(rows) ? rows : [])
+      .map((row, index) => {
+        const observedElapsed = elapsedForPoint(row);
+        const resolvedElapsed = typeof elapsed === "function" ? elapsed(row, observedElapsed) : observedElapsed;
+        return { row, index, elapsed: resolvedElapsed, observedElapsed };
       })
-      .filter(Boolean)
-      .sort((left, right) => left.elapsed - right.elapsed);
+      .filter(item => item.elapsed != null && item.observedElapsed != null)
+      .sort((left, right) => left.elapsed - right.elapsed || left.index - right.index);
+    const points = [];
+    let breakPending = false;
+    let breakElapsed = null;
+    ordered.forEach(item => {
+      const explicitBreak = Boolean(
+        item.row?.report_break_before
+        || item.row?._report_break_before
+        || item.row?.break_before
+      );
+      const staleValue = typeof stale === "function" && stale(item.row);
+      const next = value(item.row);
+      if (explicitBreak || staleValue || !finite(next)) {
+        breakPending = true;
+        if (breakElapsed == null) breakElapsed = item.observedElapsed;
+        if (!finite(next) || staleValue) return;
+      }
+      const metadata = typeof pointMeta === "function" ? pointMeta(item.row) : null;
+      const previousPoint = points.at(-1);
+      if (
+        collapseSteps
+        && previousPoint
+        && !breakPending
+        && !explicitBreak
+        && Math.abs(Number(previousPoint.value) - Number(next)) <= Math.max(.01, Math.abs(Number(next)) * .0001)
+        && Boolean(previousPoint.rawOnly) === Boolean(metadata?.rawOnly)
+      ) return;
+      points.push({
+        elapsed: Number(item.elapsed),
+        value: Number(next),
+        breakBefore: breakPending || explicitBreak,
+        breakElapsed: breakPending ? breakElapsed : null,
+        ...(metadata && typeof metadata === "object" ? metadata : {}),
+      });
+      breakPending = false;
+      breakElapsed = null;
+    });
+    if (breakPending && points.length && breakElapsed != null) {
+      points.at(-1).breakAfterElapsed = breakElapsed;
+    }
+    return points;
+  }
+  function metricGapLimit(points, sampleSeries = false) {
+    const intervals = [];
+    for (let index = 1; index < points.length; index += 1) {
+      const previous = points[index - 1];
+      const point = points[index];
+      if (!point.breakBefore && point.elapsed > previous.elapsed) {
+        intervals.push(point.elapsed - previous.elapsed);
+      }
+    }
+    intervals.sort((left, right) => left - right);
+    const median = intervals.length ? intervals[Math.floor(intervals.length / 2)] : 0;
+    const configured = finite(metadata.sample_interval_s) ? Number(metadata.sample_interval_s) : 0;
+    if (sampleSeries && reportPayload.downsampled) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return Math.max(3, median * 4, configured * 4);
+  }
+  function reportPowerChannelPresentation() {
+    const sources = Array.from(new Set(samples.map(sample => String(sample.power_source || "")).filter(Boolean)));
+    const externalPowerObserved = samples.some(sample => sample.external_power === true);
+    const systemLoad = sources.includes("ios_power_telemetry_system_load");
+    if (systemLoad) {
+      return {
+        label: "iOS 整机原始 SystemLoad 通道",
+        source: "DiagnosticsService PowerTelemetryData.SystemLoad；外供时可能接近 SystemPowerIn，非电池 I×V / 非独立电源轨实测",
+        step: true,
+        batteryFlowNeeded: true,
+        systemLoad: true,
+      };
+    }
+    if (String(metadata.platform || "").toLowerCase() === "ios") {
+      return {
+        label: "iOS 电池流量功率（电流×电压）",
+        source: `${sources[0] || "ios_battery_current_voltage"}；只表示电池端流量，不冒充 SystemLoad 或设备独立电源轨`,
+        step: false,
+        batteryFlowNeeded: false,
+        systemLoad: false,
+      };
+    }
+    if (sources.length > 1) {
+      return {
+        label: "原始功率通道",
+        source: `${sources.join(" / ")}；按来源原样展示，虚线区段不进入耗电结论`,
+        step: false,
+        batteryFlowNeeded: true,
+        systemLoad: false,
+      };
+    }
+    if (externalPowerObserved) {
+      return {
+        label: "电池侧原始流量（含外部供电区间）",
+        source: `${sources[0] || "电池电流×电压"}；external_power=true 的区段仅原样展示，不进入耗电结论`,
+        step: false,
+        batteryFlowNeeded: false,
+        systemLoad: false,
+      };
+    }
+    return {
+      label: "电池侧原始功率",
+      source: `${sources[0] || "电池电流×电压"}；虚线区段不进入耗电结论`,
+      step: false,
+      batteryFlowNeeded: false,
+      systemLoad: false,
+    };
+  }
+  function reportPrimaryPowerValue(sample, channel = reportPowerChannelPresentation()) {
+    if (channel.systemLoad && sample?.power_source !== "ios_power_telemetry_system_load") return null;
+    return sample?.power_mw;
+  }
+  function standardOnePercentLowAvailable() {
+    const source = String(performance.one_percent_low_source || "").toLowerCase();
+    const detailedIntervals = frameTimeline.some(frame => (
+      Array.isArray(frame.frame_intervals_ms) && frame.frame_intervals_ms.length > 0
+    ));
+    const detailedSource = ["slowest 1%", "frame-time histogram", "frame-jitter"].some(token => source.includes(token));
+    return detailedIntervals || (detailedSource && !source.includes("sampled-window") && !source.includes("counter-window"));
   }
   function rawMetricDefinitions() {
     const metrics = [];
@@ -3146,24 +4376,87 @@ REPORT_FRAGMENT = r"""
       if (features.length && !features.some(featureEnabled)) return;
       const points = (definition.points || [])
         .filter(point => point && finite(point.elapsed) && finite(point.value))
-        .map(point => ({ elapsed: Number(point.elapsed), value: Number(point.value) }))
+        .map(point => ({ ...point, elapsed: Number(point.elapsed), value: Number(point.value) }))
         .sort((left, right) => left.elapsed - right.elapsed);
       if (!points.length) return;
       if (definition.requiresPositive && !points.some(point => point.value > 0)) return;
-      metrics.push({ ...definition, points });
+      const overlays = (Array.isArray(definition.overlays) ? definition.overlays : [])
+        .map(overlay => ({
+          ...overlay,
+          points: (overlay.points || [])
+            .filter(point => point && finite(point.elapsed) && finite(point.value))
+            .map(point => ({ ...point, elapsed: Number(point.elapsed), value: Number(point.value) }))
+            .sort((left, right) => left.elapsed - right.elapsed),
+        }))
+        .filter(overlay => overlay.points.length);
+      metrics.push({
+        ...definition,
+        points,
+        overlays,
+        gapLimit: definition.gapLimit ?? metricGapLimit(points, definition.sampleSeries === true),
+      });
     };
     const sampleMetric = (definition, value) => add({
       ...definition,
-      points: metricPoints(samples, value),
+      sampleSeries: true,
+      points: metricPoints(samples, value, definition),
     });
     const frameMetric = (definition, value) => add({
       ...definition,
       feature: "frame_rate",
-      points: metricPoints(frameTimeline, value),
+      points: metricPoints(frameTimeline, value, definition),
     });
 
-    sampleMetric({ key: "power_mw", label: "整机功耗", unit: "mW", source: "电池侧实测", color: colors[0] }, sample => sample.power_mw);
-    sampleMetric({ key: "current_ma", label: "电流幅值", unit: "mA", source: "电池基础通道", color: colors[1] }, sample => sample.current_ma);
+    const powerChannel = reportPowerChannelPresentation();
+    sampleMetric({
+      key: "power_mw",
+      statisticsKey: "power_mw",
+      label: powerChannel.label,
+      unit: "mW",
+      source: powerChannel.source,
+      color: colors[0],
+      step: powerChannel.step,
+      carryForward: powerChannel.systemLoad,
+      gapLimit: powerChannel.systemLoad ? Number.POSITIVE_INFINITY : undefined,
+      collapseSteps: powerChannel.systemLoad,
+      elapsed: powerChannel.systemLoad
+        ? sample => {
+            const observedElapsed = elapsedForPoint(sample);
+            return observedElapsed == null
+              ? null
+              : finite(sample.power_sample_age_s)
+                ? Math.max(0, observedElapsed - Math.max(0, Number(sample.power_sample_age_s)))
+                : observedElapsed;
+          }
+        : null,
+      stale: powerChannel.systemLoad
+        ? sample => finite(sample.power_sample_age_s) && Number(sample.power_sample_age_s) > 30
+        : null,
+      summaryValue: summary.observed_power_average_mw,
+      summaryMaximum: summary.observed_power_maximum_mw,
+      summaryLabel: "时间加权均值",
+      pointMeta: sample => ({
+        rawOnly: sample.power_valid_for_consumption !== true,
+        powerSource: sample.power_source || "",
+      }),
+    }, sample => reportPrimaryPowerValue(sample, powerChannel));
+    if (powerChannel.batteryFlowNeeded) {
+      sampleMetric({
+        key: "battery_flow_mw",
+        statisticsKey: "battery_flow_mw",
+        label: "电池流量功率（电流×电压）",
+        unit: "mW",
+        source: "电池电流幅值 × 电池电压；与 iOS SystemLoad 分域展示",
+        color: colors[1],
+        summaryValue: summary.battery_flow_average_power_mw,
+        summaryMaximum: summary.battery_flow_maximum_power_mw,
+        summaryLabel: "时间加权均值",
+        pointMeta: sample => ({ rawOnly: sample.power_valid_for_consumption !== true }),
+      }, sample => finite(sample.current_ma) && finite(sample.voltage_mv)
+        ? Number(sample.current_ma) * Number(sample.voltage_mv) / 1000
+        : null);
+    }
+    sampleMetric({ key: "current_ma", label: "电池电流幅值", unit: "mA", source: "逐样本方向与有符号电流见同时间点详情", color: colors[1], summaryValue: summary.observed_average_current_ma, summaryMaximum: summary.observed_maximum_current_ma, summaryLabel: "时间加权均值" }, sample => sample.current_ma);
     sampleMetric({ key: "voltage_mv", label: "电压", unit: "mV", source: "电池基础通道", color: colors[4], requiresPositive: true }, sample => sample.voltage_mv);
     sampleMetric({ key: "cpu_pct", label: "CPU 整体负载", unit: "%", source: "整机利用率", color: colors[2], feature: "cpu_usage" }, sample => sample.cpu_pct);
 
@@ -3172,38 +4465,67 @@ REPORT_FRAGMENT = r"""
       : Array.from(new Set(samples.flatMap(sample => Object.keys(sample.frequencies_mhz || {}))))
         .map(name => ({ name, label: name, cores: [] }));
     frequencyGroups.forEach((cluster, index) => {
+      const harmonyFrequency = String(metadata.platform || "").toLowerCase() === "harmony";
+      const frequencyCadence = Number(metadata.sampling_schedule_s && metadata.sampling_schedule_s.cpu_frequency || 0);
       sampleMetric({
         key: `cpu_frequency:${cluster.name}`,
-        label: `${cpuCoreGroupLabel(cluster)} 共享频率`,
+        label: `${cpuCoreGroupLabel(cluster)} ${harmonyFrequency ? "分组频率均值" : "共享频率"}`,
         unit: "MHz",
-        source: `${clusterLabel(cluster)} · ${cluster.name || "cpufreq policy"}`,
+        source: `${clusterLabel(cluster)} · ${cluster.name || (harmonyFrequency ? "maximum-frequency group" : "cpufreq policy")}${harmonyFrequency && frequencyCadence > 1.5 ? ` · 约 ${frequencyCadence.toFixed(0)} 秒刷新，中间点保持最近值` : ""}`,
         color: colors[(index + 3) % colors.length],
         feature: "cpu_frequency",
         requiresPositive: true,
       }, sample => (sample.frequencies_mhz || {})[cluster.name]);
     });
 
-    frameMetric({ key: "frame_rate_fps", label: "主帧率", unit: "FPS", source: performance.frame_source || "前台帧计数", color: colors[0], requiresPositive: true }, frame => frame.frame_rate_fps);
-    frameMetric({ key: "one_percent_low_fps", label: "1% Low 帧率", unit: "FPS", source: performance.one_percent_low_source || "逐窗口帧间隔", color: colors[4], requiresPositive: true }, frame => frame.one_percent_low_fps);
-    frameMetric({ key: "frame_time_p95_ms", label: "帧耗时 P95", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true }, frame => frame.frame_time_p95_ms);
-    frameMetric({ key: "frame_time_p99_ms", label: "帧耗时 P99", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true }, frame => frame.frame_time_p99_ms);
-    frameMetric({ key: "frame_issue_pct", label: "异常帧比例", unit: "%", source: "截止时间 / VSync", color: colors[3] }, frame => frame.frame_issue_pct);
+    const frameRatePoints = metricPoints(frameTimeline, frame => frame.frame_rate_fps);
+    const onePercentLowPoints = standardOnePercentLowAvailable()
+      ? metricPoints(frameTimeline, frame => frame.one_percent_low_fps)
+      : [];
+    const onePercentLowTimelineLabel = performance.one_percent_low_timeline_label || "1% Low";
+    add({
+      key: "frame_rate_fps",
+      label: onePercentLowPoints.length ? `主帧率与 ${onePercentLowTimelineLabel}` : "主帧率",
+      unit: "FPS",
+      source: onePercentLowPoints.length
+        ? `${performance.frame_source || "前台帧计数"} · ${onePercentLowTimelineLabel}：${performance.one_percent_low_timeline_source || performance.one_percent_low_source || "逐帧间隔"}`
+        : performance.frame_source || "前台帧计数",
+      color: colors[0],
+      feature: "frame_rate",
+      requiresPositive: true,
+      summaryValue: performance.sampled_frame_rate_fps,
+      summaryLabel: "全程平均帧率",
+      points: frameRatePoints,
+      overlays: onePercentLowPoints.length ? [{
+        key: "one_percent_low_fps",
+        label: onePercentLowTimelineLabel,
+        color: colors[4],
+        points: onePercentLowPoints,
+      }] : [],
+    });
+    frameMetric({ key: "frame_time_p95_ms", label: "帧耗时 P95", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true, summaryValue: performance.frame_metric_p95_ms, summaryLabel: "全程 P95", statisticKind: "quantile" }, frame => frame.frame_time_p95_ms);
+    frameMetric({ key: "frame_time_p99_ms", label: "帧耗时 P99", unit: "ms", source: "逐窗口帧间隔", color: colors[3], requiresPositive: true, summaryValue: performance.frame_metric_p99_ms, summaryLabel: "全程 P99", statisticKind: "quantile" }, frame => frame.frame_time_p99_ms);
+    frameMetric({ key: "frame_issue_pct", label: "异常帧比例", unit: "%", source: performance.frame_issue_label || "截止时间 / VSync", color: colors[3], summaryValue: performance.frame_issue_pct, summaryLabel: "总体异常占比", statisticKind: "ratio" }, frame => frame.frame_issue_pct);
 
     add({
       key: "refresh_rate_hz",
       label: "屏幕刷新率",
       unit: "Hz",
-      source: performance.refresh_residency_source || "显示模式",
+      source: performance.refresh_rate_timeline_source || performance.refresh_residency_source || "显示模式",
       color: colors[5],
       features: ["foreground_window", "frame_rate"],
       requiresPositive: true,
       step: true,
+      carryForward: true,
       points: metricPoints(refreshTimeline, point => finite(point.value) ? point.value : point.refresh_rate_hz),
     });
 
+    const primaryFrameStageKey = String(frameFlow.primary_key || "");
     (Array.isArray(frameFlow.stages) ? frameFlow.stages : []).forEach((stage, index) => {
+      const stageKey = String(stage.key || index);
+      if (stageKey === primaryFrameStageKey || stageKey === "display_scanout") return;
       add({
-        key: `frame_stage:${stage.key || index}`,
+        key: `frame_stage:${stageKey}`,
         label: `链路节点 · ${stage.phase || "STAGE"} ${stage.label || stage.key || index + 1}`,
         unit: stage.timeline_unit || stage.unit || "FPS",
         source: stage.source || "渲染链路计数",
@@ -3220,30 +4542,75 @@ REPORT_FRAGMENT = r"""
     sampleMetric({ key: "gpu_load_pct", label: "GPU 负载", unit: "%", source: "GPU 计数器", color: colors[1], feature: "gpu_metrics" }, sample => sample.gpu_load_pct);
     sampleMetric({ key: "gpu_frequency_mhz", label: "GPU 频率", unit: "MHz", source: "GPU 频率节点", color: colors[5], feature: "gpu_metrics", requiresPositive: true }, sample => sample.gpu_frequency_mhz);
     sampleMetric({ key: "memory_frequency_mhz", label: "内存频率", unit: "MHz", source: "DMC / DRAM / MIF", color: colors[4], feature: "memory_frequency", requiresPositive: true }, sample => sample.memory_frequency_mhz);
-    sampleMetric({ key: "battery_temperature_c", label: "电池温度", unit: "°C", source: "BatteryService", color: colors[3], feature: "thermal" }, sample => sample.battery_temperature_c);
+    sampleMetric({ key: "battery_temperature_c", label: "电池温度", unit: "°C", source: batteryTemperatureSource, color: colors[3], feature: "thermal" }, sample => sample.battery_temperature_c);
+    sampleMetric({ key: "collector_cpu_pct", label: "观察者相关进程 CPU 上界", unit: "%", source: "sysmond / DTServiceHub / pairing daemon 同期 CPU；不是工具净开销", color: colors[2], feature: "cpu_usage" }, sample => sample.collector_cpu_pct);
+    sampleMetric({ key: "power_sample_age_s", label: "iOS SystemLoad 样本年龄", unit: "s", source: "距 DiagnosticsService SystemLoad 最近一次变化的时间", color: colors[5] }, sample => sample.power_sample_age_s);
 
     const sensorRows = Array.isArray(thermal.sensors) ? thermal.sensors : [];
-    sensorRows.forEach((sensor, index) => {
-      const name = String(sensor && sensor.name || `sensor-${index + 1}`);
-      if (/battery/i.test(name)) return;
+    const temperatureSensors = sensorRows.filter(sensor => {
+      const name = String(sensor?.name || "");
+      const type = Number(sensor?.type);
+      const unit = String(sensor?.unit || "").trim().toLowerCase();
+      if (/battery/i.test(name) || type === 2) return false;
+      if (sensor?.contributes_to_thermal_status === false || [6, 7, 8].includes(type)) return false;
+      return sensor?.contributes_to_thermal_status === true
+        || ["°c", "c", "celsius"].includes(unit);
+    });
+    const thermalSensorGroups = [
+      { key: "cpu", label: "CPU 最高温", types: [0] },
+      { key: "gpu", label: "GPU 最高温", types: [1] },
+      { key: "skin", label: "机身 / Skin 温度", types: [3] },
+      { key: "usb", label: "USB 端口最高温", types: [4] },
+      { key: "power-amplifier", label: "功放最高温", types: [5] },
+      { key: "npu", label: "NPU 最高温", types: [9] },
+    ];
+    const groupedTemperatureNames = new Set();
+    thermalSensorGroups.forEach((group, index) => {
+      const names = temperatureSensors
+        .filter(sensor => group.types.includes(Number(sensor?.type)))
+        .map(sensor => String(sensor?.name || ""))
+        .filter(Boolean);
+      if (!names.length) return;
+      names.forEach(name => groupedTemperatureNames.add(name));
       add({
-        key: `thermal_sensor:${name}`,
-        label: `温度传感器 · ${name}`,
-        unit: sensor.unit || "°C",
-        source: "ThermalService",
+        key: `thermal_sensor_group:${group.key}`,
+        label: group.label,
+        unit: "°C",
+        source: `${thermalTelemetrySource} · ${names.length} 个同类传感器取最高值`,
         color: colors[(index + 3) % colors.length],
         feature: "thermal",
-        points: metricPoints(thermalTimeline, point => (point.sensors || {})[name]),
+        points: metricPoints(thermalTimeline, point => {
+          const values = names.map(name => (point.sensors || {})[name]).filter(finite).map(Number);
+          return values.length ? Math.max(...values) : null;
+        }),
       });
     });
+    const otherTemperatureNames = temperatureSensors
+      .map(sensor => String(sensor?.name || ""))
+      .filter(name => name && !groupedTemperatureNames.has(name));
+    if (otherTemperatureNames.length) {
+      add({
+        key: "thermal_sensor_group:other",
+        label: "其他有效温度最高值",
+        unit: "°C",
+        source: `${thermalTelemetrySource} · ${otherTemperatureNames.length} 个未分类温度传感器取最高值`,
+        color: colors[2],
+        feature: "thermal",
+        points: metricPoints(thermalTimeline, point => {
+          const values = otherTemperatureNames.map(name => (point.sensors || {})[name]).filter(finite).map(Number);
+          return values.length ? Math.max(...values) : null;
+        }),
+      });
+    }
     add({
       key: "thermal_status",
       label: "热状态等级",
       unit: "级",
-      source: "ThermalService",
+      source: thermalTelemetrySource,
       color: colors[3],
       feature: "thermal",
       step: true,
+      carryForward: true,
       points: metricPoints(thermalTimeline, point => point.status),
     });
 
@@ -3274,29 +4641,112 @@ REPORT_FRAGMENT = r"""
       feature: "thermal",
       points: metricPoints(brightnessTimeline, point => finite(point.thermal_cap) ? Number(point.thermal_cap) * 100 : null),
     });
+    const foregroundCategories = [];
+    const foregroundCategoryIndex = new Map();
+    const foregroundPoints = [];
+    let previousForeground = null;
+    contexts.forEach(context => {
+      const elapsed = elapsedForPoint(context);
+      const packageName = String(context.foreground_package || "").trim();
+      if (elapsed == null || !packageName || packageName === previousForeground) return;
+      if (!foregroundCategoryIndex.has(packageName)) {
+        foregroundCategoryIndex.set(packageName, foregroundCategories.length);
+        foregroundCategories.push(packageName);
+      }
+      foregroundPoints.push({
+        elapsed,
+        value: foregroundCategoryIndex.get(packageName),
+        label: [packageName, context.foreground_activity].filter(Boolean).join(" · "),
+      });
+      previousForeground = packageName;
+    });
+    add({
+      key: "foreground_application_state",
+      label: "前台应用状态",
+      unit: "",
+      source: "实际收到的前台应用 / Ability 状态事件",
+      color: colors[2],
+      features: ["foreground_window"],
+      step: true,
+      carryForward: true,
+      categories: foregroundCategories,
+      points: foregroundPoints,
+    });
     return metrics;
   }
-  function rawMetricPointAt(metric, elapsed) {
+  function rawValueText(metric, point) {
+    if (!point) return "n/a";
+    if (Array.isArray(metric.categories) && metric.categories.length) {
+      return point.label || metric.categories[Math.round(point.value)] || "n/a";
+    }
+    return format(point.value, metric.unit);
+  }
+  function elapsedInsideReportExclusion(elapsed) {
+    return reportExcludedElapsedRanges().some(range => elapsed >= range.start && elapsed <= range.end);
+  }
+  function rawSeriesPointAt(points, metric, elapsed) {
+    if (elapsedInsideReportExclusion(elapsed)) return null;
     let selected = null;
-    for (const point of metric.points) {
-      if (point.elapsed > elapsed) break;
+    let following = null;
+    for (const point of points) {
+      if (point.elapsed > elapsed) { following = point; break; }
       selected = point;
     }
+    if (!selected) return null;
+    if (finite(selected.breakAfterElapsed) && elapsed >= Number(selected.breakAfterElapsed)) return null;
+    if (
+      following?.breakBefore
+      && finite(following.breakElapsed)
+      && elapsed >= Number(following.breakElapsed)
+    ) return null;
+    const gapLimit = Number(metric.gapLimit || 3);
+    if (!metric.carryForward && elapsed - selected.elapsed > gapLimit) return null;
+    if (
+      following
+      && following.elapsed - selected.elapsed > gapLimit
+      && elapsed > selected.elapsed + gapLimit
+    ) return null;
     return selected;
+  }
+  function rawMetricPointAt(metric, elapsed) {
+    return rawSeriesPointAt(metric.points, metric, elapsed);
+  }
+  function rawMetricSegments(points, metric) {
+    const segments = [];
+    points.forEach(point => {
+      const segment = segments.at(-1);
+      const previous = segment?.at(-1);
+      const startsNew = !segment
+        || point.breakBefore
+        || (previous && point.elapsed - previous.elapsed > Number(metric.gapLimit || 3))
+        || (previous && crossesReportExcludedRange(previous.elapsed, point.elapsed))
+        || (previous && Boolean(previous.rawOnly) !== Boolean(point.rawOnly));
+      if (startsNew) segments.push([]);
+      segments.at(-1).push(point);
+    });
+    return segments;
   }
   function rawMaximumTime() {
     return Math.max(
       maxTime(),
-      ...rawMetrics.flatMap(metric => metric.points.map(point => point.elapsed)),
+      ...rawMetrics.flatMap(metric => [
+        ...metric.points.map(point => point.elapsed),
+        ...(metric.overlays || []).flatMap(overlay => overlay.points.map(point => point.elapsed)),
+      ]),
     );
   }
   function renderRawMetricChart(metric) {
     const svg = metric.svg;
     if (!svg || !metric.points.length || !samples.length) return;
     const width = chartWidth(svg), height = 220;
-    const margin = { left: width < 440 ? 54 : 62, right: 14, top: 16, bottom: 32 };
+    const categorical = Array.isArray(metric.categories) && metric.categories.length;
+    const margin = { left: categorical ? (width < 440 ? 96 : 132) : width < 440 ? 54 : 62, right: 14, top: 16, bottom: 32 };
     const maximumTime = rawMaximumTime();
-    const maximumValue = Math.max(1, ...metric.points.map(point => point.value)) * 1.08;
+    const allSeriesPoints = [metric.points, ...(metric.overlays || []).map(overlay => overlay.points)].flat();
+    const observedMaximum = Math.max(0, ...allSeriesPoints.map(point => point.value));
+    const maximumValue = categorical
+      ? Math.max(1, metric.categories.length - 1)
+      : Math.max(1, observedMaximum * 1.08);
     const x = value => margin.left + Math.max(0, Math.min(maximumTime, Number(value))) / maximumTime * (width - margin.left - margin.right);
     const y = value => margin.top + (maximumValue - Math.max(0, Number(value))) / maximumValue * (height - margin.top - margin.bottom);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -3308,7 +4758,10 @@ REPORT_FRAGMENT = r"""
       const value = maximumValue * (1 - ratio);
       const yPos = margin.top + ratio * (height - margin.top - margin.bottom);
       svg.appendChild(svgNode("line", { x1: margin.left, x2: width - margin.right, y1: yPos, y2: yPos, class: "raw-grid-line" }));
-      svg.appendChild(svgNode("text", { x: margin.left - 7, y: yPos + 3, "text-anchor": "end", class: "raw-axis-text" }, format(value, metric.unit)));
+      const axisLabel = categorical
+        ? metric.categories[Math.max(0, Math.min(metric.categories.length - 1, Math.round(value)))] || "0"
+        : format(value, metric.unit);
+      svg.appendChild(svgNode("text", { x: margin.left - 7, y: yPos + 3, "text-anchor": "end", class: "raw-axis-text" }, axisLabel));
     }
     for (let tick = 0; tick <= 4; tick++) {
       const elapsed = maximumTime * tick / 4;
@@ -3327,55 +4780,77 @@ REPORT_FRAGMENT = r"""
         class: "raw-excluded-window",
       }));
     });
-    const deleteSelection = selectedReportRange();
-    if (deleteSelection) {
-      const startX = x(deleteSelection.start.elapsed_s);
-      const endX = x(deleteSelection.end.elapsed_s);
-      svg.appendChild(svgNode("rect", {
-        x: startX,
-        y: margin.top,
-        width: Math.max(1, endX - startX),
-        height: height - margin.top - margin.bottom,
-        class: "raw-delete-window",
-      }));
-    }
-    const coordinates = metric.points.map(point => ({ ...point, x: x(point.elapsed), y: y(point.value) }));
-    const segments = [];
-    coordinates.forEach(coordinate => {
-      const segment = segments.at(-1);
-      if (!segment || (segment.length && crossesReportExcludedRange(segment.at(-1).elapsed, coordinate.elapsed))) {
-        segments.push([]);
-      }
-      segments.at(-1).push(coordinate);
-    });
-    segments.forEach((segment, segmentIndex) => {
-      if (segment.length === 1) {
-        svg.appendChild(svgNode("circle", { cx: segment[0].x, cy: segment[0].y, r: 3.5, fill: metric.color }));
-        return;
-      }
-      let path = `M${segment[0].x.toFixed(2)},${segment[0].y.toFixed(2)}`;
-      for (let index = 1; index < segment.length; index += 1) {
-        const previous = segment[index - 1];
-        const current = segment[index];
-        path += metric.step
-          ? ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`
-          : ` L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
-      }
-      if (metric.step && segmentIndex === segments.length - 1 && segment.at(-1).elapsed < maximumTime) {
-        path += ` L${x(maximumTime).toFixed(2)},${segment.at(-1).y.toFixed(2)}`;
-      }
-      svg.appendChild(svgNode("path", { d: path, class: "raw-series-line", stroke: metric.color }));
-    });
+    const drawSeries = (seriesPoints, { color, secondary = false, step = metric.step } = {}) => {
+      const coordinates = seriesPoints.map(point => ({ ...point, x: x(point.elapsed), y: y(point.value) }));
+      const segments = rawMetricSegments(coordinates, metric);
+      segments.forEach((segment, segmentIndex) => {
+        if (segment.length === 1) {
+          svg.appendChild(svgNode("circle", {
+            cx: segment[0].x,
+            cy: segment[0].y,
+            r: secondary ? 2.7 : 3.5,
+            fill: color,
+            class: segment[0].rawOnly ? "raw-only" : "",
+          }));
+          return;
+        }
+        let path = `M${segment[0].x.toFixed(2)},${segment[0].y.toFixed(2)}`;
+        for (let index = 1; index < segment.length; index += 1) {
+          const previous = segment[index - 1];
+          const current = segment[index];
+          path += step
+            ? ` L${current.x.toFixed(2)},${previous.y.toFixed(2)} L${current.x.toFixed(2)},${current.y.toFixed(2)}`
+            : ` L${current.x.toFixed(2)},${current.y.toFixed(2)}`;
+        }
+        if (
+          step
+          && metric.carryForward
+          && segmentIndex === segments.length - 1
+          && segment.at(-1).elapsed < maximumTime
+        ) {
+          path += ` L${x(maximumTime).toFixed(2)},${segment.at(-1).y.toFixed(2)}`;
+        }
+        const classNames = [
+          "raw-series-line",
+          secondary ? "secondary" : "",
+          segment[0].rawOnly ? "raw-only" : "",
+        ].filter(Boolean).join(" ");
+        svg.appendChild(svgNode("path", { d: path, class: classNames, stroke: color }));
+      });
+    };
+    drawSeries(metric.points, { color: metric.color });
+    (metric.overlays || []).forEach(overlay => drawSeries(overlay.points, {
+      color: overlay.color,
+      secondary: true,
+      step: overlay.step === true,
+    }));
     const selectedElapsed = Number(samples[selectedIndex].elapsed_s || 0);
     const selectedPoint = rawMetricPointAt(metric, selectedElapsed);
     const selectedX = x(selectedElapsed);
     svg.appendChild(svgNode("line", { x1: selectedX, x2: selectedX, y1: margin.top, y2: height - margin.bottom, class: "raw-selected-line" }));
     if (selectedPoint) {
       svg.appendChild(svgNode("circle", { cx: x(selectedPoint.elapsed), cy: y(selectedPoint.value), r: 3.5, class: "raw-selected-dot", stroke: metric.color }));
-      metric.valueNode.textContent = format(selectedPoint.value, metric.unit);
+      const values = [rawValueText(metric, selectedPoint)];
+      (metric.overlays || []).forEach(overlay => {
+        const overlayPoint = rawSeriesPointAt(overlay.points, metric, selectedElapsed);
+        if (overlayPoint) values.push(`${overlay.label} ${format(overlayPoint.value, metric.unit)}`);
+      });
+      metric.valueNode.textContent = values.join(" · ");
     } else {
       metric.valueNode.textContent = "n/a";
     }
+    attachTimeRangeBrush(svg, {
+      width,
+      height,
+      left: margin.left,
+      right: margin.right,
+      top: margin.top,
+      bottom: margin.bottom,
+      rangeStart: 0,
+      rangeEnd: maximumTime,
+      sourceKey: metric.key,
+      hoverSelect: false,
+    });
   }
   function renderRawMetricCharts() {
     rawMetrics.forEach(renderRawMetricChart);
@@ -3383,10 +4858,18 @@ REPORT_FRAGMENT = r"""
   function renderRawMetricGrid() {
     const container = root.querySelector("#raw-metric-grid");
     const count = root.querySelector("#raw-metric-count");
+    const samplingNote = root.querySelector("#raw-sampling-note");
     if (!container) return;
     rawMetrics = rawMetricDefinitions();
     container.replaceChildren();
     if (count) count.textContent = `${rawMetrics.length} 项有效时间序列`;
+    if (samplingNote) {
+      samplingNote.hidden = !reportPayload.downsampled;
+      const detail = samplingNote.querySelector("span");
+      if (detail && reportPayload.downsampled) {
+        detail.textContent = `原始 ${Number(reportPayload.raw_sample_count || 0).toLocaleString("zh-CN")} 点，图表显示 ${Number(reportPayload.display_sample_count || 0).toLocaleString("zh-CN")} 点；CPU、GPU、温度、频率、功率及断线边界分别保峰。时间加权连续量、全程帧统计和峰值来自完整数据，不用抽样点重算。`;
+      }
+    }
     if (!rawMetrics.length) {
       const empty = document.createElement("div");
       empty.className = "raw-empty";
@@ -3410,10 +4893,27 @@ REPORT_FRAGMENT = r"""
       const current = document.createElement("strong");
       current.className = "raw-current-value";
       current.textContent = "n/a";
-      const values = metric.points.map(point => point.value);
-      const average = values.reduce((sum, value) => sum + value, 0) / values.length;
       const range = document.createElement("span");
-      range.textContent = `均 ${format(average, metric.unit)} · 峰 ${format(Math.max(...values), metric.unit)}`;
+      const statisticsKey = metric.statisticsKey || metric.key;
+      const fullStatistics = reportMetricStatistics[statisticsKey];
+      const pointValues = metric.points.map(point => point.value).filter(finite).map(Number);
+      const pointMaximum = pointValues.length ? Math.max(...pointValues) : null;
+      const summaryMaximum = finite(metric.summaryMaximum)
+        ? Number(metric.summaryMaximum)
+        : pointMaximum;
+      if (finite(metric.summaryValue)) {
+        const maximumLabel = metric.summaryMaximumLabel || (metric.sampleSeries ? "峰" : "窗口峰");
+        range.textContent = `${metric.summaryLabel || "全程汇总"} ${format(metric.summaryValue, metric.unit)}${finite(summaryMaximum) ? ` · ${maximumLabel} ${format(summaryMaximum, metric.unit)}` : ""}`;
+      } else if (metric.statisticKind === "quantile" || metric.statisticKind === "ratio") {
+        range.textContent = `${metric.points.length.toLocaleString("zh-CN")} 个窗口${finite(pointMaximum) ? ` · 窗口峰 ${format(pointMaximum, metric.unit)}` : ""} · 不对窗口统计求算术均值`;
+      } else if (fullStatistics && finite(fullStatistics.average) && finite(fullStatistics.maximum)) {
+        range.textContent = `全量样本算术均值 ${format(fullStatistics.average, metric.unit)} · 峰 ${format(fullStatistics.maximum, metric.unit)}`;
+      } else if (!reportPayload.downsampled && !metric.categories) {
+        const average = pointValues.reduce((sum, value) => sum + value, 0) / pointValues.length;
+        range.textContent = `显示点样本算术均值 ${format(average, metric.unit)} · 峰 ${format(pointMaximum, metric.unit)}`;
+      } else {
+        range.textContent = `${metric.points.length.toLocaleString("zh-CN")} 个显示点 · 不由抽样点重算统计`;
+      }
       valueGroup.append(current, range);
       heading.append(labelGroup, valueGroup);
       const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -3454,18 +4954,194 @@ REPORT_FRAGMENT = r"""
       .filter(value => finite(value) && Number(value) > 0 && Number(value) < 10000)
       .map(Number);
   }
-  function pointString(values, x, y) {
-    return values.map((value, index) => finite(value) ? `${x(samples[index].elapsed_s).toFixed(2)},${y(Number(value)).toFixed(2)}` : null).filter(Boolean).join(" ");
+  function pointStrings(values, x, y, rows = samples) {
+    const segments = [];
+    let current = [];
+    values.forEach((value, index) => {
+      if (!finite(value)) {
+        if (current.length) segments.push(current);
+        current = [];
+        return;
+      }
+      current.push(`${x(rows[index].elapsed_s).toFixed(2)},${y(Number(value)).toFixed(2)}`);
+    });
+    if (current.length) segments.push(current);
+    return segments.map(segment => segment.join(" "));
   }
-  function attachOverlay(svg, width, height, left, right, top, bottom, rangeStart = 0, rangeEnd = maxTime()) {
-    const overlay = svgNode("rect", { x: left, y: top, width: width - left - right, height: height - top - bottom, fill: "transparent" });
-    overlay.addEventListener("mousemove", event => {
+  function reportTimelineMaximum() {
+    let maximum = maxTime();
+    rawMetrics.forEach(metric => {
+      (metric.points || []).forEach(point => { maximum = Math.max(maximum, Number(point.elapsed) || 0); });
+      (metric.overlays || []).forEach(overlay => {
+        (overlay.points || []).forEach(point => { maximum = Math.max(maximum, Number(point.elapsed) || 0); });
+      });
+    });
+    (Array.isArray(frameFlow.stages) ? frameFlow.stages : []).forEach(stage => {
+      (Array.isArray(stage?.timeline) ? stage.timeline : []).forEach(point => {
+        const elapsed = elapsedForPoint(point);
+        if (elapsed != null) maximum = Math.max(maximum, elapsed);
+      });
+    });
+    return Math.max(1, maximum);
+  }
+  function setExactReportRange(startElapsed, endElapsed, sourceKey = "", { requestFullSummary = false } = {}) {
+    const maximum = reportTimelineMaximum();
+    const start = Math.max(0, Math.min(maximum, Number(startElapsed) || 0));
+    const end = Math.max(0, Math.min(maximum, Number(endElapsed) || 0));
+    if (Math.abs(end - start) < 1e-6) return;
+    reportRangeTouched = true;
+    reportRangeStartElapsed = Math.min(start, end);
+    reportRangeEndElapsed = Math.max(start, end);
+    reportRangeSourceKey = String(sourceKey || reportRangeSourceKey || "");
+    reportRangeFullSummary = null;
+    reportRangeSummaryError = "";
+    reportRangeSummaryRequestId += 1;
+    if (reportRangeSummaryTimer) window.clearTimeout(reportRangeSummaryTimer);
+    updateReportRangeEditor();
+    refreshReportRangeSelectionOverlays();
+    if (requestFullSummary) scheduleReportRangeFullSummary();
+  }
+  function drawReportRangeSelection(svg) {
+    if (!svg || !svg.__reportRangeGeometry) return;
+    svg.querySelectorAll(".report-range-window, .report-range-edge").forEach(node => node.remove());
+    const selection = selectedReportRange();
+    if (!selection) return;
+    const geometry = svg.__reportRangeGeometry;
+    const visibleStart = Math.max(geometry.rangeStart, selection.startElapsed);
+    const visibleEnd = Math.min(geometry.rangeEnd, selection.endElapsed);
+    if (visibleEnd <= visibleStart) return;
+    const startX = geometry.x(visibleStart);
+    const endX = geometry.x(visibleEnd);
+    svg.appendChild(svgNode("rect", {
+      x: startX,
+      y: geometry.top,
+      width: Math.max(1, endX - startX),
+      height: Math.max(1, geometry.bottom - geometry.top),
+      class: "raw-delete-window report-range-window",
+    }));
+    svg.appendChild(svgNode("line", {
+      x1: startX, x2: startX, y1: geometry.top, y2: geometry.bottom, class: "report-range-edge",
+    }));
+    svg.appendChild(svgNode("line", {
+      x1: endX, x2: endX, y1: geometry.top, y2: geometry.bottom, class: "report-range-edge",
+    }));
+  }
+  function registerReportRangeSurface(svg, geometry) {
+    if (!svg) return;
+    svg.__reportRangeGeometry = geometry;
+    drawReportRangeSelection(svg);
+  }
+  function refreshReportRangeSelectionOverlays() {
+    root.querySelectorAll("svg").forEach(svg => drawReportRangeSelection(svg));
+  }
+  function attachTimeRangeBrush(svg, {
+    width,
+    height,
+    left,
+    right,
+    top,
+    bottom,
+    rangeStart = 0,
+    rangeEnd = maxTime(),
+    sourceKey = "",
+    hoverSelect = true,
+  }) {
+    const plotWidth = Math.max(1, width - left - right);
+    const plotBottom = height - bottom;
+    const x = time => left + (Math.max(rangeStart, Math.min(rangeEnd, Number(time))) - rangeStart) / Math.max(1e-9, rangeEnd - rangeStart) * plotWidth;
+    registerReportRangeSurface(svg, { x, top, bottom: plotBottom, rangeStart, rangeEnd });
+    const overlay = svgNode("rect", {
+      x: left,
+      y: top,
+      width: plotWidth,
+      height: Math.max(1, plotBottom - top),
+      fill: "transparent",
+      class: "time-range-brush",
+      tabindex: "0",
+      "aria-label": "横向拖动框选时间范围",
+    });
+    let drag = null;
+    const timeForEvent = event => {
       const rect = svg.getBoundingClientRect();
-      const localX = (event.clientX - rect.left) / rect.width * width;
-      const time = Math.max(rangeStart, Math.min(rangeEnd, rangeStart + (localX - left) / (width - left - right) * (rangeEnd - rangeStart)));
+      const localX = rect.width > 0 ? (event.clientX - rect.left) / rect.width * width : left;
+      return Math.max(rangeStart, Math.min(
+        rangeEnd,
+        rangeStart + (localX - left) / plotWidth * (rangeEnd - rangeStart),
+      ));
+    };
+    const finishDrag = event => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const time = timeForEvent(event);
+      const active = drag.active;
+      if (active) setExactReportRange(drag.startTime, time, sourceKey, { requestFullSummary: true });
+      drag = null;
+      try { overlay.releasePointerCapture(event.pointerId); } catch (_error) { /* capture may already be released */ }
       selectSample(nearestIndex(time));
+    };
+    overlay.addEventListener("pointerdown", event => {
+      if (!event.isPrimary || (event.button != null && event.button !== 0)) return;
+      event.preventDefault();
+      drag = {
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startTime: timeForEvent(event),
+        active: false,
+        previousSelection: selectedReportRange(),
+        previousFullSummary: reportRangeFullSummary,
+        previousSummaryError: reportRangeSummaryError,
+      };
+      overlay.setPointerCapture(event.pointerId);
+    });
+    overlay.addEventListener("pointermove", event => {
+      const time = timeForEvent(event);
+      if (drag && event.pointerId === drag.pointerId) {
+        event.preventDefault();
+        if (!drag.active && Math.abs(event.clientX - drag.startClientX) >= 3) drag.active = true;
+        if (drag.active) setExactReportRange(drag.startTime, time, sourceKey);
+        return;
+      }
+      if (hoverSelect && event.pointerType === "mouse" && event.buttons === 0) {
+        const index = nearestIndex(time);
+        if (index !== selectedIndex) selectSample(index);
+      }
+    });
+    overlay.addEventListener("pointerup", finishDrag);
+    overlay.addEventListener("pointercancel", event => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const previous = drag.previousSelection;
+      const previousFullSummary = drag.previousFullSummary;
+      const previousSummaryError = drag.previousSummaryError;
+      const wasActive = drag.active;
+      drag = null;
+      try { overlay.releasePointerCapture(event.pointerId); } catch (_error) { /* capture may already be released */ }
+      if (!wasActive) return;
+      reportRangeSummaryRequestId += 1;
+      if (reportRangeSummaryTimer) window.clearTimeout(reportRangeSummaryTimer);
+      reportRangeTouched = Boolean(previous);
+      if (previous) {
+        reportRangeStartElapsed = previous.startElapsed;
+        reportRangeEndElapsed = previous.endElapsed;
+        reportRangeSourceKey = previous.sourceKey || "";
+      }
+      reportRangeFullSummary = previousFullSummary;
+      reportRangeSummaryError = previousSummaryError;
+      updateReportRangeEditor();
+      refreshReportRangeSelectionOverlays();
     });
     svg.appendChild(overlay);
+  }
+  function attachOverlay(svg, width, height, left, right, top, bottom, rangeStart = 0, rangeEnd = maxTime()) {
+    attachTimeRangeBrush(svg, {
+      width,
+      height,
+      left,
+      right,
+      top,
+      bottom,
+      rangeStart,
+      rangeEnd,
+      sourceKey: svg.id || "timeline",
+    });
   }
 
   function renderLanes(svg, lanes) {
@@ -3495,7 +5171,9 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("text", { x: width - 8, y: laneTop + 17, "text-anchor": "end", class: "axis-text" }, format(maximum, lane.unit)));
       svg.appendChild(svgNode("text", { x: width - 8, y: laneBottom, "text-anchor": "end", class: "axis-text" }, format(minimum, lane.unit)));
       svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: laneBottom + 8, y2: laneBottom + 8, class: "grid" }));
-      svg.appendChild(svgNode("polyline", { points: pointString(values, x, y), fill: "none", stroke: lane.color, "stroke-width": 1.8 }));
+      pointStrings(values, x, y).forEach(points => {
+        svg.appendChild(svgNode("polyline", { points, fill: "none", stroke: lane.color, "stroke-width": 1.8 }));
+      });
       const selectedValue = values[selectedIndex];
       if (finite(selectedValue)) svg.appendChild(svgNode("circle", { cx: x(samples[selectedIndex].elapsed_s), cy: y(Number(selectedValue)), r: 3.5, class: "selected-point", stroke: lane.color }));
     });
@@ -3557,6 +5235,7 @@ REPORT_FRAGMENT = r"""
     );
     const maximumValue = Math.max(30, Math.ceil(observedMaximum / 30) * 30);
     const x = value => left + Math.max(0, Math.min(maximumTime, Number(value))) / maximumTime * (width - left - right);
+    const selectedElapsed = Number(samples[selectedIndex]?.elapsed_s || 0);
     for (let tick = 0; tick <= 5; tick++) {
       const elapsed = maximumTime * tick / 5;
       const xPos = x(elapsed);
@@ -3567,9 +5246,12 @@ REPORT_FRAGMENT = r"""
       const laneTop = top + laneIndex * laneHeight;
       const laneBottom = laneTop + laneHeight - 15;
       const y = value => laneBottom - Math.max(0, Math.min(maximumValue, Number(value))) / maximumValue * (laneBottom - laneTop - 12);
-      const latestPoint = lane.points.at(-1);
+      const selectedPoint = lane.points.reduce(
+        (match, point) => point.elapsed <= selectedElapsed ? point : match,
+        null,
+      );
       svg.appendChild(svgNode("text", { x: 12, y: laneTop + 24, class: "flow-lane-label" }, `${lane.phase} · ${lane.label}`));
-      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 43, class: "flow-lane-value" }, latestPoint ? `${lane.valueLabel} ${format(latestPoint.value, lane.unit)}` : lane.valueLabel));
+      svg.appendChild(svgNode("text", { x: 12, y: laneTop + 43, class: "flow-lane-value" }, selectedPoint ? `${lane.valueLabel} ${format(selectedPoint.value, lane.unit)}` : lane.valueLabel));
       svg.appendChild(svgNode("text", { x: width - 8, y: laneTop + 14, "text-anchor": "end", class: "axis-text" }, format(maximumValue, lane.unit)));
       svg.appendChild(svgNode("text", { x: width - 8, y: laneBottom, "text-anchor": "end", class: "axis-text" }, `0 ${lane.unit}`));
       svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: laneBottom + 5, y2: laneBottom + 5, class: "grid" }));
@@ -3577,7 +5259,9 @@ REPORT_FRAGMENT = r"""
         const emptyLabel = lane.key === "display_scanout"
           ? "暂无有效刷新率时间序列"
           : lane.key === "render_queue"
-            ? "仅有阶段耗时，无独立 FPS 计数"
+            ? ["primary", "valid", "reference"].includes(lane.status)
+              ? "该节点仅提供阶段耗时，没有独立 FPS 计数"
+              : "未获得可解析的 RenderThread / BufferQueue 阶段数据"
             : "平台未公开该节点的独立帧率时间序列";
         svg.appendChild(svgNode("text", { x: left + 10, y: laneTop + 35, class: "flow-lane-empty" }, emptyLabel));
         return;
@@ -3596,10 +5280,28 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("path", { d: path, class: `flow-lane-line ${lane.status}`, stroke: lane.color }));
       const last = coordinates.at(-1);
       svg.appendChild(svgNode("circle", { cx: last.x, cy: last.y, r: 3.4, class: "flow-lane-dot", fill: lane.color }));
+      if (selectedPoint) {
+        svg.appendChild(svgNode("circle", { cx: x(selectedPoint.elapsed), cy: y(selectedPoint.value), r: 4.1, class: "selected-point", stroke: lane.color }));
+      }
+    });
+    const selectedX = x(selectedElapsed);
+    svg.appendChild(svgNode("line", { x1: selectedX, x2: selectedX, y1: top, y2: height - bottom, class: "crosshair" }));
+    attachTimeRangeBrush(svg, {
+      width,
+      height,
+      left,
+      right,
+      top,
+      bottom,
+      rangeStart: 0,
+      rangeEnd: maximumTime,
+      sourceKey: "frame_flow",
+      hoverSelect: false,
     });
   }
 
   function timelineLanes() {
+    const reportPower = reportPowerChannelPresentation();
     const lanes = testMode === "performance"
       ? [
           { label: "帧率", unit: "FPS", color: colors[0], value: sample => (frameForUptime(sample.uptime_s) || {}).frame_rate_fps },
@@ -3607,7 +5309,7 @@ REPORT_FRAGMENT = r"""
           { label: "CPU 总负载", unit: "%", color: colors[2], value: sample => sample.cpu_pct }
         ]
       : [
-          { label: "功率", unit: "mW", color: colors[0], value: sample => sample.power_mw },
+          { label: reportPower.label, unit: "mW", color: colors[0], value: sample => reportPrimaryPowerValue(sample, reportPower) },
           { label: "电流", unit: "mA", color: colors[1], value: sample => sample.current_ma },
           { label: "CPU 总负载", unit: "%", color: colors[2], value: sample => sample.cpu_pct }
         ];
@@ -3615,7 +5317,7 @@ REPORT_FRAGMENT = r"""
     if (gpu.frequency_available) lanes.push({ label: "GPU 频率", unit: "MHz", color: colors[5], value: sample => sample.gpu_frequency_mhz });
     if (gpu.load_available) lanes.push({ label: "GPU 负载", unit: "%", color: colors[1], value: sample => sample.gpu_load_pct });
     if (samples.some(sample => finite(sample.memory_frequency_mhz))) lanes.push({ label: "内存频率", unit: "MHz", color: colors[4], value: sample => sample.memory_frequency_mhz });
-    if (testMode === "performance") lanes.push({ label: "整机功耗记录", unit: "mW", color: colors[5], value: sample => sample.power_mw });
+    if (testMode === "performance") lanes.push({ label: reportPower.label, unit: "mW", color: colors[5], value: sample => reportPrimaryPowerValue(sample, reportPower) });
     return lanes;
   }
   function renderTimeline() { renderLanes(root.querySelector("#timeline-chart"), timelineLanes()); }
@@ -3632,10 +5334,24 @@ REPORT_FRAGMENT = r"""
     const issueThreshold = finite(svg.dataset.issueMs) && Number(svg.dataset.issueMs) > 0
       ? Number(svg.dataset.issueMs)
       : budget != null ? budget * 1.5 : null;
+    let dynamicBudgetLines = [];
+    try {
+      const parsed = JSON.parse(svg.dataset.budgetLines || "[]");
+      dynamicBudgetLines = Array.isArray(parsed)
+        ? parsed.filter(item => finite(item?.budget_ms) && Number(item.budget_ms) > 0)
+        : [];
+    } catch (_error) {
+      dynamicBudgetLines = [];
+    }
+    const budgetValues = dynamicBudgetLines.map(item => Number(item.budget_ms));
     const q01 = quantile(intervals, .01) || Math.min(...intervals);
     const q99 = quantile(intervals, .99) || Math.max(...intervals);
-    let minimum = Math.max(0, budget ? Math.min(q01, budget * .72) : q01 * .82);
-    let maximum = budget ? Math.max(budget * 1.6, q99 * 1.08) : q99 * 1.14;
+    const smallestBudget = budgetValues.length ? Math.min(...budgetValues) : null;
+    const largestBudget = budgetValues.length ? Math.max(...budgetValues) : null;
+    let minimum = Math.max(0, budget ? Math.min(q01, budget * .72) : smallestBudget ? Math.min(q01, smallestBudget * .72) : q01 * .82);
+    let maximum = budget
+      ? Math.max(budget * 1.6, q99 * 1.08)
+      : largestBudget ? Math.max(largestBudget * 1.18, q99 * 1.08) : q99 * 1.14;
     if (!finite(maximum) || maximum <= minimum) maximum = minimum + Math.max(1, minimum * .25);
     const binCount = width < 560 ? 14 : 22;
     const binWidth = (maximum - minimum) / binCount;
@@ -3685,6 +5401,18 @@ REPORT_FRAGMENT = r"""
       const budgetX = x(budget);
       svg.appendChild(svgNode("line", { x1: budgetX, x2: budgetX, y1: margin.top, y2: height - margin.bottom, class: "budget-line" }));
       svg.appendChild(svgNode("text", { x: Math.min(width - margin.right, budgetX + 6), y: margin.top + 13, class: "budget-label" }, `帧预算 ${budget.toFixed(2)} ms`));
+    } else if (dynamicBudgetLines.length > 1) {
+      dynamicBudgetLines.forEach((item, index) => {
+        const itemBudget = Number(item.budget_ms);
+        if (itemBudget < minimum || itemBudget > maximum) return;
+        const budgetX = x(itemBudget);
+        svg.appendChild(svgNode("line", { x1: budgetX, x2: budgetX, y1: margin.top, y2: height - margin.bottom, class: "budget-line" }));
+        svg.appendChild(svgNode("text", {
+          x: Math.min(width - margin.right, budgetX + 5),
+          y: margin.top + 12 + index * 13,
+          class: "budget-label",
+        }, `${Number(item.refresh_hz).toFixed(0)} Hz · ${itemBudget.toFixed(2)} ms`));
+      });
     }
     svg.appendChild(svgNode("text", { x: margin.left, y: 17, class: "axis-text" }, `样本 ${intervals.length.toLocaleString("zh-CN")} · 柱高为帧数`));
     const tailText = [lowerTail ? `<${minimum.toFixed(2)} ms: ${lowerTail}` : "", upperTail ? `>${maximum.toFixed(2)} ms: ${upperTail}` : ""].filter(Boolean).join(" · ");
@@ -3695,11 +5423,12 @@ REPORT_FRAGMENT = r"""
     if (testMode !== "power") return;
     const svg = root.querySelector("#flow-chart");
     if (!svg || !samples.length) return;
+    const reportPower = reportPowerChannelPresentation();
     const width = chartWidth(svg), height = 320;
     const left = width < 620 ? 88 : 124, right = 20, top = 24, powerBottom = 202, bandTop = 232, bandHeight = 32, bottom = 38;
     const plotWidth = width - left - right;
     const x = time => left + Math.max(0, Math.min(maxTime(), Number(time))) / maxTime() * plotWidth;
-    const powers = samples.map(sample => sample.power_mw);
+    const powers = samples.map(sample => reportPrimaryPowerValue(sample, reportPower));
     const [minimum, maximum] = domain(powers);
     const y = value => top + (maximum - value) / (maximum - minimum) * (powerBottom - top);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -3711,7 +5440,7 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: top, y2: bandTop + bandHeight, class: "grid" }));
       svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": "middle", class: "axis-text" }, formatTime(seconds)));
     }
-    svg.appendChild(svgNode("text", { x: 12, y: top + 18, class: "lane-label" }, "功率"));
+    svg.appendChild(svgNode("text", { x: 12, y: top + 18, class: "lane-label" }, reportPower.label));
     svg.appendChild(svgNode("text", { x: 12, y: top + 38, class: "lane-value" }, format(powers[selectedIndex], "mW")));
     svg.appendChild(svgNode("text", { x: 12, y: bandTop + 20, class: "lane-label" }, "前台应用"));
 
@@ -3728,7 +5457,9 @@ REPORT_FRAGMENT = r"""
       }
     });
 
-    svg.appendChild(svgNode("polyline", { points: pointString(powers, x, y), fill: "none", stroke: colors[0], "stroke-width": 2 }));
+    pointStrings(powers, x, y).forEach(points => {
+      svg.appendChild(svgNode("polyline", { points, fill: "none", stroke: colors[0], "stroke-width": 2 }));
+    });
 
     const startUptime = sessionStartUptime();
     let cursor = 0;
@@ -3775,6 +5506,7 @@ REPORT_FRAGMENT = r"""
   function renderTestItems() {
     const svg = root.querySelector("#test-item-chart");
     if (!svg || !samples.length) return;
+    const reportPower = reportPowerChannelPresentation();
     const width = chartWidth(svg), left = width < 660 ? 108 : 146, right = 24;
     const powerTop = 22, powerBottom = 180, laneStart = 208, laneHeight = 48, bottom = 38;
     const laneNames = ["前台应用", "测试项 / 阶段", "系统活动", "Thermal", "热 / 调度上下文"];
@@ -3785,7 +5517,7 @@ REPORT_FRAGMENT = r"""
     const plotWidth = width - left - right;
     const x = time => left + (Math.max(rangeStart, Math.min(safeEnd, Number(time))) - rangeStart) / (safeEnd - rangeStart) * plotWidth;
     const visibleSamples = samples.filter(sample => Number(sample.elapsed_s) >= rangeStart && Number(sample.elapsed_s) <= safeEnd);
-    const primaryValues = visibleSamples.map(sample => testMode === "performance" ? (frameForUptime(sample.uptime_s) || {}).frame_rate_fps : sample.power_mw);
+    const primaryValues = visibleSamples.map(sample => testMode === "performance" ? (frameForUptime(sample.uptime_s) || {}).frame_rate_fps : reportPrimaryPowerValue(sample, reportPower));
     const [minimum, maximum] = domain(primaryValues);
     const y = value => powerTop + (maximum - value) / (maximum - minimum) * (powerBottom - powerTop);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -3798,21 +5530,18 @@ REPORT_FRAGMENT = r"""
       svg.appendChild(svgNode("line", { x1: xPos, x2: xPos, y1: powerTop, y2: laneStart + laneHeight * laneNames.length, class: "grid" }));
       svg.appendChild(svgNode("text", { x: xPos, y: height - 12, "text-anchor": "middle", class: "axis-text" }, formatTime(seconds)));
     }
-    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 20, class: "lane-label" }, testMode === "performance" ? "帧率" : "整机功率"));
+    svg.appendChild(svgNode("text", { x: 12, y: powerTop + 20, class: "lane-label" }, testMode === "performance" ? "帧率" : reportPower.label));
     const selected = samples[selectedIndex];
-    const selectedPrimary = testMode === "performance" ? (frameForUptime(selected && selected.uptime_s) || {}).frame_rate_fps : selected && selected.power_mw;
+    const selectedPrimary = testMode === "performance" ? (frameForUptime(selected && selected.uptime_s) || {}).frame_rate_fps : selected && reportPrimaryPowerValue(selected, reportPower);
     svg.appendChild(svgNode("text", { x: 12, y: powerTop + 41, class: "lane-value" }, format(selectedPrimary, testMode === "performance" ? "FPS" : "mW")));
     laneNames.forEach((name, index) => {
       const top = laneStart + index * laneHeight;
       svg.appendChild(svgNode("text", { x: 12, y: top + 25, class: "lane-label" }, name));
       svg.appendChild(svgNode("line", { x1: left, x2: width - right, y1: top + laneHeight - 2, y2: top + laneHeight - 2, class: "grid" }));
     });
-    const powerPoints = visibleSamples
-      .map(sample => ({ sample, value: testMode === "performance" ? (frameForUptime(sample.uptime_s) || {}).frame_rate_fps : sample.power_mw }))
-      .filter(item => finite(item.value))
-      .map(item => `${x(item.sample.elapsed_s).toFixed(2)},${y(Number(item.value)).toFixed(2)}`)
-      .join(" ");
-    svg.appendChild(svgNode("polyline", { points: powerPoints, fill: "none", stroke: colors[0], "stroke-width": 2 }));
+    pointStrings(primaryValues, x, y, visibleSamples).forEach(points => {
+      svg.appendChild(svgNode("polyline", { points, fill: "none", stroke: colors[0], "stroke-width": 2 }));
+    });
 
     const startUptime = sessionStartUptime();
     const appTop = laneStart + 8;
@@ -3912,17 +5641,9 @@ REPORT_FRAGMENT = r"""
     const svg = root.querySelector("#cpu-chart");
     const cluster = cpu.clusters.find(item => item.name === selectedCluster);
     if (!svg || !cluster) return;
-    const timeline = cpu.timeline || [];
     const lanes = [
-      { label: `${clusterLabel(cluster)}频率`, unit: "MHz", color: colors[0], value: sample => (sample.frequencies_mhz || {})[cluster.name] },
-      { label: `${clusterLabel(cluster)}负载`, unit: "%", color: colors[1], value: sample => (sample.cluster_cpu_pct || {})[cluster.name] }
+      { label: `${clusterLabel(cluster)}频率`, unit: "MHz", color: colors[0], value: sample => (sample.frequencies_mhz || {})[cluster.name] }
     ];
-    if (testMode === "power") {
-      lanes.push(
-        { label: "CPU 模型功率", unit: "mW", color: colors[2], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).modeled_power_mw },
-        { label: "高频增量", unit: "mW", color: colors[3], value: (sample, index) => (((timeline[index] || {}).clusters || {})[cluster.name] || {}).frequency_premium_mw }
-      );
-    }
     renderLanes(svg, lanes);
   }
 
@@ -3945,15 +5666,214 @@ REPORT_FRAGMENT = r"""
     if (slider) slider.value = String(selectedIndex);
     const context = contextForUptime(sample.uptime_s);
     const packageName = context && context.foreground_package ? context.foreground_package : "未知";
+    const powerValidity = sample.power_valid_for_consumption === true
+      ? "有效放电"
+      : sample.external_power === true
+        ? "外部供电 · 仅原始流量"
+        : "不进入耗电结论";
+    const directionLabel = sample.external_power === true || sample.direction === "external_power"
+      ? "外部供电"
+      : sample.direction === "discharging"
+        ? "电池放电"
+        : sample.direction === "charging"
+          ? "电池充入"
+          : sample.direction === "idle" || sample.direction === "full"
+            ? "电池净流量接近零"
+            : "未知";
+    const signedCurrent = finite(sample.signed_current_ma)
+      ? `${Number(sample.signed_current_ma) >= 0 ? "+" : ""}${Number(sample.signed_current_ma).toFixed(1)} mA`
+      : "未知";
     detail.innerHTML = `<span>同步时间 <strong>${formatTime(sample.elapsed_s)}</strong></span>`
       + `<span>样本 <strong>${selectedIndex + 1} / ${samples.length}</strong></span>`
       + `<span>有效曲线 <strong>${rawMetrics.length}</strong></span>`
+      + `<span>功率通道 <strong>${sample.power_source || "电池基础通道"}</strong></span>`
+      + `<span>样本语义 <strong>${powerValidity}</strong></span>`
+      + `<span>电池方向 <strong>${directionLabel} · ${signedCurrent}</strong></span>`
       + `<span>前台 <strong>${packageName}</strong></span>`;
   }
   function selectSample(index) {
     selectedIndex = Math.max(0, Math.min(samples.length - 1, Number(index)));
     updateSampleDetail();
     renderRawMetricCharts();
+    renderFrameFlowHistory();
+  }
+  function scheduleReportRangeFullSummary() {
+    if (reportRangeSummaryTimer) window.clearTimeout(reportRangeSummaryTimer);
+    const selection = selectedReportRange();
+    if (!selection || !reportRunName) {
+      updateReportRangeSummary();
+      return;
+    }
+    const requestId = ++reportRangeSummaryRequestId;
+    reportRangeSummaryError = "";
+    reportRangeSummaryTimer = window.setTimeout(async () => {
+      reportRangeSummaryTimer = null;
+      try {
+        const response = await fetch("/api/range-summary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            run_name: reportRunName,
+            start_elapsed_s: selection.startElapsed,
+            end_elapsed_s: selection.endElapsed,
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        if (requestId !== reportRangeSummaryRequestId) return;
+        const current = selectedReportRange();
+        if (
+          !current
+          || Math.abs(current.startElapsed - selection.startElapsed) > 1e-6
+          || Math.abs(current.endElapsed - selection.endElapsed) > 1e-6
+        ) return;
+        reportRangeFullSummary = result && result.full_resolution === true ? result : null;
+        reportRangeSummaryError = reportRangeFullSummary ? "" : "服务端未返回全量统计";
+      } catch (error) {
+        if (requestId !== reportRangeSummaryRequestId) return;
+        reportRangeFullSummary = null;
+        reportRangeSummaryError = String(error?.message || error || "请求失败");
+      }
+      updateReportRangeSummary();
+    }, 260);
+  }
+  function reportRangeSourceLabel(key) {
+    if (key === "frame_flow") return "完整渲染链路";
+    if (key === "range_sliders") return "滑块微调";
+    const metric = rawMetrics.find(item => item.key === key);
+    if (metric) return metric.label;
+    const node = key ? root.ownerDocument.getElementById(key) : null;
+    const ariaLabel = node?.getAttribute("aria-label");
+    return ariaLabel || "时间图";
+  }
+  function reportRangeSeriesStatistics(points, selection) {
+    const values = (Array.isArray(points) ? points : [])
+      .filter(point => (
+        finite(point?.elapsed)
+        && Number(point.elapsed) >= selection.startElapsed
+        && Number(point.elapsed) <= selection.endElapsed
+        && !elapsedInsideReportExclusion(Number(point.elapsed))
+        && finite(point?.value)
+      ))
+      .map(point => Number(point.value));
+    if (!values.length) return { count: 0, average: null, minimum: null, maximum: null };
+    return {
+      count: values.length,
+      average: values.reduce((sum, value) => sum + value, 0) / values.length,
+      minimum: Math.min(...values),
+      maximum: Math.max(...values),
+    };
+  }
+  function reportRangeStatisticRows(selection) {
+    const rows = [];
+    const fullMetrics = reportRangeFullSummary?.metrics && typeof reportRangeFullSummary.metrics === "object"
+      ? reportRangeFullSummary.metrics
+      : {};
+    const resolvedStatistics = (key, points) => {
+      const preview = reportRangeSeriesStatistics(points, selection);
+      const exact = fullMetrics[key];
+      if (!exact || typeof exact !== "object") return { ...preview, fullResolution: false };
+      return {
+        count: finite(exact.sample_count) ? Number(exact.sample_count) : preview.count,
+        average: finite(exact.average) ? Number(exact.average) : null,
+        minimum: finite(exact.minimum) ? Number(exact.minimum) : null,
+        maximum: finite(exact.maximum) ? Number(exact.maximum) : null,
+        calculation: String(exact.calculation || ""),
+        fullResolution: true,
+      };
+    };
+    rawMetrics.forEach(metric => {
+      rows.push({
+        key: metric.key,
+        label: metric.label,
+        unit: metric.unit,
+        categories: metric.categories,
+        ...resolvedStatistics(metric.key, metric.points),
+      });
+      (metric.overlays || []).forEach(overlay => {
+        const overlayKey = String(overlay.key || `${metric.key}-overlay`);
+        rows.push({
+          key: overlayKey,
+          label: `${metric.label} · ${overlay.label || overlay.key || "辅助序列"}`,
+          unit: metric.unit,
+          categories: metric.categories,
+          ...resolvedStatistics(overlayKey, overlay.points),
+        });
+      });
+    });
+    return rows;
+  }
+  function reportRangeStatisticText(row, key) {
+    if (!row.count || !finite(row[key])) return "—";
+    if (Array.isArray(row.categories) && row.categories.length) return "状态型不适用";
+    return format(row[key], row.unit);
+  }
+  function reportRangeCalculationLabel(row) {
+    const labels = {
+      time_weighted_full_resolution: "全量时间加权",
+      sample_average_full_resolution: "全量样本均值",
+      frame_rate_recomputed: "选区帧率重算",
+      one_percent_low_recomputed: "选区 1% Low 重算",
+      frame_quantile_recomputed: "选区分位值重算",
+      frame_issue_ratio_recomputed: "选区异常比例重算",
+      refresh_residency_weighted: "选区驻留时间加权",
+      frame_stage_full_resolution: "全量链路样本均值",
+    };
+    return row.fullResolution
+      ? labels[row.calculation] || "全量区间统计"
+      : "显示点预览";
+  }
+  function updateReportRangeSummary() {
+    const summaryNode = root.querySelector("#report-range-summary");
+    const title = root.querySelector("#report-range-summary-title");
+    const time = root.querySelector("#report-range-summary-time");
+    const statistics = root.querySelector("#report-range-statistics");
+    const note = root.querySelector("#report-range-summary-note");
+    if (!summaryNode || !title || !time || !statistics || !note) return;
+    const selection = selectedReportRange();
+    summaryNode.hidden = !selection;
+    statistics.replaceChildren();
+    if (!selection) return;
+    title.textContent = `${reportRangeSourceLabel(selection.sourceKey)}选区统计`;
+    time.textContent = `${formatExactTime(selection.startElapsed)} – ${formatExactTime(selection.endElapsed)} · ${formatExactTime(selection.duration)}`;
+    ["指标", "区间值 / 均值", "最小", "最大", "点数"].forEach((label, index) => {
+      const cell = document.createElement("span");
+      cell.textContent = label;
+      if (index === 0) cell.className = "range-stat-name";
+      statistics.appendChild(cell);
+    });
+    const rows = reportRangeStatisticRows(selection);
+    rows.forEach(row => {
+      const values = [
+        `${row.label} · ${reportRangeCalculationLabel(row)}`,
+        reportRangeStatisticText(row, "average"),
+        reportRangeStatisticText(row, "minimum"),
+        reportRangeStatisticText(row, "maximum"),
+        row.count.toLocaleString("zh-CN"),
+      ];
+      values.forEach((value, index) => {
+        const cell = document.createElement("span");
+        cell.textContent = value;
+        if (index === 0) cell.className = "range-stat-name";
+        statistics.appendChild(cell);
+      });
+    });
+    const fullResolutionCount = rows.filter(row => row.fullResolution).length;
+    if (reportRangeFullSummary) {
+      note.textContent = fullResolutionCount === rows.length
+        ? `已使用服务端全量数据重算 ${fullResolutionCount} 项区间统计；删除后会再次用全量记录重建整份报告。`
+        : `已使用服务端全量数据覆盖 ${fullResolutionCount} 项统计；其余项目仍为显示点预览，删除后会用全量记录重建整份报告。`;
+    } else if (!reportRunName) {
+      note.textContent = reportPayload.downsampled
+        ? `独立 HTML 无法请求全量区间统计；当前按 ${Number(reportPayload.display_sample_count || samples.length).toLocaleString("zh-CN")} 个显示点预览。请从仪表盘打开报告以获得全量结果。`
+        : "独立 HTML 当前按报告内显示点预览；请从仪表盘打开报告以请求服务端全量区间统计。";
+    } else if (reportRangeSummaryError) {
+      note.textContent = `全量区间统计请求失败（${reportRangeSummaryError}），当前继续显示点预览；删除后仍会用全量记录重建整份报告。`;
+    } else {
+      note.textContent = reportPayload.downsampled
+        ? `正在准备全量统计；当前先按 ${Number(reportPayload.display_sample_count || samples.length).toLocaleString("zh-CN")} 个显示点预览。删除后会用全量 ${Number(reportPayload.raw_sample_count || 0).toLocaleString("zh-CN")} 条原始记录重建报告。`
+        : "当前先按报告内显示点预览；框选固化后会请求服务端全量区间统计，删除后仍会用全量记录重建报告。";
+    }
   }
   function updateReportRangeEditor(changed = "") {
     const startInput = root.querySelector("#report-range-start");
@@ -3966,53 +5886,62 @@ REPORT_FRAGMENT = r"""
     const maximum = Math.max(0, samples.length - 1);
     let start = Math.max(0, Math.min(maximum, Number(startInput.value || 0)));
     let end = Math.max(0, Math.min(maximum, Number(endInput.value || 0)));
-    if (changed) reportRangeTouched = true;
-    if (changed === "start" && start >= end) {
-      end = Math.min(maximum, start + 1);
-      if (end <= start) start = Math.max(0, end - 1);
-    } else if (changed === "end" && end <= start) {
-      start = Math.max(0, end - 1);
-      if (end <= start) end = Math.min(maximum, start + 1);
+    if (changed) {
+      if (changed === "start" && start >= end) {
+        end = Math.min(maximum, start + 1);
+        if (end <= start) start = Math.max(0, end - 1);
+      } else if (changed === "end" && end <= start) {
+        start = Math.max(0, end - 1);
+        if (end <= start) end = Math.min(maximum, start + 1);
+      }
+      reportRangeTouched = true;
+      reportRangeStartElapsed = Number(samples[start].elapsed_s || 0);
+      reportRangeEndElapsed = Number(samples[end].elapsed_s || 0);
+      reportRangeSourceKey = "range_sliders";
+      reportRangeFullSummary = null;
+      reportRangeSummaryError = "";
+      reportRangeSummaryRequestId += 1;
+      if (reportRangeSummaryTimer) window.clearTimeout(reportRangeSummaryTimer);
+    } else if (reportRangeTouched) {
+      start = nearestIndex(reportRangeStartElapsed);
+      end = nearestIndex(reportRangeEndElapsed);
     }
-    reportRangeStartIndex = start;
-    reportRangeEndIndex = end;
     startInput.value = String(start);
     endInput.value = String(end);
-    if (startValue) startValue.textContent = formatTime(samples[start].elapsed_s);
-    if (endValue) endValue.textContent = formatTime(samples[end].elapsed_s);
-    const selectedCount = reportRangeTouched && end > start ? end - start + 1 : 0;
-    const canDelete = Boolean(
-      reportRunName
-      && reportRangeTouched
-      && end > start
-      && samples.length - selectedCount >= 2
-    );
+    const selection = selectedReportRange();
+    if (startValue) startValue.textContent = selection ? formatExactTime(selection.startElapsed) : formatExactTime(samples[start].elapsed_s);
+    if (endValue) endValue.textContent = selection ? formatExactTime(selection.endElapsed) : formatExactTime(samples[end].elapsed_s);
+    const canDelete = Boolean(reportRunName && selection);
     deleteButton.disabled = !canDelete;
     status.dataset.state = "";
     if (!reportRunName) {
-      status.textContent = "独立 HTML 报告保持只读；请从仪表盘的历史报告中打开后删除时间段。";
-    } else if (!reportRangeTouched) {
+      status.textContent = selection
+        ? "独立 HTML 报告可查看选区统计；如需删除，请从仪表盘的历史报告中打开。"
+        : "独立 HTML 报告保持只读；可在任意时间图上框选并查看区间统计。";
+    } else if (!selection) {
       const edited = Number(reportEdits.excluded_range_count || reportExcludedRanges.length || 0);
-      status.textContent = `${edited ? `已删除 ${edited} 个时间段；` : ""}拖动起点和终点选择要删除的记录。`;
-    } else if (end <= start) {
-      status.textContent = "删除终点必须晚于起点。";
-      status.dataset.state = "error";
-    } else if (samples.length - selectedCount < 2) {
-      status.textContent = "该范围会删除过多记录，报告至少需要保留两个样本。";
-      status.dataset.state = "error";
+      status.textContent = `${edited ? `已删除 ${edited} 个时间段；` : ""}在任意时间图上横向拖动框选，也可用滑块微调。`;
     } else {
-      status.textContent = `已选择 ${formatTime(samples[start].elapsed_s)} – ${formatTime(samples[end].elapsed_s)} · 当前报告显示 ${selectedCount} 个样本。`;
+      status.textContent = `已选择 ${formatExactTime(selection.startElapsed)} – ${formatExactTime(selection.endElapsed)} · 时长 ${formatExactTime(selection.duration)}；删除资格与最终统计由全量数据校验。`;
     }
-    if (changed) selectSample(changed === "start" ? start : end);
+    updateReportRangeSummary();
+    refreshReportRangeSelectionOverlays();
+    if (changed) {
+      scheduleReportRangeFullSummary();
+      selectSample(changed === "start" ? start : end);
+    }
   }
   async function deleteSelectedReportRange() {
     const selection = selectedReportRange();
     const status = root.querySelector("#report-range-status");
     const button = root.querySelector("#delete-report-range");
     if (!selection || !status || !button || !reportRunName) return;
-    const startLabel = formatTime(selection.start.elapsed_s);
-    const endLabel = formatTime(selection.end.elapsed_s);
-    if (!window.confirm(`确认删除 ${startLabel} – ${endLabel} 的记录？报告会重新计算统计和分析结论。`)) return;
+    const startLabel = formatExactTime(selection.startElapsed);
+    const endLabel = formatExactTime(selection.endElapsed);
+    const previewNote = reportPayload.downsampled
+      ? "当前选区统计只是显示点预览；删除后会用全量原始记录重新计算整份报告。"
+      : "删除后会用全量记录重新计算整份报告。";
+    if (!window.confirm(`确认从报告中删除 ${startLabel} – ${endLabel} 的记录？原始采集包会保留，以便审计或恢复；${previewNote}`)) return;
     button.disabled = true;
     button.textContent = "正在删除并重建报告…";
     status.dataset.state = "";
@@ -4023,13 +5952,15 @@ REPORT_FRAGMENT = r"""
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           run_name: reportRunName,
-          start_uptime_s: Number(selection.start.uptime_s),
-          end_uptime_s: Number(selection.end.uptime_s),
+          start_uptime_s: Number(selection.startUptime),
+          end_uptime_s: Number(selection.endUptime),
         }),
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-      status.textContent = `已删除 ${Number(result.deleted_sample_count || 0)} 个原始样本，正在刷新报告。`;
+      const removedSamples = Number(result.deleted_sample_count || 0);
+      const removedContexts = Number(result.deleted_context_count || 0);
+      status.textContent = `已从报告排除 ${removedSamples} 个主样本${removedContexts ? `、${removedContexts} 个帧/上下文点` : ""}，正在刷新报告。`;
       const nextUrl = new URL(window.location.href);
       nextUrl.searchParams.set("edited", String(Date.now()));
       window.location.replace(nextUrl.toString());
@@ -4047,7 +5978,7 @@ REPORT_FRAGMENT = r"""
     root.querySelectorAll(".nav-tab").forEach(peer => peer.setAttribute("aria-selected", peer === tab ? "true" : "false"));
     root.querySelectorAll(".app-view").forEach(panel => { panel.hidden = panel.dataset.panel !== view; });
     window.requestAnimationFrame(() => {
-      if (view === "raw") renderRawMetricCharts();
+      if (view === "raw") { renderRawMetricCharts(); renderFrameFlowHistory(); }
       if (view === "analysis") renderFrameStability();
     });
   }));
@@ -4081,7 +6012,7 @@ REPORT_FRAGMENT = r"""
   let resizeTimer = null;
   window.addEventListener("resize", () => {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => { renderRawMetricCharts(); renderFrameStability(); }, 100);
+    resizeTimer = window.setTimeout(() => { renderRawMetricCharts(); renderFrameFlowHistory(); renderFrameStability(); }, 100);
   });
   renderRawMetricGrid();
   selectSample(testMode === "performance" ? Math.max(0, samples.length - 1) : 0);
@@ -4128,11 +6059,11 @@ def _report_platform_profile(
             "cpu_timeline_copy": "有平台级集群频率证据时才绘制；当前 iOS 采集通常留空。",
             "system_copy": (
                 "周期采集 DVT sysmontap 进程 CPU、内存、磁盘计数器和相对 powerScore；"
-                "采集器进程单独标记。"
+                "sysmond、DTServiceHub 与配对服务单独标记为观察者相关进程。"
             ),
             "system_source": "DVT sysmontap 快照",
-            "system_activity_title": "系统与采集器活动聚合",
-            "priority_activity_title": "重点系统 / 采集器活动",
+            "system_activity_title": "系统与观察者相关活动聚合",
+            "priority_activity_title": "重点系统 / 观察者相关活动",
             "thermal_copy": (
                 "展示 iOS 当前可观测的电池温度；未公开的热严重度、冷却设备、"
                 "cpuset 与调度策略会明确留空。"
@@ -4142,15 +6073,16 @@ def _report_platform_profile(
                 "它不是 GPU 电源轨，也不是应用级电能归因。"
             ),
             "attribution_copy": (
-                "iOS 整机物理功率与 DVT 进程相对功耗分数分开展示；"
+                "iOS 整机原始 SystemLoad 通道与 DVT 进程相对功耗分数分开展示；"
                 "当前不把相对分数换算成 mW 或应用独占能量。"
             ),
             "attribution_tag_kind": "context",
             "attribution_tag": "相对分数 ≠ mW",
             "attribution_note": (
                 '<div class="availability-note"><strong>iOS 归因边界</strong>'
-                '<span>DVT powerScore 仅用于同一会话内的相对诊断。整机功率仍来自电池侧 '
-                'PowerTelemetry；两类数值不可相加，也不构成单进程电源轨测量。</span></div>'
+                '<span>DVT powerScore 仅用于同一会话内的相对诊断。整机原始功率通道来自 '
+                'DiagnosticsService PowerTelemetryData.SystemLoad，电池 I×V 另作电池流量；'
+                '这些数值不可相加，也不构成单进程或独立硬件电源轨测量。</span></div>'
             ),
             "test_item_copy": (
                 "按前台应用或导入测试阶段计算整机能量，并同步检查可见的进程、"
@@ -4160,7 +6092,7 @@ def _report_platform_profile(
                 "功率、前台应用、测试项、系统活动和平台可提供的热 / 调度证据共享同一时间轴。"
             ),
             "test_item_boundary": (
-                "测试项能量来自低频刷新的电池侧整机物理功率；进程 CPU、DVT 相对功耗分数、"
+                "测试项能量仅来自低频 SystemLoad 中可验证的有效放电区间；电池电流×电压另作电池流量，进程 CPU、DVT 相对功耗分数、"
                 "GPU 利用率和温度只表示同期证据。多个重叠测试项不可相加，也不能当作单进程独占功耗。"
             ),
         }
@@ -4177,6 +6109,7 @@ def _report_platform_profile(
             "cpu_title": "CPU 活动与频率",
             "cpu_copy": (
                 "使用 HDC 持久化 shell 采集 /proc/stat 利用率，并以较低频率读取 hidumper --cpufreq；"
+                "相同最大频率的核心只按组取均值，不代表共享 Android cpufreq policy；"
                 "不套用 Android Power Profile，也不推断 CPU 电源轨功耗。"
             ),
             "cpu_tag_kind": "counter",
@@ -4211,11 +6144,13 @@ def _report_platform_profile(
                 "按前台 Ability 或导入测试阶段计算电池侧整机能量，并同步检查进程、CPU、热传感器和电源状态。"
             ),
             "test_item_timeline_copy": (
-                "功率、前台 Ability、测试项、系统活动与 HarmonyOS 热 / 电源上下文共享设备实时时钟。"
+                "功率、前台 Ability、测试项、系统活动与 HarmonyOS 热 / 电源上下文共享设备实时时钟；"
+                "前台、亮灭屏与供电状态约每 5 秒复核一次。"
             ),
             "test_item_boundary": (
                 "测试项能量来自 BatteryService 电流与电压的整机实测；进程 CPU、系统活动、频率与温度只表示同期证据。"
-                "重叠测试项不可相加，也不能当作单应用或单硬件电源轨功耗。"
+                "重叠测试项不可相加，也不能当作单应用或单硬件电源轨功耗。切换前后台、亮灭屏或插拔供电后的"
+                "过渡窗口可能保留最多约 5 秒的上一状态归属。"
             ),
         }
     model = " ".join(
@@ -4267,20 +6202,102 @@ def _report_mode_profile(
     test_mode = str(metadata.get("test_mode") or "power").strip().lower()
     result = dict(profile)
     if test_mode == "performance":
-        result.update(
-            {
+        platform = str(result.get("platform") or "android")
+        capture = metadata.get("capture_configuration", {})
+        capture = capture if isinstance(capture, dict) else {}
+        if platform == "ios":
+            result.update(
+                {
+                    "report_subtitle": "iOS CPU / GPU、整机原始 SystemLoad 与前台状态分析",
+                    "overview_title": "iOS 性能测试概览",
+                    "overview_tag": "DVT 资源遥测 + PowerTelemetry",
+                    "overview_copy": (
+                        "CPU、实际收到的 GPU 利用率、低频整机原始 SystemLoad、电池诊断与前台应用事件统一按设备时间对齐。"
+                        "当前后端不提供通用应用 FPS、1% Low 或 Core Animation 详细帧时间戳。"
+                    ),
+                    "timeline_copy": (
+                        "只并排展示本次实际采到的 CPU、GPU、整机原始 SystemLoad 通道、电池流量、电流、电压、温度和观察者相关进程 CPU。"
+                    ),
+                    "cpu_title": "iOS CPU 资源上下文",
+                    "cpu_copy": (
+                        "展示 DVT 归一化整机 CPU；iOS 未公开 CPU 集群频率，报告不会虚构频率或 CPU 电源轨。"
+                    ),
+                    "cpu_tag_kind": "counter",
+                    "cpu_tag": "DVT 计数器，非 CPU 电源轨",
+                    "cpu_timeline_copy": "CPU 用于解释资源压力，不换算独立功耗。",
+                    "gpu_copy": (
+                        "仅在实际收到 DVT Graphics 事件时展示 GPU 利用率；数据流停止后旧值不会继续冒充实时样本。"
+                    ),
+                    "test_item_copy": (
+                        "按导入阶段或真实前台应用事件聚合 CPU/GPU、整机原始 SystemLoad 和温度；不生成 FPS、1% Low 或渲染阶段结论。"
+                    ),
+                    "test_item_timeline_copy": (
+                        "CPU/GPU、前台应用、测试项、SystemLoad、电池流量与电池温度共享同一设备时间轴。"
+                    ),
+                    "test_item_boundary": (
+                        "PowerTelemetry SystemLoad 通常约 20 秒更新；观察者相关进程 CPU 是 sysmond、DTServiceHub 与配对服务同期活动上界，"
+                        "包含本底活动，不能当作工具造成的净增量。"
+                    ),
+                }
+            )
+        elif platform == "harmony":
+            smartperf = str(capture.get("backend") or "") == "harmony_smartperf"
+            result.update(
+                {
+                    "report_subtitle": "HarmonyOS 帧节奏、资源与温度分析",
+                    "overview_title": "HarmonyOS 性能测试概览",
+                    "overview_tag": "SmartPerf 应用帧" if smartperf else "RenderService 合成上下文",
+                    "overview_copy": (
+                        "SmartPerf 使用目标处于前台时的应用 FPS 与原始 jitter；CPU/GPU/DDR、温度和电池侧数据按同一设备时间域对齐。"
+                        if smartperf
+                        else "原生后端只保留亮屏期间可验证的 RenderService 合成节奏、CPU 频率、温度和电池侧上下文；不会冒充目标应用 FPS。"
+                    ),
+                    "timeline_copy": (
+                        "只展示实际采到的帧节奏、CPU/GPU/DDR、温度与电池侧原始数据；USB 充电流量不会解释为设备耗电。"
+                    ),
+                    "cpu_title": "CPU 活动与频率上下文",
+                    "cpu_copy": (
+                        "HarmonyOS 频率按最大频率相同的核心分组取均值，不代表这些核心共享 Android cpufreq policy。"
+                    ),
+                    "cpu_tag_kind": "counter",
+                    "cpu_tag": "HDC / SmartPerf 计数器",
+                    "cpu_timeline_copy": "CPU 频率和利用率用于解释帧节奏，不进行 CPU 功耗归因。",
+                    "gpu_copy": (
+                        "SmartPerf 返回 GPU/DDR 时才展示；原生 HDC 后端没有这些会话时间序列，不进行补值或推断。"
+                    ),
+                    "test_item_copy": (
+                        "按目标前台区间聚合 SmartPerf 应用 FPS、1% Low、P95/P99 jitter、资源与温度上下文。"
+                        if smartperf
+                        else "按测试阶段聚合系统级合成节奏、CPU 与温度上下文，并明确它不是目标应用独立 FPS。"
+                    ),
+                    "test_item_timeline_copy": (
+                        "帧节奏、前台 Ability、测试项、资源、温度传感器和电池侧数据共享同一设备时间域；"
+                        "前台、亮灭屏与供电状态约每 5 秒复核一次。"
+                    ),
+                    "test_item_boundary": (
+                        "SmartPerf jitter 可用于帧间隔统计，但不提供 Android RenderThread/BufferQueue/GPU 阶段拆分；"
+                        "状态切换后的归属可能有最多约 5 秒过渡延迟。"
+                        if smartperf
+                        else "原生 RenderService 是系统级合成上下文；没有目标绑定时不生成应用 1% Low 或渲染阶段结论；"
+                        "状态切换后的归属可能有最多约 5 秒过渡延迟。"
+                    ),
+                }
+            )
+        else:
+            result.update(
+                {
                 "report_subtitle": "游戏帧表现、渲染链路与资源调度分析",
                 "overview_title": "性能测试概览",
-                "overview_tag": "帧计数器 + 整机功耗记录",
+                "overview_tag": "帧计数器 + 电池侧功率记录",
                 "overview_copy": (
-                    "帧表现使用前台窗口 / 合成器计数器；CPU、GPU、调度与整机功耗统一使用设备 uptime 对齐。"
+                    "帧表现使用前台窗口 / 合成器计数器；CPU、GPU、调度与电池侧功率统一使用设备 uptime 对齐。"
                 ),
                 "timeline_copy": (
-                    "帧率窗口、CPU/GPU、可用资源、调度与整机功耗记录位于同一设备时间轴。"
+                    "帧率窗口、CPU/GPU、可用资源、调度与逐样本电池侧功率位于同一设备时间轴。"
                 ),
                 "cpu_title": "CPU 调度与频率上下文",
                 "cpu_copy": (
-                    "展示各集群负载、频率驻留与可用核心分配，用于判断主线程 / RenderThread 是否受到调度竞争或频率上限影响。"
+                    "CPU 只保留整机总负载与核心组频率；核心组表展示核心编号、频率范围和驻留，不重复罗列分组负载或模型功率。"
                 ),
                 "cpu_tag_kind": "counter",
                 "cpu_tag": "资源计数器，不换算 CPU 电源轨",
@@ -4296,10 +6313,10 @@ def _report_mode_profile(
                 ),
                 "test_item_boundary": (
                     "详细 framestats 可用时用于阶段和慢帧分析；否则使用周期帧计数窗口给出保守指标。"
-                    "整机功耗仅记录测试窗口均值，不拆分到进程、UID、Wakelock 或硬件组件。"
+                    "测试项只展示窗口平均电池侧功率，不拆分到进程、UID、Wakelock 或硬件组件。"
                 ),
-            }
-        )
+                }
+            )
     else:
         result.update(
             {
@@ -4324,12 +6341,26 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
     samples = bundle.get("samples", [])
     summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
     device = metadata.get("device", {}) if isinstance(metadata, dict) else {}
-    profile = _report_mode_profile(_report_platform_profile(metadata, device), metadata)
-    platform = profile["platform"]
     analysis_mode = analysis.get("test_mode") if isinstance(analysis, dict) else None
-    test_mode = str(analysis_mode or metadata.get("test_mode") or "power").strip().lower()
+    performance_hint = analysis.get("performance", {}) if isinstance(analysis, dict) else {}
+    performance_hint = performance_hint if isinstance(performance_hint, dict) else {}
+    inferred_mode = "performance" if (
+        performance_hint.get("available") is True
+        or isinstance(performance_hint.get("frame_sample_count"), (int, float))
+        and float(performance_hint.get("frame_sample_count") or 0.0) > 0
+    ) else "power"
+    test_mode = str(
+        analysis_mode or metadata.get("test_mode") or inferred_mode
+    ).strip().lower()
     if test_mode not in {"power", "performance"}:
         test_mode = "power"
+    profile_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    profile_metadata["test_mode"] = test_mode
+    profile = _report_mode_profile(
+        _report_platform_profile(profile_metadata, device),
+        profile_metadata,
+    )
+    platform = profile["platform"]
     target = metadata.get("target_package")
     if not target:
         target = "多应用会话" if metadata.get("session_mode") else metadata.get("foreground_package") or "未指定目标"
@@ -4554,7 +6585,11 @@ def build_report_fragment(bundle: Dict[str, object]) -> str:
             1,
             "0",
         ),
-        "@@SOURCE_ROWS@@": _source_rows(analysis),
+        "@@SOURCE_ROWS@@": _source_rows(
+            analysis,
+            samples if isinstance(samples, list) else [],
+            bundle.get("contexts", []) if isinstance(bundle.get("contexts"), list) else [],
+        ),
         "@@CAPTURE_CONFIGURATION_ROWS@@": _capture_configuration_rows(metadata),
         "@@ANALYSIS_COVERAGE_SECTION@@": _analysis_coverage_section(
             analysis,

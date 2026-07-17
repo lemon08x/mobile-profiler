@@ -64,6 +64,10 @@ def _platform_hardware(metadata: Dict[str, object]) -> str:
         version = device.get("ios") or "—"
         hardware = device.get("hardware") or device.get("product_type") or "—"
         return f"iOS {version} / {hardware}"
+    if platform == "harmony":
+        version = device.get("harmony") or device.get("openharmony") or "—"
+        hardware = device.get("soc_model") or device.get("hardware") or "—"
+        return f"HarmonyOS {version} / {hardware}"
     version = device.get("android") or "—"
     hardware = device.get("soc_model") or device.get("hardware") or "—"
     return f"Android {version} / {hardware}"
@@ -131,6 +135,15 @@ def build_run_comparison(
     summary_b = analysis_b.get("summary", {})
     summary_a = summary_a if isinstance(summary_a, dict) else {}
     summary_b = summary_b if isinstance(summary_b, dict) else {}
+    consumption_representative_a = (
+        summary_a.get("consumption_session_representative") is True
+    )
+    consumption_representative_b = (
+        summary_b.get("consumption_session_representative") is True
+    )
+    power_comparison_available = (
+        consumption_representative_a and consumption_representative_b
+    )
 
     metric_specs = [
         ("average_power_mw", "平均功率", "mW", True),
@@ -143,10 +156,19 @@ def build_run_comparison(
         ("temperature_delta_c", "电池温升", "°C", True),
         ("coverage_pct", "遥测覆盖率", "%", False),
     ]
+    consumption_metric_keys = {
+        "average_power_mw",
+        "p95_power_mw",
+        "maximum_power_mw",
+        "energy_per_minute_mwh",
+        "average_current_ma",
+    }
     summary_rows = []
     for key, label, unit, lower_is_better in metric_specs:
-        value_a = summary_a.get(key)
-        value_b = summary_b.get(key)
+        consumption_metric = key in consumption_metric_keys
+        available = not consumption_metric or power_comparison_available
+        value_a = summary_a.get(key) if available else None
+        value_b = summary_b.get(key) if available else None
         difference = _delta(value_a, value_b)
         summary_rows.append(
             {
@@ -157,6 +179,12 @@ def build_run_comparison(
                 "b": value_b,
                 "delta": difference,
                 "lower_is_better": lower_is_better,
+                "available": available,
+                "unavailable_reason": (
+                    None
+                    if available
+                    else "两侧都必须是完整、连续且明确未接外部电源的放电会话。"
+                ),
             }
         )
 
@@ -166,8 +194,14 @@ def build_run_comparison(
     for phase, name in sorted(set(map_a) | set(map_b)):
         item_a = map_a.get((phase, name))
         item_b = map_b.get((phase, name))
-        rate_a = item_a.get("mwh_per_minute") if item_a else None
-        rate_b = item_b.get("mwh_per_minute") if item_b else None
+        item_power_available = bool(
+            item_a
+            and item_b
+            and item_a.get("power_valid_for_consumption") is True
+            and item_b.get("power_valid_for_consumption") is True
+        )
+        rate_a = item_a.get("mwh_per_minute") if item_power_available and item_a else None
+        rate_b = item_b.get("mwh_per_minute") if item_power_available and item_b else None
         rate_delta = _delta(rate_a, rate_b)
         winner = None
         if _number(rate_a) is not None and _number(rate_b) is not None:
@@ -188,12 +222,12 @@ def build_run_comparison(
                 ),
                 "energy_rate_delta": rate_delta,
                 "average_power_delta": _delta(
-                    item_a.get("average_power_mw") if item_a else None,
-                    item_b.get("average_power_mw") if item_b else None,
+                    item_a.get("average_power_mw") if item_power_available and item_a else None,
+                    item_b.get("average_power_mw") if item_power_available and item_b else None,
                 ),
                 "p95_power_delta": _delta(
-                    item_a.get("p95_power_mw") if item_a else None,
-                    item_b.get("p95_power_mw") if item_b else None,
+                    item_a.get("p95_power_mw") if item_power_available and item_a else None,
+                    item_b.get("p95_power_mw") if item_power_available and item_b else None,
                 ),
                 "cpu_delta": _delta(
                     item_a.get("average_cpu_pct") if item_a else None,
@@ -210,10 +244,24 @@ def build_run_comparison(
                 "top_processes_a": _top_processes(item_a),
                 "top_processes_b": _top_processes(item_b),
                 "lower_energy_rate": winner,
+                "power_comparison_available": item_power_available,
             }
         )
 
     warnings = []
+    if not power_comparison_available:
+        invalid_labels = [
+            label
+            for label, valid in (
+                (label_a, consumption_representative_a),
+                (label_b, consumption_representative_b),
+            )
+            if not valid
+        ]
+        warnings.append(
+            "、".join(invalid_labels)
+            + " 不是完整且明确的电池放电会话；平均功耗、P95、能量速率和低能耗侧均不比较。"
+        )
     coverage_a = _number(summary_a.get("coverage_pct"))
     coverage_b = _number(summary_b.get("coverage_pct"))
     if coverage_a is not None and coverage_a < 90:
@@ -250,7 +298,7 @@ def build_run_comparison(
         warnings.append(f"有 {len(duration_mismatch)} 个配对测试项时长差超过 5%，优先比较 mWh/min 和平均功率。")
 
     return {
-        "schema": "mobile-profiler-comparison-v1",
+        "schema": "mobile-profiler-comparison-v2",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "title": title,
         "labels": {"a": label_a, "b": label_b},
@@ -271,10 +319,12 @@ def build_run_comparison(
         "summary_rows": summary_rows,
         "test_items": test_rows,
         "matched_test_item_count": len(matched),
+        "power_comparison_available": power_comparison_available,
         "warnings": warnings,
         "interpretation": (
-            "Positive delta means B minus A. Whole-device power and mWh/min are directly measured at the battery side. "
-            "Process, GC, kworker, DEX/update and thermal values remain sampled temporal evidence rather than exclusive rail power."
+            "Positive delta means B minus A. Whole-device consumption power and mWh/min are compared only when both "
+            "runs are complete, continuous, explicitly unplugged battery-discharge sessions. Process, GC, kworker, "
+            "DEX/update and thermal values remain sampled temporal evidence rather than exclusive rail power."
         ),
     }
 
@@ -348,14 +398,16 @@ def build_comparison_html(comparison: Dict[str, object]) -> str:
     for row in comparison["test_items"]:
         item_a = row.get("a") or {}
         item_b = row.get("b") or {}
+        power_item_a = item_a if row.get("power_comparison_available") is True else {}
+        power_item_b = item_b if row.get("power_comparison_available") is True else {}
         test_rows.append(
             "<tr>"
             f"<td><strong>{html.escape(str(row.get('name')))}</strong><span>{html.escape(str(row.get('phase')))}</span></td>"
             f"<td>{_fmt(item_a.get('duration_s'))} / {_fmt(item_b.get('duration_s'))} s</td>"
-            f"<td>{_fmt(item_a.get('mwh_per_minute'), 2)} / {_fmt(item_b.get('mwh_per_minute'), 2)}</td>"
-            f"<td>{_fmt(item_a.get('average_power_mw'), 0)} / {_fmt(item_b.get('average_power_mw'), 0)} mW</td>"
+            f"<td>{_fmt(power_item_a.get('mwh_per_minute'), 2)} / {_fmt(power_item_b.get('mwh_per_minute'), 2)}</td>"
+            f"<td>{_fmt(power_item_a.get('average_power_mw'), 0)} / {_fmt(power_item_b.get('average_power_mw'), 0)} mW</td>"
             f"<td>{_delta_html(row.get('average_power_delta'), 'mW', 0)}</td>"
-            f"<td>{_fmt(item_a.get('p95_power_mw'), 0)} / {_fmt(item_b.get('p95_power_mw'), 0)} mW</td>"
+            f"<td>{_fmt(power_item_a.get('p95_power_mw'), 0)} / {_fmt(power_item_b.get('p95_power_mw'), 0)} mW</td>"
             f"<td>{_fmt(item_a.get('average_cpu_pct'))}% / {_fmt(item_b.get('average_cpu_pct'))}%</td>"
             f"<td>{html.escape(_gpu_item_text(item_a))} / {html.escape(_gpu_item_text(item_b))}</td>"
             f"<td>{_fmt(item_a.get('maximum_temperature_c'))} / {_fmt(item_b.get('maximum_temperature_c'))} °C</td>"

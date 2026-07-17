@@ -66,6 +66,11 @@ The core package stays standard-library-only. Android runs through
 `collector.py`, native HarmonyOS runs through `harmony.py`, and iOS runs in a
 separate Python interpreter containing `pymobiledevice3`.
 
+For current devices, that sidecar uses official CPython 3.13+ because iOS 18.2+
+requires the TCP tunnel and Python's native TLS-PSK callback. The pinned
+`pymobiledevice3 9.34.0` runtime also pins `pmd-pytcp 0.0.6`; its synchronous
+userspace-stack API matches pymobiledevice3, whereas pmd-pytcp 0.1.x does not.
+
 ```text
 Android <-- ADB -------- S| / CTX| -------------+
 HarmonyOS <-- HDC ------ N| + JSONL ------------+
@@ -157,27 +162,34 @@ device.
 ### iOS lifecycle
 
 1. A trusted USB connection creates a persistent RemotePairing record.
-2. The parent caches the validated Wi-Fi host/port under
-   `~/.mobile-profiler/ios-devices.json`.
-3. Probe opens a userspace RSD tunnel, reads DiagnosticsService battery data,
+2. The parent caches a currently reachable RemoteXPC host/port under
+   `~/.mobile-profiler/ios-devices.json`. Reachability is retried to reduce
+   transient route failures, but it is not treated as proof of Wi-Fi.
+3. Device state separates `remote_xpc_ready` from `unplug_ready`. IPv4
+   `169.254/16` and IPv6 link-local endpoints are conservatively treated as
+   possible USB-NCM paths. An unplugged test requires a non-link-local endpoint
+   that remains reachable after USB discovery is gone.
+4. Probe opens a userspace RSD tunnel, reads DiagnosticsService battery data,
    inspects DVT sysmon capabilities, and samples DVT Graphics availability.
-4. Record starts concurrent DVT sysmontap, Graphics, and application-state
+5. Record starts concurrent DVT sysmontap, Graphics, and application-state
    notification streams plus low-frequency battery diagnostics polling.
-5. Physical battery power/current/voltage/temperature and high-frequency DVT
+6. Physical battery power/current/voltage/temperature and high-frequency DVT
    counters are normalized into `Sample`; DVT `powerScore` remains a relative
    field in process snapshots and is never converted into mW.
-6. `sysmond`, `DTServiceHub`, and `remotepairingdeviced` are tagged as collector
+7. `sysmond`, `DTServiceHub`, and `remotepairingdeviced` are tagged as collector
    overhead. Normalized collector CPU is also retained per sample.
-7. If the sidecar exits, the parent restarts it against the cached endpoint
+8. If the sidecar exits, the parent restarts it against the cached endpoint
    until the original deadline or reconnect timeout. Device uptime deduplicates
    overlapping rows across sidecar sessions.
-8. Finalization consumes the same journal, analysis, CSV, and report pipeline
+9. Finalization consumes the same journal, analysis, CSV, and report pipeline
    as Android.
 
-Apple's physical power fields commonly refresh about every 20 seconds while
-DVT counters refresh at 0.5-1 second cadence. `power_sample_age_s` records that
-staleness explicitly instead of presenting repeated rows as fresh physical
-measurements.
+Apple's `PowerTelemetryData.SystemLoad` whole-device telemetry channel commonly
+refreshes about every 20 seconds while DVT counters refresh at 0.5-1 second
+cadence. Under external power it can track `SystemPowerIn`; it is neither the
+battery current×voltage flow nor an independently measured hardware rail.
+`power_sample_age_s` records that staleness explicitly instead of presenting
+repeated rows as fresh observations.
 
 ## Runtime UI boundary
 
@@ -276,9 +288,12 @@ long disconnect and integrating it as measured energy.
 - Time-weighted averages over valid intervals.
 - Spike detection and five-minute windows.
 
-On iOS, `PowerTelemetryData.SystemLoad` is preferred for whole-device physical
-power. Current × voltage remains the fallback. The analysis also reports the
-observed power-source names, physical-sample age, and collector CPU overhead.
+On iOS, `PowerTelemetryData.SystemLoad` is retained as the preferred whole-device
+PowerTelemetry channel. Under external power it may track `SystemPowerIn`, so it
+is not renamed as battery discharge. Current × voltage is retained separately as
+battery flow; if it is used as a fallback sample source, the source name remains
+explicit and mixed domains are not presented as one rail. The analysis also
+reports source names, sample age, and observer-related CPU.
 
 ### Kernel and driver evidence
 

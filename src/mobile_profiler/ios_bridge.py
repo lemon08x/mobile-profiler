@@ -11,16 +11,80 @@ dependency and providing the same boundary a native HarmonyOS sidecar can use.
 import argparse
 import asyncio
 import dataclasses
+import inspect
 import json
+import math
 import os
 import plistlib
 import socket
+import ssl
 import sys
 import time
 import warnings
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+
+
+_WINDOWS_DLL_DIRECTORY_HANDLES: list[object] = []
+
+
+def _configure_windows_sslpsk_runtime() -> list[str]:
+    """Expose the OpenSSL runtime required by sslpsk-pmd3 on Windows.
+
+    A venv created from Conda can execute without inheriting Conda's
+    ``Library\\bin`` DLL search path.  Some sslpsk-pmd3 wheels still link to
+    OpenSSL 1.1, so pymobiledevice3 otherwise silently leaves
+    ``SSLPSKContext`` as ``None`` and RemotePairing fails much later with an
+    opaque ``NoneType is not callable`` error.
+    """
+
+    add_directory = getattr(os, "add_dll_directory", None)
+    if sys.platform != "win32" or not callable(add_directory):
+        return []
+
+    bases: list[Path] = []
+    for value in (
+        getattr(sys, "prefix", None),
+        getattr(sys, "base_prefix", None),
+        os.environ.get("CONDA_PREFIX"),
+    ):
+        if value:
+            path = Path(str(value))
+            if path not in bases:
+                bases.append(path)
+
+    candidates: list[Path] = []
+    for base in bases:
+        candidates.append(base / "Library" / "bin")
+        package_root = base / "pkgs"
+        if package_root.is_dir():
+            candidates.extend(
+                sorted(
+                    package_root.glob("openssl-*/Library/bin"),
+                    key=lambda item: item.parent.parent.parent.name,
+                    reverse=True,
+                )
+            )
+    for value in os.environ.get("PATH", "").split(os.pathsep):
+        if value:
+            candidates.append(Path(value))
+
+    configured: list[str] = []
+    seen: set[str] = set()
+    required = ("libssl-1_1-x64.dll", "libcrypto-1_1-x64.dll")
+    for directory in candidates:
+        key = os.path.normcase(os.path.abspath(str(directory)))
+        if key in seen or not all((directory / name).is_file() for name in required):
+            continue
+        seen.add(key)
+        try:
+            handle = add_directory(str(directory))
+        except OSError:
+            continue
+        _WINDOWS_DLL_DIRECTORY_HANDLES.append(handle)
+        configured.append(str(directory))
+    return configured
 
 
 def _configure_windows_event_loop() -> None:
@@ -34,7 +98,48 @@ def _configure_windows_event_loop() -> None:
         asyncio.set_event_loop_policy(policy_factory())
 
 
+_configure_windows_sslpsk_runtime()
 _configure_windows_event_loop()
+
+
+def _pairing_tls_runtime_error(
+    tunnel_service_module: object,
+    *,
+    python_version: Optional[tuple[int, ...]] = None,
+    ssl_context_type: Optional[type[ssl.SSLContext]] = None,
+) -> Optional[str]:
+    """Return an actionable error when the selected Python cannot create the TCP PSK tunnel."""
+
+    version = tuple(python_version or sys.version_info[:3])
+    context_type = ssl_context_type or ssl.SSLContext
+    if version >= (3, 13):
+        if callable(getattr(context_type, "set_psk_client_callback", None)):
+            return None
+        return (
+            "Python 3.13+ is present, but its SSLContext does not expose the native "
+            "PSK callback required by pymobiledevice3 TCP tunnels; use the official "
+            "CPython 3.13+ Windows build"
+        )
+    if getattr(tunnel_service_module, "SSLPSKContext", None) is None:
+        return (
+            "Python below 3.13 requires sslpsk-pmd3 and a compatible OpenSSL 1.1 "
+            "runtime. iOS 18.2+ removed QUIC tunnel support, so use an official "
+            "CPython 3.13+ iOS sidecar instead"
+        )
+    return None
+
+
+def _userspace_tunnel_runtime_error(userspace_tunnel_module: object) -> Optional[str]:
+    """Detect the incompatible asynchronous PyTCP API selected by an unbounded pip resolve."""
+
+    stack_module = getattr(userspace_tunnel_module, "stack", None)
+    if inspect.iscoroutinefunction(getattr(stack_module, "start", None)):
+        return (
+            "pymobiledevice3 9.34.0 expects the synchronous pmd-pytcp API, but "
+            "pmd-pytcp 0.1.0+ exposes asynchronous stack/socket methods. Install "
+            "pmd-pytcp==0.0.6 in the iOS sidecar environment"
+        )
+    return None
 
 
 DISCOVERY_IMPORT_ERROR: Optional[BaseException] = None
@@ -62,12 +167,18 @@ except BaseException as exc:  # pragma: no cover - exercised through the parent 
 try:
     from pymobiledevice3.bonjour import browse_remotepairing
     from pymobiledevice3.exceptions import RemotePairingCompletedError
-    from pymobiledevice3.remote import userspace_tunnel
+    from pymobiledevice3.remote import tunnel_service, userspace_tunnel
     from pymobiledevice3.remote.tunnel_service import (
         CoreDeviceTunnelProxy,
         RemotePairingLockdownService,
         create_core_device_tunnel_service_using_remotepairing,
     )
+    pairing_tls_error = _pairing_tls_runtime_error(tunnel_service)
+    if pairing_tls_error is not None:
+        raise RuntimeError(pairing_tls_error)
+    userspace_tunnel_error = _userspace_tunnel_runtime_error(userspace_tunnel)
+    if userspace_tunnel_error is not None:
+        raise RuntimeError(userspace_tunnel_error)
 except BaseException as exc:  # pragma: no cover - exercised through pairing/probe checks
     PAIRING_IMPORT_ERROR = exc
 
@@ -89,6 +200,28 @@ except BaseException as exc:  # pragma: no cover - exercised through probe/recor
 DEFAULT_REMOTE_PORT = 49152
 PAIR_CACHE = Path.home() / ".pymobiledevice3"
 COLLECTOR_PROCESSES = {"sysmond", "DTServiceHub", "remotepairingdeviced"}
+GPU_SAMPLE_STALE_AFTER_S = 5.0
+SYSTEM_LOAD_SAMPLE_STALE_AFTER_S = 30.0
+
+
+def _ios_collection_target_coverage_s(duration_s: float, interval_s: float) -> float:
+    """Choose the longest configured sample span that does not exceed the request."""
+
+    duration = max(0.0, float(duration_s))
+    interval = max(0.001, float(interval_s))
+    completed_intervals = max(1, int(math.floor((duration + 1e-9) / interval)))
+    return completed_intervals * interval
+
+
+def _ios_collection_window_complete(
+    first_uptime_s: float,
+    current_uptime_s: float,
+    duration_s: float,
+    interval_s: float,
+) -> bool:
+    target = _ios_collection_target_coverage_s(duration_s, interval_s)
+    tolerance = min(0.5, max(0.05, float(interval_s) * 0.1))
+    return float(current_uptime_s) - float(first_uptime_s) >= target - tolerance
 
 
 def _json_default(value: object) -> object:
@@ -496,7 +629,9 @@ async def _open_rsd(
 def _battery_payload(raw: dict[str, object]) -> dict[str, object]:
     telemetry = raw.get("PowerTelemetryData")
     telemetry = telemetry if isinstance(telemetry, dict) else {}
-    external = bool(raw.get("ExternalConnected"))
+    raw_external = raw.get("ExternalConnected")
+    external_state_available = isinstance(raw_external, (bool, int))
+    external = bool(raw_external) if external_state_available else None
     charging = bool(raw.get("IsCharging"))
     raw_current = raw.get("InstantAmperage")
     if not isinstance(raw_current, (int, float)):
@@ -517,8 +652,9 @@ def _battery_payload(raw: dict[str, object]) -> dict[str, object]:
         "voltage_mv": raw.get("Voltage"),
         "temperature_c": float(temperature) / 100.0 if isinstance(temperature, (int, float)) else None,
         "status": status,
-        "powered": ["External"] if external else [],
+        "powered": ["External"] if external is True else [],
         "external_connected": external,
+        "external_power_state_available": external_state_available,
         "is_charging": charging,
         "fully_charged": bool(raw.get("FullyCharged")),
         "current_ma": current,
@@ -558,13 +694,50 @@ def _battery_revision(raw: dict[str, object]) -> tuple[object, ...]:
     )
 
 
-def _battery_sample_age(raw: dict[str, object], changed_host_epoch_s: float) -> float:
-    update_time = raw.get("UpdateTime")
-    if isinstance(update_time, (int, float)):
-        epoch_age = time.time() - float(update_time)
-        if -5.0 <= epoch_age <= 86_400.0:
-            return max(0.0, epoch_age)
-    return max(0.0, time.time() - changed_host_epoch_s)
+def _selected_power_revision(raw: dict[str, object]) -> tuple[object, ...]:
+    """Return a conservative revision for the power source selected for samples."""
+
+    telemetry = raw.get("PowerTelemetryData")
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    system_load = telemetry.get("SystemLoad")
+    if isinstance(system_load, (int, float)):
+        return (
+            "ios_power_telemetry_system_load",
+            system_load,
+            telemetry.get("SystemEnergyConsumed"),
+            telemetry.get("AccumulatedSystemEnergyConsumed"),
+        )
+
+    raw_current = raw.get("InstantAmperage")
+    if not isinstance(raw_current, (int, float)):
+        raw_current = raw.get("Amperage")
+    return (
+        "ios_battery_current_voltage",
+        raw_current,
+        raw.get("Voltage"),
+    )
+
+
+def _sample_age_s(changed_host_monotonic_s: float) -> float:
+    return max(0.0, time.monotonic() - changed_host_monotonic_s)
+
+
+def _power_valid_for_consumption(
+    direction: str,
+    external_power: Optional[bool],
+    power_source: str,
+    power_sample_age_s: Optional[float],
+) -> bool:
+    if direction != "discharging" or external_power is not False:
+        return False
+    if power_source != "ios_power_telemetry_system_load":
+        return True
+    return bool(
+        isinstance(power_sample_age_s, (int, float))
+        and not isinstance(power_sample_age_s, bool)
+        and math.isfinite(float(power_sample_age_s))
+        and 0.0 <= float(power_sample_age_s) <= SYSTEM_LOAD_SAMPLE_STALE_AFTER_S
+    )
 
 
 async def probe_device(
@@ -644,7 +817,8 @@ async def probe_device(
             "wireless": bool(host and port),
             "process_cpu": bool(process_attributes),
             "gpu_utilization": bool(graphics),
-            "application_state_notifications": True,
+            "application_state_notifications": None,
+            "application_state_notifications_status": "not_probed",
             "battery_power_update_hint_s": 20,
         },
         "connection": {"type": "wireless" if host and port else "usb", "host": host, "port": port},
@@ -739,11 +913,14 @@ async def record_device(args: argparse.Namespace) -> None:
         async with DiagnosticsService(rsd) as diagnostics:
             initial_raw = dict(await diagnostics.get_battery() or {})
         latest_battery = initial_raw
-        latest_battery_host = time.time()
         latest_battery_revision = _battery_revision(initial_raw)
+        latest_power_revision = _selected_power_revision(initial_raw)
+        latest_power_monotonic = time.monotonic()
         latest_graphics: dict[str, object] = {}
+        latest_graphics_monotonic: Optional[float] = None
         latest_uptime = 0.0
         current_app: Optional[dict[str, object]] = None
+        notifications_observed = False
         applications: dict[str, dict[str, object]] = {}
         stop = asyncio.Event()
         collector_values: list[float] = []
@@ -812,17 +989,21 @@ async def record_device(args: argparse.Namespace) -> None:
             )
 
             async def battery_loop() -> None:
-                nonlocal latest_battery, latest_battery_host, latest_battery_revision
+                nonlocal latest_battery, latest_battery_revision
+                nonlocal latest_power_revision, latest_power_monotonic
                 warned = False
                 while not stop.is_set():
                     try:
                         async with DiagnosticsService(rsd) as service:
                             value = dict(await service.get_battery() or {})
                         latest_battery = value
+                        power_revision = _selected_power_revision(value)
+                        if power_revision != latest_power_revision:
+                            latest_power_revision = power_revision
+                            latest_power_monotonic = time.monotonic()
                         revision = _battery_revision(value)
                         if revision != latest_battery_revision:
                             latest_battery_revision = revision
-                            latest_battery_host = time.time()
                             battery = _battery_payload(value)
                             temperature = battery.get("temperature_c")
                             if isinstance(temperature, (int, float)):
@@ -856,7 +1037,7 @@ async def record_device(args: argparse.Namespace) -> None:
                         pass
 
             async def graphics_loop() -> None:
-                nonlocal latest_graphics
+                nonlocal latest_graphics, latest_graphics_monotonic
                 try:
                     async with Graphics(dvt) as graphics:
                         async for event in graphics:
@@ -864,11 +1045,12 @@ async def record_device(args: argparse.Namespace) -> None:
                                 return
                             if isinstance(event, dict):
                                 latest_graphics = dict(event)
+                                latest_graphics_monotonic = time.monotonic()
                 except Exception as exc:
                     _emit("warning", message=f"iOS GPU graphics stream unavailable: {exc}")
 
             async def notifications_loop() -> None:
-                nonlocal current_app
+                nonlocal current_app, notifications_observed
                 try:
                     async with Notifications(dvt) as notifications:
                         async for event in notifications:
@@ -882,6 +1064,7 @@ async def record_device(args: argparse.Namespace) -> None:
                             value = arguments[0]
                             if not isinstance(value, dict):
                                 continue
+                            notifications_observed = True
                             state = str(value.get("state_description") or "")
                             app_name = str(value.get("appName") or "").strip() or None
                             executable = str(value.get("execName") or "").strip() or None
@@ -904,7 +1087,7 @@ async def record_device(args: argparse.Namespace) -> None:
                                         "uptime_s": event_uptime or latest_uptime,
                                         "foreground_package": bundle_id,
                                         "foreground_activity": executable,
-                                        "screen_state": "Awake",
+                                        "screen_state": None,
                                         "brightness_raw": None,
                                         "refresh_rate_hz": None,
                                         "source": "ios_dvt_notifications",
@@ -922,7 +1105,7 @@ async def record_device(args: argparse.Namespace) -> None:
                                         "uptime_s": event_uptime or latest_uptime,
                                         "foreground_package": None,
                                         "foreground_activity": None,
-                                        "screen_state": "Awake",
+                                        "screen_state": None,
                                         "brightness_raw": None,
                                         "refresh_rate_hz": None,
                                         "source": "ios_dvt_notifications",
@@ -943,16 +1126,25 @@ async def record_device(args: argparse.Namespace) -> None:
                 asyncio.create_task(graphics_loop(), name="ios-graphics"),
                 asyncio.create_task(notifications_loop(), name="ios-notifications"),
             ]
-            deadline = time.monotonic() + float(args.duration)
+            interval_s = max(0.001, float(args.interval))
+            target_coverage_s = _ios_collection_target_coverage_s(
+                float(args.duration),
+                interval_s,
+            )
+            deadline = time.monotonic() + float(args.duration) + max(
+                5.0,
+                interval_s * 2.0,
+            )
+            first_sample_uptime: Optional[float] = None
             sample_index = 0
             next_process_snapshot = 0.0
             next_clock_sync = clock_uptime + float(args.clock_interval)
             try:
                 async with tap:
                     async for row in tap:
-                        if time.monotonic() >= deadline:
-                            break
                         if "Processes" not in row:
+                            if time.monotonic() >= deadline:
+                                break
                             continue
                         processes = [
                             dict(zip(fields, values))
@@ -962,10 +1154,18 @@ async def record_device(args: argparse.Namespace) -> None:
                             item for item in processes if isinstance(item.get("cpuUsage"), (int, float))
                         ]
                         if not cpu_visible:
+                            if time.monotonic() >= deadline:
+                                break
                             continue
                         uptime = _mach_seconds(row.get("EndMachAbsTime"), numer, denom)
                         if uptime <= 0:
                             uptime = clock_uptime + (time.monotonic() - clock_monotonic)
+                        if first_sample_uptime is None:
+                            first_sample_uptime = uptime
+                            deadline = time.monotonic() + target_coverage_s + max(
+                                5.0,
+                                interval_s * 2.0,
+                            )
                         latest_uptime = uptime
                         total_process_cpu = sum(_number(item.get("cpuUsage")) for item in cpu_visible)
                         collector_cpu = sum(
@@ -992,7 +1192,12 @@ async def record_device(args: argparse.Namespace) -> None:
                         else:
                             power_mw = abs(signed_current) * voltage / 1000.0
                             power_source = "ios_battery_current_voltage"
-                        external = bool(battery.get("ExternalConnected"))
+                        raw_external = battery.get("ExternalConnected")
+                        external = (
+                            bool(raw_external)
+                            if isinstance(raw_external, (bool, int))
+                            else None
+                        )
                         charging = bool(battery.get("IsCharging"))
                         direction = (
                             "charging"
@@ -1001,9 +1206,22 @@ async def record_device(args: argparse.Namespace) -> None:
                             if signed_current < 0
                             else "idle"
                         )
-                        power_age = _battery_sample_age(battery, latest_battery_host)
+                        power_age = _sample_age_s(latest_power_monotonic)
                         temperature = battery.get("Temperature")
-                        gpu_load = latest_graphics.get("Device Utilization %")
+                        gpu_age = (
+                            _sample_age_s(latest_graphics_monotonic)
+                            if latest_graphics_monotonic is not None
+                            else None
+                        )
+                        gpu_stale = (
+                            gpu_age is None or gpu_age > GPU_SAMPLE_STALE_AFTER_S
+                        )
+                        raw_gpu_load = latest_graphics.get("Device Utilization %")
+                        gpu_load = (
+                            float(raw_gpu_load)
+                            if not gpu_stale and isinstance(raw_gpu_load, (int, float))
+                            else None
+                        )
                         _emit(
                             "sample",
                             sample={
@@ -1020,9 +1238,11 @@ async def record_device(args: argparse.Namespace) -> None:
                                 "cluster_cpu_pct": {},
                                 "frequencies_mhz": {},
                                 "gpu_frequency_mhz": None,
-                                "gpu_load_pct": (
-                                    float(gpu_load) if isinstance(gpu_load, (int, float)) else None
-                                ),
+                                "gpu_load_pct": gpu_load,
+                                "gpu_sample_age_s": gpu_age,
+                                "gpu_sample_stale": gpu_stale,
+                                "gpu_sample_available": gpu_load is not None,
+                                "gpu_sample_stale_after_s": GPU_SAMPLE_STALE_AFTER_S,
                                 "battery_temperature_c": (
                                     float(temperature) / 100.0
                                     if isinstance(temperature, (int, float))
@@ -1032,6 +1252,12 @@ async def record_device(args: argparse.Namespace) -> None:
                                 "power_sample_age_s": power_age,
                                 "collector_cpu_pct": normalized_collector_cpu,
                                 "external_power": external,
+                                "power_valid_for_consumption": _power_valid_for_consumption(
+                                    direction,
+                                    external,
+                                    power_source,
+                                    power_age,
+                                ),
                             },
                         )
                         sample_index += 1
@@ -1054,6 +1280,16 @@ async def record_device(args: argparse.Namespace) -> None:
                                 snapshot=_process_snapshot(cpu_visible, uptime, applications),
                             )
                             next_process_snapshot = uptime + float(args.process_interval)
+                        if (
+                            first_sample_uptime is not None
+                            and _ios_collection_window_complete(
+                                first_sample_uptime,
+                                uptime,
+                                float(args.duration),
+                                interval_s,
+                            )
+                        ) or time.monotonic() >= deadline:
+                            break
             finally:
                 stop.set()
                 for task in tasks:
@@ -1074,6 +1310,14 @@ async def record_device(args: argparse.Namespace) -> None:
                     sum(collector_values) / len(collector_values) if collector_values else None
                 ),
                 "battery_update_hint_s": 20,
+                "gpu_stream_observed": latest_graphics_monotonic is not None,
+                "gpu_last_sample_age_s": (
+                    _sample_age_s(latest_graphics_monotonic)
+                    if latest_graphics_monotonic is not None
+                    else None
+                ),
+                "gpu_sample_stale_after_s": GPU_SAMPLE_STALE_AFTER_S,
+                "application_state_notifications_observed": notifications_observed,
             },
         )
 

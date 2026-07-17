@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 APP_NAME = "Mobile Profiler"
 DEFAULT_ADB = os.environ.get("ADB", "adb")
 DEFAULT_DURATION_S = 60
 DEFAULT_INTERVAL_S = 1.0
+IOS_SYSTEM_LOAD_STALE_AFTER_S = 30.0
 
 
 @dataclass
@@ -106,6 +108,8 @@ class RawSample:
     gpu_frequency_raw: Optional[float] = None
     gpu_load_raw: Optional[float] = None
     memory_frequency_raw: Optional[float] = None
+    external_power: Optional[bool] = None
+    battery_status: Optional[str] = None
 
 
 @dataclass
@@ -129,6 +133,40 @@ class Sample:
     power_source: str = "battery_current_voltage"
     power_sample_age_s: Optional[float] = None
     collector_cpu_pct: Optional[float] = None
+    power_valid_for_consumption: Optional[bool] = None
+    external_power: Optional[bool] = None
+
+
+def is_power_sample_fresh_for_consumption(sample: Sample) -> bool:
+    """Reject iOS SystemLoad values that cannot prove a recent telemetry update."""
+
+    if str(sample.power_source or "") != "ios_power_telemetry_system_load":
+        return True
+    age = sample.power_sample_age_s
+    return bool(
+        isinstance(age, (int, float))
+        and not isinstance(age, bool)
+        and math.isfinite(float(age))
+        and 0.0 <= float(age) <= IOS_SYSTEM_LOAD_STALE_AFTER_S
+    )
+
+
+def is_consumption_power_sample(sample: Sample) -> bool:
+    """Return whether a power sample may support consumption conclusions.
+
+    Raw charging or externally powered samples remain useful as battery-flow
+    telemetry, but they must not be integrated as device energy consumption.
+    The flag must be explicit. Direction alone is insufficient because a phone
+    can remain externally powered while the battery reports a negative net
+    current.
+    """
+
+    return bool(
+        sample.power_valid_for_consumption is True
+        and sample.external_power is not True
+        and str(sample.direction or "").strip().lower() == "discharging"
+        and is_power_sample_fresh_for_consumption(sample)
+    )
 
 
 @dataclass

@@ -1373,18 +1373,38 @@ def parse_android_surface_layers(
     foreground_package: Optional[str] = None,
     foreground_activity: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Select the active app SurfaceView/BLAST layer from SurfaceFlinger --list."""
+    """Select the foreground app buffer layer from SurfaceFlinger --list.
+
+    SurfaceView/BLAST remains the strongest signal for games.  Some Android 16
+    builds expose an ordinary application buffer as a child of the window
+    container instead; those layers are accepted only when their name starts
+    with the foreground component/package and control-only layers are excluded.
+    """
 
     package = str(foreground_package or "").strip().lower()
     if not package:
         return {}
-    activity_token = str(foreground_activity or "").rsplit(".", 1)[-1].lower()
-    candidates: List[Tuple[int, int, str]] = []
+    activity = str(foreground_activity or "").strip().lower()
+    activity_token = activity.rsplit(".", 1)[-1]
+    qualified_activity = (
+        package + activity
+        if activity.startswith(".")
+        else f"{package}.{activity}"
+        if activity and "." not in activity
+        else activity
+    )
+    component_names = {
+        f"{package}/{value}"
+        for value in (activity, qualified_activity)
+        if value
+    }
+    records: List[Dict[str, object]] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         name = line
+        parent_match = re.search(r"\bparentId=(-?\d+)\b", line)
         if line.startswith("RequestedLayerState{"):
             name = line[len("RequestedLayerState{") :]
             if name.endswith("}"):
@@ -1395,29 +1415,92 @@ def parse_android_surface_layers(
                 maxsplit=1,
             )[0].strip()
         lowered = name.lower()
-        if package and package not in lowered:
-            continue
-        if "surfaceview" not in lowered and "(blast)" not in lowered:
-            continue
-        score = 0
-        if package and package in lowered:
-            score += 20
-        if "surfaceview" in lowered:
-            score += 40
-        if "(blast)" in lowered:
-            score += 50
-        if activity_token and activity_token in lowered:
-            score += 5
-        if any(token in lowered for token in ("background for", "bounds for", "input sink")):
-            score -= 100
         layer_id_match = re.search(r"#(\d+)\b", name)
-        layer_id = int(layer_id_match.group(1)) if layer_id_match else -1
-        candidates.append((score, layer_id, name))
+        records.append(
+            {
+                "name": name,
+                "lowered": lowered,
+                "layer_id": int(layer_id_match.group(1)) if layer_id_match else -1,
+                "parent_id": (
+                    int(parent_match.group(1)) if parent_match is not None else None
+                ),
+            }
+        )
+
+    records_by_id = {
+        int(item["layer_id"]): item
+        for item in records
+        if isinstance(item.get("layer_id"), int) and int(item["layer_id"]) >= 0
+    }
+
+    def layer_depth(item: Dict[str, object]) -> int:
+        depth = 0
+        parent_id = item.get("parent_id")
+        visited: set[int] = set()
+        while isinstance(parent_id, int) and parent_id in records_by_id:
+            if parent_id in visited:
+                break
+            visited.add(parent_id)
+            depth += 1
+            parent_id = records_by_id[parent_id].get("parent_id")
+        return depth
+
+    excluded_tokens = (
+        "activityrecord",
+        "activity record",
+        "inputsink",
+        "input sink",
+        "background for",
+        "bounds for",
+        "dim layer",
+        "windowtoken",
+        "transition-leash",
+        "animation-leash",
+        "starting window",
+        "splash screen",
+        "snapshot",
+        "input consumer",
+        "gesture monitor",
+        "surfacecontrolviewhost",
+    )
+    candidates: List[Tuple[Tuple[int, int, int, int, int, int], str]] = []
+    for item in records:
+        name = str(item["name"])
+        lowered = str(item["lowered"])
+        if package not in lowered:
+            continue
+        if any(token in lowered for token in excluded_tokens):
+            continue
+        is_surfaceview = "surfaceview" in lowered
+        is_blast = "(blast)" in lowered
+        exact_component = any(value in lowered for value in component_names)
+        prefix_name = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", lowered)
+        exact_prefix = any(prefix_name.startswith(value) for value in component_names)
+        package_prefix = prefix_name.startswith(package + "/") or prefix_name.startswith(
+            package + "#"
+        )
+        if not (is_surfaceview or is_blast) and not (exact_prefix or package_prefix):
+            continue
+        priority = (
+            3
+            if is_surfaceview and is_blast
+            else 2
+            if is_surfaceview or is_blast
+            else 1
+        )
+        layer_id = int(item["layer_id"])
+        rank = (
+            priority,
+            int(exact_prefix),
+            int(exact_component),
+            int(bool(activity_token and activity_token in lowered)),
+            layer_depth(item),
+            layer_id,
+        )
+        candidates.append((rank, name))
     if not candidates:
         return {}
-    score, _, selected = max(candidates, key=lambda item: (item[0], item[1]))
-    if score < 20:
-        return {}
+    _, selected = max(candidates, key=lambda item: item[0])
     return {
         "surface_layer_name": selected,
         "surface_layer_type": (
@@ -1427,7 +1510,7 @@ def parse_android_surface_layers(
             if "surfaceview" in selected.lower()
             else "app_layer"
         ),
-        "surface_layer_source": "SurfaceFlinger --list",
+        "surface_layer_source": "SurfaceFlinger --list foreground application layer",
     }
 
 
@@ -1527,7 +1610,9 @@ def android_surface_frame_metrics(
         "frame_budget_ms": frame_budget_ms,
         "frame_cadence_divisor": cadence_divisor,
         "surface_frame_source": True,
-        "frame_counter_source": "Android SurfaceFlinger BLAST layer present timestamps",
+        "frame_counter_source": (
+            "Android SurfaceFlinger foreground application-layer present timestamps"
+        ),
     }
 
 
@@ -1618,10 +1703,11 @@ def build_sampler_script(
     context_period_s: float = 10.0,
     refresh_period_s: float = 30.0,
     emit_context_samples: bool = True,
+    session_has_root: bool = False,
 ) -> str:
     def cat_command(path: str, *, requires_root: bool = False) -> str:
         quoted_path = shlex.quote(path)
-        if requires_root:
+        if requires_root and not session_has_root:
             return f"su -c {shlex.quote(f'cat {quoted_path}')}"
         return f"cat {quoted_path}"
 
@@ -1634,7 +1720,7 @@ def build_sampler_script(
         "emit_context() {",
         "ctx_up=$1",
         "ctx_refresh=$2",
-        "component=$(dumpsys activity activities 2>/dev/null | awk '/mResumedActivity|topResumedActivity|mFocusedApp|mLastPausedActivity/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) { print $n; exit } }' | tr -d '},')",
+        "component=$(dumpsys activity activities 2>/dev/null | awk '/ResumedActivity|mFocusedApp/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) { print $n; exit } }' | tr -d '},')",
         "if [ -z \"$component\" ]; then component=$(dumpsys window windows 2>/dev/null | awk '/mCurrentFocus|mFocusedApp/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) { print $n; exit } }' | tr -d '},'); fi",
         "[ -n \"$component\" ] || component=unknown",
         "screen=$(dumpsys power 2>/dev/null | awk -F= '/mWakefulnessRaw=/{print $2; exit} /mWakefulness=/{print $2; exit}')",
@@ -1654,13 +1740,26 @@ def build_sampler_script(
         "i=0",
         "volt=-1",
         "temp=-1",
+        "powered=-1",
+        "battery_status=-1",
     ]
     cpu_names = ["u", "n", "s", "idle", "io", "irq", "sirq", "steal"]
     body = [
         "cur=$(cmd battery get -f current_now 2>/dev/null)",
         "set -- $cur; cur=$1",
         "[ -n \"$cur\" ] || cur=0",
-        f"if [ $((i % {voltage_every})) -eq 0 ]; then volt=$(dumpsys battery 2>/dev/null | sed -n 's/^  voltage: *//p' | head -n 1); [ -n \"$volt\" ] || volt=-1; fi",
+        (
+            f"if [ $((i % {voltage_every})) -eq 0 ]; then "
+            "battery_state=$(dumpsys battery 2>/dev/null); "
+            "volt=$(printf '%s\\n' \"$battery_state\" | sed -n 's/^  voltage: *//p' | head -n 1); "
+            "[ -n \"$volt\" ] || volt=-1; "
+            "powered=$(printf '%s\\n' \"$battery_state\" | awk -F: "
+            "'tolower($1) ~ /(ac|usb|wireless|dock) powered/ "
+            "{seen=1; if (tolower($2) ~ /true/) p=1} "
+            "END {if (seen) print p+0; else print -1}'); "
+            "battery_status=$(printf '%s\\n' \"$battery_state\" | sed -n 's/^  status: *//p' | head -n 1); "
+            "[ -n \"$battery_status\" ] || battery_status=-1; fi"
+        ),
         f"if [ $((i % {temperature_every})) -eq 0 ]; then temp=$(cmd battery get -f temp 2>/dev/null); set -- $temp; temp=$1; [ -n \"$temp\" ] || temp=-1; fi",
         "read up rest < /proc/uptime",
     ]
@@ -1728,7 +1827,15 @@ def build_sampler_script(
             ]
         )
 
-    fields = ["$i", "$up", "$cur", "$volt", "$temp"]
+    fields = [
+        "$i",
+        "$up",
+        "$cur",
+        "$volt",
+        "$temp",
+        "$powered",
+        "$battery_status",
+    ]
     fields.extend(f"$g_{name}" for name in cpu_names)
     for core in core_ids:
         fields.extend(f"$c{core}_{name}" for name in cpu_names)
@@ -1753,11 +1860,25 @@ def build_sampler_script(
             "now=${up%%.*}",
             "i=$((i+1))",
             "if [ \"$now\" -ge \"$end\" ] && [ \"$i\" -gt 1 ]; then break; fi",
-            f"sleep {interval_s:.3f}",
+            "read after_up rest < /proc/uptime",
+            (
+                "delay=$(awk -v sample=\"$up\" "
+                f"-v step=\"{interval_s:.3f}\" "
+                "-v now=\"$after_up\" 'BEGIN { due = sample + step; delay = due - now; "
+                "if (delay < 0) { due = now + step; delay = step } "
+                "printf \"%.3f\", delay }')"
+            ),
+            "if [ \"$delay\" != \"0.000\" ]; then sleep \"$delay\"; fi",
         ]
     )
     lines.extend(["while true; do", *body, "done", "wait"])
     return "\n".join(lines)
+
+
+def _sampler_shell_command(script: str, use_root_session: bool) -> str:
+    if not use_root_session:
+        return script
+    return f"su -c {shlex.quote(script)}"
 
 
 def parse_sampler_line(
@@ -1829,6 +1950,16 @@ def parse_sampler_line(
                     if isinstance(payload.get("collector_cpu_pct"), (int, float))
                     else None
                 ),
+                power_valid_for_consumption=(
+                    bool(payload["power_valid_for_consumption"])
+                    if isinstance(payload.get("power_valid_for_consumption"), bool)
+                    else None
+                ),
+                external_power=(
+                    bool(payload["external_power"])
+                    if isinstance(payload.get("external_power"), bool)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -1870,18 +2001,31 @@ def parse_sampler_line(
     else:
         parts = [part.strip() for part in stripped.split(",")]
     core_ids = sorted({core for policy in policies for core in policy.cores})
-    expected = 5 + 8 + len(core_ids) * 8 + len(policies)
+    payload_field_count = 8 + len(core_ids) * 8 + len(policies)
     if gpu_source:
-        expected += 1 + (1 if gpu_source.load_path else 0)
+        payload_field_count += 1 + (1 if gpu_source.load_path else 0)
     if memory_source is not None:
-        expected += 1
-    if len(parts) != expected:
+        payload_field_count += 1
+    base_field_count = len(parts) - payload_field_count
+    if base_field_count not in {5, 6, 7}:
         return None
     try:
         values = [float(part) for part in parts]
     except ValueError:
         return None
-    offset = 5
+    external_power = (
+        bool(int(values[5])) if base_field_count >= 6 and values[5] >= 0 else None
+    )
+    battery_status = None
+    if base_field_count >= 7:
+        battery_status = {
+            1: "unknown",
+            2: "charging",
+            3: "discharging",
+            4: "not_charging",
+            5: "full",
+        }.get(int(values[6]))
+    offset = base_field_count
     global_cpu = CpuTimes.from_values(values[offset : offset + 8])
     offset += 8
     core_cpu: Dict[int, CpuTimes] = {}
@@ -1915,6 +2059,8 @@ def parse_sampler_line(
         gpu_frequency_raw=gpu_frequency_raw,
         gpu_load_raw=gpu_load_raw,
         memory_frequency_raw=memory_frequency_raw,
+        external_power=external_power,
+        battery_status=battery_status,
     )
 
 
@@ -2090,19 +2236,31 @@ def _android_performance_context_script(
     include_frame_rate: bool,
     include_window: bool,
     include_frame_details: bool,
+    include_gfxinfo_summary: bool = True,
 ) -> str:
     needs_component = include_foreground or include_window or include_frame_rate
-    lines = []
+    lines = [
+        "app_ctx_screen=$(dumpsys power 2>/dev/null | "
+        "awk -F= '/mWakefulnessRaw=/{print $2; exit} /mWakefulness=/{print $2; exit}')",
+        "set -- $app_ctx_screen; app_ctx_screen=$1; "
+        "[ -n \"$app_ctx_screen\" ] || app_ctx_screen=unknown",
+        "case \"$app_ctx_screen\" in "
+        "Asleep|asleep|OFF|Off|off|Doze*|DOZE*) app_ctx_screen_active=0 ;; "
+        "*) app_ctx_screen_active=1 ;; esac",
+    ]
     if needs_component:
         lines.extend(
             [
+                "app_ctx_component=unknown",
+                "if [ \"$app_ctx_screen_active\" = 1 ]; then",
                 "app_ctx_component=$(dumpsys activity activities 2>/dev/null | "
-                "awk '/mResumedActivity|topResumedActivity|mFocusedApp/ { for (n=1; n<=NF; n++) "
+                "awk '/ResumedActivity|mFocusedApp/ { for (n=1; n<=NF; n++) "
                 "if ($n ~ /\\//) { print $n; exit } }' | tr -d '},')",
                 "if [ -z \"$app_ctx_component\" ]; then app_ctx_component=$(dumpsys window windows 2>/dev/null | "
                 "awk '/mCurrentFocus|mFocusedApp/ { for (n=1; n<=NF; n++) if ($n ~ /\\//) "
                 "{ print $n; exit } }' | tr -d '},'); fi",
                 "[ -n \"$app_ctx_component\" ] || app_ctx_component=unknown",
+                "fi",
             ]
         )
     else:
@@ -2110,9 +2268,6 @@ def _android_performance_context_script(
     lines.extend(
         [
         "app_ctx_package=${app_ctx_component%%/*}",
-        "app_ctx_screen=$(dumpsys power 2>/dev/null | "
-        "awk -F= '/mWakefulnessRaw=/{print $2; exit} /mWakefulness=/{print $2; exit}')",
-        "set -- $app_ctx_screen; app_ctx_screen=$1; [ -n \"$app_ctx_screen\" ] || app_ctx_screen=unknown",
         "app_ctx_brightness=$(settings get system screen_brightness 2>/dev/null)",
         "set -- $app_ctx_brightness; app_ctx_brightness=$1; "
         "[ -n \"$app_ctx_brightness\" ] || app_ctx_brightness=-1",
@@ -2127,20 +2282,24 @@ def _android_performance_context_script(
     )
     if include_surface_flinger and include_frame_rate:
         lines.append(
+            "if [ \"$app_ctx_screen_active\" = 1 ]; then "
             "dumpsys SurfaceFlinger 2>/dev/null | grep -E "
             "'^[[:space:]]*(ScreenOff:|[0-9]+([.][0-9]+)? Hz:|GLES:)'"
+            "; fi"
         )
     lines.append(f"printf '{_ANDROID_LAYER_MARKER}\\n'")
     if include_frame_rate:
         lines.append(
-            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "if [ \"$app_ctx_screen_active\" = 1 ] && "
+            "[ \"$app_ctx_package\" != unknown ]; then "
             "dumpsys SurfaceFlinger --list 2>/dev/null | "
             "grep -F \"$app_ctx_package\" | head -n 160; fi"
         )
     lines.append(f"printf '{_ANDROID_WINDOW_MARKER}\\n'")
     if include_window:
         lines.append(
-            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "if [ \"$app_ctx_screen_active\" = 1 ] && "
+            "[ \"$app_ctx_package\" != unknown ]; then "
             "dumpsys window windows 2>/dev/null | awk -v pkg=\"$app_ctx_package\" "
             "'/^[[:space:]]*Window #[0-9]+ Window\\{/ "
             "{ capture=(index($0,pkg)>0); lines=0 } "
@@ -2149,15 +2308,17 @@ def _android_performance_context_script(
     lines.append(f"printf '{_ANDROID_GFXINFO_MARKER}\\n'")
     if include_frame_rate and include_frame_details:
         lines.append(
-            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "if [ \"$app_ctx_screen_active\" = 1 ] && "
+            "[ \"$app_ctx_package\" != unknown ]; then "
             "dumpsys gfxinfo \"$app_ctx_package\" framestats 2>/dev/null | grep -E "
             "'^[[:space:]]*(Window:|Total frames rendered:|Janky frames:|"
             "Number Missed Vsync:|Number Frame deadline missed:|HISTOGRAM:|"
             "Flags,|[0-9]+,)' | head -n 360; fi"
         )
-    elif include_frame_rate:
+    elif include_frame_rate and include_gfxinfo_summary:
         lines.append(
-            "if [ \"$app_ctx_package\" != unknown ]; then "
+            "if [ \"$app_ctx_screen_active\" = 1 ] && "
+            "[ \"$app_ctx_package\" != unknown ]; then "
             "dumpsys gfxinfo \"$app_ctx_package\" framestats 2>/dev/null | grep -E "
             "'^[[:space:]]*(Window:|Total frames rendered:|Janky frames:|"
             "Number Missed Vsync:|Number Frame deadline missed:|HISTOGRAM:)' | head -n 120; fi"
@@ -2173,6 +2334,7 @@ def collect_android_performance_context(
     include_frame_rate: bool = True,
     include_window: bool = True,
     include_frame_details: bool = False,
+    include_gfxinfo_summary: bool = True,
     cached_surface: Optional[Dict[str, object]] = None,
 ) -> Tuple[Optional[ContextSample], Dict[str, object], Optional[str]]:
     uptime_s, _, output, _, error = _timed_shell_output(
@@ -2184,6 +2346,7 @@ def collect_android_performance_context(
             include_frame_rate,
             include_window,
             include_frame_details,
+            include_gfxinfo_summary,
         ),
         timeout_s=25.0,
     )
@@ -2227,6 +2390,7 @@ def collect_android_performance_context(
         else:
             foreground_package = component
 
+    screen_awake = screen.lower() not in {"asleep", "off"} and not screen.lower().startswith("doze")
     display = parse_android_display_performance(
         "\n".join(sections[_ANDROID_DISPLAY_MARKER])
     )
@@ -2238,7 +2402,7 @@ def collect_android_performance_context(
         for key, value in surface.items()
         if value not in (None, {}, [])
     }
-    performance: Dict[str, object] = dict(cached_surface or {})
+    performance: Dict[str, object] = dict(cached_surface or {}) if screen_awake else {}
     performance.update(surface_update)
     performance.update(display)
     surface_layer = parse_android_surface_layers(
@@ -2260,7 +2424,25 @@ def collect_android_performance_context(
         foreground_activity,
     )
     performance.update(gfxinfo)
-    screen_awake = screen.lower() in {"awake", "on"}
+    performance["screen_state"] = screen if screen != "unknown" else None
+    performance["foreground_active"] = screen_awake and foreground_package is not None
+    if not screen_awake:
+        if foreground_package:
+            performance["last_known_foreground_package"] = foreground_package
+        if component != "unknown":
+            performance["last_known_foreground_window_name"] = component
+        last_refresh = display.get("refresh_rate_hz")
+        if isinstance(last_refresh, (int, float)):
+            performance["last_reported_refresh_rate_hz"] = float(last_refresh)
+        performance["refresh_rate_hz"] = None
+        performance["refresh_rate_live_valid"] = False
+        performance["foreground_window_name"] = None
+        foreground_package = None
+        foreground_activity = None
+    else:
+        performance["refresh_rate_live_valid"] = isinstance(
+            display.get("refresh_rate_hz"), (int, float)
+        )
     performance["frame_data_available"] = (
         bool(gfxinfo or surface_layer) and screen_awake
         if include_frame_rate
@@ -2276,7 +2458,7 @@ def collect_android_performance_context(
     performance.setdefault("foreground_window_name", component if component != "unknown" else None)
     performance["platform"] = "android"
 
-    refresh = display.get("refresh_rate_hz")
+    refresh = performance.get("refresh_rate_hz")
     return (
         ContextSample(
             uptime_s=uptime_s,
@@ -2293,7 +2475,24 @@ def collect_android_performance_context(
     )
 
 
-def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
+def probe_android_performance(
+    adb: str,
+    device: str,
+    *,
+    include_frame_rate: bool = True,
+    include_frame_details: bool = True,
+) -> Dict[str, object]:
+    power_result = adb_shell(adb, device, ["dumpsys", "power"], timeout_s=20)
+    wakefulness_match = re.search(
+        r"^\s*mWakefulness(?:Raw)?\s*=\s*([^\s]+)",
+        power_result.stdout,
+        re.M,
+    )
+    screen_state = wakefulness_match.group(1).strip() if wakefulness_match else None
+    screen_text = str(screen_state or "").strip().lower()
+    screen_awake = not screen_text or (
+        screen_text not in {"asleep", "off"} and not screen_text.startswith("doze")
+    )
     display_result = adb_shell(adb, device, ["dumpsys", "display"], timeout_s=30)
     surface_result = adb_shell(adb, device, ["dumpsys", "SurfaceFlinger"], timeout_s=30)
     layer_result = adb_shell(
@@ -2321,10 +2520,11 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     )
     display = parse_android_display_performance(display_result.stdout)
     surface = parse_android_surfaceflinger_performance(surface_result.stdout)
-    foreground = collect_foreground_package(adb, device)
+    last_known_foreground = collect_foreground_package(adb, device)
+    foreground = last_known_foreground if screen_awake else None
     foreground_pid_result = (
-        adb_shell(adb, device, ["pidof", foreground], timeout_s=10)
-        if foreground
+        adb_shell(adb, device, ["pidof", last_known_foreground], timeout_s=10)
+        if last_known_foreground
         else None
     )
     foreground_pid_value = (
@@ -2337,40 +2537,45 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
         adb_shell(
             adb,
             device,
-            ["dumpsys", "gfxinfo", foreground, "framestats"],
+            ["dumpsys", "gfxinfo", last_known_foreground, "framestats"],
             timeout_s=30,
         )
-        if foreground
+        if include_frame_details and screen_awake and last_known_foreground
         else None
     )
     gfxinfo = (
-        parse_android_gfxinfo(gfxinfo_result.stdout, foreground)
+        parse_android_gfxinfo(gfxinfo_result.stdout, last_known_foreground)
         if gfxinfo_result is not None
         else {}
     )
     layer = (
-        parse_android_surface_layers(layer_result.stdout, foreground)
-        if foreground
+        parse_android_surface_layers(layer_result.stdout, last_known_foreground)
+        if last_known_foreground
         else {}
     )
     latency: Dict[str, object] = {}
     latency_error: Optional[str] = None
     layer_name = layer.get("surface_layer_name")
-    if isinstance(layer_name, str) and layer_name:
+    if (
+        include_frame_rate
+        and screen_awake
+        and isinstance(layer_name, str)
+        and layer_name
+    ):
         latency, latency_error = collect_android_surface_latency(
             adb,
             device,
             layer_name,
         )
-    window = parse_android_window_performance(window_result.stdout, foreground)
+    window = parse_android_window_performance(window_result.stdout, last_known_foreground)
     render_resolution = parse_android_surface_render_resolution(
         surface_result.stdout,
-        foreground,
+        last_known_foreground,
         str(layer.get("surface_layer_name") or "") or None,
     )
     interpolation = parse_android_frame_interpolation(
         interpolation_result.stdout + "\n" + surface_result.stdout,
-        foreground,
+        last_known_foreground,
         foreground_pid,
     )
     touch = parse_android_touch_devices(touch_result.stdout)
@@ -2384,10 +2589,40 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
         **layer,
     }
     performance["brightness_raw"] = first_number(brightness_result.stdout)
-    performance.setdefault("foreground_window_name", foreground)
+    performance["screen_state"] = screen_state
+    performance["foreground_active"] = screen_awake and foreground is not None
+    frame_probe_requested = include_frame_rate or include_frame_details
+    if screen_awake:
+        performance.setdefault("foreground_window_name", foreground)
+        performance["refresh_rate_live_valid"] = isinstance(
+            performance.get("refresh_rate_hz"), (int, float)
+        )
+    else:
+        if last_known_foreground:
+            performance["last_known_foreground_package"] = last_known_foreground
+        last_window = performance.get("foreground_window_name")
+        if isinstance(last_window, str) and last_window:
+            performance["last_known_foreground_window_name"] = last_window
+        last_refresh = performance.get("refresh_rate_hz")
+        if isinstance(last_refresh, (int, float)):
+            performance["last_reported_refresh_rate_hz"] = float(last_refresh)
+        performance["foreground_window_name"] = None
+        performance["refresh_rate_hz"] = None
+        performance["refresh_rate_live_valid"] = False
+        if frame_probe_requested:
+            performance["frame_evidence_scope"] = "inactive screen; live frame probes skipped"
+            performance["frame_unavailable_reason"] = (
+                "屏幕未处于亮屏交互状态；已跳过 gfxinfo framestats 与 SurfaceFlinger "
+                "应用层时间戳探测。保留显示模式仅用于确认接口能力，不代表当前 FPS 或刷新输出。"
+            )
+    if not frame_probe_requested:
+        performance["frame_evidence_scope"] = "frame probes disabled by capture configuration"
+        performance["frame_unavailable_reason"] = "本次采集配置未启用帧率或详细帧时间戳。"
     performance["platform"] = "android"
     performance["frame_data_available"] = bool(
-        gfxinfo or latency.get("surface_latency_frame_count")
+        frame_probe_requested
+        and screen_awake
+        and (gfxinfo or latency.get("surface_latency_frame_count"))
     )
     performance["surface_latency_available"] = bool(
         latency.get("surface_latency_frame_count")
@@ -2398,6 +2633,7 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     performance["touch_sampling_rate_reason"] = touch.get("sampling_rate_reason")
     warnings = []
     for label, result in (
+        ("power", power_result),
         ("display", display_result),
         ("SurfaceFlinger", surface_result),
         ("SurfaceFlinger layer list", layer_result),
@@ -2417,6 +2653,11 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
     if latency_error:
         warnings.append(f"Android SurfaceFlinger latency probe failed: {latency_error}")
     return {
+        "screen_state": screen_state,
+        "foreground_package": foreground,
+        "last_known_foreground_package": (
+            last_known_foreground if not screen_awake else None
+        ),
         "performance": performance,
         "touch": touch,
         "capabilities": {
@@ -2429,6 +2670,10 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
             "frame_rate": bool(
                 gfxinfo or performance.get("surface_latency_available")
             ),
+            "frame_probe_skipped_inactive_screen": bool(
+                frame_probe_requested and not screen_awake
+            ),
+            "frame_probe_skipped_by_configuration": not frame_probe_requested,
             "render_resolution": bool(render_resolution.get("render_width_px")),
             "frame_interpolation_switch": bool(
                 interpolation.get("frame_interpolation_evidence")
@@ -2439,6 +2684,42 @@ def probe_android_performance(adb: str, device: str) -> Dict[str, object]:
         },
         "warnings": warnings,
     }
+
+
+def compact_android_performance_probe_for_metadata(
+    performance: Dict[str, object],
+) -> Dict[str, object]:
+    """Keep probe summaries in metadata without duplicating raw frame history.
+
+    The full awake-screen probe remains available in raw/android_performance_probe.txt.
+    Metadata retains only small counters and an audit summary of any omitted bulk fields.
+    """
+
+    compact = dict(performance)
+    record_count = 0
+    histogram_bin_count = 0
+    column_count = 0
+
+    records = compact.pop("frame_records", None)
+    if isinstance(records, list):
+        record_count = len(records)
+    histogram = compact.pop("frame_histogram_ms", None)
+    if isinstance(histogram, dict):
+        histogram_bin_count = len(histogram)
+    columns = compact.pop("frame_stats_columns", None)
+    if isinstance(columns, list):
+        column_count = len(columns)
+
+    for key in ("frame_intervals_ms", "frame_interval_values_ms"):
+        compact.pop(key, None)
+
+    if record_count or histogram_bin_count or column_count:
+        compact["raw_frame_history_omitted_from_metadata"] = True
+        compact["raw_frame_history_artifact"] = "raw/android_performance_probe.txt"
+        compact["raw_frame_record_count"] = record_count
+        compact["raw_frame_histogram_bin_count"] = histogram_bin_count
+        compact["raw_frame_stats_column_count"] = column_count
+    return compact
 
 
 def _split_marked_sections(text: str) -> Tuple[Dict[str, str], Optional[int]]:
@@ -2594,6 +2875,29 @@ def collect_thermal_snapshot(
         ),
         error,
     )
+
+
+def _brightness_tracking_required(snapshot: ThermalSnapshot) -> bool:
+    relevant_cooling = any(
+        re.search(
+            r"lcd|backlight|display|screen",
+            str(item.get("name") or ""),
+            re.I,
+        )
+        and float(item.get("value") or 0.0) > 0
+        for item in snapshot.cooling_devices
+        if isinstance(item, dict)
+    )
+    brightness = snapshot.display_brightness
+    framework_clamp = bool(brightness.get("thermal_applied")) or (
+        isinstance(brightness.get("thermal_cap"), (int, float))
+        and float(brightness["thermal_cap"]) < 0.999
+        and int(brightness.get("thermal_status") or 0) > 0
+    )
+    # OEM tables only describe candidate limits.  Continue high-rate tracking
+    # only when the vendor runtime explicitly reports that its clamp is active.
+    vendor_clamp = brightness.get("vendor_thermal_active") is True
+    return bool(relevant_cooling or framework_clamp or vendor_clamp)
 
 
 def _scheduler_state_script() -> str:
@@ -2826,6 +3130,10 @@ class AndroidPerformanceContextWorker:
         return android_surface_frame_metrics(intervals, effective_refresh)
 
     def _collect(self, include_surface_flinger: bool) -> None:
+        surface_timestamps_confirmed = (
+            self._surface_layer_name is not None
+            and self._surface_last_timestamp_ns is not None
+        )
         context, surface_update, error = collect_android_performance_context(
             self.adb,
             self.device,
@@ -2834,6 +3142,9 @@ class AndroidPerformanceContextWorker:
             include_frame_rate=self.include_frame_rate,
             include_window=self.include_window,
             include_frame_details=self.include_frame_details,
+            include_gfxinfo_summary=(
+                self.include_frame_details or not surface_timestamps_confirmed
+            ),
             cached_surface=self._surface_state,
         )
         if surface_update:
@@ -3058,24 +3369,8 @@ class SystemMonitorWorker:
                     if snapshot is not None:
                         self.journal.append_thermal_snapshot(snapshot)
                         self.thermal_snapshot_count += 1
-                        relevant_cooling = any(
-                            re.search(
-                                r"lcd|backlight|display|screen",
-                                str(item.get("name") or ""),
-                                re.I,
-                            )
-                            and float(item.get("value") or 0.0) > 0
-                            for item in snapshot.cooling_devices
-                            if isinstance(item, dict)
-                        )
-                        brightness = snapshot.display_brightness
-                        framework_clamp = bool(brightness.get("thermal_applied")) or (
-                            isinstance(brightness.get("thermal_cap"), (int, float))
-                            and float(brightness["thermal_cap"]) < 0.999
-                            and int(brightness.get("thermal_status") or 0) > 0
-                        )
                         was_tracking = brightness_tracking_active
-                        brightness_tracking_active = relevant_cooling or framework_clamp
+                        brightness_tracking_active = _brightness_tracking_required(snapshot)
                         if brightness_tracking_active or was_tracking:
                             next_brightness_probe = time.monotonic() + self.thermal_interval_s
                         elif snapshot.display_brightness:
@@ -3224,6 +3519,7 @@ def collect_streaming_session(
     """Stream a wall-clock session while preserving every complete line on disk."""
 
     result = StreamCollectionResult()
+    use_root_sampler_session = bool(gpu_source is not None and gpu_source.requires_root)
     host_start = time.monotonic()
     deadline = host_start + duration_s
     next_checkpoint = host_start + checkpoint_interval_s
@@ -3285,8 +3581,10 @@ def collect_streaming_session(
                 gpu_source,
                 memory_source,
                 emit_context_samples=not performance_context_enabled,
+                session_has_root=use_root_sampler_session,
             )
-            argv = adb_prefix(adb, device) + ["shell", script]
+            remote_command = _sampler_shell_command(script, use_root_sampler_session)
+            argv = adb_prefix(adb, device) + ["shell", remote_command]
             process = subprocess.Popen(
                 argv,
                 stdout=subprocess.PIPE,

@@ -54,9 +54,10 @@ is easier to audit after a one-hour robotic workflow:
 - A standalone Overview/Timeline/Flow/Test Items/Applications/CPU/System/
   Thermal & Scheduler/GPU/Attribution/Data HTML report.
 - Optional iOS 17+ wireless RemoteXPC collection after one trusted-USB
-  RemotePairing step: physical battery power/current/voltage/temperature,
-  DVT process CPU/memory/disk and relative power scores, GPU utilization, and
-  event-driven foreground-app transitions.
+  RemotePairing step: battery current/voltage/temperature, the whole-device
+  `PowerTelemetryData.SystemLoad` channel, DVT process CPU/memory/disk and
+  relative power scores, GPU utilization, and event-driven foreground-app
+  transitions.
 
 Modeled CPU, component, and UID values are kept separate from measured total
 battery output. They are diagnostic estimates, not physical power rails.
@@ -195,8 +196,11 @@ Wireless** runs `adb disconnect` for the selected network device. Wireless
 disconnect is disabled while recording.
 
 The same picker also shows iPhones discovered by the optional sidecar. The
-**iOS Wireless** action creates RemotePairing while the trusted USB cable is
-connected; after the Wi-Fi endpoint is cached, unplug USB before recording.
+**iOS RemotePairing** action creates the pairing record while trusted USB is
+connected. A reachable RemoteXPC endpoint only proves that telemetry works on
+the current route: `169.254/16` and IPv6 link-local addresses can be USB-NCM.
+For an unplugged power test, remove USB, refresh discovery, and require the
+iPhone to remain reachable through a non-link-local LAN endpoint.
 
 HarmonyOS targets appear with a `harmony:` prefix. With a USB-authorized phone,
 **Harmony Wireless** reads `wlan0`, runs `hdc -t TARGET tmode port 8710`, and
@@ -266,14 +270,23 @@ Create a dedicated runtime so the GPL-licensed optional dependency remains
 outside the standard-library core and the Android portable bundle:
 
 ```powershell
-python -m venv .venv-ios
-.\.venv-ios\Scripts\python.exe -m pip install "pymobiledevice3==9.34.0"
+py -3.13 -m venv .venv-ios
+.\.venv-ios\Scripts\python.exe -m pip install `
+  "pymobiledevice3==9.34.0" "pmd-pytcp==0.0.6"
 $iosPython = (Resolve-Path .\.venv-ios\Scripts\python.exe)
 ```
 
-When the environment is named `.venv-ios`, `start-ui.bat` detects it
-automatically. Alternatively set the `IOS_PYTHON` environment variable before
-launching the UI.
+Use the official CPython 3.13 or newer Windows build. iOS 18.2 and newer removed
+the older QUIC tunnel, so pymobiledevice3 must use Python's native TLS-PSK
+callback. `pymobiledevice3 9.34.0` also requires the synchronous
+`pmd-pytcp 0.0.6` userspace-tunnel API; pip's newer 0.1.x API is incompatible.
+
+When the environment is named `.venv-ios`, `start-ui.bat` validates and detects
+it automatically. It also checks `.venv-ios313` and the user-local
+`%LOCALAPPDATA%\mobile-profiler\ios-python313` runtime. An incompatible old
+sidecar is ignored instead of being passed to the UI. Alternatively set the
+`IOS_PYTHON` environment variable before launching the UI; it is validated by
+the same check.
 
 On the iPhone, enable Developer Mode, unlock it, connect USB, and trust the
 computer. Create RemotePairing once:
@@ -282,8 +295,11 @@ computer. Create RemotePairing once:
 mobile-profiler --ios-python $iosPython ios-pair --json
 ```
 
-When the command reports a Wi-Fi endpoint, remove USB. Probe and record using
-the cached `ios:UDID` device identifier:
+When the command reports a RemoteXPC endpoint, inspect its scope. A link-local
+endpoint is usable for externally powered performance collection but is not
+proof that the USB cable can be removed. For an unplugged test, remove USB,
+refresh discovery, and continue only if a non-link-local endpoint remains
+reachable. Probe and record using the cached `ios:UDID` device identifier:
 
 ```powershell
 mobile-profiler --ios-python $iosPython probe `
@@ -293,18 +309,20 @@ mobile-profiler --ios-python $iosPython record `
   --platform ios `
   --device ios:00008150-EXAMPLE `
   --duration 120 `
-  --interval 1 `
   --session-mode `
   --require-unplugged `
   --output profiler-runs\ios-smoke
 ```
 
 The RemotePairing record is stored by `pymobiledevice3`; the last working
-host/port is cached under `~/.mobile-profiler/ios-devices.json`. iOS
-physical power commonly refreshes only about every 20 seconds even though DVT
-CPU/GPU/process counters update at 0.5-1 second cadence. The report retains
-`power_sample_age_s` and `collector_cpu_pct`, and never converts DVT
-`powerScore` into mW or mixes it with physical whole-device power.
+host/port is cached under `~/.mobile-profiler/ios-devices.json`. The UI keeps
+`remote_xpc_ready` separate from `unplug_ready`, so a USB-NCM endpoint is not
+presented as a verified Wi-Fi power-test path. The iOS
+`PowerTelemetryData.SystemLoad` channel commonly refreshes only about every
+20 seconds even though DVT CPU/GPU/process counters update at 0.5-1 second
+cadence. The report retains `power_sample_age_s` and `collector_cpu_pct`, and
+never converts DVT `powerScore` into mW or mixes it with SystemLoad or the
+separate battery current × voltage flow channel.
 
 For long-lived test evidence, keep `profiler-runs` outside the versioned program
 directory and pass it explicitly when starting either source or portable UI:
@@ -410,13 +428,21 @@ Useful recording options:
   process/thread scans, scheduler snapshots, delivered-touch/hitch counters, target-process
   snapshots, and BatteryStats model attribution are opt-in diagnostics by default.
   Power Standard keeps CPU/GPU, foreground/display, thermal, and before/after settings evidence;
-  Performance Standard adds FPS and detailed frame timing while leaving system diagnostics off.
+  Performance Standard adds FPS while leaving detailed `gfxinfo framestats` and system diagnostics
+  off by default; enable detailed frame timing only for a targeted investigation.
 - `--enable-feature NAME` / `--disable-feature NAME`: repeatable per-feature overrides.
 - `--harmony-high-performance`: temporarily apply HarmonyOS
   `power-shell setmode 602`; valid only in HarmonyOS Performance mode.
 - `--package PACKAGE`: retain a named target app for BatteryStats/UID analysis.
 - `--session-mode`: power mode only; do not default to the starting foreground package.
-- `--interval 1`: current, CPU, and frequency sampling interval.
+- `--interval SECONDS`: defaults to 5 seconds for iOS power mode and 1 second for
+  iOS performance mode and other platforms; Android BLAST frame timestamps remain
+  on their separate 0.5-second sampler.
+- `--require-unplugged`: reject connected or unverifiable external-power state; this
+  is the default for formal CLI recording.
+- `--allow-external-power`: explicitly allow a connected diagnostic run. Supply-powered
+  intervals retain raw channels but do not produce consumption, energy, endurance, or
+  attribution conclusions.
 - `--checkpoint-interval 30`: journal and clock-sync cadence.
 - `--reconnect-timeout 120`: maximum device-transport outage before finalizing partial data.
 - `--gpu-frequency-path PATH`: override an OEM-readable GPU frequency node.
@@ -476,11 +502,12 @@ The default Android long-session schedule limits expensive services:
 
 For iOS, DVT CPU/GPU/process rows use the selected sample interval, process
 snapshots default to 10 seconds, battery diagnostics are polled every 5
-seconds, and the underlying physical-power value typically changes about every
-20 seconds.
+seconds, and the underlying `PowerTelemetryData.SystemLoad` value typically
+changes about every 20 seconds.
 
 For HarmonyOS, BatteryService and `/proc/stat` use the selected sample interval;
-`hidumper --cpufreq` is limited to at least 10 seconds, while process and
+native `hidumper --cpufreq` defaults to 30 seconds because one full dump is
+comparatively expensive, while process and
 ThermalService snapshots use their configured monitor intervals. The foreground
 context cadence (5–10 seconds) also samples RenderService screen/fpsCount/recent
 composer timestamps, WindowManager focus, and MultimodalInput delivered events.
@@ -544,7 +571,7 @@ report remains responsive while preserving the original data files.
 | App/phase energy | Measured total energy allocated by foreground/log time intervals |
 | Per-test system interference | Sampled overlap with classified system/thermal activity and visible system CPU; not exclusive process energy |
 | BatteryStats contributors | Android model attribution; values can overlap and need not sum to measured total |
-| iOS `SystemLoad` | Physical whole-device battery-side power with a typically ~20 s refresh cadence; repeated 1 s rows retain sample age |
+| iOS `SystemLoad` | Whole-device PowerTelemetry channel with a typically ~20 s refresh cadence; under external power it can track `SystemPowerIn` and must not be renamed as battery flow. Repeated rows retain sample age |
 | iOS DVT `powerScore` | Relative diagnostic score only; not mW, joules, or per-process rail energy |
 | iOS collector CPU | Normalized CPU used by `sysmond`, `DTServiceHub`, and `remotepairingdeviced`; retained as observer-overhead evidence |
 

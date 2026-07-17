@@ -300,6 +300,8 @@ def sample_to_dict(sample: Sample) -> Dict[str, object]:
         "voltage_mv": round(sample.voltage_mv, 4),
         "power_mw": round(sample.power_mw, 4),
         "direction": sample.direction,
+        "power_valid_for_consumption": sample.power_valid_for_consumption,
+        "external_power": sample.external_power,
         "cpu_pct": round(sample.cpu_pct, 4) if sample.cpu_pct is not None else None,
         "core_cpu_pct": {name: round(value, 4) for name, value in sample.core_cpu_pct.items()},
         "cluster_cpu_pct": {
@@ -355,6 +357,8 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
         "voltage_mv",
         "power_mw",
         "direction",
+        "power_valid_for_consumption",
+        "external_power",
         "cpu_pct",
         "battery_temperature_c",
         "gpu_frequency_mhz",
@@ -380,6 +384,16 @@ def write_samples_csv(path: Path, samples: Sequence[Sample], metadata: Dict[str,
                 "voltage_mv": f"{sample.voltage_mv:.4f}",
                 "power_mw": f"{sample.power_mw:.4f}",
                 "direction": sample.direction,
+                "power_valid_for_consumption": (
+                    ""
+                    if sample.power_valid_for_consumption is None
+                    else "true"
+                    if sample.power_valid_for_consumption
+                    else "false"
+                ),
+                "external_power": (
+                    "" if sample.external_power is None else "true" if sample.external_power else "false"
+                ),
                 "cpu_pct": "" if sample.cpu_pct is None else f"{sample.cpu_pct:.4f}",
                 "battery_temperature_c": (
                     ""
@@ -435,6 +449,15 @@ def _optional_float(row: Dict[str, str], key: str) -> Optional[float]:
     return float(value) if value not in (None, "") else None
 
 
+def _optional_bool(row: Dict[str, str], key: str) -> Optional[bool]:
+    value = str(row.get(key) or "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def read_samples_csv(path: Path) -> List[Sample]:
     samples: List[Sample] = []
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -468,6 +491,10 @@ def read_samples_csv(path: Path) -> List[Sample]:
                     voltage_mv=float(row["voltage_mv"]),
                     power_mw=float(row["power_mw"]),
                     direction=direction,
+                    power_valid_for_consumption=_optional_bool(
+                        row, "power_valid_for_consumption"
+                    ),
+                    external_power=_optional_bool(row, "external_power"),
                     cpu_pct=_optional_float(row, "cpu_pct"),
                     core_cpu_pct={
                         field[len("core") : -len("_pct")]: float(row[field])

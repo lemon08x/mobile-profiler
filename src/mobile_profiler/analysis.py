@@ -4,6 +4,7 @@ import bisect
 import math
 import re
 import statistics
+from collections import deque
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .collector import frequency_to_mhz, parse_android_runtime_settings
@@ -14,10 +15,14 @@ from .models import (
     ExternalEvent,
     GpuSource,
     RawSample,
+    SCHEMA_VERSION,
     Sample,
     SchedulerSnapshot,
     SystemSnapshot,
     ThermalSnapshot,
+    IOS_SYSTEM_LOAD_STALE_AFTER_S,
+    is_consumption_power_sample,
+    is_power_sample_fresh_for_consumption,
 )
 from .parsers import (
     classify_thread_activity,
@@ -73,6 +78,7 @@ def convert_samples(
     current_unit: str,
     battery_status: str,
     max_cpu_gap_s: Optional[float] = None,
+    external_power: Optional[bool] = None,
 ) -> Tuple[List[Sample], List[str]]:
     if len(raw_samples) < 2:
         raise RuntimeError("sampler returned fewer than two valid rows")
@@ -82,6 +88,11 @@ def convert_samples(
     sign_corrected = False
     samples: List[Sample] = []
     previous_raw: Optional[RawSample] = None
+    legacy_external_power_state = not any(
+        raw.external_power is not None or raw.battery_status is not None
+        for raw in raw_samples
+    )
+    unknown_external_power_seen = False
 
     for raw in raw_samples:
         elapsed = raw.uptime_s - base_uptime
@@ -89,15 +100,27 @@ def convert_samples(
         fallback_voltage = start_voltage_mv + (end_voltage_mv - start_voltage_mv) * fraction
         voltage = raw.voltage_mv if raw.voltage_mv and raw.voltage_mv > 0 else fallback_voltage
         sensor_ma = normalize_current_ma(raw.current_raw, current_unit)
-        signed_current_ma, corrected = _directed_current(sensor_ma, battery_status)
+        sample_status = str(raw.battery_status or battery_status or "unknown").lower()
+        sample_external_power = raw.external_power
+        if sample_external_power is None and legacy_external_power_state:
+            sample_external_power = external_power
+        if sample_external_power is None:
+            unknown_external_power_seen = True
+        signed_current_ma, corrected = _directed_current(sensor_ma, sample_status)
         sign_corrected = sign_corrected or corrected
         current_ma = abs(signed_current_ma)
-        if signed_current_ma < 0:
+        if sample_external_power is True:
+            direction = (
+                "charging"
+                if sample_status in {"charging", "full"} or signed_current_ma > 0
+                else "external_power"
+            )
+        elif signed_current_ma < 0:
             direction = "discharging"
         elif signed_current_ma > 0:
             direction = "charging"
         else:
-            direction = battery_status if battery_status in {"charging", "discharging"} else "idle"
+            direction = sample_status if sample_status in {"charging", "discharging"} else "idle"
 
         cpu_pct = None
         core_cpu_pct: Dict[str, float] = {}
@@ -155,6 +178,10 @@ def convert_samples(
                     if raw.temperature_tenths_c is not None
                     else None
                 ),
+                power_valid_for_consumption=(
+                    signed_current_ma < 0 and sample_external_power is False
+                ),
+                external_power=sample_external_power,
             )
         )
         previous_raw = raw
@@ -163,6 +190,11 @@ def convert_samples(
         warnings.append(
             "厂商电流符号与 BatteryService 状态不一致，已自动标准化。"
             "current_ma 始终为正幅值，signed_current_ma 保留充放电方向。"
+        )
+    if unknown_external_power_seen:
+        warnings.append(
+            "部分样本未能确认是否接入外部电源；这些样本只保留原始电流、电压和功率，"
+            "不会进入正式耗电、能量或相关性分析。"
         )
     return samples, warnings
 
@@ -223,15 +255,21 @@ def median_absolute_deviation(values: Sequence[float]) -> float:
 
 
 def detect_spikes(samples: Sequence[Sample]) -> List[Dict[str, float]]:
-    if len(samples) < 5:
+    consumption_samples = [sample for sample in samples if is_consumption_power_sample(sample)]
+    if len(consumption_samples) < 5:
         return []
-    powers = [sample.power_mw for sample in samples]
-    median = statistics.median(powers)
-    mad = median_absolute_deviation(powers)
+    consumption_powers = [sample.power_mw for sample in consumption_samples]
+    median = statistics.median(consumption_powers)
+    mad = median_absolute_deviation(consumption_powers)
     threshold = median + max(150.0, 3.0 * mad)
     windows: List[Dict[str, float]] = []
     current: List[Sample] = []
     for sample in samples:
+        if not is_consumption_power_sample(sample):
+            if current:
+                windows.append(_spike_window(current, threshold))
+                current = []
+            continue
         if sample.power_mw >= threshold:
             current.append(sample)
             continue
@@ -256,6 +294,7 @@ def _spike_window(samples: Sequence[Sample], threshold: float) -> Dict[str, floa
 def sample_intervals(
     samples: Sequence[Sample],
     max_gap_s: Optional[float] = None,
+    require_consumption_power: bool = False,
 ) -> List[Tuple[Sample, Sample, float]]:
     intervals: List[Tuple[Sample, Sample, float]] = []
     for previous, current in zip(samples, samples[1:]):
@@ -266,6 +305,11 @@ def sample_intervals(
             continue
         if max_gap_s is not None and delta_s > max_gap_s:
             continue
+        if require_consumption_power and not (
+            is_consumption_power_sample(previous)
+            and is_consumption_power_sample(current)
+        ):
+            continue
         intervals.append((previous, current, delta_s))
     return intervals
 
@@ -274,16 +318,71 @@ def integrate_values(
     samples: Sequence[Sample],
     getter: Callable[[Sample], float],
     max_gap_s: Optional[float] = None,
+    require_consumption_power: bool = False,
 ) -> float:
     total = 0.0
-    for previous, current, delta_s in sample_intervals(samples, max_gap_s):
+    for previous, current, delta_s in sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=require_consumption_power,
+    ):
         total += (getter(previous) + getter(current)) * 0.5 * delta_s / 3600.0
     return total
+
+
+def integrate_step_values(
+    samples: Sequence[Sample],
+    getter: Callable[[Sample], float],
+    max_gap_s: Optional[float] = None,
+    require_consumption_power: bool = False,
+    transition_age_getter: Optional[Callable[[Sample], Optional[float]]] = None,
+) -> Tuple[float, float]:
+    """Integrate zero-order-held telemetry and return energy plus covered seconds.
+
+    Low-rate channels such as iOS DiagnosticsService SystemLoad retain their
+    most recent value until the next device update.  When the collector keeps
+    the age of that update, place the step at the estimated update time rather
+    than linearly interpolating between host observations.
+    """
+
+    total_mw_seconds = 0.0
+    covered_duration_s = 0.0
+    for previous, current, delta_s in sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=require_consumption_power,
+    ):
+        previous_value = float(getter(previous))
+        current_value = float(getter(current))
+        transition_uptime = current.uptime_s
+        if transition_age_getter is not None and current_value != previous_value:
+            age = transition_age_getter(current)
+            if (
+                isinstance(age, (int, float))
+                and not isinstance(age, bool)
+                and math.isfinite(float(age))
+                and float(age) >= 0.0
+            ):
+                transition_uptime = current.uptime_s - float(age)
+        transition_uptime = min(
+            current.uptime_s,
+            max(previous.uptime_s, transition_uptime),
+        )
+        previous_duration_s = transition_uptime - previous.uptime_s
+        current_duration_s = current.uptime_s - transition_uptime
+        total_mw_seconds += (
+            previous_value * previous_duration_s
+            + current_value * current_duration_s
+        )
+        covered_duration_s += delta_s
+    return total_mw_seconds / 3600.0, covered_duration_s
 
 
 def build_buckets(samples: Sequence[Sample], width_s: float = 10.0) -> List[Dict[str, object]]:
     bucket_map: Dict[int, List[Sample]] = {}
     for sample in samples:
+        if not is_consumption_power_sample(sample):
+            continue
         bucket_map.setdefault(int(sample.elapsed_s // width_s), []).append(sample)
     buckets: List[Dict[str, object]] = []
     for bucket in sorted(bucket_map):
@@ -378,6 +477,7 @@ def analyze_cpu(
         premium_values: List[float] = []
         active_core_values: List[float] = []
         valid_loads: List[float] = []
+        modeled_for_correlation: List[float] = []
         measured_for_model: List[float] = []
         model_available = bool(pair_count)
         minimum_coefficient = current_curve[0] if current_curve else None
@@ -417,7 +517,9 @@ def analyze_cpu(
                     entry["frequency_premium_mw"] = premium_power
                     modeled_values.append(modeled_power)
                     premium_values.append(premium_power)
-                    measured_for_model.append(sample.power_mw)
+                    if is_consumption_power_sample(sample):
+                        modeled_for_correlation.append(modeled_power)
+                        measured_for_model.append(sample.power_mw)
                     timeline[index]["modeled_power_mw"] = (
                         float(timeline[index]["modeled_power_mw"]) + modeled_power
                     )
@@ -473,7 +575,10 @@ def analyze_cpu(
                     if modeled_values and statistics.fmean(modeled_values) > 0
                     else None
                 ),
-                "measured_power_correlation": _pearson(modeled_values, measured_for_model),
+                "measured_power_correlation": _pearson(
+                    modeled_for_correlation,
+                    measured_for_model,
+                ),
                 "model_available": model_available,
                 "model_source": "Android Power Profile per-core frequency table" if model_available else None,
                 "residency": [
@@ -498,14 +603,30 @@ def analyze_cpu(
         for item in timeline
         if float(item["modeled_power_mw"]) > 0
     ]
+    model_available = any(bool(item.get("model_available")) for item in cluster_rows)
+    if not model_available:
+        for item in timeline:
+            item["modeled_power_mw"] = None
     return {
         "clusters": cluster_rows,
         "timeline": timeline,
         "modeled_power_mw": statistics.fmean(total_modeled) if total_modeled else None,
-        "source": "Power Profile estimate",
+        "source": (
+            "Power Profile estimate"
+            if model_available
+            else "CPU load and frequency counters"
+            if cluster_rows
+            else None
+        ),
         "limitations": (
             "The estimate combines /proc/stat utilization with instantaneous cpufreq and Android's "
             "per-core current table. It is useful for same-device comparisons, not a hardware rail measurement."
+            if model_available
+            else "CPU load and frequency are retained as measured counters, but no per-core power curve was "
+            "available, so CPU electrical power is not modeled."
+            if cluster_rows
+            else "No CPU frequency policy or per-cluster frequency source was available; only total CPU load "
+            "can be retained and no CPU electrical power is modeled."
         ),
     }
 
@@ -584,8 +705,15 @@ def analyze_gpu(
         "electrical GPU rail or a public per-application GPU energy measurement."
         if platform == "ios"
         else (
-            "HarmonyOS HDC does not expose a readable GPU frequency/load node or a public per-application "
-            "GPU energy counter on this production build. GPU activity is therefore explicitly unavailable."
+            (
+                "HarmonyOS native HDC does not expose a readable GPU frequency/load node on this production "
+                "build; the values in this session were supplied by SmartPerf. They are utilization/frequency "
+                "counters, not an electrical GPU rail or per-application GPU energy measurement."
+                if frequency_values or load_values
+                else "HarmonyOS HDC does not expose a readable GPU frequency/load node or a public "
+                "per-application GPU energy counter on this production build. GPU activity is therefore "
+                "explicitly unavailable."
+            )
             if platform == "harmony"
             else
             "GPU frequency/load is reported only when a readable OEM sysfs/devfreq node exists. "
@@ -643,19 +771,33 @@ def analyze_memory_frequency(
     source = source if isinstance(source, dict) else {}
     probe = metadata.get("memory_probe")
     probe = probe if isinstance(probe, dict) else {}
+    capture_configuration = metadata.get("capture_configuration", {})
+    capture_configuration = (
+        capture_configuration if isinstance(capture_configuration, dict) else {}
+    )
+    backend = str(capture_configuration.get("backend") or "")
     if not rows:
+        default_limitation = (
+            "HarmonyOS SmartPerf SP_daemon -d did not return a usable DDR frequency field "
+            "during this session."
+            if backend == "harmony_smartperf"
+            else "No readable DRAM/DMC/MIF frequency source was exposed."
+        )
         return {
             "available": False,
             "source": source or None,
             "probe": probe,
             "timeline": [],
-            "limitations": probe.get("limitations")
-            or "No readable DRAM/DMC/MIF frequency source was exposed.",
+            "limitations": probe.get("limitations") or default_limitation,
         }
 
     frequencies = [float(item.memory_frequency_mhz or 0.0) for item in rows]
-    powers = [float(item.power_mw) for item in rows]
-    currents = [float(item.current_ma) for item in rows]
+    consumption_rows = [item for item in rows if is_consumption_power_sample(item)]
+    consumption_frequencies = [
+        float(item.memory_frequency_mhz or 0.0) for item in consumption_rows
+    ]
+    powers = [float(item.power_mw) for item in consumption_rows]
+    currents = [float(item.current_ma) for item in consumption_rows]
     hardware_max = source.get("maximum_mhz")
     observed_min = min(frequencies)
     observed_max = max(frequencies)
@@ -672,11 +814,17 @@ def analyze_memory_frequency(
     lower_rows = [
         item for item in rows if float(item.memory_frequency_mhz or 0.0) < high_threshold
     ]
+    high_power_rows = [item for item in high_rows if is_consumption_power_sample(item)]
+    lower_power_rows = [item for item in lower_rows if is_consumption_power_sample(item)]
     high_power = (
-        statistics.fmean(item.power_mw for item in high_rows) if high_rows else None
+        statistics.fmean(item.power_mw for item in high_power_rows)
+        if high_power_rows
+        else None
     )
     lower_power = (
-        statistics.fmean(item.power_mw for item in lower_rows) if lower_rows else None
+        statistics.fmean(item.power_mw for item in lower_power_rows)
+        if lower_power_rows
+        else None
     )
     residency_counts = {"low": 0, "medium": 0, "high": 0}
     for value in frequencies:
@@ -696,8 +844,9 @@ def analyze_memory_frequency(
         "p95_frequency_mhz": percentile(frequencies, 0.95),
         "maximum_frequency_mhz": observed_max,
         "hardware_maximum_mhz": hardware_max,
-        "power_correlation": _pearson(frequencies, powers),
-        "current_correlation": _pearson(frequencies, currents),
+        "power_valid_for_consumption": bool(consumption_rows),
+        "power_correlation": _pearson(consumption_frequencies, powers),
+        "current_correlation": _pearson(consumption_frequencies, currents),
         "high_frequency_threshold_mhz": high_threshold,
         "high_frequency_share_pct": len(high_rows) / total * 100.0 if total else 0.0,
         "high_frequency_average_power_mw": high_power,
@@ -717,6 +866,7 @@ def analyze_memory_frequency(
                 "elapsed_s": item.elapsed_s,
                 "frequency_mhz": item.memory_frequency_mhz,
                 "power_mw": item.power_mw,
+                "power_valid_for_consumption": is_consumption_power_sample(item),
                 "current_ma": item.current_ma,
                 "cpu_pct": item.cpu_pct,
                 "gpu_load_pct": item.gpu_load_pct,
@@ -781,6 +931,48 @@ def _context_at(
     return contexts[index] if index >= 0 else None
 
 
+_EXPLICIT_INACTIVE_SCREEN_STATES = {
+    "off",
+    "asleep",
+    "sleep",
+    "doze",
+    "dozing",
+    "inactive",
+    "suspend",
+    "suspended",
+    "standby",
+    "stand_by",
+    "freeze",
+    "hibernate",
+}
+_HARMONY_SHELL_PACKAGES = {
+    "com.ohos.sceneboard",
+    "com.huawei.hmos.launcher",
+}
+
+
+def _context_screen_partition(context: Optional[ContextSample]) -> str:
+    state = str(context.screen_state or "").strip().lower() if context else ""
+    return "inactive" if state in _EXPLICIT_INACTIVE_SCREEN_STATES else "active-or-unknown"
+
+
+def _auto_test_context_allowed(
+    context: Optional[ContextSample],
+    *,
+    performance: bool,
+) -> bool:
+    if context is None or _context_screen_partition(context) == "inactive":
+        return False
+    package = str(context.foreground_package or "").strip()
+    activity = str(context.foreground_activity or "").strip()
+    unknown_labels = {"", "unknown", "none", "null", "--", "-"}
+    if package.lower() in unknown_labels and activity.lower() in unknown_labels:
+        return False
+    if performance and package.lower() in _HARMONY_SHELL_PACKAGES:
+        return False
+    return True
+
+
 def analyze_applications(
     samples: Sequence[Sample],
     contexts: Sequence[ContextSample],
@@ -800,6 +992,7 @@ def analyze_applications(
             {
                 "package": package,
                 "duration_s": 0.0,
+                "consumption_covered_duration_s": 0.0,
                 "energy_mwh": 0.0,
                 "discharge_mah": 0.0,
                 "transition_count": 0,
@@ -807,11 +1000,18 @@ def analyze_applications(
             },
         )
         row["duration_s"] = float(row["duration_s"]) + delta_s
-        row["energy_mwh"] = float(row["energy_mwh"]) + (
-            (previous.power_mw + current.power_mw) * 0.5 * delta_s / 3600.0
+        interval_power_valid = (
+            is_consumption_power_sample(previous)
+            and is_consumption_power_sample(current)
         )
-        average_current = (previous.current_ma + current.current_ma) * 0.5
-        if previous.direction == "discharging" or current.direction == "discharging":
+        if interval_power_valid:
+            row["consumption_covered_duration_s"] = (
+                float(row["consumption_covered_duration_s"]) + delta_s
+            )
+            row["energy_mwh"] = float(row["energy_mwh"]) + (
+                (previous.power_mw + current.power_mw) * 0.5 * delta_s / 3600.0
+            )
+            average_current = (previous.current_ma + current.current_ma) * 0.5
             row["discharge_mah"] = float(row["discharge_mah"]) + average_current * delta_s / 3600.0
         if context and context.foreground_activity:
             activities = row["activities"]
@@ -845,9 +1045,18 @@ def analyze_applications(
     result_rows: List[Dict[str, object]] = []
     for row in rows.values():
         duration_s = float(row["duration_s"])
+        consumption_duration_s = float(row["consumption_covered_duration_s"])
         energy_mwh = float(row["energy_mwh"])
         activities = row.pop("activities")
-        row["average_power_mw"] = energy_mwh * 3600.0 / duration_s if duration_s > 0 else None
+        row["power_valid_for_consumption"] = consumption_duration_s > 0
+        row["average_power_mw"] = (
+            energy_mwh * 3600.0 / consumption_duration_s
+            if consumption_duration_s > 0
+            else None
+        )
+        if consumption_duration_s <= 0:
+            row["energy_mwh"] = None
+            row["discharge_mah"] = None
         row["time_pct"] = duration_s / covered_s * 100.0 if covered_s > 0 else None
         row["activities"] = sorted(activities)[:8] if isinstance(activities, set) else []
         row["confidence"] = "medium" if row["package"] != "unknown" else "low"
@@ -861,6 +1070,9 @@ def analyze_applications(
     ]
     return {
         "available": bool(ordered),
+        "power_valid_for_consumption": any(
+            bool(item.get("power_valid_for_consumption")) for item in result_rows
+        ),
         "context_sample_count": len(ordered),
         "coverage_pct": known_s / covered_s * 100.0 if covered_s > 0 else 0.0,
         "transition_count": max(0, len(transitions) - 1),
@@ -877,7 +1089,11 @@ def analyze_external_events(
     sample_interval_s: float,
 ) -> Dict[str, object]:
     minimum_reliable_duration_s = max(3.0 * sample_interval_s, sample_interval_s + 2.0)
-    intervals = sample_intervals(samples, max_gap_s)
+    intervals = sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    )
     span_rows: List[Dict[str, object]] = []
     for event in sorted(events, key=lambda item: item.device_uptime_s):
         if event.duration_s is None or event.duration_s <= 0:
@@ -911,9 +1127,12 @@ def analyze_external_events(
                 "start_elapsed_s": start - samples[0].uptime_s,
                 "duration_s": event.duration_s,
                 "covered_duration_s": covered_s,
-                "energy_mwh": energy_mwh,
-                "discharge_mah": discharge_mah,
-                "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else None,
+                "energy_mwh": energy_mwh if covered_s > 0 else None,
+                "discharge_mah": discharge_mah if covered_s > 0 else None,
+                "average_power_mw": (
+                    energy_mwh * 3600.0 / covered_s if covered_s > 0 else None
+                ),
+                "power_valid_for_consumption": covered_s > 0,
                 "confidence": confidence,
                 "source": event.source,
                 "metadata": event.metadata,
@@ -947,6 +1166,10 @@ def analyze_external_events(
         row["average_power_mw"] = (
             float(row["energy_mwh"]) * 3600.0 / covered_s if covered_s > 0 else None
         )
+        row["power_valid_for_consumption"] = covered_s > 0
+        if covered_s <= 0:
+            row["energy_mwh"] = None
+            row["discharge_mah"] = None
     aggregate_rows.sort(key=lambda item: float(item.get("energy_mwh") or 0.0), reverse=True)
     return {
         "available": bool(events),
@@ -968,7 +1191,11 @@ def build_long_windows(
     context_uptimes = [item.uptime_s for item in ordered_contexts]
     windows: Dict[int, Dict[str, object]] = {}
     base_uptime = samples[0].uptime_s
-    for previous, current, _ in sample_intervals(samples, max_gap_s):
+    for previous, current, _ in sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    ):
         cursor = previous.uptime_s
         while cursor < current.uptime_s:
             window_index = int(max(0.0, cursor - base_uptime) // width_s)
@@ -1035,7 +1262,7 @@ def _window_power_metrics(
     intervals: Sequence[Tuple[Sample, Sample, float]],
     start_uptime_s: float,
     end_uptime_s: float,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     covered_s = 0.0
     energy_mwh = 0.0
     for previous, current, _ in intervals:
@@ -1049,8 +1276,9 @@ def _window_power_metrics(
         energy_mwh += (previous.power_mw + current.power_mw) * 0.5 * overlap_s / 3600.0
     return {
         "covered_duration_s": covered_s,
-        "energy_mwh": energy_mwh,
-        "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else 0.0,
+        "energy_mwh": energy_mwh if covered_s > 0 else None,
+        "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else None,
+        "power_valid_for_consumption": covered_s > 0,
     }
 
 
@@ -1151,7 +1379,11 @@ def analyze_system_activity(
 
     for snapshot_index, snapshot in enumerate(ordered):
         sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
-        power = sample.power_mw if sample is not None else None
+        power = (
+            sample.power_mw
+            if sample is not None and is_consumption_power_sample(sample)
+            else None
+        )
         temperature_c, temperature_sensor = thermal_context(snapshot.uptime_s)
         powers_by_snapshot.append(power)
         category_cpu: Dict[str, float] = {}
@@ -1416,7 +1648,11 @@ def analyze_system_activity(
     hot_threads.sort(key=lambda item: float(item.get("maximum_cpu_pct") or 0.0), reverse=True)
 
     cadence = _snapshot_cadence([item.uptime_s for item in ordered], 10.0)
-    intervals = sample_intervals(samples, max_gap_s)
+    intervals = sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    )
     total_metrics = _window_power_metrics(
         samples,
         intervals,
@@ -1427,8 +1663,9 @@ def analyze_system_activity(
     for process in top_processes:
         visible_power = process.get("average_power_when_visible_mw")
         process["power_delta_when_visible_mw"] = (
-            float(visible_power) - baseline_power
+            float(visible_power) - float(baseline_power)
             if isinstance(visible_power, (int, float))
+            and isinstance(baseline_power, (int, float))
             else None
         )
     activity_rows: List[Dict[str, object]] = []
@@ -1452,8 +1689,8 @@ def analyze_system_activity(
             start = max(samples[0].uptime_s, float(window[0]["uptime_s"]) - cadence * 0.5)
             end = min(samples[-1].uptime_s, float(window[-1]["uptime_s"]) + cadence * 0.5)
             metrics = _window_power_metrics(samples, intervals, start, end)
-            covered_s += metrics["covered_duration_s"]
-            energy_mwh += metrics["energy_mwh"]
+            covered_s += float(metrics.get("covered_duration_s") or 0.0)
+            energy_mwh += float(metrics.get("energy_mwh") or 0.0)
             estimated_s += max(0.0, end - start)
             activity_windows.append(
                 {
@@ -1483,15 +1720,20 @@ def analyze_system_activity(
             "last_elapsed_s": float(detections[-1]["elapsed_s"]),
             "estimated_duration_s": estimated_s,
             "covered_duration_s": covered_s,
-            "energy_mwh": energy_mwh,
+            "energy_mwh": energy_mwh if covered_s > 0 else None,
             "average_power_mw": average_power,
             "baseline_power_mw": baseline_power,
-            "power_delta_mw": average_power - baseline_power if average_power is not None else None,
-            "excess_energy_mwh": (
-                max(0.0, average_power - baseline_power) * covered_s / 3600.0
-                if average_power is not None
+            "power_delta_mw": (
+                average_power - float(baseline_power)
+                if average_power is not None and isinstance(baseline_power, (int, float))
                 else None
             ),
+            "excess_energy_mwh": (
+                max(0.0, average_power - float(baseline_power)) * covered_s / 3600.0
+                if average_power is not None and isinstance(baseline_power, (int, float))
+                else None
+            ),
+            "power_valid_for_consumption": covered_s > 0,
             "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
             "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
             "windows": activity_windows,
@@ -1561,8 +1803,8 @@ def analyze_system_activity(
                 float(window[-1]["uptime_s"]) + observation_cadence * 0.5,
             )
             metrics = _window_power_metrics(samples, intervals, start, end)
-            covered_s += metrics["covered_duration_s"]
-            energy_mwh += metrics["energy_mwh"]
+            covered_s += float(metrics.get("covered_duration_s") or 0.0)
+            energy_mwh += float(metrics.get("energy_mwh") or 0.0)
             estimated_s += max(0.0, end - start)
             window_rows.append(
                 {
@@ -1601,15 +1843,20 @@ def analyze_system_activity(
             "last_elapsed_s": float(detections[-1]["elapsed_s"]),
             "estimated_duration_s": estimated_s,
             "covered_duration_s": covered_s,
-            "energy_mwh": energy_mwh,
+            "energy_mwh": energy_mwh if covered_s > 0 else None,
             "average_power_mw": average_power,
             "baseline_power_mw": baseline_power,
-            "power_delta_mw": average_power - baseline_power if average_power is not None else None,
-            "excess_energy_mwh": (
-                max(0.0, average_power - baseline_power) * covered_s / 3600.0
-                if average_power is not None
+            "power_delta_mw": (
+                average_power - float(baseline_power)
+                if average_power is not None and isinstance(baseline_power, (int, float))
                 else None
             ),
+            "excess_energy_mwh": (
+                max(0.0, average_power - float(baseline_power)) * covered_s / 3600.0
+                if average_power is not None and isinstance(baseline_power, (int, float))
+                else None
+            ),
+            "power_valid_for_consumption": covered_s > 0,
             "average_cpu_pct": statistics.fmean(cpu_values) if cpu_values else None,
             "maximum_cpu_pct": max(cpu_values) if cpu_values else None,
             "session_average_cpu_pct": statistics.fmean(cpu_vector) if cpu_vector else None,
@@ -1693,6 +1940,7 @@ def analyze_system_activity(
     ]
     return {
         "available": True,
+        "power_valid_for_consumption": bool(intervals),
         "snapshot_count": len(ordered),
         "thread_snapshot_count": sum(1 for item in ordered if item.threads),
         "average_process_count": statistics.fmean(process_counts) if process_counts else None,
@@ -1795,13 +2043,18 @@ def analyze_thermal_history(
     sensor_statuses: Dict[str, List[int]] = {}
     sensor_types: Dict[str, object] = {}
     sensor_powers: Dict[str, List[float]] = {}
+    sensor_power_values: Dict[str, List[float]] = {}
     threshold_map: Dict[str, Dict[str, object]] = {}
     cooling: Dict[str, Dict[str, object]] = {}
     timeline: List[Dict[str, object]] = []
     statuses: List[int] = []
     for snapshot in ordered:
         sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
-        power = sample.power_mw if sample else None
+        power = (
+            sample.power_mw
+            if sample is not None and is_consumption_power_sample(sample)
+            else None
+        )
         sensors: Dict[str, float] = {}
         sensor_severity: Dict[str, int] = {}
         if snapshot.status is not None:
@@ -1814,16 +2067,26 @@ def analyze_thermal_history(
             if not isinstance(item.get("value_c"), (int, float)):
                 continue
             value = float(item["value_c"])
-            severity = int(item.get("status") or 0)
+            raw_severity = item.get("status")
+            severity = (
+                int(raw_severity)
+                if item.get("status_available") is not False
+                and isinstance(raw_severity, (int, float))
+                and not isinstance(raw_severity, bool)
+                else None
+            )
             sensor_type = item.get("type")
             sensors[name] = value
-            sensor_severity[name] = severity
+            if severity is not None:
+                sensor_severity[name] = severity
             sensor_values.setdefault(name, []).append(value)
-            sensor_statuses.setdefault(name, []).append(severity)
+            if severity is not None:
+                sensor_statuses.setdefault(name, []).append(severity)
             if sensor_type is not None:
                 sensor_types[name] = sensor_type
             if power is not None:
                 sensor_powers.setdefault(name, []).append(power)
+                sensor_power_values.setdefault(name, []).append(value)
         active_cooling = []
         for item in snapshot.cooling_devices:
             name = str(item.get("name") or "unknown")
@@ -1861,13 +2124,15 @@ def analyze_thermal_history(
         if sensor_type is None and isinstance(threshold, dict):
             sensor_type = threshold.get("type")
         contributes_to_thermal_status = _contributes_to_thermal_status(sensor_type)
-        maximum_sensor_status = max(sensor_statuses.get(name, [0]))
+        known_sensor_statuses = sensor_statuses.get(name, [])
+        maximum_sensor_status = max(known_sensor_statuses) if known_sensor_statuses else None
         hot = threshold.get("hot_c", []) if isinstance(threshold, dict) else []
         first_hot = next(
             (float(value) for value in hot if isinstance(value, (int, float))),
             None,
         )
         powers = sensor_powers.get(name, [])
+        paired_values = sensor_power_values.get(name, [])
         sensors_rows.append(
             {
                 "name": name,
@@ -1883,12 +2148,14 @@ def analyze_thermal_history(
                 "maximum_status": maximum_sensor_status,
                 "maximum_status_label": (
                     THERMAL_STATUS_LABELS.get(maximum_sensor_status, "unknown")
+                    if contributes_to_thermal_status and maximum_sensor_status is not None
+                    else "unknown"
                     if contributes_to_thermal_status
                     else "not_applicable"
                 ),
                 "first_hot_threshold_c": first_hot,
                 "margin_to_first_threshold_c": first_hot - max(values) if first_hot is not None else None,
-                "power_correlation": _pearson(values, powers) if len(values) == len(powers) else None,
+                "power_correlation": _pearson(paired_values, powers),
                 "thresholds": threshold,
             }
         )
@@ -1902,11 +2169,13 @@ def analyze_thermal_history(
     thermal_sensor_rows = [
         item for item in sensors_rows if bool(item.get("contributes_to_thermal_status"))
     ]
-    maximum_status = max(
-        statuses
-        + [int(item.get("maximum_status") or 0) for item in thermal_sensor_rows],
-        default=0,
-    )
+    status_candidates = statuses + [
+        int(item["maximum_status"])
+        for item in thermal_sensor_rows
+        if isinstance(item.get("maximum_status"), (int, float))
+    ]
+    maximum_status = max(status_candidates) if status_candidates else None
+    severity_available = maximum_status is not None
     latest_status = ordered[-1].status
     collection_times = [
         float(item.collection_ms)
@@ -1926,7 +2195,8 @@ def analyze_thermal_history(
         "latest_status_label": THERMAL_STATUS_LABELS.get(latest_status, "unknown"),
         "maximum_status": maximum_status,
         "maximum_status_label": THERMAL_STATUS_LABELS.get(maximum_status, "unknown"),
-        "throttling_observed": maximum_status > 0,
+        "severity_available": severity_available,
+        "throttling_observed": maximum_status > 0 if maximum_status is not None else None,
         "hottest_sensor": thermal_sensor_rows[0] if thermal_sensor_rows else None,
         "sensors": sensors_rows,
         "cooling_devices": cooling_rows,
@@ -1976,10 +2246,42 @@ def analyze_brightness_throttling(
         index = bisect.bisect_right(context_uptimes, uptime_s) - 1
         return ordered_contexts[max(0, index)]
 
-    def normalized(value: object) -> Optional[float]:
+    def normalized(
+        value: object,
+        minimum: object = None,
+        maximum: object = None,
+    ) -> Optional[float]:
         if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             return None
         parsed = float(value)
+        lower = (
+            float(minimum)
+            if isinstance(minimum, (int, float))
+            and not isinstance(minimum, bool)
+            and math.isfinite(float(minimum))
+            else None
+        )
+        upper = (
+            float(maximum)
+            if isinstance(maximum, (int, float))
+            and not isinstance(maximum, bool)
+            and math.isfinite(float(maximum))
+            else None
+        )
+        if upper is not None and upper > 1.001:
+            effective_lower = lower if lower is not None else 0.0
+            if effective_lower <= parsed <= upper and upper > effective_lower:
+                return max(
+                    0.0,
+                    min(1.0, (parsed - effective_lower) / (upper - effective_lower)),
+                )
+            # Some vendor fields remain normalized even when the surrounding
+            # DisplayManager state exposes a raw 0..N brightness range.  Keep
+            # positive normalized values, but reject zero below a non-zero raw
+            # minimum so an inactive HBM controller's placeholder cannot win.
+            if 0.0 < parsed <= 1.001:
+                return parsed
+            return None
         return parsed if 0.0 <= parsed <= 1.001 else None
 
     def sensor_value(snapshot: ThermalSnapshot, name_pattern: str) -> Optional[float]:
@@ -1996,6 +2298,18 @@ def analyze_brightness_throttling(
     observations: List[Dict[str, object]] = []
     cooling_exposed = False
     display_exposed = False
+    vendor_thermal_exposed = False
+    vendor_thermal_providers: List[str] = []
+    snapshot_intervals = [
+        current.uptime_s - previous.uptime_s
+        for previous, current in zip(ordered, ordered[1:])
+        if 0 < current.uptime_s - previous.uptime_s <= 120.0
+    ]
+    median_snapshot_interval_s = (
+        statistics.median(snapshot_intervals) if snapshot_intervals else 5.0
+    )
+    last_vendor_state: Dict[str, object] = {}
+    last_vendor_observed_uptime_s: Optional[float] = None
     for snapshot in ordered:
         display = (
             snapshot.display_brightness
@@ -2010,7 +2324,116 @@ def analyze_brightness_throttling(
             and re.search(r"lcd|backlight|display|screen", str(item.get("name") or ""), re.I)
         ]
         cooling_exposed = cooling_exposed or bool(relevant_cooling)
-        if not display and not relevant_cooling:
+        vendor_active_raw = display.get("vendor_thermal_active")
+        vendor_active = (
+            vendor_active_raw if isinstance(vendor_active_raw, bool) else None
+        )
+        vendor_provider = str(display.get("vendor_thermal_provider") or "").strip() or None
+        vendor_level = (
+            int(display["vendor_thermal_level"])
+            if isinstance(display.get("vendor_thermal_level"), (int, float))
+            and not isinstance(display.get("vendor_thermal_level"), bool)
+            and math.isfinite(float(display["vendor_thermal_level"]))
+            else None
+        )
+        vendor_limit_nits = (
+            float(display["vendor_thermal_limit_nits"])
+            if isinstance(display.get("vendor_thermal_limit_nits"), (int, float))
+            and not isinstance(display.get("vendor_thermal_limit_nits"), bool)
+            and math.isfinite(float(display["vendor_thermal_limit_nits"]))
+            else None
+        )
+        vendor_temperature_c = (
+            float(display["vendor_thermal_temperature_c"])
+            if isinstance(display.get("vendor_thermal_temperature_c"), (int, float))
+            and not isinstance(display.get("vendor_thermal_temperature_c"), bool)
+            and math.isfinite(float(display["vendor_thermal_temperature_c"]))
+            else None
+        )
+        raw_candidate_caps = display.get("vendor_thermal_candidate_caps_nits")
+        vendor_candidate_caps = (
+            {
+                str(level): float(cap)
+                for level, cap in raw_candidate_caps.items()
+                if isinstance(cap, (int, float))
+                and not isinstance(cap, bool)
+                and math.isfinite(float(cap))
+            }
+            if isinstance(raw_candidate_caps, dict)
+            else {}
+        )
+        vendor_state_exposed = bool(
+            vendor_provider
+            or vendor_candidate_caps
+            or any(
+                value is not None
+                for value in (
+                    vendor_active,
+                    vendor_level,
+                    vendor_limit_nits,
+                    vendor_temperature_c,
+                )
+            )
+        )
+        vendor_state_carried_forward = False
+        vendor_last_known_active: Optional[bool] = None
+        if vendor_state_exposed:
+            last_vendor_state = {
+                "provider": vendor_provider,
+                "active": vendor_active,
+                "level": vendor_level,
+                "limit_nits": vendor_limit_nits,
+                "temperature_c": vendor_temperature_c,
+                "candidate_caps_nits": dict(vendor_candidate_caps),
+            }
+            last_vendor_observed_uptime_s = snapshot.uptime_s
+        elif last_vendor_state:
+            vendor_state_carried_forward = True
+            vendor_provider = str(last_vendor_state.get("provider") or "").strip() or None
+            vendor_last_known_active = (
+                last_vendor_state.get("active")
+                if isinstance(last_vendor_state.get("active"), bool)
+                else None
+            )
+            vendor_level = (
+                int(last_vendor_state["level"])
+                if isinstance(last_vendor_state.get("level"), (int, float))
+                else None
+            )
+            vendor_limit_nits = (
+                float(last_vendor_state["limit_nits"])
+                if isinstance(last_vendor_state.get("limit_nits"), (int, float))
+                else None
+            )
+            vendor_temperature_c = (
+                float(last_vendor_state["temperature_c"])
+                if isinstance(last_vendor_state.get("temperature_c"), (int, float))
+                else None
+            )
+            cached_caps = last_vendor_state.get("candidate_caps_nits")
+            vendor_candidate_caps = dict(cached_caps) if isinstance(cached_caps, dict) else {}
+        vendor_observed_age_s = (
+            max(0.0, snapshot.uptime_s - last_vendor_observed_uptime_s)
+            if last_vendor_observed_uptime_s is not None
+            else None
+        )
+        vendor_stale_after_s = (
+            max(15.0, median_snapshot_interval_s * 3.0)
+            if vendor_last_known_active is True
+            else max(35.0, median_snapshot_interval_s * 7.0)
+        )
+        vendor_state_stale = bool(
+            vendor_state_carried_forward
+            and isinstance(vendor_observed_age_s, (int, float))
+            and vendor_observed_age_s > vendor_stale_after_s
+        )
+        vendor_thermal_exposed = vendor_thermal_exposed or vendor_state_exposed or bool(
+            last_vendor_state
+        )
+        if vendor_provider and vendor_provider not in vendor_thermal_providers:
+            vendor_thermal_providers.append(vendor_provider)
+
+        if not display and not relevant_cooling and not last_vendor_state:
             continue
 
         context = context_for(snapshot.uptime_s)
@@ -2019,15 +2442,23 @@ def analyze_brightness_throttling(
             setting_raw = context.brightness_raw
         if isinstance(setting_raw, (int, float)) and baseline_setting is None:
             baseline_setting = float(setting_raw)
+        brightness_minimum = display.get("brightness_minimum")
+        brightness_maximum = display.get("brightness_maximum")
+
+        def display_normalized(value: object) -> Optional[float]:
+            return normalized(value, brightness_minimum, brightness_maximum)
+
         setting_float = normalized(display.get("setting_float"))
+        if setting_float is None:
+            setting_float = display_normalized(setting_raw)
         requested = next(
             (
                 value
                 for value in (
-                    normalized(display.get("current_screen_brightness")),
-                    normalized(display.get("last_user_set_brightness")),
+                    display_normalized(display.get("current_screen_brightness")),
+                    display_normalized(display.get("last_user_set_brightness")),
                     setting_float,
-                    normalized(display.get("hbm_unthrottled_brightness")),
+                    display_normalized(display.get("hbm_unthrottled_brightness")),
                 )
                 if value is not None
             ),
@@ -2037,10 +2468,22 @@ def analyze_brightness_throttling(
             (
                 (value, source)
                 for value, source in (
-                    (normalized(display.get("screen_brightness")), "Display Power Controller"),
-                    (normalized(display.get("adjusted_brightness")), "BrightnessInfo adjustedBrightness"),
-                    (normalized(display.get("hbm_brightness")), "HighBrightnessModeController"),
-                    (normalized(display.get("cached_brightness")), "BrightnessInfo brightness"),
+                    (
+                        display_normalized(display.get("screen_brightness")),
+                        "Display Power Controller",
+                    ),
+                    (
+                        display_normalized(display.get("adjusted_brightness")),
+                        "BrightnessInfo adjustedBrightness",
+                    ),
+                    (
+                        display_normalized(display.get("hbm_brightness")),
+                        "HighBrightnessModeController",
+                    ),
+                    (
+                        display_normalized(display.get("cached_brightness")),
+                        "BrightnessInfo brightness",
+                    ),
                 )
                 if value is not None
             ),
@@ -2095,14 +2538,26 @@ def analyze_brightness_throttling(
         thermal_reason = maximum_reason == 1 or str(
             display.get("hbm_throttling_reason") or ""
         ).lower() == "thermal"
-        confirmed = bool(
+        framework_confirmed = bool(
             not screen_explicitly_off
             and (
-                (thermal_reason and (cap_restricts or (effective_drop or 0.0) >= 0.005))
+                (
+                    thermal_reason
+                    and (cap_restricts or (effective_drop or 0.0) >= 0.005)
+                )
                 or (thermal_applied and cap_restricts)
-                or (cooling_value > 0 and (effective_drop or 0.0) >= 0.005)
             )
         )
+        cooling_confirmed = bool(
+            not screen_explicitly_off
+            and cooling_value > 0
+            and (effective_drop or 0.0) >= 0.005
+        )
+        # The OEM's candidate table, current level and limit value are descriptive
+        # runtime fields.  Only an explicit active=true flag proves that the OEM
+        # brightness clamp is engaged.
+        vendor_confirmed = vendor_active is True and vendor_state_exposed
+        confirmed = framework_confirmed or cooling_confirmed or vendor_confirmed
         suspected = bool(
             not screen_explicitly_off
             and not confirmed
@@ -2115,6 +2570,34 @@ def analyze_brightness_throttling(
         )
         status = "confirmed" if confirmed else "suspected" if suspected else "none"
         reasons: List[str] = []
+        confirmation_sources: List[str] = []
+        if vendor_confirmed:
+            confirmation_sources.append("vendor_runtime_active")
+            reasons.append("厂商运行时明确报告温控亮度限制已生效")
+            if vendor_level is not None:
+                reasons.append(f"当前档位 {vendor_level}")
+            if vendor_limit_nits is not None:
+                reasons.append(
+                    f"系统标称上限 {vendor_limit_nits:g} nit（非亮度计实测）"
+                )
+        elif vendor_active is False:
+            reasons.append("厂商运行时明确报告温控亮度限制未生效")
+        elif vendor_state_carried_forward and vendor_last_known_active is not None:
+            age_text = (
+                f"{vendor_observed_age_s:.1f} 秒前"
+                if isinstance(vendor_observed_age_s, (int, float))
+                else "此前"
+            )
+            reasons.append(
+                "厂商运行时最近一次报告温控亮度限制"
+                f"{'已生效' if vendor_last_known_active else '未生效'}（{age_text}）"
+            )
+            if vendor_state_stale:
+                reasons.append("该厂商状态已超过低频刷新有效期，不能代表当前状态")
+        if framework_confirmed:
+            confirmation_sources.append("android_framework_thermal_clamp")
+        if cooling_confirmed:
+            confirmation_sources.append("thermal_hal_lcd_backlight")
         if thermal_applied:
             reasons.append("DisplayManager 已应用热亮度限制")
         if thermal_reason:
@@ -2160,16 +2643,37 @@ def analyze_brightness_throttling(
                 "thermal_status": thermal_status,
                 "brightness_max_reason": maximum_reason,
                 "lcd_backlight_cooling": cooling_value,
+                "confirmation_sources": confirmation_sources,
+                "vendor_thermal_provider": vendor_provider,
+                "vendor_thermal_active": vendor_active,
+                "vendor_thermal_runtime_observed": vendor_state_exposed,
+                "vendor_thermal_state_carried_forward": vendor_state_carried_forward,
+                "vendor_thermal_last_known_active": vendor_last_known_active,
+                "vendor_thermal_observed_age_s": vendor_observed_age_s,
+                "vendor_thermal_state_stale": vendor_state_stale,
+                "vendor_thermal_level": vendor_level,
+                "vendor_thermal_limit_nits": vendor_limit_nits,
+                "vendor_thermal_cap_label": (
+                    f"系统标称上限 {vendor_limit_nits:g} nit（非亮度计实测）"
+                    if vendor_confirmed and vendor_limit_nits is not None
+                    else None
+                ),
+                "vendor_thermal_temperature_c": vendor_temperature_c,
+                "vendor_thermal_candidate_caps_nits": vendor_candidate_caps,
                 "skin_temperature_c": sensor_value(snapshot, r"^skin$"),
                 "battery_temperature_c": sensor_value(snapshot, r"battery"),
                 "foreground_package": context.foreground_package if context is not None else None,
-                "power_mw": sample.power_mw if sample is not None else None,
+                "power_mw": (
+                    sample.power_mw
+                    if sample is not None and is_consumption_power_sample(sample)
+                    else None
+                ),
                 "reason": "；".join(reasons) if reasons else "未观察到热降亮证据",
                 "probe_elapsed_ms": display.get("probe_elapsed_ms"),
             }
         )
 
-    available = display_exposed or cooling_exposed
+    available = display_exposed or cooling_exposed or vendor_thermal_exposed
     points = [item for item in observations if item.get("status") in {"suspected", "confirmed"}]
     events: List[Dict[str, object]] = []
     current_event: List[Dict[str, object]] = []
@@ -2204,6 +2708,28 @@ def analyze_brightness_throttling(
             for item in current_event
             if isinstance(item.get("skin_temperature_c"), (int, float))
         ]
+        vendor_limits = [
+            float(item["vendor_thermal_limit_nits"])
+            for item in current_event
+            if item.get("vendor_thermal_active") is True
+            and isinstance(item.get("vendor_thermal_limit_nits"), (int, float))
+        ]
+        vendor_levels = list(
+            dict.fromkeys(
+                int(item["vendor_thermal_level"])
+                for item in current_event
+                if item.get("vendor_thermal_active") is True
+                and isinstance(item.get("vendor_thermal_level"), (int, float))
+            )
+        )
+        event_confirmation_sources = list(
+            dict.fromkeys(
+                str(source)
+                for item in current_event
+                for source in item.get("confirmation_sources", [])
+                if source
+            )
+        )
         events.append(
             {
                 "index": len(events) + 1,
@@ -2227,6 +2753,11 @@ def analyze_brightness_throttling(
                     for item in current_event
                 ),
                 "maximum_skin_temperature_c": max(skin_values) if skin_values else None,
+                "vendor_thermal_levels": vendor_levels,
+                "minimum_vendor_thermal_limit_nits": (
+                    min(vendor_limits) if vendor_limits else None
+                ),
+                "confirmation_sources": event_confirmation_sources,
                 "foreground_packages": list(
                     dict.fromkeys(
                         str(item.get("foreground_package"))
@@ -2247,9 +2778,24 @@ def analyze_brightness_throttling(
     finish_event()
     current_state = observations[-1] if observations else None
     latest_flagged = points[-1] if points else None
+    source_parts = [
+        "Android DisplayManager BrightnessThermalClamper",
+        "Thermal HAL lcd-backlight",
+    ]
+    if vendor_thermal_exposed:
+        provider_text = ", ".join(vendor_thermal_providers) or "OEM vendor service"
+        source_parts.append(f"{provider_text} runtime state")
     return {
         "available": available,
-        "source": "Android DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
+        "source": " + ".join(source_parts),
+        "vendor_thermal_available": vendor_thermal_exposed,
+        "vendor_thermal_providers": vendor_thermal_providers,
+        "vendor_thermal_confirmed_point_count": sum(
+            1
+            for item in observations
+            if item.get("vendor_thermal_active") is True
+            and item.get("vendor_thermal_runtime_observed") is True
+        ),
         "timeline": observations,
         "points": points,
         "events": events,
@@ -2265,8 +2811,11 @@ def analyze_brightness_throttling(
         "setting_baseline_raw": baseline_setting,
         "limitations": (
             "ADB can identify framework or Thermal HAL brightness limiting and estimate the effective normalized "
-            "brightness. It cannot guarantee physical panel luminance in nits when an OEM applies an opaque "
-            "panel-side policy; exact luminance still requires an external photometer."
+            "brightness. For an OEM channel, only vendor_thermal_active=true is treated as explicit activation; "
+            "an inactive flag, a reported limit (including 9999 nit), or a candidate-cap table does not prove "
+            "that dimming occurred. The OEM level and ‘system nominal cap’ are firmware-reported values, not "
+            "photometer measurements, and the candidate table cannot establish a temperature-to-level mapping. "
+            "Exact physical panel luminance still requires an external photometer."
         ),
     }
 
@@ -2400,7 +2949,11 @@ def analyze_scheduler_history(
                 "frozen_process_count": sum(
                     1 for item in snapshot.watched_processes if item.get("frozen")
                 ),
-                "power_mw": sample.power_mw if sample else None,
+                "power_mw": (
+                    sample.power_mw
+                    if sample is not None and is_consumption_power_sample(sample)
+                    else None
+                ),
                 "collection_ms": snapshot.collection_ms,
             }
         )
@@ -2537,6 +3090,11 @@ def analyze_test_items(
     session_start = samples[0].uptime_s
     session_end = samples[-1].uptime_s
     intervals = sample_intervals(samples, max_gap_s)
+    consumption_intervals = sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    )
     sample_uptimes = [item.uptime_s for item in samples]
     minimum_reliable_duration_s = max(3.0 * sample_interval_s, sample_interval_s + 2.0)
     definitions: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -2600,6 +3158,8 @@ def analyze_test_items(
         ) -> None:
             if end <= start:
                 return
+            if not _auto_test_context_allowed(context, performance=False):
+                return
             context_source = context.source if context and context.source else "platform_context_sampler"
             occurrence = {
                 "phase": key[0],
@@ -2623,14 +3183,17 @@ def analyze_test_items(
             row["windows"].append((start, end))  # type: ignore[union-attr]
 
         current_key = context_key(current)
+        current_partition = _context_screen_partition(current)
         for following in changes:
             next_key = context_key(following)
-            if next_key == current_key:
+            next_partition = _context_screen_partition(following)
+            if next_key == current_key and next_partition == current_partition:
                 current = following
                 continue
             append_context_window(current_key, cursor, following.uptime_s, current)
             current = following
             current_key = next_key
+            current_partition = next_partition
             cursor = following.uptime_s
         append_context_window(current_key, cursor, session_end, current)
 
@@ -2706,24 +3269,24 @@ def analyze_test_items(
         gpu_frequency_values: List[float] = []
         foreground_duration: Dict[str, float] = {}
         for start, end in valid_windows:
-            metrics = _window_power_metrics(samples, intervals, start, end)
-            covered_s += metrics["covered_duration_s"]
-            energy_mwh += metrics["energy_mwh"]
-            for previous, current, _ in intervals:
+            metrics = _window_power_metrics(samples, consumption_intervals, start, end)
+            covered_s += float(metrics.get("covered_duration_s") or 0.0)
+            energy_mwh += float(metrics.get("energy_mwh") or 0.0)
+            for previous, current, _ in consumption_intervals:
                 overlap_s = max(0.0, min(end, current.uptime_s) - max(start, previous.uptime_s))
                 if overlap_s <= 0:
                     continue
-                if previous.direction == "discharging" or current.direction == "discharging":
-                    discharge_mah += (
-                        (previous.current_ma + current.current_ma) * 0.5 * overlap_s / 3600.0
-                    )
+                discharge_mah += (
+                    (previous.current_ma + current.current_ma) * 0.5 * overlap_s / 3600.0
+                )
                 midpoint = max(start, previous.uptime_s) + overlap_s * 0.5
                 context = _context_at(ordered_contexts, context_uptimes, midpoint)
                 package = context.foreground_package if context and context.foreground_package else "unknown"
                 foreground_duration[package] = foreground_duration.get(package, 0.0) + overlap_s
             for sample in samples:
                 if start <= sample.uptime_s <= end:
-                    power_values.append(sample.power_mw)
+                    if is_consumption_power_sample(sample):
+                        power_values.append(sample.power_mw)
                     if sample.cpu_pct is not None:
                         cpu_values.append(float(sample.cpu_pct))
                     if sample.battery_temperature_c is not None:
@@ -2961,6 +3524,8 @@ def analyze_test_items(
             "medium"
             if duration_s >= minimum_reliable_duration_s and coverage_pct >= 75.0
             else "low"
+            if covered_s > 0
+            else "unavailable"
         )
         interference_confidence = (
             "medium" if len(relevant_system) >= 2 else "low"
@@ -2988,8 +3553,9 @@ def analyze_test_items(
             "duration_s": duration_s,
             "covered_duration_s": covered_s,
             "coverage_pct": coverage_pct,
-            "energy_mwh": energy_mwh,
-            "discharge_mah": discharge_mah,
+            "power_valid_for_consumption": covered_s > 0,
+            "energy_mwh": energy_mwh if covered_s > 0 else None,
+            "discharge_mah": discharge_mah if covered_s > 0 else None,
             "mwh_per_minute": energy_mwh * 60.0 / covered_s if covered_s > 0 else None,
             "average_power_mw": energy_mwh * 3600.0 / covered_s if covered_s > 0 else None,
             "p95_power_mw": percentile(power_values, 0.95),
@@ -3084,11 +3650,16 @@ def analyze_test_items(
             ):
                 overlap_count += 1
 
+    effective_source_mode = source_mode if rows else "unavailable"
     return {
         "available": bool(rows),
-        "source_mode": source_mode,
+        "source_mode": effective_source_mode,
         "source_label": (
-            "导入的持续测试事件" if source_mode == "external_events" else "前台应用 / Ability 区间"
+            "导入的持续测试事件"
+            if effective_source_mode == "external_events"
+            else "前台应用 / Ability 区间"
+            if effective_source_mode == "foreground_activity"
+            else "未获得可归属的测试区间"
         ),
         "minimum_reliable_duration_s": minimum_reliable_duration_s,
         "row_count": len(rows),
@@ -3186,6 +3757,8 @@ def analyze_performance_test_items(
         ) -> None:
             if end <= start:
                 return
+            if not _auto_test_context_allowed(context, performance=True):
+                return
             source = context.source if context and context.source else "platform_context_sampler"
             occurrences.append(
                 {
@@ -3210,16 +3783,19 @@ def analyze_performance_test_items(
             row["windows"].append((start, end))  # type: ignore[union-attr]
 
         current_key = context_key(current)
+        current_partition = _context_screen_partition(current)
         for following in (
             item for item in ordered_contexts if session_start < item.uptime_s < session_end
         ):
             next_key = context_key(following)
-            if next_key == current_key:
+            next_partition = _context_screen_partition(following)
+            if next_key == current_key and next_partition == current_partition:
                 current = following
                 continue
             append_window(current_key, cursor, following.uptime_s, current)
             current = following
             current_key = next_key
+            current_partition = next_partition
             cursor = following.uptime_s
         append_window(current_key, cursor, session_end, current)
 
@@ -3233,16 +3809,27 @@ def analyze_performance_test_items(
     thermal_timeline = thermal_timeline if isinstance(thermal_timeline, list) else []
     scheduler_timeline = scheduler_analysis.get("timeline", [])
     scheduler_timeline = scheduler_timeline if isinstance(scheduler_timeline, list) else []
+    consumption_intervals = sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    )
 
     def values_in_windows(
         field: str,
         windows: Sequence[Tuple[float, float]],
+        *,
+        require_consumption_power: bool = False,
     ) -> List[float]:
         return [
             float(getattr(sample, field))
             for sample in samples
             if _time_in_windows(sample.uptime_s, windows)
             and isinstance(getattr(sample, field), (int, float))
+            and (
+                not require_consumption_power
+                or is_consumption_power_sample(sample)
+            )
         ]
 
     def analyze_windows(windows: Sequence[Tuple[float, float]]) -> Dict[str, object]:
@@ -3299,21 +3886,7 @@ def analyze_performance_test_items(
             frame_p99 = percentile(detailed_totals, 0.99)
             frame_metric_source = "Android gfxinfo detailed framestats"
         else:
-            one_low_values = [
-                float(item["one_percent_low_fps"])
-                for item in period_rows
-                if isinstance(item.get("one_percent_low_fps"), (int, float))
-            ]
-            rate_values = [
-                float(item["frame_rate_fps"])
-                for item in period_rows
-                if isinstance(item.get("frame_rate_fps"), (int, float))
-            ]
-            one_percent_low = (
-                min(one_low_values)
-                if one_low_values
-                else percentile(rate_values, 0.01)
-            )
+            one_percent_low = None
             p95_values = [
                 float(item["frame_time_p95_ms"])
                 for item in period_rows
@@ -3328,16 +3901,39 @@ def analyze_performance_test_items(
             frame_p99 = max(p99_values) if p99_values else None
             frame_metric_source = "periodic frame counter windows"
 
-        deadline_missed = sum(
-            int(item.get("deadline_missed_count") or 0) for item in period_rows
-        )
+        frame_issue_count = 0
+        for item in period_rows:
+            explicit_count = next(
+                (
+                    item.get(key)
+                    for key in (
+                        "frame_issue_count",
+                        "missed_vsync_interval_count",
+                        "deadline_missed_count",
+                    )
+                    if isinstance(item.get(key), (int, float))
+                ),
+                None,
+            )
+            if isinstance(explicit_count, (int, float)):
+                frame_issue_count += max(0, int(explicit_count))
+                continue
+            period_frame_count = item.get("frame_count")
+            period_issue_pct = item.get("frame_issue_pct")
+            if isinstance(period_frame_count, (int, float)) and isinstance(
+                period_issue_pct, (int, float)
+            ):
+                frame_issue_count += max(
+                    0,
+                    int(round(float(period_frame_count) * float(period_issue_pct) / 100.0)),
+                )
         if detailed and not period_rows:
-            deadline_missed = sum(1 for item in detailed if item.get("deadline_missed"))
+            frame_issue_count = sum(1 for item in detailed if item.get("deadline_missed"))
             issue_denominator = len(detailed)
         else:
             issue_denominator = frame_count
         frame_issue_pct = (
-            deadline_missed / issue_denominator * 100.0
+            frame_issue_count / issue_denominator * 100.0
             if issue_denominator > 0
             else None
         )
@@ -3372,7 +3968,24 @@ def analyze_performance_test_items(
         gpu_load_values = values_in_windows("gpu_load_pct", valid_windows)
         gpu_frequency_values = values_in_windows("gpu_frequency_mhz", valid_windows)
         memory_values = values_in_windows("memory_frequency_mhz", valid_windows)
-        power_values = values_in_windows("power_mw", valid_windows)
+        power_values = values_in_windows(
+            "power_mw",
+            valid_windows,
+            require_consumption_power=True,
+        )
+        power_covered_duration_s = 0.0
+        power_energy_mwh = 0.0
+        for start, end in valid_windows:
+            power_metrics = _window_power_metrics(
+                samples,
+                consumption_intervals,
+                start,
+                end,
+            )
+            power_covered_duration_s += float(
+                power_metrics.get("covered_duration_s") or 0.0
+            )
+            power_energy_mwh += float(power_metrics.get("energy_mwh") or 0.0)
         thermal_points = [
             item
             for item in thermal_timeline
@@ -3403,7 +4016,7 @@ def analyze_performance_test_items(
             "one_percent_low_fps": one_percent_low,
             "frame_p95_ms": frame_p95,
             "frame_p99_ms": frame_p99,
-            "frame_issue_count": deadline_missed,
+            "frame_issue_count": frame_issue_count,
             "frame_issue_pct": frame_issue_pct,
             "frame_metric_source": frame_metric_source,
             "detailed_frame_count": len(detailed),
@@ -3430,16 +4043,34 @@ def analyze_performance_test_items(
             "throttling_observed": maximum_thermal_status > 0,
             "scheduler": scheduler_points[-1] if scheduler_points else None,
             "average_whole_device_power_mw": (
-                statistics.fmean(power_values) if power_values else None
+                power_energy_mwh * 3600.0 / power_covered_duration_s
+                if power_covered_duration_s > 0
+                else None
             ),
+            "power_covered_duration_s": power_covered_duration_s,
+            "power_valid_for_consumption": power_covered_duration_s > 0,
         }
 
     rows: List[Dict[str, object]] = []
+    accepted_foreground_keys: set[Tuple[str, str]] = set()
     for definition in definitions.values():
         windows = definition.get("windows", [])
         if not isinstance(windows, list):
             continue
         metrics = analyze_windows(windows)
+        definition_key = (
+            str(definition.get("phase") or ""),
+            str(definition.get("name") or ""),
+        )
+        if (
+            source_mode == "foreground_activity"
+            and int(metrics.get("frame_count") or 0) <= 0
+            and int(metrics.get("detailed_frame_count") or 0) <= 0
+            and not isinstance(metrics.get("average_fps"), (int, float))
+        ):
+            continue
+        if source_mode == "foreground_activity":
+            accepted_foreground_keys.add(definition_key)
         rows.append(
             {
                 **{key: value for key, value in definition.items() if key != "windows"},
@@ -3474,6 +4105,11 @@ def analyze_performance_test_items(
 
     span_rows: List[Dict[str, object]] = []
     for occurrence in occurrences:
+        if source_mode == "foreground_activity" and (
+            str(occurrence.get("phase") or ""),
+            str(occurrence.get("name") or ""),
+        ) not in accepted_foreground_keys:
+            continue
         start = float(occurrence["start_uptime_s"])
         end = float(occurrence["end_uptime_s"])
         metrics = analyze_windows([(start, end)])
@@ -3502,12 +4138,37 @@ def analyze_performance_test_items(
         ):
             overlap_count += 1
 
+    effective_source_mode = source_mode if rows else "unavailable"
+    frame_flow = performance_analysis.get("frame_flow", {})
+    frame_flow = frame_flow if isinstance(frame_flow, dict) else {}
+    platform = str(frame_flow.get("platform") or "android").lower()
+    if platform == "harmony":
+        limitations = (
+            "测试窗口内的帧指标来自 SmartPerf 应用 FPS 与 fpsJitters，或原生 RenderService 合成节奏。"
+            "fpsJitters 可用于 P95/P99 与 1% Low，但量产接口不拆分 RenderThread、BufferQueue、GPU 或 HWC 阶段；"
+            "整机功率只作为同期上下文，不归因到进程或组件。"
+        )
+    elif platform == "ios":
+        limitations = (
+            "当前 iOS 后端不提供通用应用 FPS、1% Low 或逐帧阶段时间戳；"
+            "测试窗口仅保留 CPU/GPU、SystemLoad、温度和前台状态等实际可观测上下文。"
+        )
+    else:
+        limitations = (
+            "测试窗口内聚合帧指标；专项开启且实际获得详细 framestats 时才用于阶段分析，"
+            "否则使用 SurfaceFlinger / 周期帧计数窗口给出保守的 P95/P99 与 1% Low 上下文。"
+            "整机功率只作为同期记录，不归因到进程、UID 或组件。"
+        )
     return {
         "available": bool(rows),
         "analysis_mode": "performance",
-        "source_mode": source_mode,
+        "source_mode": effective_source_mode,
         "source_label": (
-            "导入的持续测试事件" if source_mode == "external_events" else "前台应用 / Ability 区间"
+            "导入的持续测试事件"
+            if effective_source_mode == "external_events"
+            else "前台应用 / Ability 区间"
+            if effective_source_mode == "foreground_activity"
+            else "未获得可归属的测试区间"
         ),
         "minimum_reliable_duration_s": minimum_reliable_duration_s,
         "row_count": len(rows),
@@ -3525,11 +4186,7 @@ def analyze_performance_test_items(
             for item in events
             if not item.duration_s and session_start <= item.device_uptime_s <= session_end
         ],
-        "limitations": (
-            "Frame metrics are aggregated inside each test window. Detailed framestats are used when "
-            "available; otherwise periodic counter windows provide conservative P95/P99 and 1% Low context. "
-            "Whole-device power is recorded only as a session context and is not attributed to processes, UIDs, or components."
-        ),
+        "limitations": limitations,
     }
 
 
@@ -3735,13 +4392,8 @@ def analyze_performance_contexts(
     performance_contexts = [
         item for item in ordered if isinstance(item.performance, dict) and item.performance
     ]
-    render_pipeline = analyze_android_frame_pipeline(performance_contexts)
     latest_context = performance_contexts[-1] if performance_contexts else None
     latest = latest_context.performance if latest_context is not None else probe
-
-    def latest_value(key: str) -> object:
-        value = latest.get(key) if isinstance(latest, dict) else None
-        return probe.get(key) if value in (None, "", [], {}) else value
 
     platform = str(metadata.get("platform") or latest.get("platform") or "").lower()
     if not platform:
@@ -3750,10 +4402,67 @@ def analyze_performance_contexts(
         elif "frame_counter_total" in latest or latest.get("surface_frame_source"):
             platform = "android"
     is_android = platform == "android"
+    capture_features = capture_features_from_metadata(metadata)
+    frame_details_enabled = bool(capture_features.get("frame_details", True))
+    render_pipeline = (
+        analyze_android_frame_pipeline(performance_contexts)
+        if is_android
+        else {
+            "available": False,
+            "frame_count": 0,
+            "average_total_ms": None,
+            "p95_total_ms": None,
+            "p99_total_ms": None,
+            "maximum_total_ms": None,
+            "deadline_missed_count": 0,
+            "deadline_missed_pct": None,
+            "dominant_stage": None,
+            "stages": [],
+            "slow_frames": [],
+            "timeline": [],
+            "limitations": (
+                "Detailed per-frame render-stage timestamps were not observed for this platform."
+            ),
+        }
+    )
+
+    def latest_value(key: str) -> object:
+        value = latest.get(key) if isinstance(latest, dict) else None
+        return probe.get(key) if value in (None, "", [], {}) else value
+
+    smartperf_contexts = [
+        item
+        for item in performance_contexts
+        if bool(item.performance.get("smartperf_source"))
+    ]
+    smartperf_unavailable_reason = next(
+        (
+            str(item.performance.get("frame_unavailable_reason") or "").strip()
+            for item in reversed(smartperf_contexts)
+            if str(item.performance.get("frame_unavailable_reason") or "").strip()
+        ),
+        "",
+    )
+    if "display is inactive" in smartperf_unavailable_reason.lower():
+        smartperf_unavailable_reason = (
+            "屏幕未处于活动状态；SmartPerf 报告的 FPS 不代表当前目标应用输出。"
+        )
+    elif "target" in smartperf_unavailable_reason.lower() and "foreground" in smartperf_unavailable_reason.lower():
+        smartperf_unavailable_reason = (
+            "目标应用未处于前台；该 SmartPerf FPS 不作为当前目标应用帧率。"
+        )
 
     def context_screen_active(item: ContextSample) -> bool:
         screen_state = str(item.screen_state or "").strip().lower()
+        if platform == "harmony":
+            return screen_state in {"awake", "on"}
         return not screen_state or screen_state in {"awake", "on"}
+
+    def context_report_break(item: ContextSample) -> bool:
+        return bool(
+            getattr(item, "_report_break_before", False)
+            or item.performance.get("report_break_before") is True
+        )
 
     harmony_display_contexts = [
         item
@@ -3784,7 +4493,10 @@ def analyze_performance_contexts(
     current_refresh = refresh_values[-1] if refresh_values else None
     if (
         current_refresh is None
-        and (latest_context is None or context_screen_active(latest_context))
+        and (
+            (platform != "harmony" and latest_context is None)
+            or (latest_context is not None and context_screen_active(latest_context))
+        )
         and isinstance(latest.get("refresh_rate_hz"), (int, float))
     ):
         current_refresh = float(latest["refresh_rate_hz"])
@@ -3808,24 +4520,32 @@ def analyze_performance_contexts(
         and item.performance.get("refresh_rate_durations_s")
     ]
     if len(duration_counter_contexts) >= 2:
-        first_durations = duration_counter_contexts[0].performance[
-            "refresh_rate_durations_s"
-        ]
-        last_durations = duration_counter_contexts[-1].performance[
-            "refresh_rate_durations_s"
-        ]
-        assert isinstance(first_durations, dict) and isinstance(last_durations, dict)
-        duration_rows = []
-        for key in set(first_durations) | set(last_durations):
-            try:
-                rate = float(key)
-                start_duration = float(first_durations.get(key, 0.0))
-                end_duration = float(last_durations.get(key, 0.0))
-            except (TypeError, ValueError):
+        accumulated_durations: Dict[float, float] = {}
+        for previous, current in zip(
+            duration_counter_contexts,
+            duration_counter_contexts[1:],
+        ):
+            if context_report_break(current):
                 continue
-            delta = end_duration - start_duration
-            if rate > 0 and delta > 0:
-                duration_rows.append((rate, delta))
+            previous_durations = previous.performance.get("refresh_rate_durations_s")
+            current_durations = current.performance.get("refresh_rate_durations_s")
+            if not isinstance(previous_durations, dict) or not isinstance(
+                current_durations, dict
+            ):
+                continue
+            for key in set(previous_durations) | set(current_durations):
+                try:
+                    rate = float(key)
+                    start_duration = float(previous_durations.get(key, 0.0))
+                    end_duration = float(current_durations.get(key, 0.0))
+                except (TypeError, ValueError):
+                    continue
+                delta = end_duration - start_duration
+                if rate > 0 and delta > 0:
+                    accumulated_durations[rate] = (
+                        accumulated_durations.get(rate, 0.0) + delta
+                    )
+        duration_rows = sorted(accumulated_durations.items())
         total_duration = sum(item[1] for item in duration_rows)
         refresh_residency = [
             {
@@ -3841,26 +4561,53 @@ def analyze_performance_contexts(
 
     counter_contexts = [
         item
-        for item in performance_contexts
+        for item in refresh_contexts
         if isinstance(item.performance.get("refresh_rate_counts"), dict)
         and item.performance.get("refresh_rate_counts")
     ]
-    if not refresh_residency and len(counter_contexts) >= 2:
-        first_counts = counter_contexts[0].performance["refresh_rate_counts"]
-        last_counts = counter_contexts[-1].performance["refresh_rate_counts"]
-        assert isinstance(first_counts, dict) and isinstance(last_counts, dict)
-        weighted_rows = []
-        for key in sorted(set(first_counts) | set(last_counts), key=lambda value: float(value)):
-            try:
-                rate = float(key)
-                start_count = int(first_counts.get(key, 0))
-                end_count = int(last_counts.get(key, 0))
-            except (TypeError, ValueError):
+    if platform == "harmony" and not refresh_residency and len(counter_contexts) >= 2:
+        accumulated_counts: Dict[float, int] = {}
+        accumulated_durations: Dict[float, float] = {}
+        for previous, current in zip(refresh_contexts, refresh_contexts[1:]):
+            if context_report_break(current):
                 continue
-            delta = end_count - start_count
-            if rate <= 0 or delta <= 0:
+            previous_screen_state = str(previous.screen_state or "").strip().lower()
+            current_screen_state = str(current.screen_state or "").strip().lower()
+            if previous_screen_state not in {"awake", "on"} or current_screen_state not in {
+                "awake",
+                "on",
+            }:
                 continue
-            weighted_rows.append((rate, delta, delta / rate))
+            previous_counts = previous.performance.get("refresh_rate_counts")
+            current_counts = current.performance.get("refresh_rate_counts")
+            if (
+                not isinstance(previous_counts, dict)
+                or not previous_counts
+                or not isinstance(current_counts, dict)
+                or not current_counts
+            ):
+                continue
+            for key in sorted(
+                set(previous_counts) & set(current_counts),
+                key=lambda value: float(value),
+            ):
+                try:
+                    rate = float(key)
+                    start_count = int(previous_counts[key])
+                    end_count = int(current_counts[key])
+                except (TypeError, ValueError):
+                    continue
+                delta = end_count - start_count
+                if rate <= 0 or delta <= 0:
+                    continue
+                accumulated_counts[rate] = accumulated_counts.get(rate, 0) + delta
+                accumulated_durations[rate] = (
+                    accumulated_durations.get(rate, 0.0) + delta / rate
+                )
+        weighted_rows = [
+            (rate, accumulated_counts[rate], accumulated_durations[rate])
+            for rate in sorted(accumulated_durations)
+        ]
         total_weight = sum(row[2] for row in weighted_rows)
         for rate, count, estimated_duration in weighted_rows:
             refresh_residency.append(
@@ -3879,10 +4626,11 @@ def analyze_performance_contexts(
     if not refresh_residency and len(ordered) >= 2:
         durations: Dict[float, float] = {}
         for current, following in zip(ordered, ordered[1:]):
+            if context_report_break(following):
+                continue
             if not isinstance(current.refresh_rate_hz, (int, float)) or current.refresh_rate_hz <= 0:
                 continue
-            screen_state = str(current.screen_state or "").strip().lower()
-            if screen_state and screen_state not in {"awake", "on"}:
+            if not context_screen_active(current):
                 continue
             delta = following.uptime_s - current.uptime_s
             if 0 < delta <= 60.0:
@@ -3967,6 +4715,8 @@ def analyze_performance_contexts(
     counter_timeline: List[Dict[str, object]] = []
 
     for previous, current in zip(counter_frame_contexts, counter_frame_contexts[1:]):
+        if context_report_break(current):
+            continue
         previous_screen = str(previous.screen_state or "").strip().lower()
         current_screen = str(current.screen_state or "").strip().lower()
         if (
@@ -4059,12 +4809,14 @@ def analyze_performance_contexts(
                 "deadline_missed_count": pair_counters["deadline"],
                 "missed_vsync_count": pair_counters["vsync"],
                 "janky_frame_count": pair_counters["janky"],
+                "frame_issue_count": pair_counters["deadline"],
                 "frame_issue_pct": (
                     pair_counters["deadline"] / delta_total * 100.0
                     if delta_total > 0
                     else 0.0
                 ),
                 "refresh_rate_hz": current.refresh_rate_hz,
+                "report_break_before": context_report_break(previous),
             }
         )
 
@@ -4081,6 +4833,14 @@ def analyze_performance_contexts(
         1000.0 / counter_slowest_frame_average_ms
         if isinstance(counter_slowest_frame_average_ms, (int, float))
         and counter_slowest_frame_average_ms > 0
+        else None
+    )
+    window_frame_rate_p1_reference_fps = (
+        percentile(counter_frame_rates, 0.01) if counter_frame_rates else None
+    )
+    window_frame_rate_p1_reference_source = (
+        "Android gfxinfo counter-window FPS P1 (reference only)"
+        if counter_frame_rates
         else None
     )
 
@@ -4200,12 +4960,10 @@ def analyze_performance_contexts(
         one_percent_low_source = (
             "Android gfxinfo frame-time histogram slowest 1%"
             if counter_one_percent_low_fps is not None
-            else "Android gfxinfo counter-window 1st percentile"
+            else None
         )
-        if one_percent_low_fps is None and counter_frame_rates:
-            one_percent_low_fps = percentile(counter_frame_rates, 0.01)
         one_percent_low_confidence = (
-            "high" if counter_one_percent_low_fps is not None else "medium"
+            "high" if counter_one_percent_low_fps is not None else None
         )
         frame_issue_count = counter_deadline_missed
         frame_issue_pct = (
@@ -4225,11 +4983,12 @@ def analyze_performance_contexts(
         frame_metric_average_ms = compositor_frame_average_ms
         frame_metric_p95_ms = compositor_frame_p95_ms
         frame_metric_p99_ms = compositor_frame_p99_ms
-        one_percent_low_fps = (
-            compositor_one_percent_low_fps
-            if compositor_one_percent_low_fps is not None
-            else percentile(fps_values, 0.01) if fps_values else None
-        )
+        one_percent_low_fps = compositor_one_percent_low_fps
+        if window_frame_rate_p1_reference_fps is None and fps_values:
+            window_frame_rate_p1_reference_fps = percentile(fps_values, 0.01)
+            window_frame_rate_p1_reference_source = (
+                "sampled-window FPS P1 (reference only)"
+            )
         frame_issue_count = missed_intervals
         frame_issue_pct = compositor_missed_pct
         if is_android:
@@ -4237,21 +4996,19 @@ def analyze_performance_contexts(
                 one_percent_low_source = (
                     "Android SurfaceFlinger presented-frame slowest 1%"
                     if compositor_one_percent_low_fps is not None
-                    else "Android SurfaceFlinger sampled-window 1st percentile"
-                    if fps_values
                     else None
                 )
                 one_percent_low_confidence = (
                     "high" if compositor_one_percent_low_fps is not None
-                    else "medium" if fps_values else None
+                    else None
                 )
                 frame_rate_source = (
-                    "Android SurfaceFlinger BLAST layer present timestamps"
+                    "Android SurfaceFlinger foreground application-layer present timestamps"
                 )
                 frame_rate_label = "应用呈现帧率"
                 frame_rate_unit = "FPS"
                 frame_metric_label = "呈现帧间隔 P95"
-                frame_issue_label = "跨越帧预算"
+                frame_issue_label = "节奏校正后超出有效帧预算"
             else:
                 one_percent_low_source = None
                 one_percent_low_confidence = None
@@ -4262,15 +5019,13 @@ def analyze_performance_contexts(
                 frame_issue_label = "超出帧截止时间"
         else:
             smartperf_rows = any(item.get("smartperf_source") for item in frame_rows)
-            one_percent_low_source = (
-                "HarmonyOS SmartPerf frame-jitter slowest 1%"
-                if compositor_one_percent_low_fps is not None
-                else "RenderService sampled-window 1st percentile" if fps_values else None
-            )
-            one_percent_low_confidence = (
-                "high" if compositor_one_percent_low_fps is not None
-                else "medium" if fps_values else None
-            )
+            if smartperf_rows and compositor_one_percent_low_fps is not None:
+                one_percent_low_source = "HarmonyOS SmartPerf frame-jitter slowest 1%"
+                one_percent_low_confidence = "high"
+            else:
+                one_percent_low_fps = None
+                one_percent_low_source = None
+                one_percent_low_confidence = None
             frame_rate_source = (
                 "HarmonyOS SmartPerf SP_daemon app FPS and frame jitter"
                 if smartperf_rows
@@ -4490,17 +5245,109 @@ def analyze_performance_contexts(
                 "frame_time_p95_ms": item.performance.get("frame_interval_p95_ms"),
                 "frame_time_p99_ms": item.performance.get("frame_interval_p99_ms"),
                 "one_percent_low_fps": item.performance.get("one_percent_low_fps"),
+                "frame_budget_ms": item.performance.get("frame_budget_ms"),
+                "frame_cadence_divisor": item.performance.get(
+                    "frame_cadence_divisor"
+                ),
+                "frame_issue_count": int(
+                    item.performance.get("frame_issue_count")
+                    or item.performance.get("missed_vsync_interval_count")
+                    or item.performance.get("deadline_missed_count")
+                    or 0
+                ),
                 "frame_issue_pct": (
-                    float(item.performance.get("missed_vsync_interval_count") or 0)
+                    float(
+                        item.performance.get("frame_issue_count")
+                        or item.performance.get("missed_vsync_interval_count")
+                        or item.performance.get("deadline_missed_count")
+                        or 0
+                    )
                     / float(item.performance.get("frame_sample_count") or 1)
                     * 100.0
                 ),
                 "refresh_rate_hz": item.refresh_rate_hz,
+                "report_break_before": context_report_break(item),
             }
             for item in primary_frame_contexts
             if context_screen_active(item)
             and isinstance(item.performance.get("compositor_fps"), (int, float))
         ]
+
+    one_percent_low_timeline_label: Optional[str] = None
+    one_percent_low_timeline_source: Optional[str] = None
+    rolling_one_percent_low_supported = using_surface_frames or using_smartperf_frames
+    if frame_rate_timeline and rolling_one_percent_low_supported and any(
+        isinstance(item.get("frame_intervals_ms"), list)
+        and bool(item.get("frame_intervals_ms"))
+        for item in frame_rate_timeline
+    ):
+        rolling_intervals: deque[float] = deque()
+        rolling_coverage_s = 0.0
+        previous_uptime: Optional[float] = None
+        enriched_timeline: List[Dict[str, object]] = []
+        for item in frame_rate_timeline:
+            row = dict(item)
+            uptime = (
+                float(item["uptime_s"])
+                if isinstance(item.get("uptime_s"), (int, float))
+                else None
+            )
+            if (
+                row.get("report_break_before") is True
+                or (
+                uptime is not None
+                and previous_uptime is not None
+                and uptime - previous_uptime > 10.0
+                )
+            ):
+                rolling_intervals.clear()
+                rolling_coverage_s = 0.0
+            if uptime is not None:
+                previous_uptime = uptime
+            intervals = item.get("frame_intervals_ms", [])
+            valid_intervals = [
+                float(value)
+                for value in intervals
+                if isinstance(value, (int, float)) and 0.1 <= float(value) <= 2000.0
+            ] if isinstance(intervals, list) else []
+            for interval_ms in valid_intervals:
+                rolling_intervals.append(interval_ms)
+                rolling_coverage_s += interval_ms / 1000.0
+            while (
+                rolling_intervals
+                and rolling_coverage_s - rolling_intervals[0] / 1000.0 >= 10.0
+            ):
+                rolling_coverage_s -= rolling_intervals.popleft() / 1000.0
+            row["one_percent_low_fps"] = None
+            row["one_percent_low_window_s"] = min(10.0, rolling_coverage_s)
+            row["one_percent_low_sample_count"] = len(rolling_intervals)
+            row["one_percent_low_timeline_source"] = "rolling_10s_presented_frame_intervals"
+            if (
+                valid_intervals
+                and rolling_coverage_s >= 8.0
+                and len(rolling_intervals) >= 120
+            ):
+                slow_count = max(1, math.ceil(len(rolling_intervals) * 0.01))
+                slow_average_ms = statistics.fmean(
+                    sorted(rolling_intervals, reverse=True)[:slow_count]
+                )
+                if slow_average_ms > 0:
+                    row["one_percent_low_fps"] = 1000.0 / slow_average_ms
+            enriched_timeline.append(row)
+        frame_rate_timeline = enriched_timeline
+        one_percent_low_timeline_label = "滚动 10 秒 1% Low"
+        one_percent_low_timeline_source = "presented frame intervals, rolling 10-second window"
+    elif frame_rate_timeline and platform == "harmony" and not using_smartperf_frames:
+        frame_rate_timeline = [
+            {**item, "one_percent_low_fps": None}
+            for item in frame_rate_timeline
+        ]
+    elif any(
+        isinstance(item.get("one_percent_low_fps"), (int, float))
+        for item in frame_rate_timeline
+    ):
+        one_percent_low_timeline_label = "窗口 1% Low（参考）"
+        one_percent_low_timeline_source = "per-sampled-window frame statistics"
 
     def context_frame_rate_timeline(
         source_contexts: Sequence[ContextSample],
@@ -4530,6 +5377,7 @@ def analyze_performance_contexts(
                     ),
                     "value": float(value),
                     "frame_rate_fps": float(value),
+                    "report_break_before": context_report_break(item),
                 }
             )
         return timeline
@@ -4549,6 +5397,18 @@ def analyze_performance_contexts(
     render_service_flow_timeline = context_frame_rate_timeline(
         render_service_contexts
     )
+
+    def refresh_timeline_source(item: ContextSample) -> str:
+        if platform == "android":
+            return "Android DisplayManager active display mode"
+        if platform == "harmony":
+            if item.source == "harmony_ability_render_service":
+                return "HarmonyOS RenderService current refresh rate"
+            if bool(item.performance.get("smartperf_source")):
+                return "HarmonyOS SmartPerf reported refresh rate"
+            return "HarmonyOS display context current refresh rate"
+        return str(item.source or "platform display context")
+
     refresh_points_by_uptime: Dict[float, Dict[str, object]] = {}
     for item in refresh_contexts:
         if (
@@ -4561,7 +5421,8 @@ def analyze_performance_contexts(
             "uptime_s": item.uptime_s,
             "value": float(item.refresh_rate_hz),
             "refresh_rate_hz": float(item.refresh_rate_hz),
-            "source": item.source,
+            "source": refresh_timeline_source(item),
+            "report_break_before": context_report_break(item),
         }
     refresh_flow_points = [
         refresh_points_by_uptime[key] for key in sorted(refresh_points_by_uptime)
@@ -4570,6 +5431,7 @@ def analyze_performance_contexts(
     for point in refresh_flow_points:
         if (
             not refresh_flow_timeline
+            or point.get("report_break_before") is True
             or abs(float(point["value"]) - float(refresh_flow_timeline[-1]["value"]))
             > 0.1
         ):
@@ -4580,6 +5442,22 @@ def analyze_performance_contexts(
         != refresh_flow_points[-1]["uptime_s"]
     ):
         refresh_flow_timeline.append(refresh_flow_points[-1])
+    refresh_timeline_sources = list(
+        dict.fromkeys(
+            str(item.get("source") or "").strip()
+            for item in refresh_flow_points
+            if str(item.get("source") or "").strip()
+        )
+    )
+    refresh_rate_timeline_source = (
+        " + ".join(refresh_timeline_sources)
+        if refresh_timeline_sources
+        else "Android DisplayManager active display mode"
+        if platform == "android"
+        else "HarmonyOS RenderService current refresh rate"
+        if platform == "harmony"
+        else "platform active display mode"
+    )
 
     def flow_metric(
         label: str,
@@ -4614,22 +5492,53 @@ def analyze_performance_contexts(
         timeline_unit: str = "FPS",
         timeline_value_label: str = "帧率",
     ) -> Dict[str, object]:
+        parsed_sample_count = (
+            int(sample_count) if isinstance(sample_count, (int, float)) else None
+        )
+        parsed_timeline = [item for item in timeline if isinstance(item, dict)]
+        timeline_has_positive_value = any(
+            isinstance(
+                item.get("value", item.get("frame_rate_fps", item.get("refresh_rate_hz"))),
+                (int, float),
+            )
+            and float(
+                item.get("value", item.get("frame_rate_fps", item.get("refresh_rate_hz")))
+                or 0.0
+            )
+            > 0
+            for item in parsed_timeline
+        )
+        empty_invalid_stage = (
+            status in {"invalid", "unavailable"}
+            and not (isinstance(parsed_sample_count, int) and parsed_sample_count > 0)
+            and not timeline_has_positive_value
+        )
         return {
             "key": key,
             "phase": phase,
             "label": label,
             "status": status,
-            "value": float(value) if isinstance(value, (int, float)) else None,
+            "value": (
+                None
+                if empty_invalid_stage
+                else float(value) if isinstance(value, (int, float)) else None
+            ),
             "unit": unit,
             "value_label": value_label,
             "source": source,
             "detail": detail,
-            "sample_count": (
-                int(sample_count) if isinstance(sample_count, (int, float)) else None
+            "sample_count": parsed_sample_count,
+            "confidence": "" if empty_invalid_stage else confidence,
+            "metrics": (
+                []
+                if empty_invalid_stage
+                else [item for item in metrics if isinstance(item, dict)]
             ),
-            "confidence": confidence,
-            "metrics": [item for item in metrics if isinstance(item, dict)],
-            "timeline": [item for item in timeline if isinstance(item, dict)],
+            "timeline": (
+                []
+                if empty_invalid_stage
+                else parsed_timeline
+            ),
             "timeline_unit": timeline_unit,
             "timeline_value_label": timeline_value_label,
         }
@@ -4637,7 +5546,20 @@ def analyze_performance_contexts(
     latest_screen_state = str(
         (latest_context.screen_state if latest_context is not None else "") or ""
     ).strip().lower()
-    screen_active = not latest_screen_state or latest_screen_state in {"awake", "on"}
+    screen_active = (
+        latest_screen_state in {"awake", "on"}
+        if platform == "harmony"
+        else not latest_screen_state or latest_screen_state in {"awake", "on"}
+    )
+    refresh_rate_unavailable_reason = (
+        (
+            "屏幕未处于活动状态；保留的刷新配置不代表当前显示输出。"
+            if latest_screen_state
+            else "无法确认当前屏幕状态；保留的刷新配置不作为当前显示输出。"
+        )
+        if platform == "harmony" and not screen_active
+        else None
+    )
     unavailable_reason = str(latest_value("frame_unavailable_reason") or "").strip()
     frame_flow_stages: List[Dict[str, object]] = []
     primary_flow_key: Optional[str] = None
@@ -4652,7 +5574,7 @@ def analyze_performance_contexts(
         elif counter_pair_count > 0 and counter_frame_count > 0:
             app_status = "reference"
             app_detail = (
-                "该值只代表应用 UI 窗口提交；游戏 SurfaceView/BLAST 的真实呈现节奏以 "
+                "该值只代表应用 UI 窗口提交；游戏前台应用缓冲层的真实呈现节奏以 "
                 "SurfaceFlinger 时间戳为准。"
             )
         elif len(counter_frame_contexts) >= 2:
@@ -4702,6 +5624,11 @@ def analyze_performance_contexts(
                     "它提供阶段延迟，不是独立 FPS 计数。"
                     if pipeline_available
                     else (
+                        "详细 gfxinfo framestats 采集未启用；基础 SurfaceFlinger 呈现间隔仍用于 "
+                        "FPS、P95/P99、异常帧与 1% Low，但不拆 RenderThread、BufferQueue 或 GPU 阶段。"
+                    )
+                    if not frame_details_enabled
+                    else (
                         "当前前台窗口未产生新增且可解析的 gfxinfo framestats；"
                         "原生游戏 SurfaceView 通常不会在此公开独立 RenderThread 阶段。"
                     )
@@ -4727,12 +5654,13 @@ def analyze_performance_contexts(
             surface_status = "primary"
             primary_flow_key = "surface_present"
             surface_detail = (
-                "前台 SurfaceView/BLAST 层实际 present 时间戳；用于游戏呈现 FPS、帧间隔和 1% Low。"
+                "前台应用缓冲层实际 present 时间戳（优先 SurfaceView/BLAST）；"
+                "用于游戏呈现 FPS、帧间隔和 1% Low。"
             )
         elif isinstance(untargeted_compositor_fps, (int, float)):
             surface_status = "invalid"
             surface_detail = (
-                "检测到合成器窗口采样，但未绑定到当前应用 SurfaceView/BLAST 层，不能作为游戏呈现 FPS。"
+                "检测到合成器窗口采样，但未绑定到当前前台应用缓冲层，不能作为游戏呈现 FPS。"
             )
         else:
             surface_status = "unavailable"
@@ -4753,7 +5681,7 @@ def analyze_performance_contexts(
                 unit="FPS",
                 value_label="呈现帧率",
                 source=(
-                    "Android SurfaceFlinger BLAST layer present timestamps"
+                    "Android SurfaceFlinger foreground application-layer present timestamps"
                     if using_surface_frames
                     else "Android compositor sample without target-layer binding"
                 ),
@@ -4787,7 +5715,7 @@ def analyze_performance_contexts(
                 value=current_refresh,
                 unit="Hz",
                 value_label="刷新率",
-                source=residency_source or "Android active display mode",
+                source=refresh_rate_timeline_source,
                 detail=(
                     display_detail
                     if screen_active
@@ -4816,7 +5744,12 @@ def analyze_performance_contexts(
             app_detail = "SmartPerf SP_daemon 绑定目标进程输出的应用 FPS。"
         else:
             app_status = "unavailable"
-            app_detail = "未启用 SmartPerf，或 SP_daemon 未返回目标应用 FPS。"
+            app_detail = (
+                smartperf_unavailable_reason
+                or "SP_daemon 未返回可验证的目标应用 FPS。"
+                if smartperf_contexts
+                else "未启用 SmartPerf。"
+            )
         frame_flow_stages.append(
             flow_stage(
                 "app_submission",
@@ -4900,7 +5833,7 @@ def analyze_performance_contexts(
                 value=current_refresh,
                 unit="Hz",
                 value_label="刷新率",
-                source=residency_source or "HarmonyOS RenderService current refresh rate",
+                source=refresh_rate_timeline_source,
                 detail=(
                     "fpsCount 与当前刷新率描述显示档位驻留，不是目标应用 FPS；HWC 最终 present 计数未公开。"
                     if screen_active
@@ -4955,15 +5888,64 @@ def analyze_performance_contexts(
         if abs(current - previous) > 0.1
     )
     observed_rates = sorted(set(refresh_values))
-    available = bool(
-        refresh_values
-        or frame_rows
-        or refresh_residency
-        or latest
-        or probe
+    context_available = bool(latest or probe or ordered)
+    frame_evidence_available = bool(
+        frame_rate_timeline
+        or isinstance(sampled_frame_rate, (int, float))
+        or reported_frame_sample_count > 0
+        or render_pipeline.get("available") is True
     )
+    available = bool(
+        frame_evidence_available
+        or refresh_values
+        or refresh_residency
+        or render_resolution_available
+        or touch_interaction_count is not None
+    )
+    if platform == "ios":
+        performance_limitations = (
+            "The current iOS sidecar does not expose a general application FPS counter, per-frame Core Animation "
+            "timestamps, a display refresh-rate timeline, or a verifiable frame-interpolation switch. No frame-rate, "
+            "1% Low, refresh-switch, or render-stage conclusion is generated without those observations."
+        )
+    elif platform == "harmony":
+        performance_limitations = (
+            "Compositor FPS and frame intervals are periodic samples of recent RenderService submissions. "
+            "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed and is not "
+            "inferred. Frame interpolation is reported as enabled or disabled only when an explicit vendor switch "
+            "is readable; a refresh/application cadence ratio alone cannot distinguish MEMC from ordinary frame "
+            "repetition."
+        )
+    elif is_android:
+        performance_limitations = (
+            (
+                "Android game frame rate and frame intervals are derived from present timestamps on the "
+                "foreground application buffer layer selected from SurfaceFlinger, with SurfaceView/BLAST "
+                "preferred when available. They represent frames presented by SurfaceFlinger; "
+                "the public interface does not expose every internal engine or hardware-composer stage. "
+                if using_surface_frames
+                else (
+                    "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
+                    "for the sampled foreground window. The rate is UI frame submissions per second, not visible "
+                    "display FPS, and can exceed the panel refresh rate when an app submits redundant frames. "
+                    if using_gfxinfo_counters
+                    else "Android gfxinfo and SurfaceFlinger did not expose usable foreground frame deltas in this session. "
+                )
+            )
+            + "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed "
+            "and is not inferred. Frame interpolation is reported as enabled or disabled only when an "
+            "explicit vendor switch is readable; a refresh/application cadence ratio alone cannot "
+            "distinguish MEMC from ordinary frame repetition."
+        )
+    else:
+        performance_limitations = (
+            "This platform did not expose enough frame, refresh-rate, touch-controller, or interpolation evidence "
+            "to generate a verified rendering conclusion."
+        )
     return {
         "available": available,
+        "context_available": context_available,
+        "frame_evidence_available": frame_evidence_available,
         "context_sample_count": len(ordered),
         "current_refresh_rate_hz": current_refresh,
         "peak_refresh_rate_hz": max(supported_refresh_rates) if supported_refresh_rates else None,
@@ -4990,8 +5972,15 @@ def analyze_performance_contexts(
         "one_percent_low_fps": one_percent_low_fps,
         "one_percent_low_source": one_percent_low_source,
         "one_percent_low_confidence": one_percent_low_confidence,
+        "one_percent_low_standard": bool(one_percent_low_fps is not None),
+        "one_percent_low_timeline_label": one_percent_low_timeline_label,
+        "one_percent_low_timeline_source": one_percent_low_timeline_source,
+        "window_frame_rate_p1_reference_fps": window_frame_rate_p1_reference_fps,
+        "window_frame_rate_p1_reference_source": window_frame_rate_p1_reference_source,
         "frame_rate_timeline": frame_rate_timeline,
         "refresh_rate_timeline": refresh_flow_timeline,
+        "refresh_rate_timeline_source": refresh_rate_timeline_source,
+        "refresh_rate_unavailable_reason": refresh_rate_unavailable_reason,
         "frame_flow": frame_flow,
         "gfxinfo_submission_fps": gfxinfo_submission_fps,
         "surface_present_fps": surface_present_fps,
@@ -5062,31 +6051,11 @@ def analyze_performance_contexts(
         "frame_unavailable_reason": (
             None
             if isinstance(sampled_frame_rate, (int, float))
+            else smartperf_unavailable_reason
+            if platform == "harmony" and smartperf_contexts and smartperf_unavailable_reason
             else latest_value("frame_unavailable_reason")
         ),
-        "limitations": (
-            (
-                "Android game frame rate and frame intervals are derived from present timestamps on the "
-                "foreground SurfaceView/BLAST layer. They represent frames presented by SurfaceFlinger; "
-                "the public interface does not expose every internal engine or hardware-composer stage. "
-                if using_surface_frames
-                else (
-                    "Android frame rate and frame-duration statistics are deltas of cumulative gfxinfo counters "
-                    "for the sampled foreground window. The rate is UI frame submissions per second, not visible "
-                    "display FPS, and can exceed the panel refresh rate when an app submits redundant frames. "
-                    if using_gfxinfo_counters
-                    else (
-                        "Android gfxinfo and SurfaceFlinger did not expose usable foreground frame deltas in this session. "
-                        if is_android
-                        else "Compositor FPS and frame intervals are periodic samples of recent RenderService submissions. "
-                    )
-                )
-            )
-            + "Touch counts are delivered interactions; the panel hardware sampling rate is not exposed "
-            "and is not inferred. Frame interpolation is reported as enabled or disabled only when an "
-            "explicit vendor switch is readable; a refresh/application cadence ratio alone cannot "
-            "distinguish MEMC from ordinary frame repetition."
-        ),
+        "limitations": performance_limitations,
     }
 
 
@@ -5154,7 +6123,8 @@ def analyze_power_pressure(
     memory_analysis: Dict[str, object],
     settings_analysis: Dict[str, object],
 ) -> Dict[str, object]:
-    powers = [float(item.power_mw) for item in samples]
+    valid_samples = [item for item in samples if is_consumption_power_sample(item)]
+    powers = [float(item.power_mw) for item in valid_samples]
     drivers: List[Dict[str, object]] = []
 
     def add_driver(
@@ -5166,14 +6136,24 @@ def analyze_power_pressure(
         pairs = [
             (float(value), float(sample.power_mw))
             for sample, value in zip(samples, values)
-            if isinstance(value, (int, float))
+            if isinstance(value, (int, float)) and is_consumption_power_sample(sample)
         ]
-        if len(pairs) < 3:
+        if len(pairs) < 30:
             return
-        correlation = _pearson(
-            [item[0] for item in pairs],
-            [item[1] for item in pairs],
-        )
+        paired_samples = [
+            sample
+            for sample, value in zip(samples, values)
+            if isinstance(value, (int, float)) and is_consumption_power_sample(sample)
+        ]
+        if paired_samples[-1].uptime_s - paired_samples[0].uptime_s < 30.0:
+            return
+        driver_values = [item[0] for item in pairs]
+        power_values = [item[1] for item in pairs]
+        if len(set(driver_values)) < 3 or len(set(power_values)) < 3:
+            return
+        correlation = _pearson(driver_values, power_values)
+        if not isinstance(correlation, (int, float)) or abs(correlation) < 0.5:
+            return
         drivers.append(
             {
                 "key": key,
@@ -5199,12 +6179,6 @@ def analyze_power_pressure(
             f"{name} 频率",
             [item.frequencies_mhz.get(name) for item in samples],
             "高频驻留会提高 CPU 电压/频率压力，但仍需结合负载判断。",
-        )
-        add_driver(
-            f"cpu_load:{name}",
-            f"{name} 负载",
-            [item.cluster_cpu_pct.get(name) for item in samples],
-            "集群负载用于区分空转高频和实际计算压力。",
         )
     add_driver(
         "gpu_load",
@@ -5275,7 +6249,9 @@ def analyze_power_pressure(
                 ),
             }
         )
-    if memory_analysis.get("available"):
+    if memory_analysis.get("available") and memory_analysis.get(
+        "power_valid_for_consumption"
+    ):
         delta = memory_analysis.get("high_frequency_power_delta_mw")
         explanations.append(
             {
@@ -5293,6 +6269,7 @@ def analyze_power_pressure(
         )
     return {
         "available": bool(drivers or tasks),
+        "power_valid_for_consumption": bool(valid_samples),
         "power_distribution": {
             "median_mw": statistics.median(powers) if powers else None,
             "p95_mw": percentile(powers, 0.95),
@@ -5411,16 +6388,24 @@ def analyze_render_performance(
             "hottest_sensor": thermal_analysis.get("hottest_sensor"),
         },
         "power_recording": {
+            "power_valid_for_consumption": summary.get(
+                "power_valid_for_consumption"
+            ),
             "average_power_mw": summary.get("average_power_mw"),
             "p95_power_mw": summary.get("p95_power_mw"),
             "maximum_power_mw": summary.get("maximum_power_mw"),
             "energy_mwh": summary.get("energy_mwh"),
-            "note": "仅记录整机功耗，不执行组件、UID 或第三方任务功耗归因。",
+            "note": (
+                "仅记录整机功耗，不执行组件、UID 或第三方任务功耗归因。"
+                if summary.get("power_valid_for_consumption")
+                else "当前功率通道仅作为原始观测展示，不生成耗电结论。"
+            ),
         },
     }
 
 
 def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
+    platform = str(analysis.get("platform") or "android").lower()
     performance = analysis.get("performance", {})
     performance = performance if isinstance(performance, dict) else {}
     render = analysis.get("render_performance", {})
@@ -5428,24 +6413,85 @@ def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, st
     brightness = analysis.get("brightness_throttling", {})
     brightness = brightness if isinstance(brightness, dict) else {}
     findings: List[Dict[str, str]] = []
+    if platform == "ios":
+        summary = analysis.get("summary", {})
+        summary = summary if isinstance(summary, dict) else {}
+        # CPU/GPU/SystemLoad averages already appear in the aligned raw-data view.
+        # Findings should add interpretation instead of duplicating raw statistics.
+        observer_cpu = summary.get("average_collector_cpu_pct")
+        if isinstance(observer_cpu, (int, float)):
+            findings.append(
+                {
+                    "level": "context",
+                    "title": "观察者相关进程 CPU 上界",
+                    "detail": (
+                        f"sysmond、DTServiceHub 与配对服务同期归一化 CPU 平均为 {float(observer_cpu):.2f}%。"
+                        "该值包含这些进程的本底活动，不等于采集工具造成的净增量。"
+                    ),
+                }
+            )
+        return findings
     fps = performance.get("sampled_frame_rate_fps")
     one_low = performance.get("one_percent_low_fps")
     p99 = performance.get("frame_metric_p99_ms")
-    if isinstance(fps, (int, float)):
-        findings.append(
-            {
-                "level": "measured",
-                "title": "帧表现",
-                "detail": (
-                    f"平均提交帧率 {float(fps):.1f} FPS，"
-                    f"1% Low {float(one_low):.1f} FPS，"
-                    f"P99 帧耗时 {float(p99):.2f} ms。"
-                    if isinstance(one_low, (int, float))
-                    and isinstance(p99, (int, float))
-                    else f"平均提交帧率 {float(fps):.1f} FPS。"
-                ),
-            }
+    frame_issue_pct = performance.get("frame_issue_pct")
+    frame_issue_count = performance.get("frame_issue_count")
+    frame_sample_count = performance.get("frame_sample_count")
+    if (
+        isinstance(fps, (int, float))
+        and float(fps) > 0
+        and isinstance(one_low, (int, float))
+        and float(one_low) >= 0
+    ):
+        frame_rate_label = str(performance.get("frame_rate_label") or "帧率").strip()
+        frame_rate_unit = str(performance.get("frame_rate_unit") or "FPS").strip()
+        low_ratio = float(one_low) / float(fps)
+        evidence = (
+            f"平均{frame_rate_label} {float(fps):.1f} {frame_rate_unit}，"
+            f"1% Low {float(one_low):.1f} FPS（平均值的 {low_ratio * 100.0:.1f}%）"
         )
+        if isinstance(p99, (int, float)):
+            evidence += f"，P99 帧耗时 {float(p99):.2f} ms"
+        if isinstance(frame_issue_pct, (int, float)):
+            evidence += f"，节奏校正后异常帧占比 {float(frame_issue_pct):.2f}%"
+            if isinstance(frame_issue_count, (int, float)):
+                evidence += f"（{int(frame_issue_count)} 帧）"
+        evidence += "。"
+
+        if low_ratio < 0.75:
+            findings.append(
+                {
+                    "level": "high" if low_ratio < 0.5 else "medium",
+                    "title": "尾部帧稳定性不足",
+                    "detail": (
+                        evidence
+                        + "1% Low 明显低于全程平均，说明少量慢帧或停顿显著影响尾部体验；"
+                        "P99 是最慢 1% 的入口分位点，而 1% Low 会平均最慢 1%，两者口径不同。"
+                    ),
+                }
+            )
+        elif isinstance(frame_issue_pct, (int, float)) and float(frame_issue_pct) >= 2.0:
+            findings.append(
+                {
+                    "level": "medium",
+                    "title": "异常帧占比偏高",
+                    "detail": evidence + "异常帧已形成可重复的节奏问题，建议结合时间轴定位同段资源或热状态变化。",
+                }
+            )
+        elif (
+            isinstance(frame_issue_pct, (int, float))
+            and float(frame_issue_pct) < 1.0
+            and isinstance(frame_sample_count, (int, float))
+            and int(frame_sample_count) >= 300
+            and low_ratio >= 0.85
+        ):
+            findings.append(
+                {
+                    "level": "measured",
+                    "title": "帧节奏整体稳定",
+                    "detail": evidence + "样本量充足，1% Low 保持率和异常帧占比均未显示明显尾部劣化。",
+                }
+            )
     for item in render.get("bottlenecks", []) if isinstance(render.get("bottlenecks"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -5476,18 +6522,6 @@ def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, st
                 ),
             }
         )
-    power = render.get("power_recording", {})
-    if isinstance(power, dict) and isinstance(power.get("average_power_mw"), (int, float)):
-        findings.append(
-            {
-                "level": "measured",
-                "title": "整机功耗记录",
-                "detail": (
-                    f"平均 {float(power['average_power_mw']) / 1000.0:.3f} W；"
-                    "性能模式不继续拆分第三方任务或组件功耗来源。"
-                ),
-            }
-        )
     return findings
 
 
@@ -5507,17 +6541,12 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
     brightness = analysis.get("brightness_throttling", {})
     brightness = brightness if isinstance(brightness, dict) else {}
     target = analysis.get("target_app")
-    findings: List[Dict[str, str]] = [
-        {
-            "level": "measured",
-            "title": "电池侧实测功率",
-            "detail": (
-                f"平均功率 {float(summary.get('average_power_mw') or 0.0) / 1000.0:.3f} W，"
-                f"平均电流幅值 {float(summary.get('average_current_ma') or 0.0):.1f} mA；"
-                f"P95 功率 {float(summary.get('p95_power_mw') or 0.0) / 1000.0:.3f} W。"
-            ),
-        }
-    ]
+    if not bool(summary.get("power_valid_for_consumption")):
+        return []
+    # Average power/current/P95 are first-class raw-data statistics.  Keep the
+    # analysis page for conclusions that add causal, comparative, or validity
+    # information instead of repeating those values.
+    findings: List[Dict[str, str]] = []
     pressure = analysis.get("power_pressure", {})
     pressure = pressure if isinstance(pressure, dict) else {}
     for item in pressure.get("explanations", []) if isinstance(pressure.get("explanations"), list) else []:
@@ -5798,7 +6827,14 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
         thermal_status = thermal.get("maximum_status")
         if thermal_status is None:
             thermal_status = thermal.get("status")
-    if isinstance(thermal_status, (int, float)) and thermal_status > 0:
+    thermal_severity_available = bool(
+        isinstance(thermal, dict) and thermal.get("severity_available") is True
+    )
+    if (
+        thermal_severity_available
+        and isinstance(thermal_status, (int, float))
+        and thermal_status > 0
+    ):
         thermal_label = {
             "light": "轻度",
             "moderate": "中度",
@@ -5817,7 +6853,7 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
                 ),
             }
         )
-    elif thermal_status == 0 and platform != "harmony":
+    elif thermal_severity_available and thermal_status == 0:
         findings.append(
             {
                 "level": "low",
@@ -5846,277 +6882,626 @@ def _analysis_data_sources(
 ) -> List[Dict[str, str]]:
     capture_configuration = capture_configuration or {}
     backend = str(capture_configuration.get("backend") or "")
-    if test_mode == "performance":
-        platform_frame_source = (
-            "iOS DVT graphics/application-state counters"
-            if platform == "ios"
-            else "HarmonyOS SmartPerf SP_daemon app FPS and frame jitter"
-            if platform == "harmony" and backend == "harmony_smartperf"
-            else "HarmonyOS RenderService screen/fpsCount/composer fps"
-            if platform == "harmony"
-            else "Android SurfaceFlinger BLAST present timestamps with gfxinfo fallback and detailed framestats"
-        )
-        platform_system_source = (
-            "iOS DVT sysmontap"
-            if platform == "ios"
-            else "HarmonyOS top + ps over HDC"
-            if platform == "harmony"
-            else "Periodic toybox top/ps thread snapshots"
-        )
-        platform_scheduler_source = (
-            "iOS public runtime context"
-            if platform == "ios"
-            else "HarmonyOS PowerManagerService + cpufreq capability snapshots"
-            if platform == "harmony"
-            else "cgroup files + ActivityManager + performance_hint"
-        )
-        sources = [
-            {
-                "metric": "Frame rate, 1% Low and frame latency",
-                "source": platform_frame_source,
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Render pipeline stages",
-                "source": platform_frame_source,
-                "kind": "measured counters",
-            },
-            {
-                "metric": "CPU, GPU and memory frequency context",
-                "source": "Platform utilization, cpufreq and readable devfreq counters",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Render and compositor thread activity",
-                "source": platform_system_source,
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Scheduler and thermal context",
-                "source": platform_scheduler_source,
-                "kind": "context",
-            },
-            {
-                "metric": "Whole-device power recording",
-                "source": "Battery current and voltage telemetry",
-                "kind": "measured",
-            },
-        ]
-        if platform == "android":
-            sources.append(
-                {
-                    "metric": "Brightness thermal limiting",
-                    "source": "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
-                    "kind": "measured counters",
-                }
-            )
-        return sources
+    feature_flags = capture_configuration.get("features")
+    feature_flags = feature_flags if isinstance(feature_flags, dict) else {}
+
+    def feature_enabled(name: str, default: bool = True) -> bool:
+        value = feature_flags.get(name)
+        return bool(value) if isinstance(value, bool) else default
+    sources: List[Dict[str, str]] = []
+
+    def add(metric: str, source: str, kind: str) -> None:
+        sources.append({"metric": metric, "source": source, "kind": kind})
+
     if platform == "ios":
-        return [
-            {
-                "metric": "Whole-device battery power",
-                "source": "iOS DiagnosticsService PowerTelemetryData.SystemLoad",
-                "kind": "measured",
-            },
-            {
-                "metric": "Battery current and voltage",
-                "source": "iOS DiagnosticsService battery properties",
-                "kind": "measured",
-            },
-            {
-                "metric": "CPU and process activity",
-                "source": "iOS DVT sysmontap",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Relative process power score",
-                "source": "iOS DVT sysmontap powerScore",
-                "kind": "diagnostic score",
-            },
-            {
-                "metric": "GPU activity",
-                "source": "iOS DVT Graphics utilization",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Foreground application",
-                "source": "iOS DVT application-state notifications",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Test phases and actions",
-                "source": "Imported timestamped logs aligned to device uptime",
-                "kind": "context",
-            },
-            {
-                "metric": "System processes and collector overhead",
-                "source": "iOS DVT sysmontap process snapshots",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Battery temperature",
-                "source": "iOS DiagnosticsService battery temperature",
-                "kind": "measured counters",
-            },
-        ]
+        add(
+            "Whole-device raw SystemLoad power",
+            "iOS DiagnosticsService PowerTelemetryData.SystemLoad",
+            "measured low-rate telemetry",
+        )
+        add(
+            "Battery current and voltage",
+            "iOS DiagnosticsService battery properties",
+            "measured",
+        )
+        if feature_enabled("cpu_usage"):
+            add("CPU utilization", "iOS DVT sysmontap", "measured counters")
+        # sysmontap process rows and powerScore are opportunistic even though the
+        # base CPU stream is always enabled. The observation filter below keeps
+        # each channel only when a corresponding event was actually received.
+        add(
+            "System processes",
+            "iOS DVT sysmontap process snapshots",
+            "measured counters",
+        )
+        add(
+            "Relative process power score",
+            "iOS DVT sysmontap powerScore",
+            "diagnostic score",
+        )
+        if feature_enabled("gpu_metrics"):
+            add("GPU activity", "iOS DVT Graphics utilization", "measured counters")
+        if feature_enabled("foreground_window"):
+            add(
+                "Foreground application",
+                "iOS DVT application-state notifications when observed",
+                "event context",
+            )
+        add(
+            "Observer-related process CPU upper bound",
+            "sysmond + DTServiceHub + remotepairingdeviced concurrent CPU",
+            "interference context, not net overhead",
+        )
+        if feature_enabled("thermal"):
+            add(
+                "Battery temperature",
+                "iOS DiagnosticsService battery temperature",
+                "measured counters",
+            )
+        add(
+            "Test phases and actions",
+            "Imported timestamped logs aligned to device uptime",
+            "context",
+        )
+        return sources
+
     if platform == "harmony":
-        if backend == "harmony_smartperf":
-            return [
-                {
-                    "metric": "Battery current, voltage and temperature",
-                    "source": "HarmonyOS SmartPerf SP_daemon",
-                    "kind": "measured",
-                },
-                {
-                    "metric": "CPU/GPU/DDR and target process resources",
-                    "source": "HarmonyOS SmartPerf SP_daemon",
-                    "kind": "measured counters",
-                },
-                {
-                    "metric": "Application FPS and frame jitter",
-                    "source": "HarmonyOS SmartPerf SP_daemon",
-                    "kind": "measured counters",
-                },
-                {
-                    "metric": "Foreground window and display context",
-                    "source": "HarmonyOS RenderService/WindowManager probe",
-                    "kind": "context",
-                },
-                {
-                    "metric": "Test phases and actions",
-                    "source": "Imported timestamped logs aligned to HarmonyOS device realtime",
-                    "kind": "context",
-                },
-            ]
-        return [
-            {
-                "metric": "Battery current, voltage and temperature",
-                "source": "HarmonyOS BatteryService via hidumper",
-                "kind": "measured",
-            },
-            {
-                "metric": "CPU utilization",
-                "source": "HarmonyOS /proc/stat via persistent HDC shell",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "CPU frequency",
-                "source": "HarmonyOS hidumper --cpufreq",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Foreground application and screen state",
-                "source": "HarmonyOS AbilityManager + PowerManagerService",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Refresh-rate residency and sampled compositor frame pacing",
-                "source": "HarmonyOS RenderService screen/fpsCount/composer fps",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Foreground window and delivered touch interactions",
-                "source": "HarmonyOS WindowManagerService + MultimodalInput",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "System processes",
-                "source": "HarmonyOS top + ps over HDC",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Thermal sensors",
-                "source": "HarmonyOS ThermalService via hidumper",
-                "kind": "measured counters",
-            },
-            {
-                "metric": "Power and scheduler context",
-                "source": "HarmonyOS PowerManagerService + cpufreq capability snapshots",
-                "kind": "context",
-            },
-            {
-                "metric": "Test phases and actions",
-                "source": "Imported timestamped logs aligned to HarmonyOS device realtime",
-                "kind": "context",
-            },
-        ]
-    return [
-        {
-            "metric": "Battery current",
-            "source": "BatteryService / fuel gauge",
-            "kind": "measured",
-        },
-        {
-            "metric": "Battery voltage",
-            "source": "BatteryService state",
-            "kind": "measured",
-        },
-        {
-            "metric": "CPU utilization/frequency",
-            "source": "/proc/stat + cpufreq",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "CPU frequency impact",
-            "source": "Android Power Profile",
-            "kind": "model",
-        },
-        {
-            "metric": "Memory frequency pressure",
-            "source": "Readable DRAM/DMC/MIF devfreq clock",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "Runtime settings pressure",
-            "source": "Android settings snapshot at test start/end",
-            "kind": "context",
-        },
-        {
-            "metric": "GPU activity",
-            "source": "OEM devfreq/KGSL when readable; dumpsys gpu UID work and memory otherwise",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "Component/app attribution",
-            "source": "BatteryStats",
-            "kind": "model",
-        },
-        {
-            "metric": "Foreground application",
-            "source": "ActivityManager context sampler",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "Test phases and actions",
-            "source": "Imported timestamped logs aligned by /proc/uptime",
-            "kind": "context",
-        },
-        {
-            "metric": "Per-test power and system interference",
-            "source": "Whole-device telemetry + aligned process/thread/thermal snapshots",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "System processes and hot threads",
-            "source": "Periodic toybox top/ps snapshots",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "Thermal severity, sensors and cooling devices",
-            "source": "Android ThermalService / thermal HAL",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "Brightness thermal limiting",
-            "source": "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
-            "kind": "measured counters",
-        },
-        {
-            "metric": "cpuset, process state and ADPF hints",
-            "source": "cgroup files + ActivityManager + performance_hint",
-            "kind": "measured counters",
-        },
-    ]
+        smartperf = backend == "harmony_smartperf"
+        counter_source = (
+            "HarmonyOS SmartPerf SP_daemon"
+            if smartperf
+            else "HarmonyOS /proc/stat + hidumper --cpufreq"
+        )
+        add(
+            "Whole-device power recording",
+            "HarmonyOS SmartPerf SP_daemon current and voltage fields"
+            if smartperf
+            else "HarmonyOS BatteryService via hidumper",
+            "battery flow; consumption-valid only while discharging",
+        )
+        if feature_enabled("cpu_usage"):
+            add("CPU utilization", counter_source, "measured counters")
+        if feature_enabled("cpu_frequency"):
+            add("CPU frequency", counter_source, "measured counters")
+        if feature_enabled("gpu_metrics"):
+            add(
+                "GPU activity",
+                "HarmonyOS SmartPerf SP_daemon GPU fields",
+                "measured counters",
+            )
+        if feature_enabled("memory_frequency"):
+            add(
+                "Memory frequency pressure",
+                "HarmonyOS SmartPerf SP_daemon DDR fields",
+                "measured counters",
+            )
+        if feature_enabled("target_process"):
+            add(
+                "Target process resources",
+                "HarmonyOS SmartPerf SP_daemon target process fields",
+                "measured counters",
+            )
+        if test_mode == "performance" and feature_enabled("frame_rate"):
+            add(
+                "HarmonyOS application frame pacing"
+                if smartperf
+                else "HarmonyOS compositor cadence context",
+                "HarmonyOS SmartPerf SP_daemon target-foreground FPS and raw frame jitter"
+                if smartperf
+                else "HarmonyOS RenderService fresh active-screen compositor timestamps",
+                "measured counters" if smartperf else "system compositor context",
+            )
+        if feature_enabled("foreground_window"):
+            add(
+                "Foreground application",
+                "HarmonyOS AbilityManager + WindowManager",
+                "measured counters",
+            )
+            add(
+                "Display refresh rate",
+                "HarmonyOS RenderService screen refresh-rate counters",
+                "measured counters",
+            )
+        if feature_enabled("touch_events", False):
+            add(
+                "Delivered touch interactions",
+                "HarmonyOS MultimodalInput delivered touch events",
+                "measured counters",
+            )
+        if feature_enabled("process_snapshots", False):
+            add("System processes", "HarmonyOS top + ps over HDC", "measured counters")
+        if feature_enabled("thermal"):
+            add(
+                "Thermal sensors",
+                "HarmonyOS SmartPerf SP_daemon temperature fields"
+                if smartperf
+                else "HarmonyOS ThermalService via hidumper",
+                "measured counters",
+            )
+        if feature_enabled("scheduler", False):
+            add(
+                "Scheduler context",
+                "HarmonyOS PowerManagerService + cpufreq capability snapshots",
+                "context",
+            )
+        add(
+            "Test phases and actions",
+            "Imported timestamped logs aligned to HarmonyOS device realtime",
+            "context",
+        )
+        return sources
+
+    frame_source = (
+        "Android SurfaceFlinger foreground application-layer present timestamps "
+        "with gfxinfo fallback and detailed framestats"
+    )
+    add(
+        "Whole-device power recording",
+        "Battery current and voltage telemetry",
+        "measured",
+    )
+    if feature_enabled("cpu_usage"):
+        add(
+            "CPU utilization",
+            "Android /proc/stat utilization deltas",
+            "measured counters",
+        )
+    if feature_enabled("cpu_frequency"):
+        add(
+            "CPU frequency",
+            "Android cpufreq core-group counters",
+            "measured counters",
+        )
+        if test_mode == "power":
+            add("CPU frequency impact", "Android Power Profile", "model")
+    if feature_enabled("gpu_metrics"):
+        add(
+            "GPU activity",
+            "Readable Android KGSL/OEM GPU frequency and load counters",
+            "measured counters",
+        )
+    if feature_enabled("memory_frequency"):
+        add(
+            "Memory frequency pressure",
+            "Readable DRAM/DMC/MIF devfreq clock",
+            "measured counters",
+        )
+    if feature_enabled("foreground_window"):
+        add(
+            "Foreground application",
+            "ActivityManager context sampler",
+            "measured counters",
+        )
+        add(
+            "Display refresh rate",
+            "Android DisplayManager context sampler",
+            "measured counters",
+        )
+    if test_mode == "performance" and feature_enabled("frame_rate"):
+        add(
+            "Frame rate, 1% Low and frame latency",
+            frame_source,
+            "measured counters",
+        )
+    if test_mode == "performance" and feature_enabled("frame_details"):
+        add("Render pipeline stages", frame_source, "measured counters")
+    if feature_enabled("process_snapshots", False):
+        add(
+            "System processes",
+            "Periodic toybox top/ps snapshots",
+            "measured counters",
+        )
+    if feature_enabled("hot_threads", False):
+        add(
+            "Render and compositor thread activity",
+            "Periodic toybox top/ps thread snapshots",
+            "measured counters",
+        )
+    if feature_enabled("scheduler", False):
+        add(
+            "Scheduler context",
+            "cgroup files + ActivityManager + performance_hint",
+            "context",
+        )
+    if feature_enabled("thermal"):
+        add(
+            "Thermal context",
+            "Android ThermalService sensors, severity and cooling devices",
+            "measured context",
+        )
+        add(
+            "Brightness thermal limiting",
+            "DisplayManager BrightnessThermalClamper + Thermal HAL lcd-backlight",
+            "measured counters",
+        )
+    if test_mode == "power" and feature_enabled("runtime_settings"):
+        add(
+            "Runtime settings pressure",
+            "Android settings snapshot at test start/end",
+            "context",
+        )
+    if test_mode == "power" and feature_enabled("power_attribution"):
+        add("Component/app attribution", "BatteryStats", "model")
+    if test_mode == "power":
+        add(
+            "Per-test power and system interference",
+            "Whole-device telemetry + aligned process/thread/thermal snapshots",
+            "measured counters",
+        )
+    add(
+        "Test phases and actions",
+        "Imported timestamped logs aligned by /proc/uptime",
+        "context",
+    )
+    return sources
+
+
+def _filter_analysis_data_sources(
+    sources: Sequence[Dict[str, str]],
+    analysis: Dict[str, object],
+) -> List[Dict[str, str]]:
+    summary = analysis.get("summary", {})
+    summary = summary if isinstance(summary, dict) else {}
+    performance = analysis.get("performance", {})
+    performance = performance if isinstance(performance, dict) else {}
+    cpu = analysis.get("cpu", {})
+    cpu = cpu if isinstance(cpu, dict) else {}
+    gpu = analysis.get("gpu", {})
+    gpu = gpu if isinstance(gpu, dict) else {}
+    memory = analysis.get("memory", {})
+    memory = memory if isinstance(memory, dict) else {}
+    system = analysis.get("system", {})
+    system = system if isinstance(system, dict) else {}
+    render = analysis.get("render_performance", {})
+    render = render if isinstance(render, dict) else {}
+    scheduler = analysis.get("scheduler", {})
+    scheduler = scheduler if isinstance(scheduler, dict) else {}
+    thermal = analysis.get("thermal", {})
+    thermal = thermal if isinstance(thermal, dict) else {}
+    brightness = analysis.get("brightness_throttling", {})
+    brightness = brightness if isinstance(brightness, dict) else {}
+    applications = analysis.get("applications", {})
+    applications = applications if isinstance(applications, dict) else {}
+    external = analysis.get("external_events", {})
+    external = external if isinstance(external, dict) else {}
+    runtime_settings = analysis.get("runtime_settings", {})
+    runtime_settings = runtime_settings if isinstance(runtime_settings, dict) else {}
+    battery_usage = analysis.get("battery_usage", {})
+    battery_usage = battery_usage if isinstance(battery_usage, dict) else {}
+    test_items = analysis.get("test_items", {})
+    test_items = test_items if isinstance(test_items, dict) else {}
+
+    def rows_present(value: Dict[str, object], *keys: str) -> bool:
+        return any(isinstance(value.get(key), list) and bool(value.get(key)) for key in keys)
+
+    def numeric(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def known_foreground(value: object) -> bool:
+        text = str(value or "").strip().lower()
+        return bool(text and text not in {"unknown", "none", "null", "--", "-"})
+
+    process_rows = (
+        system.get("top_processes", [])
+        if isinstance(system.get("top_processes"), list)
+        else []
+    )
+    thread_rows = (
+        system.get("hot_threads", [])
+        if isinstance(system.get("hot_threads"), list)
+        else []
+    )
+    application_rows = (
+        applications.get("rows", [])
+        if isinstance(applications.get("rows"), list)
+        else []
+    )
+    application_transitions = (
+        applications.get("transitions", [])
+        if isinstance(applications.get("transitions"), list)
+        else []
+    )
+
+    frame_observed = bool(
+        performance.get("frame_sample_count")
+        or numeric(performance.get("sampled_frame_rate_fps"))
+        or numeric(performance.get("sampled_compositor_fps"))
+        or performance.get("frame_rate_timeline")
+    )
+    refresh_observed = bool(
+        numeric(performance.get("current_refresh_rate_hz"))
+        or rows_present(performance, "refresh_rate_timeline", "refresh_residency")
+    )
+    cpu_usage_observed = numeric(summary.get("average_cpu_pct"))
+    cpu_frequency_observed = any(
+        isinstance(item, dict)
+        and any(
+            numeric(item.get(key))
+            for key in ("average_mhz", "maximum_mhz", "load_weighted_mhz")
+        )
+        for item in (cpu.get("clusters", []) if isinstance(cpu.get("clusters"), list) else [])
+    )
+    cpu_model_observed = any(
+        isinstance(item, dict)
+        and (
+            item.get("model_available") is True
+            or numeric(item.get("modeled_power_mw"))
+            or numeric(item.get("frequency_premium_mw"))
+        )
+        for item in (cpu.get("clusters", []) if isinstance(cpu.get("clusters"), list) else [])
+    )
+    gpu_observed = bool(
+        gpu.get("frequency_available")
+        or gpu.get("load_available")
+        or gpu.get("work_by_uid")
+        or (
+            isinstance(gpu.get("memory"), dict)
+            and gpu.get("memory", {}).get("available")
+        )
+    )
+    memory_observed = bool(memory.get("available") or memory.get("timeline"))
+    target_process_observed = any(
+        isinstance(item, dict)
+        and (
+            str(item.get("source") or "") == "harmony_smartperf_target"
+            or str(item.get("watch_name") or "") == "target_app"
+        )
+        for item in process_rows
+    )
+    system_process_observed = bool(
+        thread_rows
+        or any(
+            isinstance(item, dict)
+            and str(item.get("source") or "") != "harmony_smartperf_target"
+            for item in process_rows
+        )
+    )
+    relative_power_score_observed = any(
+        isinstance(item, dict)
+        and any(
+            numeric(item.get(key))
+            for key in ("average_relative_power_score", "maximum_relative_power_score")
+        )
+        for item in process_rows
+    )
+    scheduler_observed = any(
+        scheduler.get(key)
+        for key in ("cpusets", "cpu_policies", "hint_sessions", "process_states", "timeline")
+    )
+    thermal_observed = bool(
+        thermal.get("available")
+        or thermal.get("sensors")
+        or thermal.get("cooling_devices")
+        or thermal.get("timeline")
+        or numeric(thermal.get("maximum_status"))
+    )
+    battery_temperature_observed = any(
+        isinstance(item, dict)
+        and "battery" in str(item.get("name") or "").lower()
+        and any(numeric(item.get(key)) for key in ("value_c", "maximum_c", "average_c"))
+        for item in (
+            thermal.get("sensors", [])
+            if isinstance(thermal.get("sensors"), list)
+            else []
+        )
+    )
+    foreground_observed = bool(
+        any(
+            isinstance(item, dict) and known_foreground(item.get("package"))
+            for item in [*application_rows, *application_transitions]
+        )
+        or known_foreground(performance.get("foreground_window_name"))
+    )
+    power_observed = any(
+        numeric(summary.get(key))
+        for key in (
+            "observed_power_average_mw",
+            "battery_flow_average_power_mw",
+            "average_power_mw",
+        )
+    )
+    observed_power_sources = {
+        str(item)
+        for item in (
+            summary.get("observed_power_sources", [])
+            if isinstance(summary.get("observed_power_sources"), list)
+            else summary.get("power_sources", [])
+            if isinstance(summary.get("power_sources"), list)
+            else []
+        )
+        if str(item)
+    }
+    ios_system_load_observed = (
+        "ios_power_telemetry_system_load" in observed_power_sources
+    )
+    battery_channels_observed = bool(
+        (
+            numeric(summary.get("observed_average_current_ma"))
+            or numeric(summary.get("average_current_ma"))
+        )
+        and numeric(summary.get("average_voltage_mv"))
+    )
+    observer_cpu_observed = numeric(summary.get("average_collector_cpu_pct"))
+    render_threads_observed = bool(render.get("render_threads"))
+    touch_observed = numeric(performance.get("touch_interaction_count"))
+    runtime_settings_observed = bool(
+        runtime_settings.get("available") or rows_present(runtime_settings, "rows")
+    )
+    attribution_observed = bool(
+        battery_usage.get("available")
+        or rows_present(battery_usage, "components", "uids")
+        or analysis.get("components")
+    )
+    test_items_observed = bool(
+        test_items.get("available") or rows_present(test_items, "rows", "timeline", "spans")
+    )
+    external_observed = bool(
+        external.get("event_count") or rows_present(external, "rows", "spans")
+    )
+
+    def observed(metric: str) -> bool:
+        if metric in {
+            "Frame rate, 1% Low and frame latency",
+            "HarmonyOS application frame pacing",
+            "HarmonyOS compositor cadence context",
+            "Application FPS and frame jitter",
+        }:
+            return frame_observed
+        if metric == "Display refresh rate":
+            return refresh_observed
+        if metric == "Render pipeline stages":
+            pipeline = render.get("pipeline", {})
+            return bool(
+                render.get("stages")
+                or (isinstance(pipeline, dict) and pipeline.get("stages"))
+            )
+        if metric == "Render and compositor thread activity":
+            return render_threads_observed or bool(thread_rows)
+        if metric in {"System processes", "System processes and hot threads"}:
+            return system_process_observed
+        if metric == "Target process resources":
+            return target_process_observed
+        if metric == "Relative process power score":
+            return relative_power_score_observed
+        if metric in {"Scheduler context", "Scheduler and thermal context"}:
+            return scheduler_observed
+        if metric in {
+            "Thermal context",
+            "Thermal sensors",
+            "Thermal severity, sensors and cooling devices",
+        }:
+            return thermal_observed
+        if metric == "Battery temperature":
+            return battery_temperature_observed
+        if metric == "Brightness thermal limiting":
+            return bool(brightness.get("available"))
+        if metric in {
+            "Whole-device raw SystemLoad power",
+            "Whole-device battery power",  # legacy analysis files
+        }:
+            return ios_system_load_observed
+        if metric == "Whole-device power recording":
+            return power_observed
+        if metric in {
+            "Battery current and voltage",
+            "Battery current, voltage and temperature",
+            "Battery current",
+            "Battery voltage",
+        }:
+            return battery_channels_observed
+        if metric in {
+            "Foreground application",
+            "Foreground application state",
+            "Foreground application and screen state",
+        }:
+            return foreground_observed
+        if metric == "Observer-related process CPU upper bound":
+            return observer_cpu_observed
+        if metric == "GPU activity":
+            return gpu_observed
+        if metric == "CPU utilization":
+            return cpu_usage_observed
+        if metric == "CPU frequency":
+            return cpu_frequency_observed
+        if metric == "CPU frequency impact":
+            return cpu_model_observed
+        if metric == "Memory frequency pressure":
+            return memory_observed
+        if metric == "Runtime settings pressure":
+            return runtime_settings_observed
+        if metric == "Component/app attribution":
+            return attribution_observed
+        if metric == "Per-test power and system interference":
+            return test_items_observed
+        if metric == "Delivered touch interactions":
+            return touch_observed
+        if metric == "Test phases and actions":
+            return external_observed
+
+        # Legacy compound names are accepted only when every named channel was
+        # observed. New reports no longer generate these ambiguous rows.
+        if metric == "iOS CPU and GPU performance context":
+            return cpu_usage_observed and gpu_observed
+        if metric == "CPU and process activity":
+            return cpu_usage_observed and system_process_observed
+        if metric == "System processes and collector overhead":
+            return system_process_observed and observer_cpu_observed
+        if metric == "HarmonyOS CPU/GPU/DDR and thermal context":
+            return (
+                cpu_usage_observed
+                and cpu_frequency_observed
+                and gpu_observed
+                and memory_observed
+                and thermal_observed
+            )
+        if metric == "CPU/GPU/DDR and target process resources":
+            return (
+                cpu_usage_observed
+                and cpu_frequency_observed
+                and gpu_observed
+                and memory_observed
+                and target_process_observed
+            )
+        if metric == "CPU utilization/frequency":
+            return cpu_usage_observed and cpu_frequency_observed
+        if metric == "Refresh-rate residency and sampled compositor frame pacing":
+            return refresh_observed and frame_observed
+        if metric == "Foreground window and display context":
+            return foreground_observed and refresh_observed
+        if metric == "Foreground window and delivered touch interactions":
+            return foreground_observed and touch_observed
+        if metric in {"Power and scheduler context", "cpuset, process state and ADPF hints"}:
+            return scheduler_observed
+        return False
+
+    return [item for item in sources if observed(str(item.get("metric") or ""))]
+
+
+def _apply_legacy_consumption_power_inference(
+    samples: Sequence[Sample],
+    metadata: Dict[str, object],
+) -> bool:
+    """Recover old unplugged artifacts only when both endpoints prove discharge."""
+
+    if any(
+        sample.power_valid_for_consumption is not None
+        or sample.external_power is not None
+        for sample in samples
+    ):
+        return False
+    try:
+        schema_version = int(metadata.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    if schema_version >= SCHEMA_VERSION:
+        return False
+    start = metadata.get("battery_start")
+    end = metadata.get("battery_end")
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return False
+
+    def explicitly_unplugged(value: Dict[str, object]) -> bool:
+        return (
+            "powered" in value
+            and value.get("powered") in (False, [], ())
+            and str(value.get("status") or "").strip().lower() == "discharging"
+        )
+
+    if not explicitly_unplugged(start) or not explicitly_unplugged(end):
+        return False
+    if any(
+        str(sample.direction or "").strip().lower() != "discharging"
+        for sample in samples
+    ):
+        return False
+    for sample in samples:
+        sample.external_power = False
+        sample.power_valid_for_consumption = True
+    return True
 
 
 def analyze_run(
@@ -6141,7 +7526,72 @@ def analyze_run(
     def feature(name: str) -> bool:
         return bool(capture_features.get(name, True))
 
-    powers = [sample.power_mw for sample in samples]
+    legacy_power_validity_inferred = _apply_legacy_consumption_power_inference(
+        samples,
+        metadata,
+    )
+    platform = str(metadata.get("platform") or "android").lower()
+    if platform == "harmony":
+        sample_window_start = samples[0].uptime_s
+        sample_window_end = samples[-1].uptime_s
+        contexts = tuple(
+            item
+            for item in contexts
+            if sample_window_start <= item.uptime_s <= sample_window_end
+        )
+    power_sources = sorted({sample.power_source for sample in samples if sample.power_source})
+    primary_power_source: Optional[str] = None
+    if platform == "ios":
+        if "ios_power_telemetry_system_load" in power_sources:
+            primary_power_source = "ios_power_telemetry_system_load"
+        elif "ios_battery_current_voltage" in power_sources:
+            primary_power_source = "ios_battery_current_voltage"
+    primary_power_samples = [
+        sample
+        for sample in samples
+        if primary_power_source is None or sample.power_source == primary_power_source
+    ]
+    if not primary_power_samples:
+        primary_power_samples = list(samples)
+        primary_power_source = None
+    excluded_power_sources = sorted(
+        {
+            sample.power_source
+            for sample in samples
+            if primary_power_source is not None
+            and sample.power_source
+            and sample.power_source != primary_power_source
+        }
+    )
+    # iOS can expose battery I×V before the lower-cadence SystemLoad channel first
+    # arrives.  They are different physical domains, so never integrate them into
+    # one whole-device average.  The discarded samples remain available through
+    # the dedicated battery-flow statistics and raw timeline.
+    if platform == "ios" and excluded_power_sources:
+        for sample in samples:
+            if sample.power_source != primary_power_source:
+                sample.power_valid_for_consumption = False
+
+    stale_system_load_samples = []
+    if platform == "ios":
+        stale_system_load_samples = [
+            sample
+            for sample in primary_power_samples
+            if sample.power_source == "ios_power_telemetry_system_load"
+            and not is_power_sample_fresh_for_consumption(sample)
+        ]
+        for sample in stale_system_load_samples:
+            sample.power_valid_for_consumption = False
+
+    powers = [sample.power_mw for sample in primary_power_samples]
+    consumption_samples = [
+        sample for sample in samples if is_consumption_power_sample(sample)
+    ]
+    consumption_powers = [sample.power_mw for sample in consumption_samples]
+    consumption_currents = [sample.current_ma for sample in consumption_samples]
+    battery_flow_powers = [
+        sample.current_ma * sample.voltage_mv / 1000.0 for sample in samples
+    ]
     currents = [sample.current_ma for sample in samples]
     signed_currents = [sample.signed_current_ma for sample in samples]
     cpus = (
@@ -6151,7 +7601,7 @@ def analyze_run(
     )
     power_sample_ages = [
         sample.power_sample_age_s
-        for sample in samples
+        for sample in primary_power_samples
         if sample.power_sample_age_s is not None
     ]
     collector_cpu_values = [
@@ -6159,12 +7609,21 @@ def analyze_run(
         for sample in samples
         if sample.collector_cpu_pct is not None
     ]
-    power_sources = sorted({sample.power_source for sample in samples if sample.power_source})
-    platform = str(metadata.get("platform") or "android").lower()
     test_mode = str(metadata.get("test_mode") or "power").strip().lower()
     if test_mode not in {"power", "performance"}:
         test_mode = "power"
     power_mode = test_mode == "power"
+    invalid_power_observation_text = (
+        "SystemLoad 仅作为整机原始功率通道，电流×电压另作为电池流量"
+        if platform == "ios"
+        else "电流和功率仅作为电池侧原始流量"
+    )
+    invalid_power_pressure_text = (
+        "外部供电或充电时只保留整机 SystemLoad 原始通道与独立的电池 I×V 流量，"
+        "不分析耗电压力来源。"
+        if platform == "ios"
+        else "充电或外部供电样本只展示电池侧原始流量，不分析功耗压力来源。"
+    )
     duration_s = samples[-1].uptime_s - samples[0].uptime_s
     configured_interval = metadata.get("sample_interval_s")
     observed_intervals = [
@@ -6177,28 +7636,187 @@ def analyze_run(
         if isinstance(configured_interval, (int, float)) and float(configured_interval) > 0
         else statistics.median(observed_intervals) if observed_intervals else 1.0
     )
+    cadence_target_s = sample_interval_s
+    cadence_on_time_limit_s = max(
+        cadence_target_s * 1.5,
+        cadence_target_s + 0.25,
+    )
+    cadence_on_time_count = sum(
+        1 for value in observed_intervals if value <= cadence_on_time_limit_s
+    )
+    cadence_on_time_pct = (
+        cadence_on_time_count / len(observed_intervals) * 100.0
+        if observed_intervals
+        else None
+    )
+    cadence_p95_s = percentile(observed_intervals, 0.95)
+    cadence_assessment_available = len(observed_intervals) >= 10
+    sampling_cadence_stable = (
+        bool(
+            cadence_on_time_pct is not None
+            and cadence_on_time_pct >= 90.0
+            and cadence_p95_s is not None
+            and cadence_p95_s <= max(cadence_target_s * 2.0, cadence_target_s + 1.0)
+        )
+        if cadence_assessment_available
+        else None
+    )
+    estimated_missed_sample_slots = sum(
+        max(0, int(round(value / cadence_target_s)) - 1)
+        for value in observed_intervals
+        if cadence_target_s > 0
+    )
     max_gap_s = max(sample_interval_s * 3.0, sample_interval_s + 2.0)
     valid_intervals = sample_intervals(samples, max_gap_s)
     covered_duration_s = sum(item[2] for item in valid_intervals)
+    primary_power_intervals = [
+        item
+        for item in valid_intervals
+        if primary_power_source is None
+        or (
+            item[0].power_source == primary_power_source
+            and item[1].power_source == primary_power_source
+        )
+    ]
+    ios_system_load_primary = (
+        platform == "ios"
+        and primary_power_source == "ios_power_telemetry_system_load"
+    )
+    if ios_system_load_primary:
+        (
+            observed_power_energy_mwh,
+            observed_power_covered_duration_s,
+        ) = integrate_step_values(
+            primary_power_samples,
+            lambda sample: sample.power_mw,
+            max_gap_s,
+            transition_age_getter=lambda sample: sample.power_sample_age_s,
+        )
+    else:
+        observed_power_covered_duration_s = sum(item[2] for item in primary_power_intervals)
+        observed_power_energy_mwh = sum(
+            (previous.power_mw + current.power_mw) * 0.5 * delta_s / 3600.0
+            for previous, current, delta_s in primary_power_intervals
+        )
+    consumption_intervals = sample_intervals(
+        samples,
+        max_gap_s,
+        require_consumption_power=True,
+    )
+    consumption_covered_duration_s = sum(item[2] for item in consumption_intervals)
     missing_duration_s = max(0.0, duration_s - covered_duration_s)
     average_voltage_mv = statistics.fmean(sample.voltage_mv for sample in samples)
-    energy_mwh = integrate_values(samples, lambda sample: sample.power_mw, max_gap_s)
-    discharge_mah = integrate_values(
+    observed_power_average_mw = (
+        observed_power_energy_mwh * 3600.0 / observed_power_covered_duration_s
+        if observed_power_covered_duration_s > 0
+        else statistics.fmean(powers)
+    )
+    battery_flow_energy_mwh = integrate_values(
         samples,
-        lambda sample: sample.current_ma if sample.direction == "discharging" else 0.0,
+        lambda sample: sample.current_ma * sample.voltage_mv / 1000.0,
         max_gap_s,
     )
-    time_weighted_power_mw = (
-        energy_mwh * 3600.0 / covered_duration_s if covered_duration_s > 0 else statistics.fmean(powers)
+    battery_flow_average_power_mw = (
+        battery_flow_energy_mwh * 3600.0 / covered_duration_s
+        if covered_duration_s > 0
+        else statistics.fmean(battery_flow_powers)
     )
-    time_weighted_current_ma = (
+    if consumption_intervals and ios_system_load_primary:
+        energy_mwh, consumption_covered_duration_s = integrate_step_values(
+            primary_power_samples,
+            lambda sample: sample.power_mw,
+            max_gap_s,
+            require_consumption_power=True,
+            transition_age_getter=lambda sample: sample.power_sample_age_s,
+        )
+    else:
+        energy_mwh = (
+            integrate_values(
+                samples,
+                lambda sample: sample.power_mw,
+                max_gap_s,
+                require_consumption_power=True,
+            )
+            if consumption_intervals
+            else None
+        )
+    discharge_mah = (
+        integrate_values(
+            samples,
+            lambda sample: sample.current_ma,
+            max_gap_s,
+            require_consumption_power=True,
+        )
+        if consumption_intervals
+        else None
+    )
+    time_weighted_power_mw = (
+        float(energy_mwh) * 3600.0 / consumption_covered_duration_s
+        if energy_mwh is not None and consumption_covered_duration_s > 0
+        else None
+    )
+    observed_time_weighted_current_ma = (
         integrate_values(samples, lambda sample: sample.current_ma, max_gap_s)
         * 3600.0
         / covered_duration_s
         if covered_duration_s > 0
         else statistics.fmean(currents)
     )
+    time_weighted_current_ma = (
+        float(discharge_mah) * 3600.0 / consumption_covered_duration_s
+        if discharge_mah is not None and consumption_covered_duration_s > 0
+        else None
+    )
+    observed_directions = {
+        str(sample.direction or "unknown").strip().lower() for sample in samples
+    }
+    if samples and all(sample.external_power is True for sample in samples):
+        power_flow_direction = "external_power"
+    elif observed_directions == {"discharging"}:
+        power_flow_direction = "discharging"
+    elif observed_directions <= {"charging", "full"}:
+        power_flow_direction = "charging"
+    elif observed_directions <= {"idle", "unknown"}:
+        power_flow_direction = "idle"
+    else:
+        power_flow_direction = "mixed"
+    power_valid_for_consumption = bool(consumption_intervals)
+    consumption_session_representative = bool(
+        duration_s > 0
+        and covered_duration_s / duration_s >= 0.9
+        and primary_power_samples
+        and all(is_consumption_power_sample(sample) for sample in primary_power_samples)
+        and consumption_covered_duration_s / duration_s >= 0.9
+    )
     analysis_warnings = list(warnings)
+    if platform == "ios" and excluded_power_sources:
+        analysis_warnings.append(
+            "iOS 会话中同时观测到 SystemLoad 与电池 I×V fallback；"
+            "整机功率统计只使用 SystemLoad，电池 I×V 仅保留在独立电池流量通道，"
+            "两者不会合并求平均。"
+        )
+    if legacy_power_validity_inferred:
+        analysis_warnings.append(
+            "旧版记录未保存逐样本外部供电标志；因起止状态均明确为未插电放电，"
+            "本次以低置信度恢复耗电分析。"
+        )
+    if stale_system_load_samples:
+        analysis_warnings.append(
+            f"iOS SystemLoad 有 {len(stale_system_load_samples)} 个样本因超过 "
+            f"{IOS_SYSTEM_LOAD_STALE_AFTER_S:.0f} 秒未刷新或缺少刷新年龄而被排除；"
+            "耗电与能量积分会在这些区间断开，不会沿用旧功率值。"
+        )
+    if not power_valid_for_consumption:
+        analysis_warnings.append(
+            "采集期间未获得连续的电池放电样本；"
+            f"{invalid_power_observation_text}，"
+            "不会用于设备耗电、测试项能量、平均功耗或续航结论。"
+        )
+    elif not consumption_session_representative:
+        analysis_warnings.append(
+            "采集期间存在充电、外部供电或较大的数据缺口；正式功耗和能量只统计连续有效的放电区间，"
+            "BatteryStats、UID/组件/网络/Wakelock 归因及续航推算不会用于本次全会话结论。"
+        )
     if duration_s > 0 and missing_duration_s > max_gap_s:
         analysis_warnings.append(
             f"遥测覆盖率为 {covered_duration_s / duration_s * 100.0:.1f}%；"
@@ -6223,12 +7841,16 @@ def analyze_run(
 
     package_uids, package_to_uid = (
         parse_package_uids(raw_outputs.get("packages", ""))
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else ({}, {})
     )
     usage = (
         parse_battery_usage(raw_outputs.get("batterystats_usage", ""), package_uids)
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else {
             "available": False,
             "analysis_disabled": True,
@@ -6242,14 +7864,29 @@ def analyze_run(
             "uids": [],
         }
     )
+    if power_mode and feature("power_attribution") and not consumption_session_representative:
+        usage["reason"] = (
+            "采集期间设备未持续由电池放电；BatteryStats 不用于本次设备耗电或 UID 归因。"
+        )
+    if cadence_assessment_available and sampling_cadence_stable is False:
+        analysis_warnings.append(
+            f"主采样节奏未达到设定的 {cadence_target_s:g} 秒："
+            f"{float(cadence_on_time_pct or 0.0):.1f}% 的间隔在 "
+            f"{cadence_on_time_limit_s:.2f} 秒内，P95 间隔为 {float(cadence_p95_s or 0.0):.2f} 秒。"
+            "所有积分仍使用真实设备时间戳，但短时尖峰的时间分辨率会下降。"
+        )
     stats_window = (
         extract_stats_window(raw_outputs.get("batterystats", ""))
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else {}
     )
     power_profile = (
         parse_power_profile(raw_outputs.get("power_profile", ""))
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else {}
     )
     display = parse_display(
@@ -6259,6 +7896,12 @@ def analyze_run(
     )
     performance_analysis = analyze_performance_contexts(contexts, metadata)
     if not feature("frame_rate"):
+        frame_unavailable_reason = (
+            "当前 iOS sidecar 不提供通用应用 FPS、逐帧 Core Animation 时间戳或刷新率时间线；"
+            "该采集项默认关闭且不生成帧率结论。"
+            if platform == "ios"
+            else "帧率与帧间隔采集已关闭。"
+        )
         performance_analysis.update(
             {
                 "sampled_compositor_fps": None,
@@ -6272,7 +7915,7 @@ def analyze_run(
                 "frame_rate_timeline": [],
                 "frame_sample_count": 0,
                 "frame_source": None,
-                "frame_unavailable_reason": "帧率与帧间隔采集已关闭。",
+                "frame_unavailable_reason": frame_unavailable_reason,
             }
         )
     if not isinstance(display.get("active_refresh_hz"), (int, float)) and isinstance(
@@ -6291,7 +7934,9 @@ def analyze_run(
     processes = parse_cpu_processes(raw_outputs.get("cpuinfo", ""))
     wakelocks = (
         extract_kernel_wakelocks(raw_outputs.get("batterystats", ""))
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else []
     )
 
@@ -6326,7 +7971,10 @@ def analyze_run(
         target_package = metadata.get("foreground_package")
     target_uid = (
         package_to_uid.get(str(target_package))
-        if power_mode and feature("power_attribution") and target_package
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
+        and target_package
         else None
     )
     target_usage = (
@@ -6334,18 +7982,28 @@ def analyze_run(
             (item for item in usage.get("uids", []) if item.get("uid") == target_uid),
             None,
         )
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else None
     )
     target_network = (
         parse_checkin_network(raw_outputs.get("batterystats_checkin", ""), target_uid)
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else None
     )
     gpu_analysis = analyze_gpu(
         samples,
         metadata,
-        raw_outputs if power_mode and feature("power_attribution") else {},
+        (
+            raw_outputs
+            if power_mode
+            and feature("power_attribution")
+            and consumption_session_representative
+            else {}
+        ),
         package_uids,
         target_uid,
         duration_s,
@@ -6393,16 +8051,24 @@ def analyze_run(
             None,
         )
     average_discharge_ma = (
-        discharge_mah * 3600.0 / covered_duration_s if covered_duration_s > 0 else 0.0
+        float(discharge_mah) * 3600.0 / consumption_covered_duration_s
+        if discharge_mah is not None and consumption_covered_duration_s > 0
+        else None
     )
     drain_pct_per_hour = (
-        average_discharge_ma / float(capacity_mah) * 100.0
-        if isinstance(capacity_mah, (int, float)) and capacity_mah > 0
+        float(average_discharge_ma) / float(capacity_mah) * 100.0
+        if consumption_session_representative
+        and isinstance(average_discharge_ma, (int, float))
+        and isinstance(capacity_mah, (int, float))
+        and capacity_mah > 0
         else None
     )
     full_runtime_h = (
-        float(capacity_mah) / average_discharge_ma
-        if average_discharge_ma > 0 and isinstance(capacity_mah, (int, float))
+        float(capacity_mah) / float(average_discharge_ma)
+        if consumption_session_representative
+        and isinstance(average_discharge_ma, (int, float))
+        and average_discharge_ma > 0
+        and isinstance(capacity_mah, (int, float))
         else None
     )
     end_level = end_battery.get("level_pct") if isinstance(end_battery, dict) else None
@@ -6420,12 +8086,16 @@ def analyze_run(
             power_profile,
             display,
         )
-        if power_mode and feature("power_attribution")
+        if power_mode
+        and feature("power_attribution")
+        and consumption_session_representative
         else []
     )
     application_analysis = (
         analyze_applications(samples, contexts, max_gap_s)
-        if power_mode and feature("foreground_window")
+        if power_mode
+        and feature("foreground_window")
+        and power_valid_for_consumption
         else {
             "available": False,
             "analysis_disabled": True,
@@ -6433,6 +8103,8 @@ def analyze_run(
                 "性能模式不按前台应用分配整机实测能量。"
                 if not power_mode
                 else "前台应用与窗口采集已关闭。"
+                if not feature("foreground_window")
+                else "没有连续有效的电池放电区间；前台上下文仅保留在原始时间序列中。"
             ),
             "rows": [],
             "transitions": [],
@@ -6445,10 +8117,19 @@ def analyze_run(
             max_gap_s,
             sample_interval_s,
         )
-        if power_mode
+        if power_mode and power_valid_for_consumption
         else {
             "available": bool(events),
-            "analysis_mode": "performance",
+            "analysis_mode": (
+                "power_unavailable" if power_mode else "performance"
+            ),
+            "analysis_disabled": bool(power_mode),
+            "power_valid_for_consumption": False if power_mode else None,
+            "reason": (
+                "设备未持续由电池放电，外部事件仅保留时间标记，不计算能量。"
+                if power_mode
+                else None
+            ),
             "event_count": len(events),
             "instant_count": sum(1 for event in events if not event.duration_s),
             "rows": [],
@@ -6521,26 +8202,88 @@ def analyze_run(
             "hint_sessions": [],
             "watched_processes": [],
         }
-    if platform == "harmony":
+    if platform == "ios" and thermal.get("available"):
         thermal["status"] = None
         thermal["latest_status"] = None
         thermal["maximum_status"] = None
         thermal["latest_status_label"] = "unavailable"
         thermal["maximum_status_label"] = "unavailable"
+        thermal["severity_available"] = False
+        thermal["throttling_observed"] = None
+        thermal["source"] = "iOS DiagnosticsService battery temperature"
+        thermal["limitations"] = (
+            "The current iOS sidecar exposes battery temperature only. It does not provide a public thermal "
+            "severity, throttling state, cooling-device state, threshold table, or thermal brightness cap; "
+            "unknown severity must not be interpreted as status 0."
+        )
+        for sensor in thermal.get("sensors", []) if isinstance(thermal.get("sensors"), list) else []:
+            if isinstance(sensor, dict):
+                sensor["maximum_status"] = None
+                sensor["maximum_status_label"] = "unavailable"
+        for point in thermal.get("timeline", []) if isinstance(thermal.get("timeline"), list) else []:
+            if isinstance(point, dict):
+                point["status"] = None
+                point["status_label"] = "unavailable"
+                point["sensor_status"] = {}
+    if platform == "harmony":
+        smartperf_thermal = (
+            str(capture_configuration.get("backend") or "") == "harmony_smartperf"
+        )
+        thermal["status"] = None
+        thermal["latest_status"] = None
+        thermal["maximum_status"] = None
+        thermal["latest_status_label"] = "unavailable"
+        thermal["maximum_status_label"] = "unavailable"
+        thermal["severity_available"] = False
         thermal["throttling_observed"] = None
         for sensor in thermal.get("sensors", []) if isinstance(thermal.get("sensors"), list) else []:
             if isinstance(sensor, dict):
                 sensor["maximum_status"] = None
                 sensor["maximum_status_label"] = "unavailable"
-        thermal["limitations"] = (
-            "HarmonyOS ThermalService exposes sensor temperatures through hidumper, but this adapter does "
-            "not receive Android thermal severity, cooling-device or threshold semantics."
-        )
+        if feature("thermal"):
+            thermal["source"] = (
+                "HarmonyOS SmartPerf SP_daemon temperature fields"
+                if smartperf_thermal
+                else "HarmonyOS ThermalService via hidumper"
+            )
+            thermal["limitations"] = (
+                "HarmonyOS SmartPerf exposes sampled temperature fields through SP_daemon, but it does not "
+                "provide Android thermal severity, cooling-device or threshold semantics."
+                if smartperf_thermal
+                else "HarmonyOS ThermalService exposes sensor temperatures through hidumper, but this adapter does "
+                "not receive Android thermal severity, cooling-device or threshold semantics."
+            )
         scheduler_analysis["limitations"] = (
             "HarmonyOS snapshots retain cpufreq and PowerManager state. Android cpuset, ActivityManager and "
             "ADPF HintSession concepts are not present and remain explicitly unavailable."
         )
-    if not power_mode:
+    if not power_mode or not power_valid_for_consumption:
+        invalid_power_fields = {
+            "power_mw",
+            "energy_mwh",
+            "average_power_mw",
+            "baseline_power_mw",
+            "power_delta_mw",
+            "excess_energy_mwh",
+            "power_correlation",
+            "average_power_when_visible_mw",
+            "power_delta_when_visible_mw",
+            "average_relative_power_score",
+            "maximum_relative_power_score",
+        }
+
+        def strip_invalid_power_metrics(value: object) -> None:
+            if isinstance(value, dict):
+                for key in list(value):
+                    if key in invalid_power_fields:
+                        value.pop(key, None)
+                    else:
+                        strip_invalid_power_metrics(value[key])
+            elif isinstance(value, list):
+                for item in value:
+                    strip_invalid_power_metrics(item)
+
+        strip_invalid_power_metrics(system_analysis)
         for collection_name in ("top_processes", "hot_threads"):
             collection = system_analysis.get(collection_name, [])
             if not isinstance(collection, list):
@@ -6558,30 +8301,108 @@ def analyze_run(
                     item.pop(key, None)
         system_analysis["power_attribution_disabled"] = True
         system_analysis["power_attribution_note"] = (
-            "性能模式仅把进程和线程 CPU 活动作为调度竞争证据，不分析其功耗来源。"
+            "采集期间未获得可用于耗电结论的连续放电样本；仅保留进程和线程 CPU 活动。"
+            if power_mode
+            else "性能模式仅把进程和线程 CPU 活动作为调度竞争证据，不分析其功耗来源。"
         )
 
     summary_analysis: Dict[str, object] = {
         "duration_s": duration_s,
         "covered_duration_s": covered_duration_s,
+        "consumption_covered_duration_s": consumption_covered_duration_s,
+        "consumption_coverage_pct": (
+            consumption_covered_duration_s / duration_s * 100.0
+            if duration_s > 0
+            else 0.0
+        ),
         "missing_duration_s": missing_duration_s,
         "coverage_pct": covered_duration_s / duration_s * 100.0 if duration_s > 0 else 0.0,
         "sample_count": len(samples),
+        "configured_sample_interval_s": cadence_target_s,
+        "observed_sample_interval_median_s": (
+            statistics.median(observed_intervals) if observed_intervals else None
+        ),
+        "observed_sample_interval_p95_s": cadence_p95_s,
+        "observed_sample_interval_maximum_s": (
+            max(observed_intervals) if observed_intervals else None
+        ),
+        "sampling_interval_on_time_pct": cadence_on_time_pct,
+        "sampling_cadence_assessment_available": cadence_assessment_available,
+        "sampling_cadence_stable": sampling_cadence_stable,
+        "estimated_missed_sample_slots": estimated_missed_sample_slots,
         "current_semantics": "positive magnitude",
         "average_current_ma": time_weighted_current_ma,
-        "minimum_current_ma": min(currents),
-        "maximum_current_ma": max(currents),
+        "minimum_current_ma": min(consumption_currents) if power_valid_for_consumption else None,
+        "maximum_current_ma": max(consumption_currents) if power_valid_for_consumption else None,
+        "observed_average_current_ma": observed_time_weighted_current_ma,
+        "observed_minimum_current_ma": min(currents),
+        "observed_maximum_current_ma": max(currents),
         "average_signed_current_ma": statistics.fmean(signed_currents),
         "average_voltage_mv": average_voltage_mv,
+        "power_flow_direction": power_flow_direction,
+        "power_valid_for_consumption": power_valid_for_consumption,
+        "consumption_session_representative": consumption_session_representative,
+        "power_consumption_unavailable_reason": (
+            None
+            if power_valid_for_consumption
+            else "采集期间设备未持续由电池放电；"
+            f"{invalid_power_observation_text}。"
+        ),
+        "full_session_attribution_unavailable_reason": (
+            None
+            if consumption_session_representative
+            else "会话不是连续、完整且可代表整场测试的电池放电窗口。"
+        ),
+        "observed_power_average_mw": observed_power_average_mw,
+        "observed_power_median_mw": statistics.median(powers),
+        "observed_power_p95_mw": percentile(powers, 0.95),
+        "observed_power_minimum_mw": min(powers),
+        "observed_power_maximum_mw": max(powers),
+        "observed_power_energy_mwh": observed_power_energy_mwh,
+        "observed_power_covered_duration_s": observed_power_covered_duration_s,
+        "observed_power_primary_source": primary_power_source,
+        "observed_power_excluded_sources": excluded_power_sources,
+        "observed_power_sources": power_sources,
+        "battery_flow_average_power_mw": battery_flow_average_power_mw,
+        "battery_flow_median_power_mw": statistics.median(battery_flow_powers),
+        "battery_flow_p95_power_mw": percentile(battery_flow_powers, 0.95),
+        "battery_flow_minimum_power_mw": min(battery_flow_powers),
+        "battery_flow_maximum_power_mw": max(battery_flow_powers),
+        "battery_flow_energy_mwh": battery_flow_energy_mwh,
+        "battery_flow_power_source": "battery_current_voltage",
         "average_power_mw": time_weighted_power_mw,
-        "median_power_mw": statistics.median(powers),
-        "p95_power_mw": percentile(powers, 0.95),
-        "minimum_power_mw": min(powers),
-        "maximum_power_mw": max(powers),
+        "median_power_mw": (
+            statistics.median(consumption_powers)
+            if power_valid_for_consumption and consumption_powers
+            else None
+        ),
+        "p95_power_mw": (
+            percentile(consumption_powers, 0.95)
+            if power_valid_for_consumption
+            else None
+        ),
+        "minimum_power_mw": (
+            min(consumption_powers)
+            if power_valid_for_consumption and consumption_powers
+            else None
+        ),
+        "maximum_power_mw": (
+            max(consumption_powers)
+            if power_valid_for_consumption and consumption_powers
+            else None
+        ),
         "energy_mwh": energy_mwh,
         "discharge_mah": discharge_mah,
-        "energy_per_minute_mwh": energy_mwh / duration_s * 60.0 if duration_s > 0 else None,
-        "mah_per_minute": discharge_mah / duration_s * 60.0 if duration_s > 0 else None,
+        "energy_per_minute_mwh": (
+            float(energy_mwh) / consumption_covered_duration_s * 60.0
+            if energy_mwh is not None and consumption_covered_duration_s > 0
+            else None
+        ),
+        "mah_per_minute": (
+            float(discharge_mah) / consumption_covered_duration_s * 60.0
+            if discharge_mah is not None and consumption_covered_duration_s > 0
+            else None
+        ),
         "average_cpu_pct": statistics.fmean(cpus) if cpus else None,
         "maximum_cpu_pct": max(cpus) if cpus else None,
         "power_sources": power_sources,
@@ -6626,7 +8447,7 @@ def analyze_run(
             "rows": [],
         }
     )
-    if power_mode:
+    if power_mode and power_valid_for_consumption:
         test_item_analysis = analyze_test_items(
             samples,
             contexts,
@@ -6647,6 +8468,26 @@ def analyze_run(
             settings_analysis,
         )
         render_performance: Dict[str, object] = {
+            "available": False,
+            "analysis_disabled": True,
+            "reason": "功耗模式不展开帧延迟和渲染链路归因。",
+        }
+    elif power_mode:
+        test_item_analysis = {
+            "available": False,
+            "analysis_disabled": True,
+            "power_valid_for_consumption": False,
+            "reason": "设备未持续由电池放电，测试项耗电、平均功耗和能量排名均不生成。",
+            "rows": [],
+            "timeline": [],
+        }
+        power_pressure = {
+            "available": False,
+            "analysis_disabled": True,
+            "power_valid_for_consumption": False,
+            "reason": invalid_power_pressure_text,
+        }
+        render_performance = {
             "available": False,
             "analysis_disabled": True,
             "reason": "功耗模式不展开帧延迟和渲染链路归因。",
@@ -6682,9 +8523,17 @@ def analyze_run(
         "test_mode": test_mode,
         "capture_configuration": capture_configuration,
         "summary": summary_analysis,
-        "buckets": build_buckets(samples) if power_mode else [],
-        "long_windows": build_long_windows(samples, contexts, max_gap_s) if power_mode else [],
-        "spikes": detect_spikes(samples) if power_mode else [],
+        "buckets": (
+            build_buckets(samples) if power_mode and power_valid_for_consumption else []
+        ),
+        "long_windows": (
+            build_long_windows(samples, contexts, max_gap_s)
+            if power_mode and power_valid_for_consumption
+            else []
+        ),
+        "spikes": (
+            detect_spikes(samples) if power_mode and power_valid_for_consumption else []
+        ),
         "cpu": cpu_analysis,
         "frequency_summary": cpu_analysis.get("clusters", []),
         "gpu": gpu_analysis,
@@ -6718,8 +8567,12 @@ def analyze_run(
         "external_events": event_analysis,
         "test_items": test_item_analysis,
         "stats_window": stats_window,
-        "data_sources": _analysis_data_sources(platform, test_mode, capture_configuration),
+        "data_sources": [],
         "warnings": analysis_warnings,
     }
+    analysis["data_sources"] = _filter_analysis_data_sources(
+        _analysis_data_sources(platform, test_mode, capture_configuration),
+        analysis,
+    )
     analysis["findings"] = build_findings(analysis)
     return analysis

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import signal
 import socket
@@ -165,14 +166,79 @@ def _save_endpoint(
     _write_endpoints(endpoints)
 
 
-def _endpoint_reachable(host: object, port: object, timeout_s: float = 0.5) -> bool:
+def _endpoint_reachable(
+    host: object,
+    port: object,
+    timeout_s: float = 0.5,
+    attempts: int = 3,
+) -> bool:
     if not host or not isinstance(port, (int, float)):
         return False
+    for _ in range(max(1, int(attempts))):
+        try:
+            with socket.create_connection((str(host), int(port)), timeout=timeout_s):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _endpoint_addresses(host: object) -> List[ipaddress._BaseAddress]:
+    text = str(host or "").strip().strip("[]")
+    if not text:
+        return []
+    literal = text.split("%", 1)[0]
     try:
-        with socket.create_connection((str(host), int(port)), timeout=timeout_s):
-            return True
+        return [ipaddress.ip_address(literal)]
+    except ValueError:
+        pass
+    addresses: List[ipaddress._BaseAddress] = []
+    try:
+        results = socket.getaddrinfo(text, None, type=socket.SOCK_STREAM)
     except OSError:
-        return False
+        return []
+    for result in results:
+        try:
+            address = ipaddress.ip_address(str(result[4][0]).split("%", 1)[0])
+        except (IndexError, ValueError):
+            continue
+        if address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+def _endpoint_scope(host: object) -> str:
+    addresses = _endpoint_addresses(host)
+    if not addresses:
+        return "unknown"
+    usable = [
+        address
+        for address in addresses
+        if not address.is_loopback
+        and not address.is_unspecified
+        and not address.is_multicast
+    ]
+    if not usable:
+        return "local-only"
+    if all(address.is_link_local for address in usable):
+        return "link-local"
+    if any(address.is_private and not address.is_link_local for address in usable):
+        return "private-lan"
+    return "routed"
+
+
+def _endpoint_is_unplug_candidate(host: object) -> bool:
+    return _endpoint_scope(host) in {"private-lan", "routed"}
+
+
+def _device_flag(
+    device: Dict[str, str],
+    name: str,
+    fallback: Optional[str] = None,
+) -> bool:
+    if name in device:
+        return str(device.get(name) or "").strip().lower() == "true"
+    return bool(fallback) and str(device.get(fallback) or "").strip().lower() == "true"
 
 
 def list_ios_devices(
@@ -202,28 +268,34 @@ def list_ios_devices(
         cached = dict(endpoints.get(udid, {}))
         host = raw.get("host") or raw.get("wireless_host") or cached.get("host")
         port = raw.get("port") or raw.get("wireless_port") or cached.get("port")
-        remote_ready = _endpoint_reachable(host, port)
-        if remote_ready:
+        remote_xpc_ready = _endpoint_reachable(host, port)
+        endpoint_scope = _endpoint_scope(host) if host else "unknown"
+        if remote_xpc_ready:
             _save_endpoint(udid, host, port, raw)
         reported_connection = str(raw.get("connection_type") or "usb").lower()
         usb_present = reported_connection == "usb"
-        if not usb_present and not remote_ready:
+        unplug_ready = bool(
+            remote_xpc_ready
+            and not usb_present
+            and _endpoint_is_unplug_candidate(host)
+        )
+        if not usb_present and not remote_xpc_ready:
             endpoint = f"{host}:{port}" if host and port else "no reachable endpoint"
             unavailable_wireless[udid] = endpoint
             continue
         state = str(raw.get("state") or "offline") if usb_present else "device"
-        if remote_ready:
+        if remote_xpc_ready:
             state = "device"
         connection_type = (
             "usb"
             if usb_present
             else "wireless"
-            if remote_ready
+            if remote_xpc_ready
             else reported_connection
         )
         transports = ["usb"] if usb_present else []
-        if remote_ready:
-            transports.append("wireless")
+        if remote_xpc_ready:
+            transports.append("wireless" if unplug_ready else "remote-xpc")
         devices[udid] = {
             "serial": ios_device_id(udid),
             "udid": udid,
@@ -231,7 +303,13 @@ def list_ios_devices(
             "platform": "ios",
             "connection_type": connection_type,
             "transports": ",".join(transports),
-            "wireless_ready": str(remote_ready).lower(),
+            "remote_xpc_ready": str(remote_xpc_ready).lower(),
+            "wireless_ready": str(unplug_ready).lower(),
+            "unplug_ready": str(unplug_ready).lower(),
+            "wireless_lan_candidate": str(
+                bool(remote_xpc_ready and _endpoint_is_unplug_candidate(host))
+            ).lower(),
+            "endpoint_scope": endpoint_scope,
             "model": str(raw.get("name") or cached.get("model") or "iPhone"),
             "product": str(raw.get("product_type") or cached.get("product_type") or "iOS"),
             "product_version": str(
@@ -251,14 +329,20 @@ def list_ios_devices(
             endpoint = f"{host}:{port}" if host and port else "no reachable endpoint"
             unavailable_wireless[udid] = endpoint
             continue
+        endpoint_scope = _endpoint_scope(host)
+        unplug_ready = _endpoint_is_unplug_candidate(host)
         devices[udid] = {
             "serial": ios_device_id(udid),
             "udid": udid,
             "state": "device",
             "platform": "ios",
             "connection_type": "wireless",
-            "transports": "wireless",
-            "wireless_ready": "true",
+            "transports": "wireless" if unplug_ready else "remote-xpc",
+            "remote_xpc_ready": "true",
+            "wireless_ready": str(unplug_ready).lower(),
+            "unplug_ready": str(unplug_ready).lower(),
+            "wireless_lan_candidate": str(unplug_ready).lower(),
+            "endpoint_scope": endpoint_scope,
             "model": str(cached.get("model") or cached.get("name") or "iPhone"),
             "product": str(cached.get("product_type") or "iOS"),
             "product_version": str(cached.get("product_version") or ""),
@@ -272,7 +356,7 @@ def list_ios_devices(
             for udid, endpoint in unavailable_wireless.items()
         )
         unavailable_error = (
-            "The cached iOS wireless connection is no longer reachable: "
+            "The cached iOS RemotePairing endpoint is no longer reachable: "
             f"{endpoints_text}. Connect the iPhone by USB, keep it unlocked, "
             "and create iOS wireless pairing again."
         )
@@ -334,7 +418,7 @@ def pair_ios_device(
         port = 0
     if not host or not port:
         raise RuntimeError(
-            "RemotePairing completed, but no reachable Wi-Fi endpoint was discovered "
+            "RemotePairing completed, but no reachable RemoteXPC endpoint was discovered "
             f"within {timeout_s:g} seconds. Keep the iPhone unlocked, confirm Wi-Fi "
             "connections are enabled, place the computer and iPhone on the same LAN, "
             "and allow Bonjour/RemotePairing through the firewall."
@@ -345,8 +429,18 @@ def pair_ios_device(
             "Keep the iPhone unlocked, verify both devices are on the same LAN, and "
             "check VPN, access-point isolation, and firewall settings."
         )
+    endpoint_scope = _endpoint_scope(host)
+    wireless_lan_candidate = _endpoint_is_unplug_candidate(host)
     _save_endpoint(udid, host, port, device)
-    result["endpoint"] = {**endpoint, "host": host, "port": port}
+    result["endpoint"] = {
+        **endpoint,
+        "host": host,
+        "port": port,
+        "scope": endpoint_scope,
+        "remote_xpc_ready": True,
+        "wireless_lan_candidate": wireless_lan_candidate,
+        "unplug_ready": False,
+    }
     result["serial"] = ios_device_id(udid)
     result["connected"] = True
     return result
@@ -373,6 +467,21 @@ def probe_ios_device(
         arguments.extend(["--host", host, "--port", port])
     result = _run_bridge_json(ios_python, arguments, timeout_s=90.0)
     result["selected_device"] = device
+    connection = result.get("connection")
+    if isinstance(connection, dict):
+        connection.update(
+            {
+                "type": "remote-pairing",
+                "remote_xpc_ready": _device_flag(
+                    device, "remote_xpc_ready", "wireless_ready"
+                ),
+                "unplug_ready": _device_flag(device, "unplug_ready", "wireless_ready"),
+                "wireless_lan_candidate": _device_flag(
+                    device, "wireless_lan_candidate", "wireless_ready"
+                ),
+                "endpoint_scope": str(device.get("endpoint_scope") or "unknown"),
+            }
+        )
     if host and port:
         _save_endpoint(udid, host, port, result.get("device") if isinstance(result.get("device"), dict) else None)
     return result
@@ -414,7 +523,7 @@ def collect_ios_session(
     host, port = _device_endpoint(device)
     if not host or not port:
         raise RuntimeError(
-            "iOS recording requires a cached RemotePairing Wi-Fi endpoint; run ios-pair while USB is connected"
+            "iOS recording requires a cached, reachable RemotePairing endpoint; run ios-pair while USB is connected"
         )
 
     result = IOSCollectionResult()
@@ -575,7 +684,7 @@ def collect_ios_session(
         if time.monotonic() - outage_started >= reconnect_timeout_s:
             result.stop_reason = "ios_disconnected"
             result.warnings.append(
-                "iPhone Wi-Fi RemotePairing did not recover before the reconnect timeout."
+                "iPhone RemotePairing RemoteXPC endpoint did not recover before the reconnect timeout."
             )
             break
         result.reconnect_count += 1

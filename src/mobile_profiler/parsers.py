@@ -1131,6 +1131,11 @@ def parse_display_brightness_state(
         {"mThrottlingStatus", "mBrightnessCap", "mApplied"},
         limit=20,
     )
+    vendor_thermal = section_values(
+        "OplusFeatureTemperatureLimitBrightness",
+        {"mLimitNit", "mIsLimitTakeEffect", "mCurLevel", "mCurTemperature"},
+        limit=24,
+    )
     hbm = section_values(
         "HighBrightnessModeController:",
         {"mBrightness", "mUnthrottledBrightness", "mThrottlingReason", "mCurrentMax"},
@@ -1152,17 +1157,35 @@ def parse_display_brightness_state(
     maximum_reason = last_match(
         r"^\s*mCachedBrightnessInfo\.brightnessMaxReason\s*=\s*([^\s]+)"
     )
+    vendor_temperature_table_text = last_match(
+        r"^\s*mTemperatureNitTable\s*=\s*\{([^}]*)\}"
+    )
 
     def number(value: Optional[str]) -> Optional[float]:
         return first_number(value)
 
     applied_text = str(thermal.get("mApplied") or "").strip().lower()
+    vendor_applied_text = str(
+        vendor_thermal.get("mIsLimitTakeEffect") or ""
+    ).strip().lower()
+    vendor_temperature_table: Dict[str, float] = {}
+    for entry in str(vendor_temperature_table_text or "").split(","):
+        match = re.fullmatch(
+            r"\s*(-?\d+)\s*=\s*([-+]?\d+(?:\.\d+)?)\s*",
+            entry,
+        )
+        if match:
+            vendor_temperature_table[match.group(1)] = float(match.group(2))
     screen_state = str(thread.get("mScreenState") or "").strip().upper() or None
     setting_raw = number(setting_text)
     setting_float = number(setting_float_text)
     parsed: Dict[str, object] = {
         "available": False,
-        "source": "Android DisplayManager + settings",
+        "source": (
+            "Android DisplayManager + Oplus temperature-limit brightness + settings"
+            if vendor_thermal
+            else "Android DisplayManager + settings"
+        ),
         "screen_state": screen_state,
         "setting_raw": setting_raw,
         "setting_float": setting_float,
@@ -1190,6 +1213,25 @@ def parse_display_brightness_state(
             if applied_text in {"true", "false"}
             else None
         ),
+        "vendor_thermal_provider": (
+            "OplusFeatureTemperatureLimitBrightness" if vendor_thermal else None
+        ),
+        "vendor_thermal_limit_nits": number(vendor_thermal.get("mLimitNit")),
+        "vendor_thermal_active": (
+            vendor_applied_text == "true"
+            if vendor_applied_text in {"true", "false"}
+            else None
+        ),
+        "vendor_thermal_level": (
+            int(float(vendor_thermal["mCurLevel"]))
+            if number(vendor_thermal.get("mCurLevel")) is not None
+            else None
+        ),
+        "vendor_thermal_temperature_c": number(
+            vendor_thermal.get("mCurTemperature")
+        ),
+        "vendor_thermal_candidate_caps_nits": vendor_temperature_table,
+        "vendor_thermal_limit_is_system_reported": bool(vendor_thermal),
         "hbm_brightness": number(hbm.get("mBrightness")),
         "hbm_unthrottled_brightness": number(hbm.get("mUnthrottledBrightness")),
         "hbm_current_maximum": number(hbm.get("mCurrentMax")),
@@ -1198,7 +1240,16 @@ def parse_display_brightness_state(
     parsed["available"] = any(
         value is not None
         for key, value in parsed.items()
-        if key not in {"available", "source", "screen_state", "hbm_throttling_reason"}
+        if key
+        not in {
+            "available",
+            "source",
+            "screen_state",
+            "hbm_throttling_reason",
+            "vendor_thermal_provider",
+            "vendor_thermal_candidate_caps_nits",
+            "vendor_thermal_limit_is_system_reported",
+        }
     ) or bool(screen_state)
     return parsed
 
