@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mobile-profiler"
-version = "0.7.1"
+version = "0.7.2"
 description = "Standalone Android, HarmonyOS, and iOS power and performance profiler"
 readme = "README.md"
 requires-python = ">=3.10"

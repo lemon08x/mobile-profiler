@@ -1705,6 +1705,8 @@ def build_sampler_script(
     emit_context_samples: bool = True,
     session_has_root: bool = False,
 ) -> str:
+    unlimited = duration_s <= 0
+
     def cat_command(path: str, *, requires_root: bool = False) -> str:
         quoted_path = shlex.quote(path)
         if requires_root and not session_has_root:
@@ -1736,7 +1738,7 @@ def build_sampler_script(
         "}",
         "read first_up rest < /proc/uptime",
         "start=${first_up%%.*}",
-        f"end=$((start+{int(duration_s)}+1))",
+        "end=0" if unlimited else f"end=$((start+{int(duration_s)}+1))",
         "i=0",
         "volt=-1",
         "temp=-1",
@@ -1859,7 +1861,7 @@ def build_sampler_script(
         [
             "now=${up%%.*}",
             "i=$((i+1))",
-            "if [ \"$now\" -ge \"$end\" ] && [ \"$i\" -gt 1 ]; then break; fi",
+            "if [ \"$end\" -gt 0 ] && [ \"$now\" -ge \"$end\" ] && [ \"$i\" -gt 1 ]; then break; fi",
             "read after_up rest < /proc/uptime",
             (
                 "delay=$(awk -v sample=\"$up\" "
@@ -3521,7 +3523,8 @@ def collect_streaming_session(
     result = StreamCollectionResult()
     use_root_sampler_session = bool(gpu_source is not None and gpu_source.requires_root)
     host_start = time.monotonic()
-    deadline = host_start + duration_s
+    unlimited = duration_s <= 0
+    deadline = math.inf if unlimited else host_start + duration_s
     next_checkpoint = host_start + checkpoint_interval_s
     fatal_stop = False
     monitor: Optional[SystemMonitorWorker] = None
@@ -3573,7 +3576,11 @@ def collect_streaming_session(
                 result.clock_sync.append(sync)
                 journal.append_clock_sync(sync)
 
-            remaining_s = max(2, int(math.ceil(deadline - time.monotonic())))
+            remaining_s = (
+                0
+                if unlimited
+                else max(2, int(math.ceil(deadline - time.monotonic())))
+            )
             script = build_sampler_script(
                 remaining_s,
                 interval_s,

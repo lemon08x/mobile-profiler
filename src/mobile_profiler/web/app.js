@@ -33,6 +33,8 @@
   });
   const storedPlatform = localStorage.getItem("mobile-profiler-platform");
   const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1";
+  const maxUiLogLines = 500;
+  const uiErrorDedupWindowS = 2;
   const liveTimelineLayoutDefinitions = [
     { key: "cpu_pct", label: "CPU 总负载", hint: "整体 CPU 使用率" },
     { key: "cpu_frequency", label: "CPU 核心组频率", hint: "按平台可验证的核心/频率分组展示" },
@@ -100,12 +102,14 @@
     state: null,
     metric: "power_mw",
     testMode: "power",
+    durationUnlimited: false,
     platform: ["android", "ios", "harmony"].includes(storedPlatform)
       ? storedPlatform
       : "android",
     polling: false,
     activeView: location.hash.replace("#", "") || "live",
     consoleClearedAt: 0,
+    uiLogs: [],
     currentRunName: null,
     chartGeometry: null,
     notifiedWarnings: new Set(),
@@ -589,6 +593,39 @@
     return String(device?.endpoint_scope || "unknown").toLowerCase();
   }
 
+  function iosWirelessTransport(device) {
+    const value = String(
+      device?.wireless_transport
+      || device?.transport
+      || device?.connection?.transport
+      || device?.metadata?.connection?.transport
+      || device?.config?.wireless_transport
+      || "unknown"
+    ).trim().toLowerCase().replaceAll("_", "-");
+    if (["bluetooth", "bluetooth-pan", "pan"].includes(value)) return "bluetooth-pan";
+    if (["wifi", "wi-fi", "wlan"].includes(value)) return "wifi";
+    if (["usb-ncm", "link-local"].includes(value)) return "usb-ncm";
+    return "unknown";
+  }
+
+  function iosWirelessTransportLabel(device, compact = false) {
+    const transport = iosWirelessTransport(device);
+    if (compact) {
+      return {
+        "bluetooth-pan": "蓝牙 PAN",
+        wifi: "Wi-Fi",
+        "usb-ncm": "USB-NCM",
+        unknown: "无线类型未确认",
+      }[transport];
+    }
+    return {
+      "bluetooth-pan": "蓝牙热点（PAN）RemotePairing",
+      wifi: "Wi-Fi RemotePairing",
+      "usb-ncm": "USB-NCM 链路本地 RemotePairing",
+      unknown: "无线 RemotePairing（类型未确认）",
+    }[transport];
+  }
+
   function recordingDeviceReadiness(device = selectedDeviceInfo()) {
     if (!device || device.state !== "device") {
       return { ready: false, reason: `需要一台处于 device 状态的 ${platformLabel(selectedPlatform())} 设备。` };
@@ -609,7 +646,7 @@
         ready: false,
         reason: scope === "link-local"
           ? "当前 RemoteXPC 端点是链路本地地址，可能依赖 USB-NCM，不能证明拔线后仍可用。请让电脑和 iPhone 接入同一局域网，拔掉 USB 后刷新确认。"
-          : "当前 RemotePairing 只确认了端点可连，尚未在拔掉 USB 后验证。请拔线并刷新；设备仍通过非链路本地 LAN 在线后才能开始断电测试。",
+          : "当前 RemotePairing 只确认了端点可连，尚未在拔掉 USB 后验证。请拔线并刷新；设备仍通过 Wi-Fi、局域网或蓝牙 PAN 在线后才能开始断电测试。",
       };
     }
     return { ready: true, reason: "" };
@@ -629,7 +666,7 @@
     const duration = Number(durationInput?.value);
     const minimumDuration = Number(durationInput?.min || 2);
     const maximumDuration = Number(durationInput?.max || 604800);
-    if (!finite(duration) || duration < minimumDuration || duration > maximumDuration) {
+    if (!app.durationUnlimited && (!finite(duration) || duration < minimumDuration || duration > maximumDuration)) {
       return {
         ready: false,
         reason: `测试时间必须在 ${minimumDuration}–${maximumDuration} 秒之间。`,
@@ -705,7 +742,7 @@
     document.body.dataset.platform = platform;
     $("#config-app-panel-title").textContent = platform === "android" ? "扫描出的应用" : "目标应用";
     $("#config-app-panel-source").textContent = platform === "android"
-      ? performance ? "选择后回填首页目标游戏" : "选择后回填目标应用"
+      ? performance ? "应用扫描已移至首页" : "选择后回填目标应用"
       : performance ? "请在首页手工填写" : "请在测试配置中手工填写";
     $("#platform-title").textContent = profile.title;
     $("#platform-description").textContent = profile.description;
@@ -736,7 +773,6 @@
         ? "性能模式必须确认测试时间和目标游戏"
         : "性能模式需确认测试时间；目标应用用于场景标记"
       : "功耗模式只需确认测试时间";
-    $("#home-open-apps").classList.toggle("hidden", !(performance && platform === "android"));
     placeTargetPackageField();
     $("#start-context-input").querySelector('option[value="desktop"]').textContent = profile.desktopLabel;
     $("#scheduler-interval-label").textContent = profile.schedulerLabel;
@@ -958,11 +994,39 @@
     });
   }
 
+  function activeDurationUnlimited(active) {
+    return Boolean(
+      active?.duration_unlimited
+      || active?.config?.duration_unlimited
+      || active?.metadata?.duration_unlimited
+    );
+  }
+
   function syncDurationPreset() {
-    const duration = Number($("#duration-input")?.value);
+    const durationInput = $("#duration-input");
+    if (durationInput) {
+      durationInput.dataset.minimumDuration ||= durationInput.min || "2";
+      durationInput.dataset.maximumDuration ||= durationInput.max || "604800";
+      durationInput.min = app.durationUnlimited ? "" : durationInput.dataset.minimumDuration;
+      durationInput.max = app.durationUnlimited ? "" : durationInput.dataset.maximumDuration;
+    }
+    const duration = Number(durationInput?.value);
     $$('[data-duration]').forEach(button => {
-      button.classList.toggle("active", Number(button.dataset.duration) === duration);
+      const selected = button.dataset.duration === "unlimited"
+        ? app.durationUnlimited
+        : !app.durationUnlimited && Number(button.dataset.duration) === duration;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
     });
+    const durationField = $("#duration-field");
+    const durationHint = $("#duration-mode-hint");
+    durationField?.classList.toggle("duration-unlimited", app.durationUnlimited);
+    durationHint?.classList.toggle("is-unlimited", app.durationUnlimited);
+    if (durationHint) {
+      durationHint.textContent = app.durationUnlimited
+        ? "无上限模式已开启；上方秒数会保留为有限模式草稿，采集需手动停止。"
+        : "达到设置时间后自动收尾；也可选择无上限并手动停止。";
+    }
   }
 
   const modeDefaults = {
@@ -1329,8 +1393,11 @@
     const durationInput = $("#duration-input");
     if (durationInput) {
       const minimumDuration = platform === "harmony" ? (smartPerf ? 4 : 8) : 2;
-      durationInput.min = String(minimumDuration);
-      if (Number(durationInput.value) < minimumDuration) {
+      durationInput.dataset.minimumDuration = String(minimumDuration);
+      durationInput.dataset.maximumDuration ||= durationInput.max || "604800";
+      durationInput.min = app.durationUnlimited ? "" : String(minimumDuration);
+      durationInput.max = app.durationUnlimited ? "" : durationInput.dataset.maximumDuration;
+      if (!app.durationUnlimited && Number(durationInput.value) < minimumDuration) {
         durationInput.value = String(minimumDuration);
         syncDurationPreset();
       }
@@ -1384,6 +1451,7 @@
     Object.entries(modeDefaults[nextMode]).forEach(([id, nextValue]) => {
       const input = document.getElementById(id);
       if (!input) return;
+      if (id === "duration-input" && app.durationUnlimited) return;
       const previousDefault = id === "performance-interval-input"
         ? recommendedPerformanceInterval(selectedPlatform(), previousMode)
         : id === "interval-input"
@@ -1940,7 +2008,31 @@
     return data;
   }
 
+  function recordUiError(title, detail = "") {
+    const now = Date.now() / 1000;
+    const normalizedTitle = String(title || "未知错误").trim();
+    const normalizedDetail = String(detail || "").trim();
+    const signature = `${normalizedTitle}\u0000${normalizedDetail}`;
+    const previous = app.uiLogs.at(-1);
+    if (
+      previous?.signature === signature
+      && now - Number(previous.time || 0) < uiErrorDedupWindowS
+    ) return;
+    app.uiLogs.push({
+      time: now,
+      source: "ui",
+      type: "error",
+      line: normalizedDetail ? `${normalizedTitle}：${normalizedDetail}` : normalizedTitle,
+      signature,
+    });
+    if (app.uiLogs.length > maxUiLogLines) {
+      app.uiLogs.splice(0, app.uiLogs.length - maxUiLogLines);
+    }
+    renderConsole(app.state?.active);
+  }
+
   function notify(title, detail = "", type = "success", timeout = 5000) {
+    if (type === "error") recordUiError(title, detail);
     const container = $("#toast-stack");
     const toast = document.createElement("div");
     toast.className = `toast ${type}`;
@@ -1967,20 +2059,33 @@
 
   function placeTargetPackageField() {
     const field = $(".target-app-field");
-    const destination = app.testMode === "performance"
+    const performance = app.testMode === "performance";
+    const scannerOnHome = performance && selectedPlatform() === "android";
+    const destination = performance
       ? $("#home-package-slot")
       : $("#config-package-slot");
     if (field && destination && field.parentElement !== destination) {
       destination.appendChild(field);
     }
+    const appPicker = $(".app-picker");
+    const appPickerDestination = scannerOnHome
+      ? field
+      : $("#config-app-picker-content");
+    if (appPicker && appPickerDestination && appPicker.parentElement !== appPickerDestination) {
+      if (scannerOnHome) {
+        appPickerDestination.insertBefore(appPicker, $("#package-input-hint"));
+      } else {
+        appPickerDestination.appendChild(appPicker);
+      }
+    }
+    $("#config-app-column")?.classList.toggle("scanner-on-home", scannerOnHome);
+    $("#config-view-columns")?.classList.toggle("scanner-on-home", scannerOnHome);
   }
 
   function mountConfigurationView() {
     const target = $("#config-view-content");
     const formTarget = $("#config-form-column");
-    const appPickerTarget = $("#config-app-picker-content");
     const controlPanel = $(".control-panel");
-    const appPicker = $(".app-picker");
     const runtimeLayout = $(".runtime-layout");
     const durationField = $("#duration-field");
     const durationPresets = $("#duration-presets");
@@ -1988,11 +2093,10 @@
     const startButton = $("#start-record");
     const startSlot = $("#home-start-slot");
     if (
-      !target || !formTarget || !appPickerTarget || !controlPanel || !appPicker
-      || !runtimeLayout || !durationField || !durationPresets || !durationSlot
+      !target || !formTarget || !controlPanel || !runtimeLayout
+      || !durationField || !durationPresets || !durationSlot
       || !startButton || !startSlot
     ) return;
-    appPickerTarget.append(appPicker);
     durationSlot.append(durationField, durationPresets);
     startButton.setAttribute("form", "record-form");
     startSlot.append(startButton);
@@ -2209,9 +2313,9 @@
           : "USB 有线（RemotePairing 已建立，待拔线验证）";
       }
       if (deviceConnectionType(device) === "wireless") {
-        return iosUnplugReady(device)
-          ? "Wi-Fi RemotePairing"
-          : "链路本地 RemotePairing（不可作为断电证明）";
+        return iosEndpointScope(device) === "link-local"
+          ? "USB-NCM 链路本地 RemotePairing（不可作为断电证明）"
+          : iosWirelessTransportLabel(device);
       }
     }
     return {
@@ -2250,7 +2354,7 @@
     } else {
       [
         ["usb", "有线设备（USB）"],
-        ["wireless", "无线设备（Wi-Fi）"],
+        ["wireless", platform === "ios" ? "无线设备（Wi-Fi / 蓝牙 PAN）" : "无线设备（Wi-Fi）"],
         ["emulator", "模拟器"],
         ["unknown", "其他设备"],
       ].forEach(([type, label]) => {
@@ -2264,7 +2368,8 @@
           option.dataset.connectionType = type;
           option.dataset.platform = devicePlatform(device);
           const name = [device.model, device.product].filter(Boolean).join(" / ");
-          option.textContent = `${name || platformLabel(platform) + " Device"} · ${device.serial} · ${device.state}`;
+          const connection = platform === "ios" ? ` · ${deviceConnectionLabel(device)}` : "";
+          option.textContent = `${name || platformLabel(platform) + " Device"}${connection} · ${device.serial} · ${device.state}`;
           option.disabled = device.state !== "device";
           group.appendChild(option);
         });
@@ -2306,6 +2411,7 @@
     $("#enable-tcpip").disabled = !chosen || chosenPlatform !== "android" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#enable-harmony-tcpip").disabled = !chosen || chosenPlatform !== "harmony" || chosen.state !== "device" || chosenType !== "usb" || Boolean(state.active?.running);
     $("#pair-ios").disabled = !chosen || chosenPlatform !== "ios" || chosenType !== "usb" || Boolean(state.active?.running);
+    $("#connect-ios-bluetooth").disabled = chosenPlatform !== "ios" || Boolean(state.active?.running);
     $("#disconnect-wireless").disabled = !chosen || chosenPlatform !== "android" || chosenType !== "wireless" || Boolean(state.active?.running);
     updateAppScannerAvailability(chosen);
     updateCaptureFeatureControls();
@@ -2424,6 +2530,7 @@
   }
 
   function renderPerformanceMetrics(active) {
+    const performance = active?.performance || {};
     if (activePlatform(active) === "ios") {
       $("#live-resolution-note")?.classList.add("hidden");
       const latest = active?.latest || {};
@@ -2470,7 +2577,6 @@
       $("#metric-interpolation-sub").textContent = "iOS battery diagnostics";
       return;
     }
-    const performance = active?.performance || {};
     const fps = finite(performance.sampled_frame_rate_fps)
       ? Number(performance.sampled_frame_rate_fps)
       : finite(performance.sampled_compositor_fps)
@@ -3043,16 +3149,29 @@
     orbit.className = "record-orbit";
     if (running) orbit.classList.add("active");
     if (["complete", "collected", "recovered"].includes(status)) orbit.classList.add("complete");
-    $("#session-kicker").textContent = kicker;
+    const sessionTransport = active && activePlatform(active) === "ios"
+      ? iosWirelessTransportLabel(active, true)
+      : "";
+    $("#session-kicker").textContent = sessionTransport
+      ? `${kicker} · ${sessionTransport}`
+      : kicker;
     const defaultSessionTitle = (active?.test_mode || active?.metadata?.test_mode) === "performance"
       ? "Performance session"
       : "Power session";
     $("#session-title").textContent = active ? `${label} · ${active.title || active.run_name || defaultSessionTitle}` : "等待开始新的采集";
     const elapsed = Number(active?.elapsed_s || 0);
     const requested = Number(active?.requested_duration_s || 0);
-    $("#session-time").textContent = `${formatDuration(elapsed)} / ${formatDuration(requested)}`;
+    const durationUnlimited = activeDurationUnlimited(active);
+    $("#session-time").textContent = durationUnlimited
+      ? `已运行 ${formatDuration(elapsed)} / 无上限`
+      : `${formatDuration(elapsed)} / ${formatDuration(requested)}`;
     $("#session-samples").textContent = `${active?.sample_count || 0} samples`;
-    $("#session-progress").style.width = `${clamp(Number(active?.progress || 0), 0, 1) * 100}%`;
+    const sessionProgress = $("#session-progress");
+    const indeterminateProgress = running && durationUnlimited;
+    sessionProgress.closest(".progress-track")?.classList.toggle("indeterminate", indeterminateProgress);
+    sessionProgress.style.width = indeterminateProgress
+      ? "34%"
+      : `${clamp(Number(active?.progress || 0), 0, 1) * 100}%`;
     stopButton.classList.toggle("hidden", !running);
     markerButton.classList.toggle("hidden", !running);
     reportLink.classList.toggle("hidden", !active?.report_ready);
@@ -3489,8 +3608,12 @@
   */
   function renderConsole(active) {
     const container = $("#console-output");
-    let logs = Array.isArray(active?.logs) ? active.logs : [];
+    let logs = [
+      ...(Array.isArray(active?.logs) ? active.logs : []),
+      ...app.uiLogs,
+    ];
     if (app.consoleClearedAt) logs = logs.filter(item => Number(item.time || 0) >= app.consoleClearedAt);
+    logs.sort((left, right) => Number(left.time || 0) - Number(right.time || 0));
     const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 30;
     if (!logs.length) {
       container.innerHTML = '<div class="console-line ui"><time>--:--:--</time><span>UI</span><p>Dashboard ready. Select a device and configure a session.</p></div>';
@@ -3500,7 +3623,7 @@
       const date = finite(item.time) ? new Date(Number(item.time) * 1000) : null;
       const clock = date ? date.toLocaleTimeString("zh-CN", { hour12: false }) : "--:--:--";
       const source = String(item.source || "ui");
-      const type = /error|failed/i.test(String(item.line || "")) ? "error" : source;
+      const type = item.type === "error" || /error|failed/i.test(String(item.line || "")) ? "error" : source;
       return `<div class="console-line ${escapeHtml(type)}"><time>${escapeHtml(clock)}</time><span>${escapeHtml(source)}</span><p>${escapeHtml(item.line || "")}</p></div>`;
     }).join("");
     if (nearBottom) container.scrollTop = container.scrollHeight;
@@ -4731,6 +4854,10 @@
       app.liveRangeSummary = null;
       app.liveRangeSummaryRequestId += 1;
     }
+    if (isNewRun && active) {
+      app.durationUnlimited = activeDurationUnlimited(active);
+      syncDurationPreset();
+    }
     if (active && (isNewRun || active.running)) {
       if (active.running) {
         setPlatform(active.platform || active.metadata?.platform || selectedPlatform(), {
@@ -4744,8 +4871,10 @@
       });
       if (isNewRun && active.running && active.config) {
         const config = active.config;
+        if (!app.durationUnlimited && finite(config.duration)) {
+          $("#duration-input").value = String(config.duration);
+        }
         [
-          ["duration-input", "duration"],
           ["interval-input", "interval"],
           ["checkpoint-input", "checkpoint_interval"],
           ["reconnect-input", "reconnect_timeout"],
@@ -4902,6 +5031,9 @@
       || iosProbeDevice.endpoint_scope
       || "unknown"
     );
+    const iosProbeTransportLabel = iosWirelessTransportLabel(
+      data.connection || iosProbeDevice
+    );
     const harmonyScreenState = String(
       data.power_state?.screen_state
       || data.display?.screen_state
@@ -4916,10 +5048,10 @@
       ["GPU 利用率", "仅 DVT Graphics 利用率事件，不含 GPU 频率", Boolean(data.capabilities?.gpu_utilization)],
       ["前台应用状态", iosAppStateStatus === "not_probed" ? "采集期间确认 DVT Running / Suspended；不含显示参数" : "DVT Running / Suspended；不含分辨率、亮度和刷新率", iosAppStateAvailable],
       ["RemoteXPC telemetry", iosRemoteReady
-        ? `${data.connection.host}:${data.connection.port}`
+        ? `${iosProbeTransportLabel} · ${data.connection.host}:${data.connection.port}`
         : "当前仅 USB Probe；正式录制需可达的 RemotePairing 端点", Boolean(data.capabilities?.remote_xpc && iosRemoteReady)],
       ["Unplugged power-test link", iosUnpluggedReady
-        ? `${data.connection.host}:${data.connection.port} · 拔线后 LAN 在线`
+        ? `${iosProbeTransportLabel} · ${data.connection.host}:${data.connection.port} · 拔线后在线`
         : iosRemoteReady
           ? `${iosProbeEndpointScope} · 当前端点不能证明拔掉 USB 后仍可达`
           : "未验证", iosUnpluggedReady],
@@ -5194,6 +5326,7 @@
       title: $("#title-input").value.trim(),
       run_name: $("#run-name-input").value.trim(),
       duration: Number($("#duration-input").value),
+      duration_unlimited: app.durationUnlimited,
       interval: Number($("#interval-input").value),
       package: $("#package-input").value.trim(),
       start_context: $("#start-context-input").value,
@@ -5459,6 +5592,50 @@
       }
     });
 
+    $("#connect-ios-bluetooth").addEventListener("click", async () => {
+      const device = selectedDevice();
+      const selected = (app.state?.devices || []).find(item => item.serial === device);
+      if (selected && devicePlatform(selected) !== "ios") {
+        notify("请选择 iPhone", "蓝牙热点连接只适用于 iOS 设备。", "error");
+        return;
+      }
+      if (!confirm(
+        "将连接已配对 iPhone 的蓝牙个人热点，并把 RemotePairing 切换到蓝牙 PAN 地址。\n\n"
+        + "请先完成“1. 创建 RemotePairing”，并确认 iPhone 已开启蓝牙和“个人热点”。"
+        + "首次使用时还需要在 Windows 与 iPhone 两端完成蓝牙配对。是否继续？",
+      )) return;
+      setBusy(true, "正在连接 iPhone 蓝牙热点...");
+      try {
+        const result = await api("/api/ios/bluetooth", {
+          method: "POST",
+          body: JSON.stringify({ device: device || null }),
+        });
+        const endpoint = result.endpoint || {};
+        const connectedDevice = result.device || {};
+        if (!result.connected || !endpoint.host || !endpoint.port) {
+          throw new Error("蓝牙 PAN 已连接，但没有返回可用的 RemotePairing 端点");
+        }
+        const unplugReady = deviceBooleanField(
+          connectedDevice,
+          "unplug_ready",
+          "wireless_ready",
+        );
+        notify(
+          result.already_connected ? "iPhone 蓝牙已在线" : "iPhone 蓝牙连接成功",
+          `${result.address} → ${endpoint.host}:${endpoint.port} · ${result.link_speed || "Bluetooth PAN"}`
+            + (unplugReady ? " · 已通过拔线验证" : " · 可拔掉 USB 后刷新验证"),
+          "success",
+          12000,
+        );
+        await refreshState();
+      } catch (error) {
+        const reason = String(error?.message || "未知蓝牙连接错误").replace(/^ERROR:\s*/i, "");
+        notify("iPhone 蓝牙连接失败", reason, "error", 0);
+      } finally {
+        setBusy(false);
+      }
+    });
+
     $("#disconnect-wireless").addEventListener("click", async () => {
       const address = selectedDevice();
       const selected = (app.state?.devices || []).find(item => item.serial === address);
@@ -5583,23 +5760,21 @@
     });
 
     $$("[data-duration]").forEach(button => button.addEventListener("click", () => {
-      $("#duration-input").value = button.dataset.duration;
+      if (button.dataset.duration === "unlimited") {
+        app.durationUnlimited = true;
+      } else {
+        app.durationUnlimited = false;
+        $("#duration-input").value = button.dataset.duration;
+      }
       syncDurationPreset();
       updateStartControlState();
     }));
 
     $("#duration-input").addEventListener("input", () => {
+      app.durationUnlimited = false;
       syncDurationPreset();
       updateStartControlState();
     });
-    $("#home-open-apps").addEventListener("click", () => {
-      switchView("config");
-      window.requestAnimationFrame(() => {
-        const scanButton = $("#scan-apps");
-        if (scanButton && !scanButton.disabled) scanButton.focus();
-      });
-    });
-
     $$("[data-metric]").forEach(button => button.addEventListener("click", () => {
       app.metric = button.dataset.metric;
       $$("[data-metric]").forEach(item => item.classList.toggle("active", item === button));
@@ -5717,6 +5892,7 @@
 
     $("#clear-console").addEventListener("click", () => {
       app.consoleClearedAt = Date.now() / 1000;
+      app.uiLogs = [];
       renderConsole(app.state?.active);
     });
 

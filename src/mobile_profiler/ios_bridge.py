@@ -207,7 +207,9 @@ SYSTEM_LOAD_SAMPLE_STALE_AFTER_S = 30.0
 def _ios_collection_target_coverage_s(duration_s: float, interval_s: float) -> float:
     """Choose the longest configured sample span that does not exceed the request."""
 
-    duration = max(0.0, float(duration_s))
+    duration = float(duration_s)
+    if duration <= 0:
+        return math.inf
     interval = max(0.001, float(interval_s))
     completed_intervals = max(1, int(math.floor((duration + 1e-9) / interval)))
     return completed_intervals * interval
@@ -219,6 +221,8 @@ def _ios_collection_window_complete(
     duration_s: float,
     interval_s: float,
 ) -> bool:
+    if float(duration_s) <= 0:
+        return False
     target = _ios_collection_target_coverage_s(duration_s, interval_s)
     tolerance = min(0.5, max(0.05, float(interval_s) * 0.1))
     return float(current_uptime_s) - float(first_uptime_s) >= target - tolerance
@@ -905,6 +909,7 @@ def _process_snapshot(
 
 async def record_device(args: argparse.Namespace) -> None:
     _require_collection_runtime()
+    duration_s = 0.0 if bool(getattr(args, "unlimited", False)) else float(args.duration)
     udid = str(args.udid)
     host = str(args.host) if args.host else None
     port = int(args.port) if args.port else None
@@ -1128,12 +1133,18 @@ async def record_device(args: argparse.Namespace) -> None:
             ]
             interval_s = max(0.001, float(args.interval))
             target_coverage_s = _ios_collection_target_coverage_s(
-                float(args.duration),
+                duration_s,
                 interval_s,
             )
-            deadline = time.monotonic() + float(args.duration) + max(
-                5.0,
-                interval_s * 2.0,
+            deadline = (
+                math.inf
+                if duration_s <= 0
+                else time.monotonic()
+                + duration_s
+                + max(
+                    5.0,
+                    interval_s * 2.0,
+                )
             )
             first_sample_uptime: Optional[float] = None
             sample_index = 0
@@ -1162,10 +1173,11 @@ async def record_device(args: argparse.Namespace) -> None:
                             uptime = clock_uptime + (time.monotonic() - clock_monotonic)
                         if first_sample_uptime is None:
                             first_sample_uptime = uptime
-                            deadline = time.monotonic() + target_coverage_s + max(
-                                5.0,
-                                interval_s * 2.0,
-                            )
+                            if duration_s > 0:
+                                deadline = time.monotonic() + target_coverage_s + max(
+                                    5.0,
+                                    interval_s * 2.0,
+                                )
                         latest_uptime = uptime
                         total_process_cpu = sum(_number(item.get("cpuUsage")) for item in cpu_visible)
                         collector_cpu = sum(
@@ -1285,7 +1297,7 @@ async def record_device(args: argparse.Namespace) -> None:
                             and _ios_collection_window_complete(
                                 first_sample_uptime,
                                 uptime,
-                                float(args.duration),
+                                duration_s,
                                 interval_s,
                             )
                         ) or time.monotonic() >= deadline:
@@ -1340,7 +1352,9 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--udid", required=True)
     record.add_argument("--host")
     record.add_argument("--port", type=int)
-    record.add_argument("--duration", type=float, required=True)
+    duration = record.add_mutually_exclusive_group(required=True)
+    duration.add_argument("--duration", type=float)
+    duration.add_argument("--unlimited", action="store_true")
     record.add_argument("--interval", type=float, default=1.0)
     record.add_argument("--process-interval", type=float, default=10.0)
     record.add_argument("--clock-interval", type=float, default=30.0)

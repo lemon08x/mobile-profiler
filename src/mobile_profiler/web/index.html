@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-33">
-  <script src="/app.js?v=platform-ui-33" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-41">
+  <script src="/app.js?v=platform-ui-41" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -44,7 +44,7 @@
     <section class="workspace">
       <header class="topbar">
         <div class="page-title">
-          <p>MOBILE PROFILING LAB <span class="app-version-badge" id="app-version-badge" title="Mobile Profiler 0.7.1">v0.7.1</span></p>
+          <p>MOBILE PROFILING LAB <span class="app-version-badge" id="app-version-badge" title="Mobile Profiler 0.7.2">v0.7.2</span></p>
           <h1 id="page-heading">实时监控</h1>
         </div>
         <div class="topbar-actions">
@@ -52,10 +52,10 @@
             <label id="connection-address-label" for="adb-address-input" data-platforms="android harmony">ADB IP</label>
             <input id="adb-address-input" data-platforms="android harmony" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.20:5555">
             <button id="connect-address" data-platforms="android harmony" type="submit">连接 ADB</button>
-            <span class="ios-pair-hint" id="ios-pair-hint" data-platforms="ios">USB 信任后创建 RemotePairing，再拔线采集</span>
             <button class="tcpip-button" id="enable-tcpip" data-platforms="android" type="button" title="对当前设备执行 adb tcpip 5555，并自动连接 Wi-Fi IP">无线 ADB</button>
             <button class="tcpip-button" id="enable-harmony-tcpip" data-platforms="harmony" type="button" title="对当前 USB 鸿蒙设备执行 hdc tmode port 8710，并自动连接 Wi-Fi IP">鸿蒙无线</button>
-            <button class="tcpip-button" id="pair-ios" data-platforms="ios" type="button" title="通过已信任的 USB iPhone 创建 RemotePairing；拔线能力需之后单独验证">创建 iOS RemotePairing</button>
+            <button class="tcpip-button" id="pair-ios" data-platforms="ios" type="button" title="第 1 步：通过已信任的 USB iPhone 创建 RemotePairing；通常只需首次执行或连接失效时修复">1. 创建 RemotePairing</button>
+            <button class="tcpip-button" id="connect-ios-bluetooth" data-platforms="ios" type="button" title="第 2 步：确认 iPhone 已开启蓝牙和个人热点，并已与 Windows 配对；然后连接蓝牙 PAN">2. 连接蓝牙热点</button>
             <button class="disconnect-button" id="disconnect-wireless" data-platforms="android" type="button" title="断开当前选择的无线 ADB 设备">断开无线</button>
           </form>
           <label class="device-picker" for="device-select">
@@ -108,52 +108,55 @@
         </section>
 
         <section class="view active" data-panel="live">
-          <div class="test-mode-bar panel" id="test-mode-bar">
-            <div class="test-mode-copy">
-              <small>TEST PROFILE</small>
-              <strong id="test-mode-title">功耗测试模式</strong>
-              <span id="test-mode-description">以电流、功率和累计能量为主，保持低干扰采样。</span>
-            </div>
-            <div class="test-mode-switch" role="group" aria-label="测试模式">
-              <button class="active" type="button" data-test-mode="power" aria-pressed="true">
-                <i aria-hidden="true"></i><span><strong>功耗测试</strong><small id="power-mode-subtitle">默认 · 电流 / 功率</small></span>
-              </button>
-              <button type="button" data-test-mode="performance" aria-pressed="false">
-                <i aria-hidden="true"></i><span><strong>性能测试</strong><small id="performance-mode-subtitle">FPS / 1% Low / 渲染链路</small></span>
-              </button>
-            </div>
-          </div>
+          <div class="live-overview-grid">
+            <div class="live-overview-stack">
+              <div class="test-mode-bar panel" id="test-mode-bar">
+                <div class="test-mode-copy">
+                  <small>TEST PROFILE</small>
+                  <strong id="test-mode-title">功耗测试模式</strong>
+                  <span id="test-mode-description">以电流、功率和累计能量为主，保持低干扰采样。</span>
+                </div>
+                <div class="test-mode-switch" role="group" aria-label="测试模式">
+                  <button class="active" type="button" data-test-mode="power" aria-pressed="true">
+                    <i aria-hidden="true"></i><span><strong>功耗测试</strong><small id="power-mode-subtitle">默认 · 电流 / 功率</small></span>
+                  </button>
+                  <button type="button" data-test-mode="performance" aria-pressed="false">
+                    <i aria-hidden="true"></i><span><strong>性能测试</strong><small id="performance-mode-subtitle">FPS / 1% Low / 渲染链路</small></span>
+                  </button>
+                </div>
+              </div>
 
-          <section class="home-start-panel panel" id="home-start-panel" aria-labelledby="home-start-title">
-            <div class="home-start-heading">
-              <div><small>QUICK START</small><h2 id="home-start-title">开始任务</h2><p>首页只保留开测前必须确认的项目；其他采集参数继续使用“测试配置”中的当前设置。</p></div>
-              <span id="home-start-requirements">功耗模式只需确认测试时间</span>
-            </div>
-            <div class="home-start-controls">
-              <div class="home-start-duration" id="home-duration-slot"></div>
-              <div class="home-start-package" id="home-package-slot"></div>
-              <div class="home-start-actions">
-                <button class="button ghost hidden" id="home-open-apps" type="button">扫描 / 选择游戏</button>
-                <div id="home-start-slot"></div>
-                <small>设备满足采集条件后即可直接开始</small>
+              <div class="session-strip" id="session-strip">
+                <div class="session-status">
+                  <span class="record-orbit" id="record-orbit"><i></i></span>
+                  <div><small id="session-kicker">SESSION READY</small><strong id="session-title">等待开始新的采集</strong></div>
+                </div>
+                <div class="session-progress-block">
+                  <div class="session-progress-copy"><span id="session-time">00:00 / 00:00</span><span id="session-samples">0 samples</span></div>
+                  <div class="progress-track"><span id="session-progress"></span></div>
+                </div>
+                <div class="session-actions">
+                  <a class="button ghost hidden" id="open-report" href="#" target="_blank" rel="noreferrer">查看报告</a>
+                  <button class="button ghost hidden" id="add-marker" type="button">添加时间标记</button>
+                  <button class="button danger hidden" id="stop-record" type="button">停止并收尾</button>
+                </div>
               </div>
             </div>
-          </section>
 
-          <div class="session-strip" id="session-strip">
-            <div class="session-status">
-              <span class="record-orbit" id="record-orbit"><i></i></span>
-              <div><small id="session-kicker">SESSION READY</small><strong id="session-title">等待开始新的采集</strong></div>
-            </div>
-            <div class="session-progress-block">
-              <div class="session-progress-copy"><span id="session-time">00:00 / 00:00</span><span id="session-samples">0 samples</span></div>
-              <div class="progress-track"><span id="session-progress"></span></div>
-            </div>
-            <div class="session-actions">
-              <a class="button ghost hidden" id="open-report" href="#" target="_blank" rel="noreferrer">查看报告</a>
-              <button class="button ghost hidden" id="add-marker" type="button">添加时间标记</button>
-              <button class="button danger hidden" id="stop-record" type="button">停止并收尾</button>
-            </div>
+            <section class="home-start-panel panel" id="home-start-panel" aria-labelledby="home-start-title">
+              <div class="home-start-heading">
+                <div><small>QUICK START</small><h2 id="home-start-title">开始任务</h2><p>首页只保留开测前必须确认的项目；其他采集参数继续使用“测试配置”中的当前设置。</p></div>
+                <span id="home-start-requirements">功耗模式只需确认测试时间</span>
+              </div>
+              <div class="home-start-controls">
+                <div class="home-start-duration" id="home-duration-slot"></div>
+                <div class="home-start-package" id="home-package-slot"></div>
+                <div class="home-start-actions">
+                  <div id="home-start-slot"></div>
+                  <small>设备满足采集条件后即可直接开始</small>
+                </div>
+              </div>
+            </section>
           </div>
 
           <div class="runtime-layout">
@@ -170,7 +173,8 @@
                   </div>
                   <div class="form-field" id="duration-field">
                     <label for="duration-input">测试时间</label>
-                    <div class="input-with-unit"><input id="duration-input" name="duration" form="record-form" type="number" min="2" max="604800" step="1" value="3720"><span>秒</span></div>
+                    <div class="input-with-unit"><input id="duration-input" name="duration" form="record-form" type="number" min="2" max="604800" step="1" value="3720" aria-describedby="duration-mode-hint"><span>秒</span></div>
+                    <small class="field-hint duration-mode-hint" id="duration-mode-hint" aria-live="polite">达到设置时间后自动收尾；也可选择无上限并手动停止。</small>
                   </div>
                 <div class="duration-presets" id="duration-presets" aria-label="测试时间快捷选项">
                   <button type="button" data-duration="60">1 分钟</button>
@@ -179,6 +183,7 @@
                   <button type="button" data-duration="1920">32 分钟</button>
                   <button type="button" data-duration="3600">1 小时</button>
                   <button type="button" data-duration="3720" class="active">1 小时 + 2 分钟</button>
+                  <button type="button" data-duration="unlimited">无上限 · 手动停止</button>
                 </div>
                 <div id="config-package-slot">
                 <div class="form-field target-app-field">
@@ -186,7 +191,7 @@
                   <input id="package-input" name="package" form="record-form" type="text" maxlength="200" placeholder="com.example.app">
                   <section class="app-picker" data-platforms="android" aria-labelledby="app-picker-title">
                     <div class="app-picker-heading">
-                      <span><strong id="app-picker-title">从当前设备扫描</strong><small>读取 Android 可启动应用；选择后自动填写左侧目标包名</small></span>
+                      <span><strong id="app-picker-title">从当前设备扫描</strong><small>读取 Android 可启动应用；选择后自动填写目标包名</small></span>
                       <button id="scan-apps" type="button">扫描手机应用</button>
                     </div>
                     <div class="app-picker-controls">

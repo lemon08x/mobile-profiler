@@ -37,7 +37,12 @@ from .analysis import (
 from .collector import adb_connection_type, adb_shell, list_adb_devices, parse_sampler_line
 from .evidence import create_evidence_archive
 from .features import capture_feature_names, capture_preset_names
-from .ios import DEFAULT_IOS_PYTHON, list_ios_devices, pair_ios_device
+from .ios import (
+    DEFAULT_IOS_PYTHON,
+    connect_ios_bluetooth as connect_ios_bluetooth_device,
+    list_ios_devices,
+    pair_ios_device,
+)
 from .harmony import (
     DEFAULT_HDC,
     connect_harmony_device,
@@ -1259,6 +1264,9 @@ class LiveTelemetryReader:
         self.refresh()
         samples, conversion_warnings = self._converted_samples()
         requested_duration = _number(self.metadata.get("requested_duration_s"), 0.0)
+        duration_unlimited = bool(self.metadata.get("duration_unlimited", False)) or (
+            "requested_duration_s" in self.metadata and requested_duration <= 0
+        )
         sample_interval = max(0.05, _number(self.metadata.get("sample_interval_s"), 1.0))
         max_gap = max(sample_interval * 3.0, sample_interval + 2.0)
         latest = samples[-1] if samples else None
@@ -1885,6 +1893,7 @@ class LiveTelemetryReader:
             "sample_count": len(samples),
             "elapsed_s": elapsed,
             "requested_duration_s": requested_duration,
+            "duration_unlimited": duration_unlimited,
             "progress": max(0.0, min(1.0, progress)),
             "latest": (
                 {
@@ -2170,8 +2179,9 @@ class ActiveRun:
         watchdog.start()
 
     def _stop_watchdog(self) -> None:
+        graceful_timeout = 120 if self.config.get("duration_unlimited") else 15
         try:
-            self.process.wait(timeout=15)
+            self.process.wait(timeout=graceful_timeout)
             return
         except subprocess.TimeoutExpired:
             pass
@@ -3258,6 +3268,44 @@ class DashboardManager:
         result["devices"] = refreshed_devices
         return result
 
+    def connect_ios_bluetooth(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip() or None
+        if device and not device.lower().startswith("ios:"):
+            raise ValueError("Select an iPhone before connecting the Bluetooth hotspot")
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("Stop the active recording before changing iOS Bluetooth")
+
+        result = connect_ios_bluetooth_device(device, self.ios_python, 30.0)
+        refreshed_devices, refreshed_error = self.devices(
+            force=True,
+            refresh_android=False,
+            refresh_harmony=False,
+            refresh_ios=True,
+        )
+        connected = next(
+            (
+                item
+                for item in refreshed_devices
+                if item.get("serial") == result.get("serial")
+            ),
+            None,
+        )
+        connected_remote_ready = bool(connected) and str(
+            connected.get("remote_xpc_ready")
+            if "remote_xpc_ready" in connected
+            else connected.get("wireless_ready")
+        ).lower() == "true"
+        if connected is None or not connected_remote_ready:
+            raise RuntimeError(
+                refreshed_error
+                or "Bluetooth PAN connected, but the iPhone RemoteXPC endpoint failed validation"
+            )
+        result["device"] = connected
+        result["devices"] = refreshed_devices
+        return result
+
     def start_record(self, payload: Dict[str, object]) -> Dict[str, object]:
         with self._lock:
             if self._starting or (self.active is not None and self.active.running):
@@ -3361,14 +3409,19 @@ class DashboardManager:
             if platform == "harmony"
             else 2
         )
-        duration = _bounded_int(
-            payload.get("duration"),
-            "duration",
-            minimum_duration,
-            604800,
-            DEFAULT_PERFORMANCE_UI_DURATION_S
-            if test_mode == "performance"
-            else DEFAULT_UI_DURATION_S,
+        duration_unlimited = bool(payload.get("duration_unlimited", False))
+        duration = (
+            0
+            if duration_unlimited
+            else _bounded_int(
+                payload.get("duration"),
+                "duration",
+                minimum_duration,
+                604800,
+                DEFAULT_PERFORMANCE_UI_DURATION_S
+                if test_mode == "performance"
+                else DEFAULT_UI_DURATION_S,
+            )
         )
         default_interval = 5.0 if platform == "ios" and test_mode == "power" else 1.0
         interval = _bounded_float(
@@ -3472,11 +3525,14 @@ class DashboardManager:
         config: Dict[str, object] = {
             "device": device,
             "platform": platform,
+            "wireless_transport": str(selected.get("wireless_transport") or ""),
+            "transport_adapter": str(selected.get("transport_adapter") or ""),
             "test_mode": test_mode,
             "capture_preset": capture_preset,
             "capture_features": capture_features,
             "harmony_high_performance": harmony_high_performance,
             "duration": duration,
+            "duration_unlimited": duration_unlimited,
             "interval": interval,
             "checkpoint_interval": checkpoint,
             "reconnect_timeout": reconnect,
@@ -3508,8 +3564,12 @@ class DashboardManager:
             capture_preset,
             "--device",
             device,
-            "--duration",
-            str(duration),
+        ]
+        if duration_unlimited:
+            command.append("--unlimited")
+        else:
+            command.extend(["--duration", str(duration)])
+        command.extend([
             "--interval",
             str(interval),
             "--checkpoint-interval",
@@ -3532,7 +3592,7 @@ class DashboardManager:
             str(scheduler_interval),
             "--performance-interval",
             str(performance_interval),
-        ]
+        ])
         if title:
             command.extend(["--title", title])
         if package:
@@ -4995,6 +5055,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.brightness(payload)
             elif path == "/api/ios/pair":
                 result = self.server.manager.pair_ios(payload)
+            elif path == "/api/ios/bluetooth":
+                result = self.server.manager.connect_ios_bluetooth(payload)
             elif path == "/api/record":
                 result = self.server.manager.start_record(payload)
             elif path == "/api/stop":

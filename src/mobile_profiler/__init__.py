@@ -3,4 +3,4 @@
 from .models import APP_NAME, SCHEMA_VERSION
 
 __all__ = ["APP_NAME", "SCHEMA_VERSION"]
-__version__ = "0.7.1"
+__version__ = "0.7.2"

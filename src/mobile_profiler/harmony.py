@@ -34,6 +34,9 @@ from .storage import RunJournal
 
 HARMONY_DEVICE_PREFIX = "harmony:"
 HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S = 30.0
+# SP_daemon requires a finite -N value.  Unlimited recordings therefore use
+# bounded one-hour batches and relaunch the sampler between batches.
+SMARTPERF_UNLIMITED_BATCH_SAMPLE_COUNT = 3601
 _SAMPLE_BEGIN = "__MPP_HARMONY_SAMPLE_BEGIN__"
 _SAMPLE_BATTERY = "__MPP_HARMONY_BATTERY__"
 _SAMPLE_CPU = "__MPP_HARMONY_CPU__"
@@ -2283,6 +2286,7 @@ def collect_harmony_smartperf_session(
     target = harmony_target(device)
     result = HarmonyCollectionResult()
     started = time.monotonic()
+    unlimited = duration_s <= 0
     last_checkpoint = started
     next_process = started
     next_scheduler = started
@@ -2300,6 +2304,7 @@ def collect_harmony_smartperf_session(
     latest_foreground_package: Optional[str] = None
     latest_foreground_activity: Optional[str] = None
     last_render_service_timestamp_ns: Optional[int] = None
+    last_sample_received_at = started
     warned: set[str] = set()
 
     def warn_once(key: str, message: str) -> None:
@@ -2352,58 +2357,13 @@ def collect_harmony_smartperf_session(
             warn_once("initial_context", initial_context_error)
         next_extra_context = time.monotonic() + max(5.0, context_interval_s)
 
-    requested_sample_count = max(2, int(math.ceil(duration_s)) + 1)
-    command = [
-        hdc,
-        "-t",
-        target,
-        "shell",
-        _smartperf_command(requested_sample_count, target_package, features),
-    ]
-    creationflags = 0
-    if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"could not start HarmonyOS SP_daemon: {exc}") from exc
-    result.sampler_launch_count = 1
-    messages: queue.Queue[Tuple[str, Optional[str]]] = queue.Queue()
-
-    def read_stream(name: str, stream: Optional[TextIO]) -> None:
-        if stream is not None:
-            for line in stream:
-                messages.put((name, line))
-        messages.put((name, None))
-
-    stdout_thread = threading.Thread(
-        target=read_stream, args=("stdout", process.stdout), daemon=True
-    )
-    stderr_thread = threading.Thread(
-        target=read_stream, args=("stderr", process.stderr), daemon=True
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    parser = HarmonySmartPerfParser()
-    streams_ended: set[str] = set()
-    startup_deadline = time.monotonic() + max(10.0, reconnect_timeout_s)
-
     def accept_record(record: Dict[str, str]) -> None:
         nonlocal last_checkpoint, next_process, next_scheduler, next_extra_context
         nonlocal next_battery_probe, current_external_power
         nonlocal collection_started_at, collection_deadline
         nonlocal first_sample_uptime_s
         nonlocal latest_screen_state, latest_foreground_package, latest_foreground_activity
-        nonlocal last_render_service_timestamp_ns
+        nonlocal last_render_service_timestamp_ns, last_sample_received_at
         now = time.monotonic()
         if now >= next_battery_probe:
             battery_result = hdc_shell(
@@ -2451,7 +2411,11 @@ def collect_harmony_smartperf_session(
             # SP_daemon's -N controls the requested one-second samples.  This
             # deadline is only a bounded completion grace, not the measurement
             # start, so setup/probe latency does not consume the requested run.
-            collection_deadline = collection_started_at + float(duration_s) + 3.0
+            collection_deadline = (
+                math.inf
+                if unlimited
+                else collection_started_at + float(duration_s) + 3.0
+            )
             next_battery_probe = collection_started_at + battery_probe_interval_s
         journal.append_sampler_line(
             "SP|" + json.dumps(record, ensure_ascii=False, separators=(",", ":"))
@@ -2461,6 +2425,7 @@ def collect_harmony_smartperf_session(
         )
         result.sample_count += 1
         result.last_device_uptime_s = sample.uptime_s
+        last_sample_received_at = time.monotonic()
 
         now = time.monotonic()
         if (
@@ -2555,49 +2520,155 @@ def collect_harmony_smartperf_session(
             checkpoint("collecting")
             last_checkpoint = now
 
-    try:
-        while len(streams_ended) < 2:
-            now = time.monotonic()
-            if collection_deadline is not None and now >= collection_deadline:
-                break
-            if collection_started_at is None and now >= startup_deadline:
-                warn_once(
-                    "smartperf_start_timeout",
-                    "HarmonyOS SP_daemon did not produce its first complete sample before the startup timeout.",
-                )
-                break
-            try:
-                name, line = messages.get(timeout=0.5)
-            except queue.Empty:
-                if process.poll() is not None:
+    def run_batch(requested_sample_count: int) -> Tuple[int, int]:
+        command = [
+            hdc,
+            "-t",
+            target,
+            "shell",
+            _smartperf_command(requested_sample_count, target_package, features),
+        ]
+        creationflags = 0
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"could not start HarmonyOS SP_daemon: {exc}") from exc
+        result.sampler_launch_count += 1
+        messages: queue.Queue[Tuple[str, Optional[str]]] = queue.Queue()
+
+        def read_stream(name: str, stream: Optional[TextIO]) -> None:
+            if stream is not None:
+                for line in stream:
+                    messages.put((name, line))
+            messages.put((name, None))
+
+        stdout_thread = threading.Thread(
+            target=read_stream, args=("stdout", process.stdout), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=read_stream, args=("stderr", process.stderr), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        parser = HarmonySmartPerfParser()
+        streams_ended: set[str] = set()
+        samples_before_launch = result.sample_count
+        startup_deadline = time.monotonic() + max(10.0, reconnect_timeout_s)
+        try:
+            while len(streams_ended) < 2:
+                now = time.monotonic()
+                if collection_deadline is not None and now >= collection_deadline:
                     break
-                continue
-            if line is None:
-                streams_ended.add(name)
-                continue
-            if name == "stderr":
-                text = line.rstrip("\r\n")
-                if text:
-                    journal.append_stderr_line(text)
-                continue
-            record = parser.feed_line(line)
-            if record:
-                accept_record(record)
-        final_record = parser.finish()
-        if final_record and _smartperf_record_has_sample_fields(final_record):
-            accept_record(final_record)
-    except KeyboardInterrupt:
-        result.stop_reason = "interrupted"
-        _stop_process(process)
-        checkpoint("interrupted")
-        raise
-    finally:
-        if process.poll() is None:
+                if result.sample_count == samples_before_launch and now >= startup_deadline:
+                    warn_once(
+                        "smartperf_start_timeout",
+                        "HarmonyOS SP_daemon did not produce its first complete sample before the startup timeout.",
+                    )
+                    break
+                try:
+                    name, line = messages.get(timeout=0.5)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        break
+                    continue
+                if line is None:
+                    streams_ended.add(name)
+                    continue
+                if name == "stderr":
+                    text = line.rstrip("\r\n")
+                    if text:
+                        journal.append_stderr_line(text)
+                    continue
+                record = parser.feed_line(line)
+                if record:
+                    accept_record(record)
+            final_record = parser.finish()
+            if final_record and _smartperf_record_has_sample_fields(final_record):
+                accept_record(final_record)
+        except KeyboardInterrupt:
+            result.stop_reason = "interrupted"
             _stop_process(process)
-        with suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=3)
-        stdout_thread.join(timeout=2)
-        stderr_thread.join(timeout=2)
+            checkpoint("interrupted")
+            raise
+        finally:
+            if process.poll() is None:
+                _stop_process(process)
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=3)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+        return (
+            int(process.returncode) if process.returncode is not None else -1,
+            result.sample_count - samples_before_launch,
+        )
+
+    requested_sample_count = (
+        SMARTPERF_UNLIMITED_BATCH_SAMPLE_COUNT
+        if unlimited
+        else max(2, int(math.ceil(duration_s)) + 1)
+    )
+    while True:
+        try:
+            returncode, samples_added = run_batch(requested_sample_count)
+        except RuntimeError as exc:
+            if not unlimited or result.sample_count < 2:
+                raise
+            warn_once("smartperf_relaunch", str(exc))
+            returncode = -1
+            samples_added = 0
+
+        if not unlimited:
+            break
+
+        expected_batch_samples = max(2, requested_sample_count - 1)
+        if samples_added >= expected_batch_samples:
+            checkpoint("collecting")
+            continue
+
+        result.reconnect_count += 1
+        if samples_added > 0:
+            warn_once(
+                "smartperf_batch_ended_early",
+                "HarmonyOS SP_daemon ended an unlimited recording batch early; collection will continue in a new batch.",
+            )
+        elif returncode != 0:
+            warn_once(
+                "smartperf_batch_failed",
+                f"HarmonyOS SP_daemon exited with code {returncode} during unlimited recording; collection will be retried.",
+            )
+        else:
+            warn_once(
+                "smartperf_batch_empty",
+                "HarmonyOS SP_daemon ended before the operator stopped the unlimited recording and produced no new samples.",
+            )
+
+        if time.monotonic() - last_sample_received_at >= reconnect_timeout_s:
+            result.stop_reason = "partial"
+            warn_once(
+                "smartperf_reconnect_timeout",
+                "HarmonyOS SP_daemon did not recover before the reconnect timeout.",
+            )
+            break
+        checkpoint("reconnecting")
+        if harmony_connection_type(target) == "wireless":
+            with suppress(RuntimeError, ValueError):
+                connect_harmony_device(
+                    hdc,
+                    target,
+                    timeout_s=min(20.0, reconnect_timeout_s),
+                )
+        time.sleep(1.0)
 
     if result.sample_count < 2:
         raise RuntimeError("HarmonyOS SP_daemon did not produce at least two usable samples")
@@ -2607,16 +2678,19 @@ def collect_harmony_smartperf_session(
         and first_sample_uptime_s is not None
         else 0.0
     )
-    minimum_complete_span_s = max(1.0, float(duration_s) - 1.5)
-    result.stop_reason = (
-        "completed"
-        if sample_span_s >= minimum_complete_span_s
-        else "partial"
-    )
-    if result.stop_reason == "partial":
-        result.warnings.append(
-            f"HarmonyOS SP_daemon covered only {sample_span_s:.2f}s of the requested {duration_s}s window."
+    if unlimited:
+        result.stop_reason = "partial"
+    else:
+        minimum_complete_span_s = max(1.0, float(duration_s) - 1.5)
+        result.stop_reason = (
+            "completed"
+            if sample_span_s >= minimum_complete_span_s
+            else "partial"
         )
+        if result.stop_reason == "partial":
+            result.warnings.append(
+                f"HarmonyOS SP_daemon covered only {sample_span_s:.2f}s of the requested {duration_s}s window."
+            )
     battery_result = hdc_shell(hdc, target, "hidumper -s BatteryService -a '-i'", timeout_s=15)
     if battery_result.ok:
         result.battery_end = parse_harmony_battery(battery_result.stdout)
@@ -2725,7 +2799,7 @@ def collect_harmony_session(
     target = harmony_target(device)
     result = HarmonyCollectionResult()
     started = time.monotonic()
-    deadline = started + float(duration_s)
+    deadline = math.inf if duration_s <= 0 else started + float(duration_s)
     last_checkpoint = started
     last_frame_at = started
     outage_started: Optional[float] = None
@@ -2976,7 +3050,7 @@ def collect_harmony_session(
         if time.monotonic() >= deadline:
             result.stop_reason = "completed"
             break
-        if not ended and process.returncode == 0:
+        if duration_s > 0 and not ended and process.returncode == 0:
             result.stop_reason = "completed"
             break
         if outage_started is None:

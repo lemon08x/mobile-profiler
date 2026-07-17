@@ -71,12 +71,18 @@ from mobile_profiler.features import (
     resolve_capture_configuration,
 )
 from mobile_profiler.ios import (
+    _classify_windows_route_adapter,
     _endpoint_reachable,
     _endpoint_scope,
+    _ios_wireless_transport_details,
     _load_endpoints,
+    _run_windows_bluetooth_pan,
+    _windows_endpoint_route,
     collect_ios_session,
+    connect_ios_bluetooth,
     list_ios_devices,
     pair_ios_device,
+    probe_ios_device,
     select_ios_device,
 )
 from mobile_profiler import ios_bridge
@@ -401,6 +407,12 @@ class ParserTests(unittest.TestCase):
         script = build_sampler_script(5, 1.0, [], None)
         self.assertIn("/ResumedActivity|mFocusedApp/", script)
         self.assertNotIn("mLastPausedActivity", script)
+
+    def test_sampler_script_supports_unlimited_recording(self) -> None:
+        script = build_sampler_script(0, 1.0, [], None)
+
+        self.assertIn("end=0", script)
+        self.assertIn('[ "$end" -gt 0 ] && [ "$now" -ge "$end" ]', script)
 
     def test_android_display_surface_and_touch_performance_parsers(self) -> None:
         display = parse_android_display_performance(
@@ -5108,6 +5120,13 @@ class IosAdapterTests(unittest.TestCase):
         )
 
     def test_ios_collection_duration_starts_at_first_valid_sample(self) -> None:
+        self.assertEqual(
+            ios_bridge._ios_collection_target_coverage_s(0.0, 1.0),
+            float("inf"),
+        )
+        self.assertFalse(
+            ios_bridge._ios_collection_window_complete(100.0, 10000.0, 0.0, 1.0)
+        )
         self.assertEqual(ios_bridge._ios_collection_target_coverage_s(16.0, 5.0), 15.0)
         self.assertFalse(
             ios_bridge._ios_collection_window_complete(100.0, 110.0, 16.0, 5.0)
@@ -5387,6 +5406,80 @@ class IosAdapterTests(unittest.TestCase):
             self.assertTrue(_endpoint_reachable("169.254.47.225", 49152))
         self.assertEqual(connect.call_count, 2)
 
+    def test_windows_route_adapter_distinguishes_bluetooth_pan_and_wifi(self) -> None:
+        bluetooth = {
+            "interface_alias": "蓝牙网络连接",
+            "interface_description": "Bluetooth Device (Personal Area Network)",
+            "physical_media_type": "BlueTooth",
+            "ndis_physical_medium": 10,
+            "pnp_device_id": r"BTH\MS_BTHPAN\TEST",
+        }
+        wifi = {
+            "interface_alias": "WLAN",
+            "interface_description": "MediaTek Wi-Fi 6 Wireless LAN Card",
+            "physical_media_type": "Native 802.11",
+            "ndis_physical_medium": 9,
+        }
+        ethernet = {
+            "interface_alias": "Ethernet",
+            "interface_description": "PCIe GbE Family Controller",
+            "physical_media_type": "802.3",
+            "ndis_physical_medium": 0,
+        }
+
+        self.assertEqual(_classify_windows_route_adapter(bluetooth), "bluetooth-pan")
+        self.assertEqual(_classify_windows_route_adapter(wifi), "wifi")
+        self.assertEqual(_classify_windows_route_adapter(ethernet), "unknown")
+
+    def test_windows_endpoint_route_uses_best_route_without_ip_heuristics(self) -> None:
+        completed = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "interface_alias": "WLAN",
+                    "interface_description": "Wi-Fi adapter",
+                    "interface_index": 23,
+                    "physical_media_type": "Native 802.11",
+                    "ndis_physical_medium": 9,
+                    "local_address": "192.168.31.125",
+                }
+            ),
+            stderr="",
+        )
+        with (
+            patch("mobile_profiler.ios.sys.platform", "win32"),
+            patch("mobile_profiler.ios.shutil.which", return_value="powershell.exe"),
+            patch("mobile_profiler.ios._run_subprocess", return_value=completed) as run,
+        ):
+            route = _windows_endpoint_route("172.20.10.1")
+
+        self.assertEqual(route["interface_alias"], "WLAN")
+        command = run.call_args.args[0]
+        self.assertIn("Find-NetRoute", command[-1])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["MOBILE_PROFILER_IOS_ENDPOINT_HOST"],
+            "172.20.10.1",
+        )
+
+    def test_live_route_transport_overrides_cached_bluetooth_transport(self) -> None:
+        cached = {
+            "host": "172.20.10.1",
+            "wireless_transport": "bluetooth-pan",
+        }
+        with patch(
+            "mobile_profiler.ios._windows_endpoint_route",
+            return_value={
+                "interface_alias": "WLAN",
+                "physical_media_type": "Native 802.11",
+                "ndis_physical_medium": 9,
+                "local_address": "192.168.31.125",
+            },
+        ):
+            details = _ios_wireless_transport_details("172.20.10.1", cached)
+
+        self.assertEqual(details["wireless_transport"], "wifi")
+        self.assertEqual(details["transport_source"], "windows-route")
+
     def test_unreachable_cached_wireless_endpoint_is_removed_from_device_list(self) -> None:
         cached = {
             "00008150-TEST": {
@@ -5488,6 +5581,120 @@ class IosAdapterTests(unittest.TestCase):
         self.assertFalse(result["endpoint"]["unplug_ready"])
         save.assert_called_once()
 
+    def test_bluetooth_pan_updates_the_cached_remote_pairing_endpoint(self) -> None:
+        cached = {
+            "00008150-TEST": {
+                "host": "169.254.47.225",
+                "port": 49152,
+                "model": "Test iPhone",
+                "product_type": "iPhone18,2",
+            }
+        }
+        with (
+            patch("mobile_profiler.ios.sys.platform", "win32"),
+            patch("mobile_profiler.ios._load_endpoints", return_value=cached),
+            patch(
+                "mobile_profiler.ios._run_windows_bluetooth_pan",
+                return_value={
+                    "adapter_name": "Bluetooth Device (Personal Area Network)",
+                    "address": "172.20.10.3",
+                    "gateway": "172.20.10.1",
+                    "link_speed": "3 Mbps",
+                    "already_connected": False,
+                },
+            ) as connect,
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=True),
+            patch("mobile_profiler.ios._save_endpoint") as save,
+        ):
+            result = connect_ios_bluetooth(
+                "ios:00008150-TEST",
+                "ios-python",
+                30.0,
+            )
+
+        connect.assert_called_once_with("Test iPhone", 30.0)
+        save.assert_called_once_with(
+            "00008150-TEST",
+            "172.20.10.1",
+            49152,
+            cached["00008150-TEST"],
+            wireless_transport="bluetooth-pan",
+            transport_source="bluetooth-connect",
+            local_address="172.20.10.3",
+            adapter_name="Bluetooth Device (Personal Area Network)",
+        )
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["transport"], "bluetooth-pan")
+        self.assertEqual(result["endpoint"]["wireless_transport"], "bluetooth-pan")
+        self.assertEqual(result["address"], "172.20.10.3")
+        self.assertEqual(result["endpoint"]["scope"], "private-lan")
+        self.assertTrue(result["endpoint"]["remote_xpc_ready"])
+        self.assertTrue(result["endpoint"]["wireless_lan_candidate"])
+
+    def test_windows_bluetooth_helper_parses_the_powershell_result(self) -> None:
+        completed = Mock(
+            returncode=0,
+            stdout=(
+                "diagnostic\n"
+                '{"adapter_name":"Bluetooth PAN","address":"172.20.10.3",'
+                '"gateway":"172.20.10.1","already_connected":false}\n'
+            ),
+            stderr="",
+        )
+        with (
+            patch("mobile_profiler.ios.sys.platform", "win32"),
+            patch("mobile_profiler.ios.shutil.which", return_value="powershell.exe"),
+            patch("mobile_profiler.ios._run_subprocess", return_value=completed) as run,
+        ):
+            result = _run_windows_bluetooth_pan("Test iPhone", 20.0)
+
+        self.assertEqual(result["gateway"], "172.20.10.1")
+        command = run.call_args.args[0]
+        self.assertIn("[ScriptBlock]::Create", command[-1])
+        self.assertIn("MOBILE_PROFILER_IOS_BLUETOOTH_NAME", run.call_args.kwargs["env"])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["MOBILE_PROFILER_IOS_BLUETOOTH_NAME"],
+            "Test iPhone",
+        )
+
+    def test_bluetooth_pan_requires_windows_and_existing_remote_pairing(self) -> None:
+        with patch("mobile_profiler.ios.sys.platform", "linux"):
+            with self.assertRaisesRegex(RuntimeError, "only on Windows"):
+                connect_ios_bluetooth("ios:00008150-TEST", "ios-python")
+
+        with (
+            patch("mobile_profiler.ios.sys.platform", "win32"),
+            patch("mobile_profiler.ios._load_endpoints", return_value={}),
+        ):
+            with self.assertRaisesRegex(ValueError, "Create iOS RemotePairing"):
+                connect_ios_bluetooth("ios:00008150-TEST", "ios-python")
+
+    def test_bluetooth_pan_reports_an_unreachable_remote_pairing_port(self) -> None:
+        cached = {
+            "00008150-TEST": {
+                "host": "169.254.47.225",
+                "port": 49152,
+                "model": "Test iPhone",
+            }
+        }
+        with (
+            patch("mobile_profiler.ios.sys.platform", "win32"),
+            patch("mobile_profiler.ios._load_endpoints", return_value=cached),
+            patch(
+                "mobile_profiler.ios._run_windows_bluetooth_pan",
+                return_value={
+                    "address": "172.20.10.3",
+                    "gateway": "172.20.10.1",
+                },
+            ),
+            patch("mobile_profiler.ios._endpoint_reachable", return_value=False),
+            patch("mobile_profiler.ios._save_endpoint") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "172.20.10.1:49152"):
+                connect_ios_bluetooth("ios:00008150-TEST", "ios-python")
+
+        save.assert_not_called()
+
     def test_cached_wireless_endpoint_survives_sidecar_discovery_failure(self) -> None:
         cached = {
             "00008150-TEST": {
@@ -5504,6 +5711,16 @@ class IosAdapterTests(unittest.TestCase):
             ),
             patch("mobile_profiler.ios._load_endpoints", return_value=cached),
             patch("mobile_profiler.ios._endpoint_reachable", return_value=True),
+            patch(
+                "mobile_profiler.ios._ios_wireless_transport_details",
+                return_value={
+                    "wireless_transport": "bluetooth-pan",
+                    "transport_source": "windows-route",
+                    "local_address": "172.20.10.3",
+                    "adapter_name": "Bluetooth PAN",
+                    "adapter_index": 13,
+                },
+            ),
         ):
             devices, error = list_ios_devices("ios-python")
             selected = select_ios_device("ios:00008150-TEST", "ios-python")
@@ -5511,9 +5728,46 @@ class IosAdapterTests(unittest.TestCase):
         self.assertIn("Bonjour unavailable", error or "")
         self.assertEqual(devices[0]["state"], "device")
         self.assertEqual(devices[0]["connection_type"], "wireless")
+        self.assertEqual(devices[0]["wireless_transport"], "bluetooth-pan")
+        self.assertEqual(devices[0]["transport_adapter"], "Bluetooth PAN")
         self.assertEqual(devices[0]["remote_xpc_ready"], "true")
         self.assertEqual(devices[0]["unplug_ready"], "true")
         self.assertEqual(selected["serial"], "ios:00008150-TEST")
+
+    def test_ios_probe_preserves_wireless_transport_for_run_metadata(self) -> None:
+        selected = {
+            "serial": "ios:00008150-TEST",
+            "udid": "00008150-TEST",
+            "host": "172.20.10.1",
+            "port": "49152",
+            "wireless_transport": "bluetooth-pan",
+            "transport_source": "windows-route",
+            "transport_local_address": "172.20.10.3",
+            "transport_adapter": "Bluetooth PAN",
+            "transport_adapter_index": "13",
+            "remote_xpc_ready": "true",
+            "unplug_ready": "true",
+            "wireless_lan_candidate": "true",
+            "endpoint_scope": "private-lan",
+        }
+        with (
+            patch("mobile_profiler.ios.select_ios_device", return_value=selected),
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={
+                    "connection": {"host": "172.20.10.1", "port": 49152},
+                    "device": {"model": "Test iPhone"},
+                },
+            ),
+            patch("mobile_profiler.ios._save_endpoint"),
+        ):
+            result = probe_ios_device("ios:00008150-TEST", "ios-python")
+
+        connection = result["connection"]
+        self.assertEqual(connection["transport"], "bluetooth-pan")
+        self.assertEqual(connection["transport_label"], "Bluetooth PAN")
+        self.assertEqual(connection["local_address"], "172.20.10.3")
+        self.assertEqual(connection["adapter_name"], "Bluetooth PAN")
 
     def test_ios_sidecar_events_are_journaled_as_normalized_samples(self) -> None:
         events = [

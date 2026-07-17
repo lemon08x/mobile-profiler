@@ -202,6 +202,14 @@ the current route: `169.254/16` and IPv6 link-local addresses can be USB-NCM.
 For an unplugged power test, remove USB, refresh discovery, and require the
 iPhone to remain reachable through a non-link-local LAN endpoint.
 
+On Windows, **Connect iPhone Bluetooth** can join an already paired iPhone
+Personal Hotspot through Bluetooth PAN. Create RemotePairing over USB first,
+enable Bluetooth and Personal Hotspot on the iPhone, then click the button. It
+uses the PAN gateway as the iPhone address, validates the cached RemotePairing
+port, and updates the endpoint cache. If Windows has not paired the phone yet,
+the Bluetooth pairing wizard is opened; finish pairing and click the button
+again. Bluetooth PAN is sufficient for telemetry but is slower than Wi-Fi.
+
 HarmonyOS targets appear with a `harmony:` prefix. With a USB-authorized phone,
 **Harmony Wireless** reads `wlan0`, runs `hdc -t TARGET tmode port 8710`, and
 connects `IP:8710`. The address field also accepts

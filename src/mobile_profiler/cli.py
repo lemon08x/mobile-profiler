@@ -953,6 +953,7 @@ def run_ios_pair(args: argparse.Namespace) -> int:
 
 
 def run_ios_record(args: argparse.Namespace) -> int:
+    duration_unlimited = args.duration <= 0
     output_dir = args.output or default_output_dir("ios")
     if output_dir.exists() and any(output_dir.iterdir()):
         print(
@@ -1063,6 +1064,7 @@ def run_ios_record(args: argparse.Namespace) -> int:
         },
         "session_mode": bool(args.session_mode),
         "requested_duration_s": args.duration,
+        "duration_unlimited": duration_unlimited,
         "sample_interval_s": args.interval,
         "power_observation_interval_s": 20.0,
         "sampling_schedule_s": {
@@ -1101,11 +1103,19 @@ def run_ios_record(args: argparse.Namespace) -> int:
         "collection_status": "collecting",
         "collection_warnings": warnings,
     }
-    print(
-        f"Recording {args.duration}s from {selected['serial']} over "
-        f"{connection.get('host')}:{connection.get('port')}...",
-        file=sys.stderr,
-    )
+    transport_label = str(connection.get("transport_label") or "RemotePairing")
+    if duration_unlimited:
+        print(
+            f"Recording from {selected['serial']} over {transport_label} "
+            f"{connection.get('host')}:{connection.get('port')} until manually stopped...",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Recording {args.duration}s from {selected['serial']} over {transport_label} "
+            f"{connection.get('host')}:{connection.get('port')}...",
+            file=sys.stderr,
+        )
 
     collection = None
     try:
@@ -1139,7 +1149,9 @@ def run_ios_record(args: argparse.Namespace) -> int:
                 )
             metadata["collection_warnings"] = warnings + collection.warnings
             metadata["collection_status"] = (
-                "collected" if collection.stop_reason == "completed" else "partial"
+                "collected"
+                if collection.stop_reason in {"completed", "operator_stopped"}
+                else "partial"
             )
             journal.write_metadata(metadata)
             journal.write_raw_output(
@@ -1159,18 +1171,31 @@ def run_ios_record(args: argparse.Namespace) -> int:
         print_run_summary(output_dir, analysis, report_path)
         return 6
     except KeyboardInterrupt:
-        print("\nCollection interrupted; finalizing the recoverable portion...", file=sys.stderr)
+        operator_stopped = duration_unlimited
+        if operator_stopped:
+            print("\nStop requested; finalizing the iOS recording...", file=sys.stderr)
+            metadata["collection_stop_reason"] = "operator_stopped"
+            metadata["collection_status"] = "collected"
+            try:
+                with RunJournal(output_dir) as journal:
+                    journal.write_metadata(metadata)
+            except OSError:
+                pass
+        else:
+            print("\nCollection interrupted; finalizing the recoverable portion...", file=sys.stderr)
         try:
             analysis, report_path = finalize_run(
                 output_dir,
-                ["iOS collection was interrupted; recoverable data has been retained."],
-                "interrupted",
+                ()
+                if operator_stopped
+                else ["iOS collection was interrupted; recoverable data has been retained."],
+                "complete" if operator_stopped else "interrupted",
             )
         except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"Partial data kept in {output_dir.resolve()}: {exc}", file=sys.stderr)
             return 130
         print_run_summary(output_dir, analysis, report_path)
-        return 130
+        return 0 if operator_stopped else 130
 
     if collection is None or collection.sample_count < 2:
         print(
@@ -1178,13 +1203,18 @@ def run_ios_record(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 7
-    final_status = "complete" if collection.stop_reason == "completed" else "partial"
+    final_status = (
+        "complete"
+        if collection.stop_reason in {"completed", "operator_stopped"}
+        else "partial"
+    )
     analysis, report_path = finalize_run(output_dir, collection_status=final_status)
     print_run_summary(output_dir, analysis, report_path)
     return 0 if final_status == "complete" else 6
 
 
 def run_harmony_record(args: argparse.Namespace) -> int:
+    duration_unlimited = args.duration <= 0
     output_dir = args.output or default_output_dir("harmony")
     if output_dir.exists() and any(output_dir.iterdir()):
         print(
@@ -1347,6 +1377,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         },
         "session_mode": bool(args.session_mode),
         "requested_duration_s": args.duration,
+        "duration_unlimited": duration_unlimited,
         "sample_interval_s": 1.0 if smartperf_enabled else args.interval,
         "clock_domain": "harmony_device_realtime_epoch_s",
         "sampling_schedule_s": {
@@ -1425,11 +1456,18 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         "collection_status": "collecting",
         "collection_warnings": warnings,
     }
-    print(
-        f"Recording {args.duration}s from {selected['serial']} over "
-        f"{connection.get('type') or selected.get('connection_type')} HDC...",
-        file=sys.stderr,
-    )
+    if duration_unlimited:
+        print(
+            f"Recording from {selected['serial']} over "
+            f"{connection.get('type') or selected.get('connection_type')} HDC until manually stopped...",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Recording {args.duration}s from {selected['serial']} over "
+            f"{connection.get('type') or selected.get('connection_type')} HDC...",
+            file=sys.stderr,
+        )
 
     collection = None
     restore_power_mode: Optional[int] = None
@@ -1596,7 +1634,9 @@ def run_harmony_record(args: argparse.Namespace) -> int:
             metadata["battery_end"] = collection.battery_end or battery_start
             metadata["collection_warnings"] = warnings + collection.warnings
             metadata["collection_status"] = (
-                "collected" if collection.stop_reason == "completed" else "partial"
+                "collected"
+                if collection.stop_reason in {"completed", "operator_stopped"}
+                else "partial"
             )
             journal.write_metadata(metadata)
             journal.write_raw_output(
@@ -1607,7 +1647,12 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         print(f"ERROR: HarmonyOS collector failed: {exc}", file=sys.stderr)
         collection_error = str(exc)
     except KeyboardInterrupt:
-        print("\nHarmonyOS collection interrupted; finalizing recoverable data...", file=sys.stderr)
+        print(
+            "\nStop requested; finalizing the HarmonyOS recording..."
+            if duration_unlimited
+            else "\nHarmonyOS collection interrupted; finalizing recoverable data...",
+            file=sys.stderr,
+        )
         collection_interrupted = True
     finally:
         if restore_power_mode is not None:
@@ -1658,17 +1703,27 @@ def run_harmony_record(args: argparse.Namespace) -> int:
         print_run_summary(output_dir, analysis, report_path)
         return 6
     if collection_interrupted:
+        if duration_unlimited:
+            metadata["collection_stop_reason"] = "operator_stopped"
+            metadata["collection_status"] = "collected"
+            try:
+                with RunJournal(output_dir) as journal:
+                    journal.write_metadata(metadata)
+            except OSError:
+                pass
         try:
             analysis, report_path = finalize_run(
                 output_dir,
-                ["HarmonyOS collection was interrupted; recoverable samples were retained."],
-                "interrupted",
+                ()
+                if duration_unlimited
+                else ["HarmonyOS collection was interrupted; recoverable samples were retained."],
+                "complete" if duration_unlimited else "interrupted",
             )
         except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"Partial data kept in {output_dir.resolve()}: {exc}", file=sys.stderr)
             return 130
         print_run_summary(output_dir, analysis, report_path)
-        return 130
+        return 0 if duration_unlimited else 130
 
     if collection is None or collection.sample_count < 2:
         print(
@@ -1676,13 +1731,19 @@ def run_harmony_record(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 7
-    final_status = "complete" if collection.stop_reason == "completed" else "partial"
+    final_status = (
+        "complete"
+        if collection.stop_reason in {"completed", "operator_stopped"}
+        else "partial"
+    )
     analysis, report_path = finalize_run(output_dir, collection_status=final_status)
     print_run_summary(output_dir, analysis, report_path)
     return 0 if final_status == "complete" else 6
 
 
 def run_record(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "unlimited", False)):
+        args.duration = 0
     apply_record_interval_defaults(args)
 
     if str(args.test_mode) == "performance" and bool(args.session_mode):
@@ -1876,6 +1937,7 @@ def run_record(args: argparse.Namespace) -> int:
             "dumpsys gpu UID 活跃时长和内存快照作为回退证据。"
         )
 
+    duration_unlimited = args.duration <= 0
     metadata: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "platform": "android",
@@ -1905,6 +1967,7 @@ def run_record(args: argparse.Namespace) -> int:
         },
         "session_mode": bool(args.session_mode),
         "requested_duration_s": args.duration,
+        "duration_unlimited": duration_unlimited,
         "sample_interval_s": args.interval,
         "sampling_schedule_s": {
             "current_cpu_frequency": args.interval if feature("cpu_frequency") else None,
@@ -1983,14 +2046,17 @@ def run_record(args: argparse.Namespace) -> int:
         "collection_status": "collecting",
         "collection_warnings": warnings,
     }
+    recording_target = (
+        " in multi-app session mode"
+        if args.session_mode
+        else f" for {target_package}" if target_package else ""
+    )
     print(
-        f"Recording {args.duration}s from {device}"
-        + (
-            " in multi-app session mode"
-            if args.session_mode
-            else f" for {target_package}" if target_package else ""
-        )
-        + "...",
+        (
+            f"Recording from {device}{recording_target} until manually stopped..."
+            if duration_unlimited
+            else f"Recording {args.duration}s from {device}{recording_target}..."
+        ),
         file=sys.stderr,
     )
 
@@ -2055,7 +2121,9 @@ def run_record(args: argparse.Namespace) -> int:
             metadata["scheduler_snapshot_count"] = collection.scheduler_snapshot_count
             metadata["collection_warnings"] = warnings + collection.warnings
             metadata["collection_status"] = (
-                "collected" if collection.stop_reason == "completed" else "partial"
+                "collected"
+                if collection.stop_reason in {"completed", "operator_stopped"}
+                else "partial"
             )
             journal.write_metadata(metadata)
             for name, value in collect_post_run_outputs(
@@ -2078,18 +2146,29 @@ def run_record(args: argparse.Namespace) -> int:
         print_run_summary(output_dir, analysis, report_path)
         return 6
     except KeyboardInterrupt:
-        print("\nCollection interrupted; finalizing the recoverable portion...", file=sys.stderr)
+        operator_stopped = duration_unlimited
+        if operator_stopped:
+            print("\nStop requested; finalizing the recording...", file=sys.stderr)
+            metadata["collection_stop_reason"] = "operator_stopped"
+            metadata["collection_status"] = "collected"
+            try:
+                with RunJournal(output_dir) as journal:
+                    journal.write_metadata(metadata)
+            except OSError:
+                pass
+        else:
+            print("\nCollection interrupted; finalizing the recoverable portion...", file=sys.stderr)
         try:
             analysis, report_path = finalize_run(
                 output_dir,
-                ["采集被操作员中断，已保留可恢复的部分数据。"],
-                "interrupted",
+                () if operator_stopped else ["采集被操作员中断，已保留可恢复的部分数据。"],
+                "complete" if operator_stopped else "interrupted",
             )
         except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"Partial data kept in {output_dir.resolve()}: {exc}", file=sys.stderr)
             return 130
         print_run_summary(output_dir, analysis, report_path)
-        return 130
+        return 0 if operator_stopped else 130
 
     if collection is None or len(collection.raw_samples) < 2:
         print(
@@ -2097,7 +2176,11 @@ def run_record(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 7
-    final_status = "complete" if collection.stop_reason == "completed" else "partial"
+    final_status = (
+        "complete"
+        if collection.stop_reason in {"completed", "operator_stopped"}
+        else "partial"
+    )
     analysis, report_path = finalize_run(output_dir, collection_status=final_status)
     print_run_summary(output_dir, analysis, report_path)
     return 0 if final_status == "complete" else 6
@@ -2829,8 +2912,14 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--device", help="device identifier; HarmonyOS uses harmony:HDC_TARGET and iPhones use ios:UDID"
     )
-    record.add_argument(
+    duration_group = record.add_mutually_exclusive_group()
+    duration_group.add_argument(
         "--duration", type=positive_int, default=DEFAULT_DURATION_S, help="test duration in seconds"
+    )
+    duration_group.add_argument(
+        "--unlimited",
+        action="store_true",
+        help="record until interrupted by the operator",
     )
     record.add_argument(
         "--interval",

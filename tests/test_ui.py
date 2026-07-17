@@ -26,6 +26,7 @@ from mobile_profiler.collector import (
 )
 from mobile_profiler.harmony import (
     HarmonySmartPerfParser,
+    SMARTPERF_UNLIMITED_BATCH_SAMPLE_COUNT,
     _smartperf_command,
     build_harmony_sample,
     build_harmony_smartperf_sample,
@@ -99,6 +100,26 @@ class LiveTelemetryTests(unittest.TestCase):
         self.assertEqual(displayed_indexes[-1], 62 * 60)
         self.assertIn(1877, displayed_indexes)
         self.assertIn(2133, displayed_indexes)
+
+    def test_live_snapshot_exposes_unlimited_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "requested_duration_s": 0,
+                        "duration_unlimited": True,
+                        "sample_interval_s": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = LiveTelemetryReader(output_dir).snapshot()
+
+        self.assertTrue(snapshot["duration_unlimited"])
+        self.assertEqual(snapshot["requested_duration_s"], 0.0)
+        self.assertEqual(snapshot["progress"], 0.0)
 
     def test_live_timeline_decimation_keeps_short_steps_and_fps_drops(self) -> None:
         refresh_rows = [
@@ -184,6 +205,98 @@ class LiveTelemetryTests(unittest.TestCase):
         self.assertIn("运行时 active=false，当前没有生效档位", block)
         self.assertIn("候选表不能证明哪些档位会在实际温控中触发", block)
         self.assertIn("只有 active=true 时才把运行时档位和标称 nit 作为限亮证据", block)
+
+    def test_frontend_error_notifications_are_recorded_in_runtime_console(self) -> None:
+        javascript = (
+            Path(__file__).parents[1]
+            / "src"
+            / "mobile_profiler"
+            / "web"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        record_start = javascript.index("function recordUiError")
+        notify_start = javascript.index("function notify", record_start)
+        set_busy_start = javascript.index("function setBusy", notify_start)
+        console_start = javascript.index("function renderConsole")
+        console_end = javascript.index("const liveTimelinePalette", console_start)
+        clear_start = javascript.index('$("#clear-console").addEventListener')
+        clear_end = javascript.index('$("#refresh-history")', clear_start)
+        record_block = javascript[record_start:notify_start]
+        notify_block = javascript[notify_start:set_busy_start]
+        console_block = javascript[console_start:console_end]
+        clear_block = javascript[clear_start:clear_end]
+
+        self.assertIn("uiLogs: []", javascript)
+        self.assertIn('if (type === "error") recordUiError(title, detail)', notify_block)
+        self.assertIn('notify("无法开始采集", error.message, "error", 8000)', javascript)
+        self.assertIn("Date.now() / 1000", record_block)
+        self.assertIn("uiErrorDedupWindowS", record_block)
+        self.assertIn("previous?.signature === signature", record_block)
+        self.assertIn('source: "ui"', record_block)
+        self.assertIn('type: "error"', record_block)
+        self.assertIn("normalizedTitle", record_block)
+        self.assertIn("normalizedDetail", record_block)
+        self.assertIn("active?.logs", console_block)
+        self.assertIn("...app.uiLogs", console_block)
+        self.assertIn("logs.sort(", console_block)
+        self.assertIn('item.type === "error"', console_block)
+        self.assertRegex(clear_block, r"app\.uiLogs\s*=\s*\[\]")
+        self.assertIn("app.consoleClearedAt", clear_block)
+        self.assertIn("renderConsole", clear_block)
+
+    def test_frontend_supports_unlimited_duration_mode(self) -> None:
+        web_root = Path(__file__).parents[1] / "src" / "mobile_profiler" / "web"
+        html = (web_root / "index.html").read_text(encoding="utf-8")
+        css = (web_root / "app.css").read_text(encoding="utf-8")
+        javascript = (web_root / "app.js").read_text(encoding="utf-8")
+        readiness_start = javascript.index("function recordingStartReadiness")
+        readiness_end = javascript.index("function updateStartControlState", readiness_start)
+        payload_start = javascript.index("function recordPayload")
+        payload_end = javascript.index("function bindEvents", payload_start)
+        session_start = javascript.index("function renderSession")
+        session_end = javascript.index("function renderClusters", session_start)
+
+        self.assertIn('data-duration="unlimited">无上限 · 手动停止</button>', html)
+        self.assertIn('id="duration-mode-hint"', html)
+        self.assertIn('.duration-presets button[data-duration="unlimited"]', css)
+        self.assertIn("grid-column: 1 / -1", css)
+        self.assertIn(".progress-track.indeterminate span", css)
+        self.assertIn("durationUnlimited: false", javascript)
+        self.assertIn("!app.durationUnlimited", javascript[readiness_start:readiness_end])
+        self.assertIn("duration_unlimited: app.durationUnlimited", javascript[payload_start:payload_end])
+        self.assertIn("active?.config?.duration_unlimited", javascript)
+        self.assertIn("/ 无上限", javascript[session_start:session_end])
+        self.assertIn('classList.toggle("indeterminate"', javascript[session_start:session_end])
+
+    def test_frontend_distinguishes_ios_bluetooth_pan_and_wifi(self) -> None:
+        javascript = (
+            Path(__file__).parents[1]
+            / "src"
+            / "mobile_profiler"
+            / "web"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+        helper_start = javascript.index("function iosWirelessTransport")
+        helper_end = javascript.index("function recordingDeviceReadiness", helper_start)
+        devices_start = javascript.index("function deviceConnectionLabel")
+        devices_end = javascript.index("function renderDevices", devices_start)
+        performance_start = javascript.index("function renderPerformanceMetrics")
+        performance_end = javascript.index("function renderPerformanceResources", performance_start)
+        helper_block = javascript[helper_start:helper_end]
+        devices_block = javascript[devices_start:devices_end]
+        performance_block = javascript[performance_start:performance_end]
+
+        self.assertIn('return "bluetooth-pan"', helper_block)
+        self.assertIn('return "wifi"', helper_block)
+        self.assertIn('"bluetooth-pan": "蓝牙热点（PAN）RemotePairing"', helper_block)
+        self.assertIn('wifi: "Wi-Fi RemotePairing"', helper_block)
+        self.assertIn("iosWirelessTransportLabel(device)", devices_block)
+        self.assertIn("无线设备（Wi-Fi / 蓝牙 PAN）", javascript)
+        self.assertIn("device?.config?.wireless_transport", helper_block)
+        self.assertLess(
+            performance_block.index("const performance = active?.performance || {}"),
+            performance_block.index('activePlatform(active) === "ios"'),
+        )
 
     def test_live_decimation_preserves_power_source_switch_boundaries(self) -> None:
         samples = [
@@ -1099,6 +1212,13 @@ class PlatformTelemetrySemanticsTests(unittest.TestCase):
     def test_smartperf_requests_full_sample_span_and_ignores_terminal_summary(self) -> None:
         command = _smartperf_command(7, "com.example.game", {"cpu_usage": True})
         self.assertIn("-N 7", command)
+        unlimited_batch = _smartperf_command(
+            SMARTPERF_UNLIMITED_BATCH_SAMPLE_COUNT,
+            "com.example.game",
+            {"cpu_usage": True},
+        )
+        self.assertEqual(SMARTPERF_UNLIMITED_BATCH_SAMPLE_COUNT, 3601)
+        self.assertIn("-N 3601", unlimited_batch)
 
         parser = HarmonySmartPerfParser()
         self.assertIsNone(parser.feed_line("order:0 Battery=28"))
@@ -1700,6 +1820,87 @@ class UiServerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Bonjour endpoint discovery timed out"):
                     manager.pair_ios({"device": "ios:IPHONE"})
 
+    def test_ios_bluetooth_connect_refreshes_the_wireless_device(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            wireless = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "wireless",
+                "wireless_transport": "bluetooth-pan",
+                "remote_xpc_ready": "true",
+                "wireless_ready": "true",
+                "unplug_ready": "true",
+                "host": "172.20.10.1",
+                "port": "49152",
+            }
+            with (
+                patch.object(manager, "devices", return_value=([wireless], None)),
+                patch(
+                    "mobile_profiler.ui.connect_ios_bluetooth_device",
+                    return_value={
+                        "serial": "ios:IPHONE",
+                        "connected": True,
+                        "address": "172.20.10.3",
+                        "endpoint": {"host": "172.20.10.1", "port": 49152},
+                    },
+                ) as connect,
+            ):
+                result = manager.connect_ios_bluetooth({"device": "ios:IPHONE"})
+
+            connect.assert_called_once_with("ios:IPHONE", "ios-python", 30.0)
+            self.assertEqual(result["device"]["connection_type"], "wireless")
+            self.assertEqual(result["device"]["wireless_transport"], "bluetooth-pan")
+            self.assertEqual(result["device"]["unplug_ready"], "true")
+            self.assertEqual(result["devices"], [wireless])
+
+    def test_ios_wireless_transport_is_kept_in_active_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            wireless = {
+                "serial": "ios:IPHONE",
+                "udid": "IPHONE",
+                "state": "device",
+                "platform": "ios",
+                "connection_type": "wireless",
+                "wireless_transport": "wifi",
+                "transport_adapter": "Wi-Fi adapter",
+                "remote_xpc_ready": "true",
+                "wireless_ready": "true",
+                "unplug_ready": "true",
+                "host": "192.0.2.10",
+                "port": "49152",
+            }
+            fake_active = Mock()
+            fake_active.running = True
+            fake_active.snapshot.return_value = {"running": True, "status": "starting"}
+            with (
+                patch.object(manager, "devices", return_value=([wireless], None)),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()),
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active) as active_run,
+            ):
+                manager.start_record(
+                    {
+                        "device": "ios:IPHONE",
+                        "platform": "ios",
+                        "run_name": "iOS Wi-Fi transport",
+                    }
+                )
+
+            config = active_run.call_args.args[2]
+            self.assertEqual(config["wireless_transport"], "wifi")
+            self.assertEqual(config["transport_adapter"], "Wi-Fi adapter")
+
+    def test_ios_bluetooth_connect_rejects_a_non_ios_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory), ios_python="ios-python")
+            with patch("mobile_profiler.ui.connect_ios_bluetooth_device") as connect:
+                with self.assertRaisesRegex(ValueError, "Select an iPhone"):
+                    manager.connect_ios_bluetooth({"device": "ANDROID"})
+            connect.assert_not_called()
+
     def test_demo_server_serves_assets_and_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager(
@@ -1714,9 +1915,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-33", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-41", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-33", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-41", timeout=5) as response:
                     javascript = response.read().decode("utf-8")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -1727,7 +1928,7 @@ class UiServerTests(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertIn("Mobile Profiler", html)
-            self.assertIn("v0.7.1", html)
+            self.assertIn("v0.7.2", html)
             self.assertIn('class="app-version-badge"', html)
             self.assertEqual(state["version"], __version__)
             self.assertIn("TEST PLATFORM", html)
@@ -1737,7 +1938,12 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("ADB IP", html)
             self.assertIn("无线 ADB", html)
             self.assertIn("鸿蒙无线", html)
-            self.assertIn("iOS RemotePairing", html)
+            self.assertIn('id="pair-ios"', html)
+            self.assertIn('id="connect-ios-bluetooth"', html)
+            self.assertIn("1. 创建 RemotePairing", html)
+            self.assertIn("2. 连接蓝牙热点", html)
+            self.assertNotIn('id="ios-pair-hint"', html)
+            self.assertIn("grid-template-columns: repeat(2, max-content)", css)
             self.assertIn("断开无线", html)
             self.assertNotIn('data-view="system"', html)
             self.assertNotIn('data-panel="system"', html)
@@ -1748,7 +1954,9 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn("platform-ui-33", html)
+            self.assertIn('/app.css?v=platform-ui-41', html)
+            self.assertIn('/app.js?v=platform-ui-41', html)
+            self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
             self.assertIn("当前功率通道", html)
@@ -2059,6 +2267,8 @@ class UiServerTests(unittest.TestCase):
             self.assertNotIn("function renderSchedulerHistory(active)", executable_javascript)
             self.assertIn("function iosRemoteXpcReady", javascript)
             self.assertIn("function iosUnplugReady", javascript)
+            self.assertIn('api("/api/ios/bluetooth"', javascript)
+            self.assertIn('$("#connect-ios-bluetooth")', javascript)
             self.assertIn("169.254/16 可能只是 USB-NCM", javascript)
             self.assertIn("state.active && (state.active.running || activeIsNewRun)", javascript)
             self.assertIn("32 分钟", html)
@@ -2083,7 +2293,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="config-app-column"', html)
             self.assertIn('id="config-app-picker-content"', html)
             self.assertIn("formTarget.append(controlPanel)", javascript)
-            self.assertIn("appPickerTarget.append(appPicker)", javascript)
+            self.assertNotIn("appPickerTarget.append(appPicker)", javascript)
             self.assertNotIn("target.prepend(modeBar)", javascript)
             self.assertIn('id="home-start-panel"', html)
             self.assertIn('id="home-duration-slot"', html)
@@ -2093,12 +2303,26 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("startSlot.append(startButton)", javascript)
             self.assertIn("function placeTargetPackageField", javascript)
             self.assertIn('app.testMode === "performance"', javascript)
+            self.assertIn(
+                'const scannerOnHome = performance && selectedPlatform() === "android"',
+                javascript,
+            )
+            self.assertIn("appPickerDestination.insertBefore(appPicker", javascript)
+            self.assertIn('classList.toggle("scanner-on-home", scannerOnHome)', javascript)
+            self.assertNotIn('id="home-open-apps"', html)
+            self.assertNotIn('$("#home-open-apps")', javascript)
             self.assertIn('startButton.setAttribute("form", "record-form")', javascript)
             self.assertIn("function updateStartControlState", javascript)
             self.assertIn("const minimumDuration = Number(durationInput?.min || 2)", javascript)
             self.assertIn('.test-mode-switch [data-test-mode]', javascript)
             self.assertIn(".config-view-columns", css)
             self.assertIn("grid-template-columns: minmax(0, 1.35fr) minmax(360px, .85fr)", css)
+            self.assertIn(".live-overview-grid", css)
+            self.assertIn(".live-overview-stack", css)
+            self.assertIn('class="live-overview-stack"', html)
+            self.assertIn(".monitoring-stack > .live-timeline-panel", css)
+            self.assertIn("grid-column: 1 / -1", css)
+            self.assertIn(".config-app-panel.scanner-on-home", css)
             self.assertIn('body:not([data-platform="android"]) .config-app-placeholder', css)
             self.assertEqual(html.count('id="package-input"'), 1)
             self.assertEqual(html.count('id="duration-input"'), 1)
@@ -2246,6 +2470,14 @@ class UiServerTests(unittest.TestCase):
                     "warnings": [],
                 }
             )
+            manager.connect_ios_bluetooth = Mock(
+                return_value={
+                    "serial": "ios:IPHONE",
+                    "connected": True,
+                    "address": "172.20.10.3",
+                    "endpoint": {"host": "172.20.10.1", "port": 49152},
+                }
+            )
             server = DashboardHTTPServer(("127.0.0.1", 0), manager)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -2309,6 +2541,14 @@ class UiServerTests(unittest.TestCase):
                 )
                 with urlopen(apps_request, timeout=5) as response:
                     apps_result = json.loads(response.read().decode("utf-8"))
+                bluetooth_request = Request(
+                    base + "/api/ios/bluetooth",
+                    data=json.dumps({"device": "ios:IPHONE"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(bluetooth_request, timeout=5) as response:
+                    bluetooth_result = json.loads(response.read().decode("utf-8"))
                 with urlopen(
                     base + "/comparisons/phone-a-vs-b/comparison.html", timeout=5
                 ) as response:
@@ -2329,6 +2569,8 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(tcpip_result["tcpip_enabled"])
             self.assertTrue(disconnect_result["disconnected"])
             self.assertEqual(apps_result["apps"][0]["package"], "com.example.game")
+            self.assertTrue(bluetooth_result["connected"])
+            self.assertEqual(bluetooth_result["endpoint"]["host"], "172.20.10.1")
             self.assertIn("comparison", comparison_html)
             manager.regenerate_run.assert_called_once_with({"run_name": "phone-a"})
             manager.range_summary.assert_called_once_with(range_summary_payload)
@@ -2395,6 +2637,38 @@ class UiServerTests(unittest.TestCase):
             duration_index = command.index("--duration")
             self.assertEqual(command[duration_index + 1], "900")
             self.assertTrue(any(Path(value).name == "UI-smoke" for value in command))
+            self.assertEqual(result["status"], "starting")
+
+    def test_start_record_launches_unlimited_cli_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            fake_active = Mock()
+            fake_active.running = True
+            fake_active.snapshot.return_value = {"running": True, "status": "starting"}
+            with (
+                patch(
+                    "mobile_profiler.ui.list_adb_devices",
+                    return_value=([{"serial": "SERIAL", "state": "device"}], None),
+                ),
+                patch("mobile_profiler.ui.subprocess.Popen", return_value=object()) as popen,
+                patch("mobile_profiler.ui.ActiveRun", return_value=fake_active) as active_run,
+            ):
+                result = manager.start_record(
+                    {
+                        "device": "SERIAL",
+                        "platform": "android",
+                        "duration": 1,
+                        "duration_unlimited": True,
+                        "run_name": "Unlimited smoke",
+                    }
+                )
+
+            command = popen.call_args.args[0]
+            config = active_run.call_args.args[2]
+            self.assertIn("--unlimited", command)
+            self.assertNotIn("--duration", command)
+            self.assertEqual(config["duration"], 0)
+            self.assertTrue(config["duration_unlimited"])
             self.assertEqual(result["status"], "starting")
 
     def test_repeated_start_reserves_unique_run_directories_without_overwriting(self) -> None:
@@ -3320,6 +3594,17 @@ class UiConfigurationTests(unittest.TestCase):
         self.assertEqual(performance.thread_interval, 5.0)
         self.assertEqual(performance.thermal_interval, 5.0)
         self.assertEqual(performance.scheduler_interval, 5.0)
+
+    def test_cli_parser_exposes_unlimited_recording(self) -> None:
+        args = build_parser().parse_args(
+            ["record", "--platform", "ios", "--unlimited"]
+        )
+
+        self.assertTrue(args.unlimited)
+        with patch("mobile_profiler.cli.run_ios_record", return_value=0) as run_ios:
+            self.assertEqual(args.handler(args), 0)
+
+        self.assertEqual(run_ios.call_args.args[0].duration, 0)
 
     def test_cli_defaults_to_requiring_unplugged_power(self) -> None:
         default = build_parser().parse_args(["record"])

@@ -346,14 +346,8 @@ body[data-platform="harmony"] .adb-connect-form {
 }
 
 body[data-platform="ios"] .adb-connect-form {
-  min-width: 360px;
-  grid-template-columns: minmax(190px, 1fr) auto;
-}
-
-.ios-pair-hint {
-  color: var(--muted);
-  font-size: 9px;
-  line-height: 1.35;
+  min-width: 330px;
+  grid-template-columns: repeat(2, max-content);
 }
 
 .adb-connect-form label {
@@ -668,6 +662,61 @@ body[data-platform="harmony"] .platform-switch button.active {
     var(--surface);
 }
 
+.live-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 17px;
+  margin-bottom: 17px;
+}
+
+.live-overview-stack {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.live-overview-stack > .test-mode-bar {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  margin: 0;
+}
+
+.live-overview-grid .test-mode-switch {
+  width: 100%;
+  min-width: 0;
+}
+
+.live-overview-grid > .home-start-panel {
+  min-width: 0;
+  margin: 0;
+}
+
+.live-overview-grid .home-start-controls,
+body[data-test-mode="power"] .live-overview-grid .home-start-controls {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.live-overview-grid .home-start-actions .start-button {
+  min-width: 0;
+}
+
+.live-overview-stack > .session-strip {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 11px;
+  margin: 0;
+}
+
+.live-overview-grid .session-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 body[data-test-mode="performance"] .test-mode-bar {
   border-color: rgb(75 198 232 / 28%);
   background:
@@ -903,7 +952,11 @@ body[data-test-mode="power"] .home-start-controls {
 }
 
 .home-start-panel .target-app-field {
-  align-content: end;
+  align-content: start;
+}
+
+.home-start-panel .app-result-list {
+  max-height: 240px;
 }
 
 .home-start-panel .duration-presets {
@@ -1030,6 +1083,12 @@ body[data-test-mode="power"] .home-start-controls {
   transition: width .35s ease;
 }
 
+.progress-track.indeterminate span {
+  animation: session-progress-indeterminate 1.25s ease-in-out infinite;
+  transition: none;
+  will-change: transform;
+}
+
 .session-actions {
   display: flex;
   justify-content: flex-end;
@@ -1076,6 +1135,14 @@ body[data-test-mode="power"] .home-start-controls {
   position: sticky;
   top: 100px;
   overflow: hidden;
+}
+
+.config-app-panel.scanner-on-home {
+  display: none;
+}
+
+.config-view-columns.scanner-on-home {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .config-app-panel #config-app-picker-content {
@@ -1408,6 +1475,16 @@ body:not([data-platform="android"]) .config-app-placeholder {
 
 .duration-presets button {
   height: 28px;
+}
+
+.duration-presets button[data-duration="unlimited"] {
+  grid-column: 1 / -1;
+  height: 32px;
+  font-weight: 570;
+}
+
+.duration-mode-hint.is-unlimited {
+  color: var(--accent);
 }
 
 .duration-presets button:hover,
@@ -2240,7 +2317,13 @@ body:not([data-platform="android"]) .config-app-placeholder {
 .monitoring-stack {
   min-width: 0;
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 17px;
+}
+
+.monitoring-stack > .live-timeline-panel {
+  grid-column: 1 / -1;
 }
 
 .legacy-live-summary,
@@ -3328,7 +3411,7 @@ body:not([data-platform="android"]) .config-app-placeholder {
 
 .performance-evidence-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .performance-evidence-grid article {
@@ -3337,11 +3420,11 @@ body:not([data-platform="android"]) .config-app-placeholder {
   align-content: center;
   gap: 4px;
   padding: 15px 17px;
-  border-right: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .performance-evidence-grid article:last-child {
-  border-right: 0;
+  border-bottom: 0;
 }
 
 .performance-evidence-grid small {
@@ -3375,9 +3458,8 @@ body:not([data-platform="android"]) .config-app-placeholder {
 }
 
 .frame-flow-heading {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
+  display: grid;
+  align-items: start;
   gap: 16px;
 }
 
@@ -3399,7 +3481,7 @@ body:not([data-platform="android"]) .config-app-placeholder {
 .frame-flow-legend {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 5px;
 }
 
@@ -3708,12 +3790,12 @@ body:not([data-platform="android"]) .config-app-placeholder {
 .pressure-layout,
 .pipeline-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
 }
 
 .pipeline-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .pressure-layout > div,
@@ -3807,7 +3889,7 @@ body:not([data-platform="android"]) .config-app-placeholder {
 
 .pipeline-summary {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
@@ -5171,6 +5253,11 @@ button.history-link:disabled {
   to { transform: rotate(360deg); }
 }
 
+@keyframes session-progress-indeterminate {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(320%); }
+}
+
 @keyframes priority-pulse {
   0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgb(255 101 125 / 0%); }
   50% { transform: scale(1.03); box-shadow: 0 0 0 7px rgb(255 101 125 / 4%); }
@@ -5206,10 +5293,17 @@ button.history-link:disabled {
   .platform-switch { min-width: 470px; }
   .test-mode-bar { align-items: stretch; }
   .test-mode-switch { min-width: 380px; }
+  .live-overview-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .live-overview-grid .test-mode-switch { min-width: 0; }
   .home-start-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body[data-test-mode="power"] .home-start-controls { grid-template-columns: minmax(0, 1fr) minmax(220px, 300px); }
+  .live-overview-grid .home-start-controls,
+  body[data-test-mode="power"] .live-overview-grid .home-start-controls { grid-template-columns: minmax(0, 1fr); }
   .home-start-package:not(:empty) + .home-start-actions { grid-column: 1 / -1; }
   .runtime-layout { grid-template-columns: 1fr; }
+  .monitoring-stack { grid-template-columns: minmax(0, 1fr); }
   .config-view-columns { grid-template-columns: 1fr; }
   .config-app-panel { position: static; }
   .control-panel { position: static; }
@@ -5274,8 +5368,8 @@ button.history-link:disabled {
   #enable-tcpip { grid-column: 1; }
   #disconnect-wireless { grid-column: 2; }
   #enable-harmony-tcpip { grid-column: 1 / -1; }
-  #ios-pair-hint { grid-column: 1; }
-  #pair-ios { grid-column: 2; }
+  #pair-ios { grid-column: 1; }
+  #connect-ios-bluetooth { grid-column: 2; }
   .device-picker { min-width: 0; width: 100%; grid-column: 1; }
   #refresh-devices { grid-column: 2; }
   .device-state { display: none; }
@@ -5286,8 +5380,7 @@ button.history-link:disabled {
   .platform-switch button > i { width: 24px; height: 24px; font-size: 10px; }
   .platform-switch button small,
   .platform-switch button > b { display: none; }
-  body[data-platform="ios"] .adb-connect-form { min-width: 0; grid-template-columns: minmax(0, 1fr) auto; }
-  .ios-pair-hint { align-self: center; }
+  body[data-platform="ios"] .adb-connect-form { min-width: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   #record-form { grid-template-columns: 1fr; }
   #record-form > * { grid-column: 1 !important; }
   .live-timeline-config > summary { align-items: flex-start; gap: 8px; padding-inline: 12px; }

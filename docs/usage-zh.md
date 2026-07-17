@@ -28,7 +28,7 @@ mobile-profiler ui
 
 ### 1.2 在便携包电脑启动
 
-完整解压 `mobile-profiler-v0.7.1-portable.zip`，然后双击解压目录中的：
+完整解压 `mobile-profiler-v0.7.2-portable.zip`，然后双击解压目录中的：
 
 ```text
 start-ui.bat
@@ -125,7 +125,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 1. 确认当前没有手机采集正在运行。
 2. 保持默认输出目录
-   `dist\mobile-profiler-v0.7.1-portable`。
+   `dist\mobile-profiler-v0.7.2-portable`。
 3. 根据目标电脑需要，选择是否包含本机 ADB Platform Tools。
 4. 点击 **生成新版便携包**。
 
@@ -148,8 +148,8 @@ build-portable.bat
 输出为：
 
 ```text
-dist\mobile-profiler-v0.7.1-portable\
-dist\mobile-profiler-v0.7.1-portable.zip
+dist\mobile-profiler-v0.7.2-portable\
+dist\mobile-profiler-v0.7.2-portable.zip
 ```
 
 ZIP 中包含：
@@ -755,8 +755,8 @@ UI：
 构建脚本会替换源码工程中默认的：
 
 ```text
-dist\mobile-profiler-v0.7.1-portable\
-dist\mobile-profiler-v0.7.1-portable.zip
+dist\mobile-profiler-v0.7.2-portable\
+dist\mobile-profiler-v0.7.2-portable.zip
 ```
 
 不会删除 `profiler-runs`、`build` 或源码目录。
@@ -764,20 +764,20 @@ dist\mobile-profiler-v0.7.1-portable.zip
 ### 10.5 验证新包
 
 ```powershell
-.\dist\mobile-profiler-v0.7.1-portable\profiler.cmd --help
-.\dist\mobile-profiler-v0.7.1-portable\start-ui.bat --demo
+.\dist\mobile-profiler-v0.7.2-portable\profiler.cmd --help
+.\dist\mobile-profiler-v0.7.2-portable\start-ui.bat --demo
 ```
 
 如果需要包内 ADB，再检查：
 
 ```powershell
-Test-Path .\dist\mobile-profiler-v0.7.1-portable\platform-tools\adb.exe
+Test-Path .\dist\mobile-profiler-v0.7.2-portable\platform-tools\adb.exe
 ```
 
 确认后分发：
 
 ```text
-dist\mobile-profiler-v0.7.1-portable.zip
+dist\mobile-profiler-v0.7.2-portable.zip
 ```
 
 ### 10.6 升级目标电脑
@@ -1138,6 +1138,19 @@ mobile-profiler --ios-python $iosPython ios-pair --json
 ```
 
 UI 中也可以选择 USB iPhone 后点击顶部 **iOS RemotePairing** 完成同一操作。
+
+Windows 还提供顶部 **连接 iPhone 蓝牙** 按钮，用于不启用 Wi-Fi 的蜂窝网络测试：
+
+1. 先保持 USB 连接并完成一次 **iOS RemotePairing**。
+2. 在 iPhone 开启蓝牙和“个人热点”。
+3. 首次使用时在 Windows 与 iPhone 两端确认蓝牙配对码；若尚未配对，按钮会打开
+   Windows 配对窗口，配对完成后再点击一次。
+4. 点击 **连接 iPhone 蓝牙**。程序会连接 Windows 的 Bluetooth PAN“接入点”，读取
+   iPhone 网关地址，验证已有 RemotePairing 端口，并更新端点缓存。
+5. 拔掉 USB、刷新设备，确认 `wireless_ready` 和 `unplug_ready` 均为 `true`。
+
+蓝牙 PAN 常见地址为电脑 `172.20.10.x`、iPhone 网关 `172.20.10.1`，但程序不依赖
+固定地址。它适合遥测采集，带宽和时延通常不如 Wi-Fi。
 
 这里必须区分两个状态：
 
