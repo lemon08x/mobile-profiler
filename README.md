@@ -203,6 +203,15 @@ are intentionally reserved for the next integration stage. The task-card and
 prompt contracts are designed to host additional phone-initialization recipes
 without changing the allowlisted ADB executor.
 
+The next automation layer is being defined independently under
+`mobile_profiler.automation`. It currently exposes only standard-library data
+contracts and ports for semantic UI providers, typed device gateways, policy /
+approval, deterministic verifiers, watchers, skills, scenario graphs, evidence,
+and UI-state loop detection. It is not imported by the dashboard or the current
+agent. See [`docs/automation-kernel.md`](docs/automation-kernel.md) for the
+open-source mechanism mapping, functional requirements, safety boundary, and
+explicit non-goals.
+
 The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
 test profile. It filters the device picker and changes connection controls,
 field labels, supported capture switches, capability guidance, live metrics,

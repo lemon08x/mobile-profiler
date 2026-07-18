@@ -17,6 +17,7 @@ mobile-profiler/
 |   `-- build-portable.ps1
 |-- tests/
 |   |-- test_adb_agent.py
+|   |-- test_automation.py
 |   |-- test_profiler.py
 |   `-- test_ui.py
 `-- src/mobile_profiler/
@@ -35,6 +36,13 @@ mobile-profiler/
     |-- evidence.py
     |-- adb_agent.py
     |-- adb_agent_prompts.py
+    |-- automation/
+    |   |-- __init__.py
+    |   |-- contracts.py
+    |   |-- ports.py
+    |   |-- registry.py
+    |   |-- scenario.py
+    |   `-- state.py
     |-- ui.py
     |-- web/
     |   |-- index.html
@@ -525,6 +533,7 @@ same indices, preserving cross-chart alignment.
 | `report.py` | Downsampled interactive presentation |
 | `comparison.py` | Paired run/test-item comparison JSON and standalone Chinese HTML |
 | `evidence.py` | Attachment preservation and SHA-256 evidence ZIP generation |
+| `automation/` | Integration-free contracts, dependency-inversion ports, component registry, scenario validation, and UI state/loop algorithms for future ADB automation providers |
 | `ui.py` | Local HTTP API, child-process lifecycle, live journal reader, run history |
 | `web/` | Responsive runtime dashboard assets and SVG telemetry charts |
 | `cli.py` | User workflows and finalization orchestration |
