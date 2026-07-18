@@ -134,6 +134,10 @@
     agentDefaultsApplied: false,
     agentScreenshotRevision: -1,
     agentNotificationKey: "",
+    agentTaskSeed: 0,
+    agentTemplateSignature: "",
+    agentDefaultSystemPrompt: "",
+    agentEditorSessionId: "",
   };
 
   const platformProfiles = {
@@ -5271,12 +5275,184 @@
     }
   }
 
+  function defaultAgentTask(overrides = {}) {
+    const defaults = app.state?.adb_agent?.defaults || {};
+    return {
+      id: "",
+      name: "",
+      prompt: "",
+      attention_prompt: "",
+      max_steps: Number(defaults.max_steps || 30),
+      timeout_s: Number(defaults.task_timeout_s || 300),
+      on_failure: "stop",
+      ...overrides,
+    };
+  }
+
+  function agentTaskCardMarkup(rawTask, index) {
+    const task = defaultAgentTask(rawTask || {});
+    const taskId = String(task.id || `task-${Date.now()}-${index + 1}`);
+    const failure = task.on_failure === "continue" ? "continue" : "stop";
+    return `
+      <article class="agent-task-card" data-agent-task-id="${escapeHtml(taskId)}">
+        <header>
+          <span class="agent-task-index" data-agent-task-number>${index + 1}</span>
+          <div><strong>${escapeHtml(task.name || `任务 ${index + 1}`)}</strong><small>一个 finish 对应一个子任务</small></div>
+          <nav aria-label="调整任务顺序">
+            <button type="button" title="上移" data-agent-task-action="up">↑</button>
+            <button type="button" title="下移" data-agent-task-action="down">↓</button>
+            <button type="button" title="删除" data-agent-task-action="remove">×</button>
+          </nav>
+        </header>
+        <div class="agent-task-card-body">
+          <div class="form-field agent-task-name-field">
+            <label>任务名称</label>
+            <input type="text" maxlength="120" data-agent-task-field="name" value="${escapeHtml(task.name || "")}" placeholder="例如：打开系统设置">
+          </div>
+          <div class="form-field agent-task-prompt-field">
+            <label>任务目标</label>
+            <textarea rows="4" maxlength="6000" data-agent-task-field="prompt" placeholder="说明当前子任务需要在手机上完成并验证的目标" required>${escapeHtml(task.prompt || "")}</textarea>
+          </div>
+          <div class="form-field agent-task-attention-field">
+            <label>注意事项 <span>可选</span></label>
+            <textarea rows="2" maxlength="3000" data-agent-task-field="attention_prompt" placeholder="限定入口、禁止动作、成功证据或厂商差异">${escapeHtml(task.attention_prompt || "")}</textarea>
+          </div>
+          <div class="agent-task-limits">
+            <div class="form-field"><label>最大步骤</label><input type="number" min="1" max="200" step="1" data-agent-task-field="max_steps" value="${escapeHtml(task.max_steps)}"></div>
+            <div class="form-field"><label>任务超时</label><div class="input-with-unit"><input type="number" min="5" max="7200" step="1" data-agent-task-field="timeout_s" value="${escapeHtml(task.timeout_s)}"><span>秒</span></div></div>
+            <div class="form-field"><label>失败策略</label><select data-agent-task-field="on_failure"><option value="stop"${failure === "stop" ? " selected" : ""}>停止流程</option><option value="continue"${failure === "continue" ? " selected" : ""}>记录并继续</option></select></div>
+          </div>
+        </div>
+      </article>`;
+  }
+
+  function refreshAgentTaskOrder() {
+    const cards = $$("#agent-task-list .agent-task-card");
+    cards.forEach((card, index) => {
+      card.querySelector("[data-agent-task-number]").textContent = String(index + 1);
+      const title = card.querySelector("header strong");
+      const name = card.querySelector('[data-agent-task-field="name"]')?.value.trim();
+      title.textContent = name || `任务 ${index + 1}`;
+      card.querySelector('[data-agent-task-action="up"]').disabled = index === 0;
+      card.querySelector('[data-agent-task-action="down"]').disabled = index === cards.length - 1;
+      card.querySelector('[data-agent-task-action="remove"]').disabled = cards.length <= 1;
+    });
+    const label = $("#agent-task-count-label");
+    if (label) label.textContent = `${cards.length} 个子任务 · 按顺序执行；finish 只完成当前子任务`;
+  }
+
+  function renderAgentTaskEditor(tasks) {
+    const normalized = Array.isArray(tasks) && tasks.length ? tasks : [defaultAgentTask()];
+    $("#agent-task-list").innerHTML = normalized
+      .map((task, index) => agentTaskCardMarkup(task, index))
+      .join("");
+    refreshAgentTaskOrder();
+  }
+
+  function appendAgentTask(task = {}) {
+    app.agentTaskSeed += 1;
+    const item = defaultAgentTask(task);
+    const baseId = String(item.id || "task");
+    item.id = `${baseId}-${Date.now()}-${app.agentTaskSeed}`;
+    const list = $("#agent-task-list");
+    const initialCard = list.children.length === 1 ? list.firstElementChild : null;
+    const initialCardIsBlank = Boolean(
+      initialCard
+      && !initialCard.querySelector('[data-agent-task-field="name"]').value.trim()
+      && !initialCard.querySelector('[data-agent-task-field="prompt"]').value.trim()
+      && !initialCard.querySelector('[data-agent-task-field="attention_prompt"]').value.trim()
+    );
+    if (item.prompt && initialCardIsBlank) {
+      list.innerHTML = agentTaskCardMarkup(item, 0);
+    } else {
+      list.insertAdjacentHTML("beforeend", agentTaskCardMarkup(item, list.children.length));
+    }
+    refreshAgentTaskOrder();
+    list.lastElementChild?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function readAgentTasks() {
+    return $$("#agent-task-list .agent-task-card").map((card, index) => ({
+      id: card.dataset.agentTaskId || `task-${index + 1}`,
+      name: card.querySelector('[data-agent-task-field="name"]').value.trim() || `任务 ${index + 1}`,
+      prompt: card.querySelector('[data-agent-task-field="prompt"]').value.trim(),
+      attention_prompt: card.querySelector('[data-agent-task-field="attention_prompt"]').value.trim(),
+      max_steps: Number(card.querySelector('[data-agent-task-field="max_steps"]').value),
+      timeout_s: Number(card.querySelector('[data-agent-task-field="timeout_s"]').value),
+      on_failure: card.querySelector('[data-agent-task-field="on_failure"]').value,
+    }));
+  }
+
+  function populateAgentTaskTemplates(templates) {
+    const items = Array.isArray(templates) ? templates : [];
+    const signature = JSON.stringify(items.map(item => [item.id, item.label]));
+    if (signature === app.agentTemplateSignature) return;
+    app.agentTemplateSignature = signature;
+    $("#agent-task-template-select").innerHTML = [
+      '<option value="">选择任务模板</option>',
+      ...items.map(item => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.label || item.name || item.id || "未命名模板")}</option>`),
+    ].join("");
+  }
+
+  function renderAgentTaskResults(agent) {
+    const tasks = Array.isArray(agent.tasks) ? agent.tasks : [];
+    const results = Array.isArray(agent.task_results) ? agent.task_results : [];
+    const resultByIndex = new Map(results.map(item => [Number(item.index), item]));
+    const container = $("#agent-task-results");
+    const summary = $("#agent-task-progress-summary");
+    if (!tasks.length) {
+      container.innerHTML = '<div class="agent-log-empty">编排任务后启动流程</div>';
+      summary.textContent = "尚未启动流程";
+      return;
+    }
+    const currentIndex = Number(agent.task_index || 0);
+    const statusLabels = {
+      pending: "等待执行",
+      running: "执行中",
+      completed: "已完成",
+      timeout: "已超时",
+      max_steps: "步骤耗尽",
+      take_over: "人工接管",
+      stopped: "已停止",
+      error: "运行失败",
+    };
+    container.innerHTML = tasks.map((task, offset) => {
+      const index = offset + 1;
+      const result = resultByIndex.get(index);
+      let taskStatus = String(result?.status || "pending");
+      if (!result && currentIndex === index && agent.running) taskStatus = "running";
+      if (!result && currentIndex === index && ["stopped", "error"].includes(agent.status)) {
+        taskStatus = agent.status;
+      }
+      const message = result?.message
+        || (taskStatus === "running" ? agent.message : "等待前序任务完成");
+      const details = result
+        ? `${result.steps || 0} 步 · ${formatDuration(result.duration_s || 0)} · ${task.on_failure === "continue" ? "失败后继续" : "失败即停止"}`
+        : `${task.max_steps || "--"} 步上限 · ${task.timeout_s || "--"} 秒超时`;
+      return `<article class="agent-task-result ${escapeHtml(taskStatus)}"><i>${index}</i><div><strong>${escapeHtml(task.name || `任务 ${index}`)}</strong><p>${escapeHtml(message || "")}</p><small>${escapeHtml(details)}</small></div><em>${escapeHtml(statusLabels[taskStatus] || taskStatus)}</em></article>`;
+    }).join("");
+    const completed = results.filter(item => item.status === "completed").length;
+    summary.textContent = agent.running
+      ? `执行第 ${currentIndex || 1} / ${tasks.length} 项 · 已完成 ${completed} 项`
+      : `已结束 ${results.length} / ${tasks.length} 项 · 通过 ${completed} 项`;
+  }
+
   function renderAdbAgent(state) {
     const agent = state?.adb_agent || {};
     const defaults = agent.defaults || {};
     const sessionSource = agent.session_id ? agent : defaults;
-    if (!app.agentDefaultsApplied) {
-      const storedValue = (key, fallback) => localStorage.getItem(key) || String(fallback ?? "");
+    app.agentDefaultSystemPrompt = String(defaults.system_prompt || app.agentDefaultSystemPrompt || "");
+    populateAgentTaskTemplates(defaults.task_templates);
+    const agentSessionChanged = Boolean(
+      agent.session_id && String(agent.session_id) !== app.agentEditorSessionId
+    );
+    if (!app.agentDefaultsApplied || agentSessionChanged) {
+      const useStoredDefaults = !agent.session_id;
+      const storedValue = (key, fallback) => (
+        useStoredDefaults
+          ? (localStorage.getItem(key) || String(fallback ?? ""))
+          : String(fallback ?? "")
+      );
       $("#agent-api-base-input").value = storedValue(
         "mobile-profiler-agent-api-base",
         sessionSource.api_base_url,
@@ -5284,10 +5460,6 @@
       $("#agent-model-input").value = storedValue(
         "mobile-profiler-agent-model",
         sessionSource.model,
-      );
-      $("#agent-max-steps-input").value = storedValue(
-        "mobile-profiler-agent-max-steps",
-        sessionSource.max_steps || 30,
       );
       $("#agent-step-delay-input").value = storedValue(
         "mobile-profiler-agent-step-delay",
@@ -5297,10 +5469,15 @@
         "mobile-profiler-agent-timeout",
         sessionSource.request_timeout_s || 90,
       );
-      if (agent.task && !$("#agent-task-input").value.trim()) {
-        $("#agent-task-input").value = String(agent.task);
-      }
+      $("#agent-workflow-name-input").value = String(sessionSource.workflow_name || "ADB 测试流程");
+      $("#agent-system-prompt-input").value = String(sessionSource.system_prompt || defaults.system_prompt || "");
+      $("#agent-system-prompt-version").textContent = `${sessionSource.system_prompt_version || defaults.system_prompt_version || "custom"} · 坐标协议、动作边界与安全规则`;
+      const sessionTasks = Array.isArray(agent.tasks) && agent.tasks.length
+        ? agent.tasks
+        : (agent.task ? [defaultAgentTask({ name: "任务 1", prompt: agent.task, max_steps: agent.max_steps })] : []);
+      renderAgentTaskEditor(sessionTasks);
       app.agentDefaultsApplied = true;
+      app.agentEditorSessionId = String(agent.session_id || "");
     }
 
     const status = String(agent.status || "idle");
@@ -5309,9 +5486,11 @@
       starting: ["正在启动", agent.message || "准备截图与模型客户端"],
       running: ["任务运行中", agent.message || "截图、决策与 ADB 动作闭环"],
       stopping: ["正在停止", "当前模型请求返回后安全退出"],
-      completed: ["任务已完成", agent.message || "模型确认目标已达成"],
-      stopped: ["任务已停止", agent.message || "用户已停止任务"],
+      completed: ["流程已完成", agent.message || "全部子任务已完成"],
+      completed_with_warnings: ["流程完成，有跳过", agent.message || "部分子任务按失败策略继续"],
+      stopped: ["流程已停止", agent.message || "用户已停止流程"],
       take_over: ["需要人工接管", agent.message || "模型无法安全继续"],
+      task_failed: ["子任务失败", agent.message || "流程已按失败策略停止"],
       max_steps: ["达到步骤上限", agent.message || "任务未确认完成"],
       error: ["运行失败", agent.error || agent.message || "请查看闭环日志"],
     }[status] || [status.toUpperCase(), agent.message || "--"];
@@ -5339,6 +5518,8 @@
       $("#agent-screen-meta").textContent = "尚未截图";
     }
 
+    $("#agent-task-progress-value").textContent = `${agent.task_index || 0} / ${agent.task_count || 0}`;
+    $("#agent-current-task-value").textContent = agent.current_task?.name || "尚未开始";
     $("#agent-step-value").textContent = `${agent.step || 0} / ${agent.max_steps || defaults.max_steps || 0}`;
     $("#agent-phase-value").textContent = String(agent.phase || "idle").toUpperCase();
     $("#agent-model-value").textContent = agent.model || defaults.model || "--";
@@ -5356,11 +5537,13 @@
     $("#agent-action-state").textContent = status === "idle"
       ? "等待模型"
       : `${status.toUpperCase()} · ${String(agent.phase || "--").toUpperCase()}`;
+    renderAgentTaskResults(agent);
 
-    const terminal = ["completed", "stopped", "take_over", "max_steps", "error"].includes(status);
+    const terminal = ["completed", "completed_with_warnings", "stopped", "take_over", "task_failed", "max_steps", "error"].includes(status);
     const completion = $("#agent-completion-message");
     completion.hidden = !terminal;
-    completion.classList.toggle("error", ["take_over", "max_steps", "error"].includes(status));
+    completion.classList.toggle("error", ["take_over", "task_failed", "max_steps", "error"].includes(status));
+    completion.classList.toggle("warning", status === "completed_with_warnings");
     completion.textContent = status === "error"
       ? `${agent.message || "ADB Agent 运行失败"}${agent.error ? `：${agent.error}` : ""}`
       : agent.message || statusPresentation[0];
@@ -5393,13 +5576,21 @@
       ? ""
       : "请先在右上角选择已授权的 Android ADB 设备";
     $("#agent-stop-button").disabled = !running || status === "stopping";
-    $$("#adb-agent-form input, #adb-agent-form textarea, #adb-agent-form details").forEach(control => {
+    $$("#adb-agent-form input, #adb-agent-form textarea, #adb-agent-form select, #adb-agent-form details").forEach(control => {
       if (control.tagName === "DETAILS") {
         control.classList.toggle("disabled", running);
       } else {
         control.disabled = running;
       }
     });
+    $$("#agent-add-task-button, #agent-add-template-button, #agent-reset-system-prompt-button").forEach(control => {
+      control.disabled = running;
+    });
+    if (running) {
+      $$('[data-agent-task-action]').forEach(control => { control.disabled = true; });
+    } else {
+      refreshAgentTaskOrder();
+    }
 
     if (terminal && agent.session_id) {
       const notificationKey = `${agent.session_id}:${status}`;
@@ -5408,7 +5599,7 @@
         notify(
           statusPresentation[0],
           status === "error" ? (agent.error || agent.message || "运行失败") : (agent.message || "任务结束"),
-          ["completed", "stopped"].includes(status) ? "success" : "error",
+          status === "completed" ? "success" : (status === "completed_with_warnings" || status === "stopped" ? "warning" : "error"),
           9000,
         );
       }
@@ -5543,6 +5734,39 @@
       void applyBrightnessValue();
     });
 
+    $("#agent-add-task-button").addEventListener("click", () => appendAgentTask());
+    $("#agent-add-template-button").addEventListener("click", () => {
+      const templateId = $("#agent-task-template-select").value;
+      const templates = app.state?.adb_agent?.defaults?.task_templates || [];
+      const template = templates.find(item => String(item.id) === templateId);
+      if (!template) {
+        notify("请选择任务模板", "从下拉框选择一个模板后再添加。", "warning", 4000);
+        return;
+      }
+      appendAgentTask({ ...template, name: template.label || template.name || "模板任务" });
+    });
+    $("#agent-task-list").addEventListener("input", event => {
+      if (event.target.matches('[data-agent-task-field="name"]')) refreshAgentTaskOrder();
+    });
+    $("#agent-task-list").addEventListener("click", event => {
+      const button = event.target.closest("[data-agent-task-action]");
+      if (!button || button.disabled) return;
+      const card = button.closest(".agent-task-card");
+      const action = button.dataset.agentTaskAction;
+      if (action === "up" && card.previousElementSibling) {
+        card.parentElement.insertBefore(card, card.previousElementSibling);
+      } else if (action === "down" && card.nextElementSibling) {
+        card.parentElement.insertBefore(card.nextElementSibling, card);
+      } else if (action === "remove" && card.parentElement.children.length > 1) {
+        card.remove();
+      }
+      refreshAgentTaskOrder();
+    });
+    $("#agent-reset-system-prompt-button").addEventListener("click", () => {
+      $("#agent-system-prompt-input").value = app.agentDefaultSystemPrompt;
+      notify("已恢复默认 System Prompt", "本次启动时将使用内置 ADB 操作与安全规则。", "success", 4000);
+    });
+
     $("#adb-agent-form").addEventListener("submit", async event => {
       event.preventDefault();
       const device = selectedDevice();
@@ -5551,19 +5775,29 @@
         notify("请选择 Android ADB 设备", "AI 自动化基础闭环当前只支持已授权的 Android 设备。", "error");
         return;
       }
-      const task = $("#agent-task-input").value.trim();
-      if (!task) {
-        notify("请输入任务", "描述希望模型在手机上完成的目标。", "error");
-        $("#agent-task-input").focus();
+      const tasks = readAgentTasks();
+      const missingTaskIndex = tasks.findIndex(task => !task.prompt);
+      if (missingTaskIndex >= 0) {
+        notify("任务目标不能为空", `请填写第 ${missingTaskIndex + 1} 个子任务的目标。`, "error");
+        $$("#agent-task-list .agent-task-card")[missingTaskIndex]
+          ?.querySelector('[data-agent-task-field="prompt"]')
+          ?.focus();
+        return;
+      }
+      const systemPrompt = $("#agent-system-prompt-input").value.trim();
+      if (!systemPrompt) {
+        notify("System Prompt 不能为空", "请恢复默认 prompt 或填写自定义 ADB Agent 规则。", "error");
+        $("#agent-system-prompt-input").focus();
         return;
       }
       const payload = {
         device,
-        task,
+        workflow_name: $("#agent-workflow-name-input").value.trim() || "ADB 测试流程",
+        tasks,
+        system_prompt: systemPrompt,
         api_base_url: $("#agent-api-base-input").value.trim(),
         model: $("#agent-model-input").value.trim(),
         api_key: $("#agent-api-key-input").value,
-        max_steps: Number($("#agent-max-steps-input").value),
         step_delay_s: Number($("#agent-step-delay-input").value),
         request_timeout_s: Number($("#agent-timeout-input").value),
       };
@@ -5576,18 +5810,17 @@
         });
         localStorage.setItem("mobile-profiler-agent-api-base", payload.api_base_url);
         localStorage.setItem("mobile-profiler-agent-model", payload.model);
-        localStorage.setItem("mobile-profiler-agent-max-steps", String(payload.max_steps));
         localStorage.setItem("mobile-profiler-agent-step-delay", String(payload.step_delay_s));
         localStorage.setItem("mobile-profiler-agent-timeout", String(payload.request_timeout_s));
         $("#agent-api-key-input").value = "";
         app.agentNotificationKey = "";
         app.state = { ...(app.state || {}), adb_agent: result };
         renderAdbAgent(app.state);
-        notify("ADB Agent 已启动", `${device} · ${payload.model}`, "success", 5000);
+        notify("ADB 测试流程已启动", `${tasks.length} 个子任务 · ${device} · ${payload.model}`, "success", 5000);
       } catch (error) {
         notify("无法启动 ADB Agent", error.message, "error", 9000);
       } finally {
-        $("#agent-start-button").textContent = "启动闭环任务";
+        $("#agent-start-button").textContent = "启动测试流程";
         if (app.state) renderAdbAgent(app.state);
       }
     });

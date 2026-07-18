@@ -239,10 +239,23 @@ revalidates that the selected device is a ready Android ADB target, creates an
 isolated directory below `agent-runs/`, and returns immediately so the HTTP UI
 can continue polling.
 
-For each step the worker:
+The session configuration has three prompt/orchestration layers:
+
+1. A versioned, editable global system prompt defines the ADB screenshot and
+   0-999 coordinate protocol, supported actions, one-action-per-observation
+   behavior, verification rules, loop prevention, and sensitive-operation
+   takeover boundaries.
+2. Each task defines `id`, `name`, `prompt`, `attention_prompt`, `max_steps`,
+   `timeout_s`, and `on_failure` (`stop` or `continue`). Legacy `{task,
+   max_steps}` payloads are normalized into a one-task workflow.
+3. The controller orchestrates tasks sequentially and adds the current task,
+   elapsed time, limits, completed-task summary, and task-local action history
+   to each multimodal request.
+
+For each task step the worker:
 
 1. Captures a raw PNG with `adb exec-out screencap -p` and reads its IHDR size.
-2. Sends the user task, screenshot, and compact recent action results to an
+2. Sends the current task, screenshot, and compact task-local action results to an
    OpenAI-compatible `/v1/chat/completions` endpoint using BTR2's normalized
    0-999 coordinate convention and native `phone_action` tool schema.
 3. Parses exactly one tool call and maps normalized coordinates into the
@@ -253,12 +266,20 @@ For each step the worker:
 5. Persists the pre-action screenshot and event JSON, waits for the configured
    settle interval, and observes the next frame.
 
-`finish` and `take_over` are terminal model actions. User stop is cooperative:
-an in-flight HTTP request finishes or times out, after which no further ADB
-action is issued. `/api/state` returns only serializable status and recent logs;
-the PNG is served independently by `/api/ai-agent/screenshot` to avoid embedding
-large base64 images in every one-second dashboard poll. API keys exist only in
-the in-memory client configuration and are excluded from state and disk.
+`finish` is terminal only for the current task. The controller writes a task
+result and advances to the next item. `take_over` stops the whole workflow.
+Timeout and max-step failures either produce `task_failed` immediately or are
+recorded and skipped; a workflow that reaches the end after skips returns
+`completed_with_warnings`. User stop is cooperative: an in-flight HTTP request
+finishes or times out, after which no further ADB action is issued.
+
+Screenshots use `task-NN-step-NNN.png`. `events.jsonl` records `task_start`,
+`action`, and `task_end` events, while `config.json` stores the exact tasks and
+system prompt needed to reproduce the run. `/api/state` returns only
+serializable status and recent logs; the PNG is served independently by
+`/api/ai-agent/screenshot` to avoid embedding large base64 images in every
+one-second dashboard poll. API keys exist only in the in-memory client
+configuration and are excluded from state and disk.
 
 The `/api/tcpip` workflow is also guarded against active recording. It reads
 global IPv4 interfaces before restarting adbd, prioritizes `wlan*`/`wifi*`,

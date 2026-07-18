@@ -47,10 +47,11 @@ is easier to audit after a one-hour robotic workflow:
 - A local runtime dashboard for device Probe, recording control, live telemetry,
   collector logs, report history, log import, recovery, evidence packaging,
   two-run comparison, and source-project portable builds.
-- An Android ADB vision-agent block that sends each fresh device screenshot to
-  the BTR2 vLLM/OpenAI-compatible endpoint, receives one native `phone_action`
-  tool call, executes a validated ADB action, and repeats until completion,
-  takeover, stop, error, or the configured step limit.
+- An Android ADB vision-agent block with a versioned/editable system prompt and
+  ordered task-card orchestration. It sends each fresh device screenshot to the
+  BTR2 vLLM/OpenAI-compatible endpoint, receives one native `phone_action`,
+  executes a validated ADB action, and advances tasks under per-task step,
+  timeout, and failure policies.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -144,8 +145,11 @@ stay identical.
 ### ADB vision agent using the BTR2 model API
 
 The **AI Automation** view is an independent MVP workflow for Android. Select
-an authorized ADB device, enter a natural-language task, confirm the BTR2 model
-endpoint/model, and start the loop. The current BTR2 defaults are
+an authorized ADB device, arrange one or more natural-language task cards,
+confirm the BTR2 model endpoint/model, and start the workflow. Each task has its
+own objective, attention prompt, step/time limit, and stop-or-continue failure
+policy. Reusable templates cover returning home, opening Settings, brightness
+initialization, and read-only smoke browsing. The current BTR2 defaults are
 `http://192.168.31.237:8000` and `qwen3.6-27b`; both fields remain editable and
 can also be supplied through `BTR2_LLM_ENDPOINT`, `BTR2_LLM_MODEL`, and
 `BTR2_LLM_TOKEN`.
@@ -154,12 +158,22 @@ Each step performs this closed loop:
 
 ```text
 adb exec-out screencap -p
-        -> screenshot + task + recent action results
+        -> editable ADB system prompt
+        -> current task + attention rules + workflow summary
+        -> screenshot + recent action results
         -> BTR2 OpenAI-compatible /v1/chat/completions
         -> one native phone_action tool call (0-999 coordinates)
         -> validated adb input / keyevent / monkey action
         -> next screenshot
 ```
+
+Tasks run sequentially. `finish` completes only the current task and advances
+the orchestrator; `take_over` stops the whole workflow. A timeout or exhausted
+step budget either stops with `task_failed` or is recorded and skipped,
+according to the task's failure policy. The editable system prompt defines the
+ADB screenshot/coordinate protocol, one-action-per-frame behavior, popup and
+input handling, loop prevention, and takeover boundaries. Its built-in version
+is exposed by `/api/state` so the UI can restore the default safely.
 
 The model cannot provide arbitrary shell commands. The server only accepts
 tap, double-tap, long-press, swipe, key events, printable-ASCII text input,
@@ -171,9 +185,10 @@ returned by `/api/state` nor persisted in those artifacts.
 
 This first PR keeps the agent block separate from power recording. A power run
 and an agent may already coexist at the ADB level, but automatic shared
-start/stop, timeline markers, workflow templates, phone-initialization recipes,
-and external-API tools are intentionally reserved for the next integration
-stage.
+start/stop, timeline markers, power-aware orchestration, and external-API tools
+are intentionally reserved for the next integration stage. The task-card and
+prompt contracts are designed to host additional phone-initialization recipes
+without changing the allowlisted ADB executor.
 
 The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
 test profile. It filters the device picker and changes connection controls,

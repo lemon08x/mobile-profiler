@@ -25,6 +25,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from .adb_agent_prompts import (
+    ADB_AGENT_SYSTEM_PROMPT_VERSION,
+    DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+    task_templates_snapshot,
+)
+
 
 DEFAULT_BTR2_API_BASE_URL = os.environ.get(
     "BTR2_LLM_ENDPOINT",
@@ -34,31 +40,12 @@ DEFAULT_BTR2_MODEL = os.environ.get("BTR2_LLM_MODEL", "qwen3.6-27b").strip()
 DEFAULT_BTR2_API_KEY = os.environ.get("BTR2_LLM_TOKEN", "").strip()
 MAX_AGENT_LOGS = 240
 MAX_AGENT_HISTORY = 20
+MAX_AGENT_TASKS = 50
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ANDROID_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 
-
-ADB_AGENT_SYSTEM_PROMPT = """你是 Mobile Profiler 的 Android ADB 手机操作智能体。
-你看到的是 adb exec-out screencap 获取的完整手机帧缓冲截图，截图包含状态栏和导航栏。
-你的目标是根据用户任务观察当前屏幕，每轮只调用一次 phone_action 工具推进任务。
-
-坐标与动作规则：
-- 截图坐标统一归一化为 0 到 999，左上角为 (0,0)，右下角为 (999,999)。
-- tap、double_tap、long_press 使用 element=[x,y]。
-- swipe、swipe_fast 使用 start=[x1,y1] 和 end=[x2,y2]；滚动页面时滑动距离应超过屏幕高度 50%。
-- back、home、recent、wake、enter、delete 会转换为 Android keyevent。
-- input_text 会转换为 adb shell input text，仅适合 ASCII 文本；不要用它输入中文。
-- launch_app 仅接受 Android 包名，不允许提供 shell 命令。
-- 页面加载或动画未结束时使用 wait，通常等待 1 到 3 秒。
-- 明确完成任务时立即 finish；需要验证码、账号授权、支付、隐私确认或人工判断时 take_over。
-
-安全与决策规则：
-1. 执行下一步前核对截图是否符合上一动作预期。
-2. 不要连续三次执行完全相同的点击或滑动；两次无效后必须换方式。
-3. 不要自行执行购买、支付、删除账号/数据、发送消息等不可逆操作；遇到这些步骤必须 take_over。
-4. 不要输出或请求任意 adb shell；只能使用 phone_action 中列出的动作。
-5. 每轮必须产生一个 phone_action 工具调用，不要只输出分析文字。
-"""
+# Backward-compatible export for callers that imported the original constant.
+ADB_AGENT_SYSTEM_PROMPT = DEFAULT_ADB_AGENT_SYSTEM_PROMPT
 
 
 PHONE_ACTION_TOOL: Dict[str, object] = {
@@ -175,6 +162,91 @@ def _short_text(value: object, limit: int = 1000) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _multiline_text(value: object, limit: int) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) > limit:
+        raise ValueError(f"文本不能超过 {limit} 个字符")
+    return text
+
+
+def normalize_agent_tasks(payload: Dict[str, object]) -> List[Dict[str, object]]:
+    """Validate the orchestration task list, with legacy single-task support."""
+
+    raw_tasks = payload.get("tasks")
+    legacy = raw_tasks is None
+    if legacy:
+        raw_tasks = [
+            {
+                "name": str(payload.get("task_name") or "任务 1"),
+                "prompt": payload.get("task"),
+                "attention_prompt": payload.get("attention_prompt"),
+                "max_steps": payload.get("max_steps"),
+                "timeout_s": payload.get("task_timeout_s"),
+                "on_failure": payload.get("on_failure"),
+            }
+        ]
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise ValueError("请至少编排一个测试任务")
+    if len(raw_tasks) > MAX_AGENT_TASKS:
+        raise ValueError(f"测试任务不能超过 {MAX_AGENT_TASKS} 个")
+
+    default_max_steps = _bounded_int(payload.get("max_steps"), 1, 200, 30)
+    normalized: List[Dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for index, raw_task in enumerate(raw_tasks, 1):
+        if not isinstance(raw_task, dict):
+            raise ValueError(f"第 {index} 个测试任务必须是 JSON 对象")
+        prompt = _multiline_text(raw_task.get("prompt"), 6000)
+        if not prompt:
+            raise ValueError(f"第 {index} 个测试任务缺少任务目标")
+        attention_prompt = _multiline_text(raw_task.get("attention_prompt"), 3000)
+        name = _short_text(
+            raw_task.get("name") or raw_task.get("label") or f"任务 {index}",
+            120,
+        )
+        raw_id = str(raw_task.get("id") or f"task-{index}").strip().lower()
+        task_id = re.sub(r"[^a-z0-9._-]+", "-", raw_id).strip("-.")[:64]
+        if not task_id:
+            task_id = f"task-{index}"
+        base_id = task_id
+        suffix = 2
+        while task_id in seen_ids:
+            task_id = f"{base_id[: max(1, 61 - len(str(suffix)))]}-{suffix}"
+            suffix += 1
+        seen_ids.add(task_id)
+        on_failure = str(raw_task.get("on_failure") or "stop").strip().lower()
+        if on_failure not in {"stop", "continue"}:
+            raise ValueError(f"第 {index} 个测试任务的失败策略必须是 stop 或 continue")
+        normalized.append(
+            {
+                "id": task_id,
+                "name": name or f"任务 {index}",
+                "prompt": prompt,
+                "attention_prompt": attention_prompt,
+                "max_steps": _bounded_int(
+                    raw_task.get("max_steps"), 1, 200, default_max_steps
+                ),
+                "timeout_s": _bounded_float(
+                    raw_task.get("timeout_s"), 5.0, 7200.0, 300.0
+                ),
+                "on_failure": on_failure,
+            }
+        )
+    return normalized
+
+
+def _workflow_summary(results: Sequence[Dict[str, object]]) -> str:
+    if not results:
+        return "尚无已完成的子任务。"
+    lines = []
+    for result in results[-12:]:
+        lines.append(
+            f"{result.get('index')}. {result.get('name')} - "
+            f"{result.get('status')}: {_short_text(result.get('message'), 160)}"
+        )
+    return "\n".join(lines)
+
+
 def chat_completions_url(api_base_url: str) -> str:
     """Return the chat-completions URL for a BTR2/OpenAI-compatible base URL."""
 
@@ -288,6 +360,7 @@ class OpenAICompatibleVisionClient:
         model: str,
         api_key: str = "",
         request_timeout_s: float = 90.0,
+        system_prompt: str = DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
     ) -> None:
         self.url = chat_completions_url(api_base_url)
         self.model = str(model or "").strip()
@@ -295,6 +368,7 @@ class OpenAICompatibleVisionClient:
             raise ValueError("模型名称不能为空")
         self.api_key = str(api_key or "").strip()
         self.request_timeout_s = request_timeout_s
+        self.system_prompt = str(system_prompt or DEFAULT_ADB_AGENT_SYSTEM_PROMPT).strip()
 
     @staticmethod
     def _history_text(history: Sequence[Dict[str, object]]) -> str:
@@ -318,19 +392,37 @@ class OpenAICompatibleVisionClient:
         width: int,
         height: int,
         history: Sequence[Dict[str, object]],
+        task_name: str = "",
+        attention_prompt: str = "",
+        workflow_summary: str = "",
+        task_elapsed_s: float = 0.0,
+        task_timeout_s: float = 0.0,
     ) -> ModelDecision:
         encoded = base64.b64encode(screenshot_png).decode("ascii")
+        attention_block = (
+            f"\n\n当前子任务注意事项：\n{attention_prompt}"
+            if str(attention_prompt or "").strip()
+            else ""
+        )
+        timeout_block = (
+            f"{task_elapsed_s:.1f}/{task_timeout_s:.1f} 秒"
+            if task_timeout_s > 0
+            else f"{task_elapsed_s:.1f} 秒"
+        )
         user_text = (
-            f"用户任务：\n{task}\n\n"
-            f"当前步骤：{step}/{max_steps}\n"
+            f"当前测试子任务：{task_name or '未命名任务'}\n"
+            f"任务目标：\n{task}{attention_block}\n\n"
+            f"当前子任务步骤：{step}/{max_steps}\n"
+            f"当前子任务用时：{timeout_block}\n"
             f"ADB 截图尺寸：{width}x{height}；工具坐标仍使用 0-999。\n\n"
+            f"已完成子任务摘要：\n{workflow_summary or '尚无已完成的子任务。'}\n\n"
             f"最近动作与结果：\n{self._history_text(history)}\n\n"
-            "观察最新截图，调用一次 phone_action。"
+            "只处理当前子任务。观察最新截图，调用一次 phone_action；finish 只表示当前子任务完成。"
         )
         request_payload: Dict[str, object] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": ADB_AGENT_SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {
                     "role": "user",
                     "content": [
@@ -587,6 +679,7 @@ class AdbAgentController:
             str(config["model"]),
             str(config.get("api_key") or ""),
             _number(config.get("request_timeout_s"), 90.0),
+            str(config.get("system_prompt") or DEFAULT_ADB_AGENT_SYSTEM_PROMPT),
         )
 
     def _log_locked(self, level: str, message: str) -> None:
@@ -631,8 +724,9 @@ class AdbAgentController:
             self._log_locked("error" if status == "error" else "info", message)
 
     @staticmethod
-    def _session_directory(output_root: Path, task: str) -> Path:
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", task).strip("-.")[:42] or "task"
+    def _session_directory(output_root: Path, workflow_name: str) -> Path:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", workflow_name).strip("-.")[:42]
+        slug = slug or "workflow"
         name = f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}-{uuid.uuid4().hex[:6]}"
         directory = output_root / "agent-runs" / name
         directory.mkdir(parents=True, exist_ok=False)
@@ -654,13 +748,21 @@ class AdbAgentController:
 
     def start(self, payload: Dict[str, object]) -> Dict[str, object]:
         device = str(payload.get("device") or "").strip()
-        task = str(payload.get("task") or "").strip()
         if not device:
             raise ValueError("请选择已授权的 Android ADB 设备")
-        if not task:
-            raise ValueError("请输入 Agent 任务")
-        if len(task) > 6000:
-            raise ValueError("Agent 任务不能超过 6000 个字符")
+        tasks = normalize_agent_tasks(payload)
+        workflow_name = _short_text(
+            payload.get("workflow_name") or tasks[0].get("name") or "ADB 测试流程",
+            160,
+        )
+        system_prompt = _multiline_text(payload.get("system_prompt"), 24000)
+        if not system_prompt:
+            system_prompt = DEFAULT_ADB_AGENT_SYSTEM_PROMPT
+        system_prompt_version = (
+            ADB_AGENT_SYSTEM_PROMPT_VERSION
+            if system_prompt == DEFAULT_ADB_AGENT_SYSTEM_PROMPT
+            else "custom"
+        )
         api_base_url = str(
             payload.get("api_base_url") or DEFAULT_BTR2_API_BASE_URL
         ).strip()
@@ -670,11 +772,14 @@ class AdbAgentController:
             raise ValueError("请输入有效的模型名称")
         config: Dict[str, object] = {
             "device": device,
-            "task": task,
+            "workflow_name": workflow_name,
+            "tasks": tasks,
+            "task": tasks[0]["prompt"],
+            "system_prompt": system_prompt,
+            "system_prompt_version": system_prompt_version,
             "api_base_url": api_base_url,
             "model": model,
             "api_key": str(payload.get("api_key") or DEFAULT_BTR2_API_KEY).strip(),
-            "max_steps": _bounded_int(payload.get("max_steps"), 1, 200, 30),
             "step_delay_s": _bounded_float(payload.get("step_delay_s"), 0.2, 30.0, 1.2),
             "request_timeout_s": _bounded_float(
                 payload.get("request_timeout_s"), 5.0, 600.0, 90.0
@@ -684,7 +789,7 @@ class AdbAgentController:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("已有 ADB Agent 任务正在运行，请先停止")
-            directory = self._session_directory(self.output_root, task)
+            directory = self._session_directory(self.output_root, workflow_name)
             try:
                 self._persist_config(directory, config)
             except OSError as exc:
@@ -699,11 +804,23 @@ class AdbAgentController:
             self._session = {
                 "session_id": session_id,
                 "device": device,
-                "task": task,
+                "workflow_name": workflow_name,
+                "task": tasks[0]["prompt"],
+                "tasks": [dict(task) for task in tasks],
+                "task_count": len(tasks),
+                "task_index": 0,
+                "current_task": None,
+                "current_task_status": "pending",
+                "current_task_started_at": None,
+                "current_task_timeout_s": None,
+                "task_results": [],
+                "total_steps": 0,
+                "system_prompt": system_prompt,
+                "system_prompt_version": system_prompt_version,
                 "api_base_url": api_base_url,
                 "model": model,
                 "api_key_configured": bool(config.get("api_key")),
-                "max_steps": config["max_steps"],
+                "max_steps": tasks[0]["max_steps"],
                 "step_delay_s": config["step_delay_s"],
                 "request_timeout_s": config["request_timeout_s"],
                 "step": 0,
@@ -725,7 +842,9 @@ class AdbAgentController:
                 "completion_tokens": 0,
                 "output_dir": str(directory),
             }
-            self._log_locked("info", f"任务已创建：{task}")
+            self._log_locked(
+                "info", f"测试流程已创建：{workflow_name} · {len(tasks)} 个子任务"
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 args=(session_id, config, directory, self._stop_event),
@@ -742,9 +861,9 @@ class AdbAgentController:
             self._stop_event.set()
             if self._session is not None:
                 self._session.update(
-                    {"status": "stopping", "phase": "stopping", "message": "正在停止任务"}
+                    {"status": "stopping", "phase": "stopping", "message": "正在停止流程"}
                 )
-            self._log_locked("warning", "用户请求停止任务")
+            self._log_locked("warning", "用户请求停止流程")
         return self.snapshot()
 
     def latest_screenshot(self) -> Optional[bytes]:
@@ -757,9 +876,13 @@ class AdbAgentController:
                 "api_base_url": DEFAULT_BTR2_API_BASE_URL,
                 "model": DEFAULT_BTR2_MODEL,
                 "max_steps": 30,
+                "task_timeout_s": 300,
                 "step_delay_s": 1.2,
                 "request_timeout_s": 90,
                 "api_key_configured": bool(DEFAULT_BTR2_API_KEY),
+                "system_prompt": DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+                "system_prompt_version": ADB_AGENT_SYSTEM_PROMPT_VERSION,
+                "task_templates": task_templates_snapshot(),
             }
             if self._session is None:
                 return {
@@ -778,6 +901,12 @@ class AdbAgentController:
                 state["elapsed_s"] = max(
                     0.0, time.time() - _number(state.get("started_at"), time.time())
                 )
+                if state.get("current_task_started_at"):
+                    state["task_elapsed_s"] = max(
+                        0.0,
+                        time.time()
+                        - _number(state.get("current_task_started_at"), time.time()),
+                    )
             state.update(
                 {
                     "available": True,
@@ -805,126 +934,275 @@ class AdbAgentController:
         try:
             client = self._client_factory(config)
             self._log("info", f"已连接 BTR2 模型协议：{config['model']}")
-            max_steps = _integer(config.get("max_steps"), 30)
-            for step in range(1, max_steps + 1):
+            tasks = config.get("tasks")
+            if not isinstance(tasks, list) or not tasks:
+                raise RuntimeError("Agent workflow has no tasks")
+            task_results: List[Dict[str, object]] = []
+            had_warnings = False
+            total_steps = 0
+
+            for task_index, raw_task in enumerate(tasks, 1):
                 if stop_event.is_set():
-                    self._finish(session_id, "stopped", "任务已由用户停止")
+                    self._finish(session_id, "stopped", "测试流程已由用户停止")
                     return
+                if not isinstance(raw_task, dict):
+                    raise RuntimeError(f"Agent workflow task {task_index} is invalid")
+                task = dict(raw_task)
+                task_name = str(task.get("name") or f"任务 {task_index}")
+                max_steps = _integer(task.get("max_steps"), 30)
+                timeout_s = _number(task.get("timeout_s"), 300.0)
+                task_started_at = time.time()
+                task_history: List[Dict[str, object]] = []
+                task_status: Optional[str] = None
+                task_message = ""
+
                 self._update(
                     session_id,
-                    step=step,
-                    status="running",
-                    phase="capturing",
-                    message="正在通过 ADB 获取截图",
-                )
-                screenshot, width, height = self._screenshot_capture(
-                    self.adb, str(config["device"])
-                )
-                with self._lock:
-                    if self._session is None or self._session.get("session_id") != session_id:
-                        return
-                    self._latest_screenshot = screenshot
-                    self._screenshot_revision += 1
-                    self._session.update(
-                        {
-                            "screenshot_width": width,
-                            "screenshot_height": height,
-                        }
-                    )
-                try:
-                    (directory / f"step-{step:03d}.png").write_bytes(screenshot)
-                except OSError as exc:
-                    self._log("warning", f"保存第 {step} 步截图失败：{exc}")
-                self._update(
-                    session_id,
-                    phase="thinking",
-                    message=f"模型正在决策第 {step} 步",
-                )
-                request_started = time.monotonic()
-                decision = client.decide(  # type: ignore[attr-defined]
-                    task=str(config["task"]),
-                    step=step,
+                    task_index=task_index,
+                    current_task=task,
+                    current_task_status="running",
+                    current_task_started_at=task_started_at,
+                    current_task_timeout_s=timeout_s,
+                    step=0,
                     max_steps=max_steps,
-                    screenshot_png=screenshot,
-                    width=width,
-                    height=height,
-                    history=list(self._history),
+                    status="running",
+                    phase="task_start",
+                    message=f"开始子任务 {task_index}/{len(tasks)}：{task_name}",
                 )
-                request_duration = time.monotonic() - request_started
-                if not isinstance(decision, ModelDecision):
-                    raise RuntimeError("Agent client returned an invalid decision")
-                with self._lock:
-                    if self._session is None or self._session.get("session_id") != session_id:
-                        return
-                    self._session["latest_reasoning"] = decision.reasoning
-                    self._session["latest_action"] = dict(decision.action)
-                    self._session["latest_request_s"] = request_duration
-                    self._session["prompt_tokens"] = _integer(
-                        self._session.get("prompt_tokens"), 0
-                    ) + (decision.prompt_tokens or 0)
-                    self._session["completion_tokens"] = _integer(
-                        self._session.get("completion_tokens"), 0
-                    ) + (decision.completion_tokens or 0)
                 self._log(
-                    "model",
-                    f"第 {step} 步决策：{json.dumps(decision.action, ensure_ascii=False)}",
+                    "task",
+                    f"开始子任务 {task_index}/{len(tasks)}：{task_name} · "
+                    f"{max_steps} 步 / {timeout_s:g} 秒",
                 )
-                if stop_event.is_set():
-                    self._finish(session_id, "stopped", "任务已由用户停止")
-                    return
+                try:
+                    self._persist_event(
+                        directory,
+                        {
+                            "event_type": "task_start",
+                            "time": task_started_at,
+                            "task_index": task_index,
+                            "task_id": task.get("id"),
+                            "task_name": task_name,
+                            "max_steps": max_steps,
+                            "timeout_s": timeout_s,
+                            "on_failure": task.get("on_failure"),
+                        },
+                    )
+                except OSError as exc:
+                    self._log("warning", f"保存子任务开始事件失败：{exc}")
+
+                for step in range(1, max_steps + 1):
+                    task_elapsed = time.time() - task_started_at
+                    if task_elapsed >= timeout_s:
+                        task_status = "timeout"
+                        task_message = f"子任务超过 {timeout_s:g} 秒超时"
+                        break
+                    if stop_event.is_set():
+                        self._finish(session_id, "stopped", "测试流程已由用户停止")
+                        return
+                    self._update(
+                        session_id,
+                        step=step,
+                        phase="capturing",
+                        task_elapsed_s=task_elapsed,
+                        message=f"子任务 {task_index}/{len(tasks)} · 正在获取第 {step} 步截图",
+                    )
+                    screenshot, width, height = self._screenshot_capture(
+                        self.adb, str(config["device"])
+                    )
+                    screenshot_name = f"task-{task_index:02d}-step-{step:03d}.png"
+                    with self._lock:
+                        if (
+                            self._session is None
+                            or self._session.get("session_id") != session_id
+                        ):
+                            return
+                        self._latest_screenshot = screenshot
+                        self._screenshot_revision += 1
+                        self._session.update(
+                            {
+                                "screenshot_width": width,
+                                "screenshot_height": height,
+                            }
+                        )
+                    try:
+                        (directory / screenshot_name).write_bytes(screenshot)
+                    except OSError as exc:
+                        self._log("warning", f"保存第 {task_index}.{step} 步截图失败：{exc}")
+                    self._update(
+                        session_id,
+                        phase="thinking",
+                        message=f"子任务 {task_index}/{len(tasks)} · 模型正在决策第 {step} 步",
+                    )
+                    request_started = time.monotonic()
+                    decision = client.decide(  # type: ignore[attr-defined]
+                        task=str(task.get("prompt") or ""),
+                        task_name=task_name,
+                        attention_prompt=str(task.get("attention_prompt") or ""),
+                        workflow_summary=_workflow_summary(task_results),
+                        task_elapsed_s=time.time() - task_started_at,
+                        task_timeout_s=timeout_s,
+                        step=step,
+                        max_steps=max_steps,
+                        screenshot_png=screenshot,
+                        width=width,
+                        height=height,
+                        history=task_history,
+                    )
+                    request_duration = time.monotonic() - request_started
+                    if not isinstance(decision, ModelDecision):
+                        raise RuntimeError("Agent client returned an invalid decision")
+                    with self._lock:
+                        if (
+                            self._session is None
+                            or self._session.get("session_id") != session_id
+                        ):
+                            return
+                        self._session["latest_reasoning"] = decision.reasoning
+                        self._session["latest_action"] = dict(decision.action)
+                        self._session["latest_request_s"] = request_duration
+                        self._session["prompt_tokens"] = _integer(
+                            self._session.get("prompt_tokens"), 0
+                        ) + (decision.prompt_tokens or 0)
+                        self._session["completion_tokens"] = _integer(
+                            self._session.get("completion_tokens"), 0
+                        ) + (decision.completion_tokens or 0)
+                    self._log(
+                        "model",
+                        f"子任务 {task_index} 第 {step} 步决策："
+                        f"{json.dumps(decision.action, ensure_ascii=False)}",
+                    )
+                    if stop_event.is_set():
+                        self._finish(session_id, "stopped", "测试流程已由用户停止")
+                        return
+                    if time.time() - task_started_at >= timeout_s:
+                        task_status = "timeout"
+                        task_message = f"模型返回时子任务已超过 {timeout_s:g} 秒超时"
+                        break
+                    self._update(
+                        session_id,
+                        phase="acting",
+                        message=f"子任务 {task_index}/{len(tasks)} · 正在执行第 {step} 步",
+                    )
+                    execution = self._action_executor(
+                        self.adb,
+                        str(config["device"]),
+                        decision.action,
+                        width,
+                        height,
+                        stop_event,
+                    )
+                    total_steps += 1
+                    event = {
+                        "event_type": "action",
+                        "time": time.time(),
+                        "task_index": task_index,
+                        "task_id": task.get("id"),
+                        "task_name": task_name,
+                        "step": step,
+                        "workflow_step": total_steps,
+                        "screenshot": screenshot_name,
+                        "reasoning": decision.reasoning,
+                        "action": decision.action,
+                        "result": execution.summary,
+                        "request_s": request_duration,
+                        "prompt_tokens": decision.prompt_tokens,
+                        "completion_tokens": decision.completion_tokens,
+                    }
+                    with self._lock:
+                        self._history.append(event)
+                        if self._session is not None:
+                            self._session["total_steps"] = total_steps
+                    task_history.append(event)
+                    try:
+                        self._persist_event(directory, event)
+                    except OSError as exc:
+                        self._log("warning", f"保存第 {task_index}.{step} 步事件失败：{exc}")
+                    self._update(session_id, latest_action_result=execution.summary)
+                    self._log("action", execution.summary)
+                    if execution.terminal_status == "completed":
+                        task_status = "completed"
+                        task_message = execution.message or execution.summary
+                        break
+                    if execution.terminal_status == "take_over":
+                        task_status = "take_over"
+                        task_message = execution.message or execution.summary
+                        break
+                    if execution.terminal_status:
+                        task_status = execution.terminal_status
+                        task_message = execution.message or execution.summary
+                        break
+                    if stop_event.is_set():
+                        self._finish(session_id, "stopped", "测试流程已由用户停止")
+                        return
+                    self._update(
+                        session_id,
+                        phase="settling",
+                        message=f"子任务 {task_index}/{len(tasks)} · 等待界面稳定",
+                    )
+                    stop_event.wait(_number(config.get("step_delay_s"), 1.2))
+
+                if task_status is None:
+                    task_status = "max_steps"
+                    task_message = f"达到子任务步骤上限 {max_steps}，未确认完成"
+                task_finished_at = time.time()
+                task_result = {
+                    "index": task_index,
+                    "id": task.get("id"),
+                    "name": task_name,
+                    "status": task_status,
+                    "message": task_message,
+                    "steps": len(task_history),
+                    "started_at": task_started_at,
+                    "finished_at": task_finished_at,
+                    "duration_s": max(0.0, task_finished_at - task_started_at),
+                    "on_failure": task.get("on_failure"),
+                }
+                task_results.append(task_result)
                 self._update(
                     session_id,
-                    phase="acting",
-                    message=f"正在通过 ADB 执行第 {step} 步",
+                    task_results=list(task_results),
+                    current_task_status=task_status,
+                    task_elapsed_s=task_result["duration_s"],
                 )
-                execution = self._action_executor(
-                    self.adb,
-                    str(config["device"]),
-                    decision.action,
-                    width,
-                    height,
-                    stop_event,
-                )
-                event = {
-                    "time": time.time(),
-                    "step": step,
-                    "screenshot": f"step-{step:03d}.png",
-                    "reasoning": decision.reasoning,
-                    "action": decision.action,
-                    "result": execution.summary,
-                    "request_s": request_duration,
-                    "prompt_tokens": decision.prompt_tokens,
-                    "completion_tokens": decision.completion_tokens,
-                }
-                with self._lock:
-                    self._history.append(event)
                 try:
-                    self._persist_event(directory, event)
+                    self._persist_event(
+                        directory,
+                        {"event_type": "task_end", "time": task_finished_at, **task_result},
+                    )
                 except OSError as exc:
-                    self._log("warning", f"保存第 {step} 步事件失败：{exc}")
-                self._update(session_id, latest_action_result=execution.summary)
-                self._log("action", execution.summary)
-                if execution.terminal_status:
+                    self._log("warning", f"保存子任务结束事件失败：{exc}")
+                self._log(
+                    "info" if task_status == "completed" else "warning",
+                    f"子任务 {task_index}/{len(tasks)} {task_status}：{task_message}",
+                )
+
+                if task_status == "completed":
+                    continue
+                if task_status == "take_over":
                     self._finish(
                         session_id,
-                        execution.terminal_status,
-                        execution.message or execution.summary,
+                        "take_over",
+                        f"子任务“{task_name}”请求人工接管：{task_message}",
                     )
                     return
-                if stop_event.is_set():
-                    self._finish(session_id, "stopped", "任务已由用户停止")
-                    return
-                self._update(
+                if str(task.get("on_failure") or "stop") == "continue":
+                    had_warnings = True
+                    continue
+                self._finish(
                     session_id,
-                    phase="settling",
-                    message="等待界面稳定后继续观察",
+                    "task_failed",
+                    f"子任务“{task_name}”未完成：{task_message}",
                 )
-                stop_event.wait(_number(config.get("step_delay_s"), 1.2))
-            self._finish(
-                session_id,
-                "max_steps",
-                f"已达到最大步骤数 {max_steps}，任务未确认完成",
+                return
+
+            final_status = "completed_with_warnings" if had_warnings else "completed"
+            final_message = (
+                f"测试流程完成，共 {len(tasks)} 个子任务；部分子任务按策略跳过"
+                if had_warnings
+                else f"测试流程完成，共 {len(tasks)} 个子任务全部通过"
             )
+            self._finish(session_id, final_status, final_message)
         except Exception as exc:
             self._finish(
                 session_id,

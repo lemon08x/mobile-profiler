@@ -19,9 +19,11 @@ from mobile_profiler.adb_agent import (
     PNG_SIGNATURE,
     chat_completions_url,
     execute_adb_action,
+    normalize_agent_tasks,
     parse_model_decision,
     png_dimensions,
 )
+from mobile_profiler.adb_agent_prompts import DEFAULT_ADB_AGENT_SYSTEM_PROMPT
 from mobile_profiler.ui import DashboardHTTPServer, DashboardManager
 
 
@@ -120,9 +122,15 @@ class AdbAgentProtocolTests(unittest.TestCase):
                 "http://192.168.31.237:8000",
                 "qwen3.6-27b",
                 request_timeout_s=12,
+                system_prompt="CUSTOM ADB SYSTEM PROMPT",
             )
             decision = client.decide(
                 task="回到桌面",
+                task_name="初始化桌面",
+                attention_prompt="遇到锁屏就接管",
+                workflow_summary="1. 打开设置 - completed: 已完成",
+                task_elapsed_s=2.5,
+                task_timeout_s=60,
                 step=1,
                 max_steps=5,
                 screenshot_png=sample_png(),
@@ -135,9 +143,50 @@ class AdbAgentProtocolTests(unittest.TestCase):
         self.assertEqual(request.full_url, "http://192.168.31.237:8000/v1/chat/completions")
         self.assertEqual(body["tool_choice"], "required")
         self.assertEqual(body["tools"][0]["function"]["name"], "phone_action")
+        self.assertEqual(body["messages"][0]["content"], "CUSTOM ADB SYSTEM PROMPT")
+        prompt_text = body["messages"][1]["content"][0]["text"]
+        self.assertIn("当前测试子任务：初始化桌面", prompt_text)
+        self.assertIn("遇到锁屏就接管", prompt_text)
+        self.assertIn("finish 只表示当前子任务完成", prompt_text)
         image_url = body["messages"][1]["content"][1]["image_url"]["url"]
         self.assertTrue(image_url.startswith("data:image/png;base64,"))
         self.assertEqual(decision.action["action"], "finish")
+
+
+class AdbAgentTaskNormalizationTests(unittest.TestCase):
+    def test_legacy_single_task_payload_is_normalized(self) -> None:
+        tasks = normalize_agent_tasks(
+            {
+                "task": "回到桌面",
+                "task_name": "准备测试",
+                "max_steps": 8,
+                "task_timeout_s": 45,
+                "on_failure": "continue",
+            }
+        )
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["name"], "准备测试")
+        self.assertEqual(tasks[0]["prompt"], "回到桌面")
+        self.assertEqual(tasks[0]["max_steps"], 8)
+        self.assertEqual(tasks[0]["timeout_s"], 45)
+        self.assertEqual(tasks[0]["on_failure"], "continue")
+
+    def test_task_list_validates_content_and_deduplicates_ids(self) -> None:
+        tasks = normalize_agent_tasks(
+            {
+                "tasks": [
+                    {"id": "same", "prompt": "任务一"},
+                    {"id": "same", "prompt": "任务二", "on_failure": "continue"},
+                ]
+            }
+        )
+        self.assertEqual([task["id"] for task in tasks], ["same", "same-2"])
+        with self.assertRaisesRegex(ValueError, "至少编排一个"):
+            normalize_agent_tasks({"tasks": []})
+        with self.assertRaisesRegex(ValueError, "缺少任务目标"):
+            normalize_agent_tasks({"tasks": [{"name": "空任务"}]})
+        with self.assertRaisesRegex(ValueError, "失败策略"):
+            normalize_agent_tasks({"tasks": [{"prompt": "test", "on_failure": "retry"}]})
 
 
 class AdbAgentActionTests(unittest.TestCase):
@@ -233,6 +282,7 @@ class AdbAgentControllerTests(unittest.TestCase):
                     "api_base_url": "http://127.0.0.1:8000",
                     "model": "test-model",
                     "api_key": "secret-token",
+                    "system_prompt": "CUSTOM CONTROLLER SYSTEM PROMPT",
                     "max_steps": 4,
                     "step_delay_s": 0.2,
                 }
@@ -250,13 +300,128 @@ class AdbAgentControllerTests(unittest.TestCase):
             self.assertTrue(state["screenshot_available"])
             self.assertEqual(len(state["history"]), 2)
             output_dir = Path(str(state["output_dir"]))
-            self.assertTrue((output_dir / "step-001.png").is_file())
-            self.assertTrue((output_dir / "step-002.png").is_file())
-            self.assertEqual(len((output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()), 2)
+            self.assertTrue((output_dir / "task-01-step-001.png").is_file())
+            self.assertTrue((output_dir / "task-01-step-002.png").is_file())
+            events = [
+                json.loads(line)
+                for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([event["event_type"] for event in events], ["task_start", "action", "action", "task_end"])
             config_text = (output_dir / "config.json").read_text(encoding="utf-8")
             self.assertNotIn("secret-token", config_text)
             self.assertIn('"api_key_configured": true', config_text)
+            self.assertIn("CUSTOM CONTROLLER SYSTEM PROMPT", config_text)
+            self.assertEqual(state["system_prompt_version"], "custom")
+            self.assertEqual(
+                state["defaults"]["system_prompt"], DEFAULT_ADB_AGENT_SYSTEM_PROMPT
+            )
             self.assertNotIn("api_key", state)
+
+    def test_two_tasks_run_sequentially_and_finish_is_task_local(self) -> None:
+        calls: list[dict] = []
+
+        class FinishEveryTaskClient:
+            def decide(self, **kwargs: object) -> ModelDecision:
+                calls.append(dict(kwargs))
+                return ModelDecision(
+                    {"action": "finish", "message": f"{kwargs['task_name']} 完成"},
+                    reasoning="当前子任务目标已满足",
+                )
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            return ActionExecution("模型确认任务完成", str(action.get("message")), "completed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: FinishEveryTaskClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "workflow_name": "two tasks",
+                    "tasks": [
+                        {"name": "任务 A", "prompt": "完成 A", "max_steps": 3},
+                        {"name": "任务 B", "prompt": "完成 B", "max_steps": 3},
+                    ],
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "step_delay_s": 0.2,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual([call["task_name"] for call in calls], ["任务 A", "任务 B"])
+            self.assertEqual([item["status"] for item in state["task_results"]], ["completed", "completed"])
+            self.assertEqual(state["task_index"], 2)
+            self.assertEqual(state["total_steps"], 2)
+            self.assertIn("任务 A - completed", calls[1]["workflow_summary"])
+            output_dir = Path(str(state["output_dir"]))
+            self.assertTrue((output_dir / "task-01-step-001.png").is_file())
+            self.assertTrue((output_dir / "task-02-step-001.png").is_file())
+
+    def test_continue_policy_completes_workflow_with_warnings(self) -> None:
+        class ContinueClient:
+            def decide(self, **kwargs: object) -> ModelDecision:
+                if kwargs["task_name"] == "允许失败":
+                    return ModelDecision({"action": "tap", "element": [500, 500]})
+                return ModelDecision({"action": "finish", "message": "第二项完成"})
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            if action["action"] == "finish":
+                return ActionExecution("模型确认任务完成", "第二项完成", "completed")
+            return ActionExecution("点击完成")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: ContinueClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "tasks": [
+                        {"name": "允许失败", "prompt": "不结束", "max_steps": 1, "on_failure": "continue"},
+                        {"name": "后续任务", "prompt": "完成", "max_steps": 1},
+                    ],
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "step_delay_s": 0.2,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+            self.assertEqual(state["status"], "completed_with_warnings")
+            self.assertEqual([item["status"] for item in state["task_results"]], ["max_steps", "completed"])
 
     def test_dashboard_manager_requires_a_ready_android_device(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

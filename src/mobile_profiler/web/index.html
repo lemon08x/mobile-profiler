@@ -121,11 +121,22 @@
             <section class="panel agent-config-panel">
               <div class="panel-heading"><div><small>TASK &amp; MODEL</small><h2>任务配置</h2></div><span class="data-source">BTR2 OpenAI-compatible API</span></div>
               <form id="adb-agent-form" class="agent-form">
-                <div class="form-field agent-task-field">
-                  <label for="agent-task-input">自然语言任务</label>
-                  <textarea id="agent-task-input" rows="7" maxlength="6000" placeholder="例如：打开系统设置，关闭自动亮度并把亮度调整到约 50%，完成后结束任务。" required></textarea>
-                  <small class="field-hint">模型每一步都会读取最新 ADB 截图；遇到验证码、账号授权、支付或不可逆操作会请求人工接管。</small>
+                <div class="form-field">
+                  <label for="agent-workflow-name-input">流程名称</label>
+                  <input id="agent-workflow-name-input" type="text" maxlength="160" placeholder="例如：续航测试前手机初始化" value="ADB 测试流程">
                 </div>
+                <section class="agent-task-editor" aria-labelledby="agent-task-editor-title">
+                  <div class="agent-task-editor-heading">
+                    <div><strong id="agent-task-editor-title">测试任务编排</strong><small id="agent-task-count-label">按顺序执行；finish 只完成当前子任务</small></div>
+                    <button class="button ghost compact" id="agent-add-task-button" type="button">＋ 空白任务</button>
+                  </div>
+                  <div class="agent-template-toolbar">
+                    <select id="agent-task-template-select" aria-label="任务模板"><option value="">选择任务模板</option></select>
+                    <button class="button secondary compact" id="agent-add-template-button" type="button">添加模板</button>
+                  </div>
+                  <div class="agent-task-list" id="agent-task-list"></div>
+                  <small class="field-hint">每个任务独立设置目标、注意事项、步骤/时间上限和失败策略；遇到验证码、账号授权、支付或不可逆操作会请求人工接管。</small>
+                </section>
                 <div class="form-row agent-model-row">
                   <div class="form-field">
                     <label for="agent-api-base-input">BTR2 模型 API</label>
@@ -141,16 +152,22 @@
                   <input id="agent-api-key-input" type="password" autocomplete="new-password" placeholder="不会保存到浏览器或运行记录">
                 </div>
                 <details class="agent-advanced-settings">
-                  <summary><span><strong>执行参数</strong><small>步骤上限、动作间隔和模型超时</small></span><em>展开</em></summary>
+                  <summary><span><strong>执行参数</strong><small>动作间隔和单次模型请求超时</small></span><em>展开</em></summary>
                   <div class="agent-advanced-grid">
-                    <div class="form-field"><label for="agent-max-steps-input">最大步骤</label><input id="agent-max-steps-input" type="number" min="1" max="200" step="1" value="30"></div>
                     <div class="form-field"><label for="agent-step-delay-input">动作后等待</label><div class="input-with-unit"><input id="agent-step-delay-input" type="number" min="0.2" max="30" step="0.1" value="1.2"><span>秒</span></div></div>
                     <div class="form-field"><label for="agent-timeout-input">单次模型超时</label><div class="input-with-unit"><input id="agent-timeout-input" type="number" min="5" max="600" step="1" value="90"><span>秒</span></div></div>
                   </div>
                 </details>
+                <details class="agent-advanced-settings agent-system-prompt-settings">
+                  <summary><span><strong>ADB Agent System Prompt</strong><small id="agent-system-prompt-version">坐标协议、动作边界与安全规则</small></span><em>展开编辑</em></summary>
+                  <div class="agent-system-prompt-editor">
+                    <textarea id="agent-system-prompt-input" rows="14" maxlength="24000" spellcheck="false" aria-label="ADB Agent System Prompt"></textarea>
+                    <div><small>该 prompt 会随运行配置保存；API Key 不会写入运行记录。</small><button class="button ghost compact" id="agent-reset-system-prompt-button" type="button">恢复默认</button></div>
+                  </div>
+                </details>
                 <div class="agent-form-actions">
-                  <button class="button primary" id="agent-start-button" type="submit">启动闭环任务</button>
-                  <button class="button danger" id="agent-stop-button" type="button" disabled>停止任务</button>
+                  <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
+                  <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
                 </div>
                 <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单动作。当前仅支持 Android ADB，中文文本输入暂不作为基础闭环能力。</p>
               </form>
@@ -165,6 +182,7 @@
                 </div>
               </div>
               <div class="agent-runtime-stats">
+                <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
                 <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
                 <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
                 <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
@@ -179,6 +197,11 @@
                 <article><small>PHONE ACTION</small><pre id="agent-action-output">--</pre><p id="agent-action-result">尚未执行动作</p></article>
               </div>
               <div class="agent-completion-message" id="agent-completion-message" hidden></div>
+            </section>
+
+            <section class="panel agent-task-progress-panel">
+              <div class="panel-heading"><div><small>WORKFLOW PROGRESS</small><h2>子任务执行结果</h2></div><span class="data-source" id="agent-task-progress-summary">尚未启动流程</span></div>
+              <div class="agent-task-results" id="agent-task-results"><div class="agent-log-empty">编排任务后启动流程</div></div>
             </section>
 
             <section class="panel agent-log-panel">
