@@ -34,6 +34,7 @@ mobile-profiler/
     |-- comparison.py
     |-- evidence.py
     |-- adb_agent.py
+    |-- adb_agent_prompts.py
     |-- ui.py
     |-- web/
     |   |-- index.html
@@ -44,10 +45,10 @@ mobile-profiler/
 
 ## External workflow boundary
 
-The profiler and BTR2 are independent processes and repositories. They expose
-two optional integration boundaries: offline timestamped logs for power-run
-alignment, and BTR2's separately deployed OpenAI-compatible model endpoint for
-the Android ADB vision agent.
+The profiler and BTR2 are independent processes and repositories. BTR2 exposes
+an optional offline timestamped-log boundary for power-run alignment. The ADB
+vision agent separately accepts any configured supported multimodal endpoint;
+the temporary default happens to be BTR2's LAN OpenAI-compatible Qwen server.
 
 ```text
 Android device  <-- ADB -->+
@@ -57,15 +58,17 @@ HarmonyOS phone <-- HDC -->+--> Mobile Profiler --> run directory
 robot/camera
              |
             BTR2 ------------------------> timestamped text log
-              `--> OpenAI-compatible VLM          |
-                       ^                           `-- optional offline import
+              `--> default LAN Qwen                |
+                       ^                            `-- optional offline import
                        |
 Android device <-- ADB screenshot/action --> Mobile Profiler ADB agent
+                       |
+                       `--> OpenAI-compatible / Anthropic / Gemini
 ```
 
-There is no shared Python module, callback, database, or lifecycle API. The
-model endpoint is a stateless OpenAI-compatible chat-completions boundary; the
-profiler owns screenshots, action validation, ADB execution, session state, and
+There is no shared Python module, callback, database, or lifecycle API. Model
+endpoints are stateless provider boundaries; the profiler owns screenshots,
+provider translation, action validation, ADB execution, session state, and
 artifacts. Power-run correlation remains an offline timestamped text file
 interpreted by a user-selected JSON regex rule file.
 
@@ -213,9 +216,11 @@ Browser <-- local JSON/HTML --> ui.py --> python -m mobile_profiler record
                                       |--> compare
                                       |--> evidence archive
                                       |--> source-only portable build script
-                                      |--> adb_agent.py --> BTR2 model API
-                                      |                       |
-                                      |<-- native phone_action-+
+                                      |--> adb_agent.py --> model adapter factory
+                                      |                       |--> OpenAI-compatible
+                                      |                       |--> Anthropic Messages
+                                      |                       `--> Gemini generateContent
+                                      |<-- unified phone_action
                                       |--> validated ADB screenshot/action loop
                                       `--> run journals and snapshot tails
 ```
@@ -252,14 +257,31 @@ The session configuration has three prompt/orchestration layers:
    elapsed time, limits, completed-task summary, and task-local action history
    to each multimodal request.
 
+The model transport is a fourth, independent layer. `model_provider` selects
+one of three standard-library adapters:
+
+- `openai_compatible` sends Chat Completions image content and the native
+  function-tool schema. A complete Azure deployment URL with its query string
+  is preserved; local vLLM/Ollama endpoints can use an empty key.
+- `anthropic` converts the screenshot to a base64 image content block, converts
+  the common JSON Schema to `input_schema`, forces `phone_action` through
+  `tool_choice`, and parses `tool_use`.
+- `gemini` converts the screenshot to `inlineData`, converts the common schema
+  to `functionDeclarations`, configures `ANY` function calling for
+  `phone_action`, and parses `functionCall`.
+
+All adapters return the same `ModelDecision`; the orchestrator and ADB executor
+contain no provider-specific branch. Provider-specific request bodies and
+response JSON never enter the action layer.
+
 For each task step the worker:
 
 1. Captures a raw PNG with `adb exec-out screencap -p` and reads its IHDR size.
-2. Sends the current task, screenshot, and compact task-local action results to an
-   OpenAI-compatible `/v1/chat/completions` endpoint using BTR2's normalized
-   0-999 coordinate convention and native `phone_action` tool schema.
-3. Parses exactly one tool call and maps normalized coordinates into the
-   current framebuffer pixel size.
+2. Sends the current task, screenshot, and compact task-local action results
+   through the selected model adapter using the provider-neutral 0-999
+   coordinate convention and common `phone_action` schema.
+3. Translates one provider-native tool/function call into `ModelDecision` and
+   maps normalized coordinates into the current framebuffer pixel size.
 4. Executes only a fixed allowlist: `input tap`, `input swipe`, validated
    keyevents, printable-ASCII `input text`, or a validated package launch with
    `monkey`. There is no generic shell action.

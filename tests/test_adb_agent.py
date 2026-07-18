@@ -14,12 +14,18 @@ from urllib.request import urlopen
 from mobile_profiler.adb_agent import (
     ActionExecution,
     AdbAgentController,
+    AnthropicVisionClient,
+    GeminiVisionClient,
     ModelDecision,
     OpenAICompatibleVisionClient,
     PNG_SIGNATURE,
+    anthropic_messages_url,
     chat_completions_url,
+    create_vision_model_client,
     execute_adb_action,
+    gemini_generate_content_url,
     normalize_agent_tasks,
+    normalize_model_provider,
     parse_model_decision,
     png_dimensions,
 )
@@ -66,8 +72,37 @@ class AdbAgentProtocolTests(unittest.TestCase):
             chat_completions_url("https://host/v1/chat/completions"),
             "https://host/v1/chat/completions",
         )
+        self.assertEqual(
+            chat_completions_url(
+                "https://azure.example/openai/deployments/vision/chat/completions?api-version=2025-01-01"
+            ),
+            "https://azure.example/openai/deployments/vision/chat/completions?api-version=2025-01-01",
+        )
+        self.assertEqual(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages",
+        )
+        self.assertEqual(
+            gemini_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-vision-model",
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-vision-model:generateContent",
+        )
         with self.assertRaises(ValueError):
             chat_completions_url("file:///tmp/model")
+        with self.assertRaisesRegex(ValueError, "独立的 API Key 字段"):
+            gemini_generate_content_url(
+                "https://generativelanguage.googleapis.com/v1beta?key=secret",
+                "gemini-vision-model",
+            )
+
+    def test_model_provider_aliases_are_normalized(self) -> None:
+        self.assertEqual(normalize_model_provider("openai"), "openai_compatible")
+        self.assertEqual(normalize_model_provider("claude"), "anthropic")
+        self.assertEqual(normalize_model_provider("google"), "gemini")
+        with self.assertRaisesRegex(ValueError, "不支持"):
+            normalize_model_provider("unknown-provider")
 
     def test_native_phone_action_tool_call_is_parsed(self) -> None:
         decision = parse_model_decision(
@@ -121,8 +156,10 @@ class AdbAgentProtocolTests(unittest.TestCase):
             client = OpenAICompatibleVisionClient(
                 "http://192.168.31.237:8000",
                 "qwen3.6-27b",
+                api_key="openai-secret",
                 request_timeout_s=12,
                 system_prompt="CUSTOM ADB SYSTEM PROMPT",
+                api_key_mode="api-key",
             )
             decision = client.decide(
                 task="回到桌面",
@@ -141,8 +178,11 @@ class AdbAgentProtocolTests(unittest.TestCase):
         request = opener.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(request.full_url, "http://192.168.31.237:8000/v1/chat/completions")
+        self.assertEqual(request.get_header("Api-key"), "openai-secret")
         self.assertEqual(body["tool_choice"], "required")
         self.assertEqual(body["tools"][0]["function"]["name"], "phone_action")
+        self.assertNotIn("chat_template_kwargs", body)
+        self.assertNotIn("frequency_penalty", body)
         self.assertEqual(body["messages"][0]["content"], "CUSTOM ADB SYSTEM PROMPT")
         prompt_text = body["messages"][1]["content"][0]["text"]
         self.assertIn("当前测试子任务：初始化桌面", prompt_text)
@@ -151,6 +191,118 @@ class AdbAgentProtocolTests(unittest.TestCase):
         image_url = body["messages"][1]["content"][1]["image_url"]["url"]
         self.assertTrue(image_url.startswith("data:image/png;base64,"))
         self.assertEqual(decision.action["action"], "finish")
+
+    def test_anthropic_adapter_translates_image_tool_and_response(self) -> None:
+        response = {
+            "content": [
+                {"type": "text", "text": "目标已经完成"},
+                {
+                    "type": "tool_use",
+                    "name": "phone_action",
+                    "input": {"action": "finish", "message": "设置页可见"},
+                },
+            ],
+            "usage": {"input_tokens": 41, "output_tokens": 7},
+        }
+        with patch(
+            "mobile_profiler.adb_agent.urlopen",
+            return_value=FakeHttpResponse(response),
+        ) as opener:
+            client = AnthropicVisionClient(
+                "https://api.anthropic.com",
+                "claude-vision-model",
+                api_key="anthropic-secret",
+            )
+            decision = client.decide(
+                task="打开设置",
+                step=1,
+                max_steps=3,
+                screenshot_png=sample_png(),
+                width=1080,
+                height=2400,
+                history=[],
+            )
+        request = opener.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(request.get_header("X-api-key"), "anthropic-secret")
+        self.assertEqual(request.get_header("Anthropic-version"), "2023-06-01")
+        self.assertEqual(body["tools"][0]["name"], "phone_action")
+        self.assertEqual(body["tool_choice"], {"type": "tool", "name": "phone_action"})
+        image = body["messages"][0]["content"][1]
+        self.assertEqual(image["source"]["media_type"], "image/png")
+        self.assertEqual(decision.action["action"], "finish")
+        self.assertEqual(decision.prompt_tokens, 41)
+
+    def test_gemini_adapter_translates_image_function_and_response(self) -> None:
+        response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "截图显示桌面", "thought": True},
+                            {
+                                "functionCall": {
+                                    "name": "phone_action",
+                                    "args": {"action": "finish", "message": "桌面可见"},
+                                }
+                            },
+                        ]
+                    }
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 33, "candidatesTokenCount": 6},
+        }
+        with patch(
+            "mobile_profiler.adb_agent.urlopen",
+            return_value=FakeHttpResponse(response),
+        ) as opener:
+            client = GeminiVisionClient(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-vision-model",
+                api_key="gemini-secret",
+            )
+            decision = client.decide(
+                task="回到桌面",
+                step=1,
+                max_steps=3,
+                screenshot_png=sample_png(),
+                width=1080,
+                height=2400,
+                history=[],
+            )
+        request = opener.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertTrue(request.full_url.endswith("/models/gemini-vision-model:generateContent"))
+        self.assertEqual(request.get_header("X-goog-api-key"), "gemini-secret")
+        declaration = body["tools"][0]["functionDeclarations"][0]
+        self.assertEqual(declaration["name"], "phone_action")
+        self.assertNotIn("additionalProperties", declaration["parameters"])
+        self.assertEqual(declaration["parameters"]["type"], "OBJECT")
+        self.assertEqual(
+            declaration["parameters"]["properties"]["action"]["type"], "STRING"
+        )
+        self.assertEqual(
+            body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            ["phone_action"],
+        )
+        self.assertEqual(decision.action["action"], "finish")
+        self.assertEqual(decision.reasoning, "截图显示桌面")
+        self.assertEqual(decision.completion_tokens, 6)
+
+    def test_client_factory_selects_native_provider_adapter(self) -> None:
+        base = {
+            "api_base_url": "https://api.anthropic.com",
+            "model": "claude-vision-model",
+            "model_provider": "anthropic",
+        }
+        self.assertIsInstance(create_vision_model_client(base), AnthropicVisionClient)
+        gemini = {
+            "api_base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "model": "gemini-vision-model",
+            "model_provider": "gemini",
+        }
+        self.assertIsInstance(create_vision_model_client(gemini), GeminiVisionClient)
 
 
 class AdbAgentTaskNormalizationTests(unittest.TestCase):
@@ -294,6 +446,11 @@ class AdbAgentControllerTests(unittest.TestCase):
                 state = controller.snapshot()
 
             self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["model_provider"], "openai_compatible")
+            self.assertEqual(
+                [item["id"] for item in state["defaults"]["model_providers"]],
+                ["openai_compatible", "anthropic", "gemini"],
+            )
             self.assertEqual(state["step"], 2)
             self.assertEqual(state["prompt_tokens"], 21)
             self.assertEqual(state["completion_tokens"], 5)

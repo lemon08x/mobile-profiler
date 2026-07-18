@@ -5579,7 +5579,7 @@ body[data-view="agent"] .platform-bar {
 
 .agent-advanced-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   padding: 0 12px 12px;
 }

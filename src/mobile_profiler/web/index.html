@@ -113,13 +113,13 @@
 
         <section class="view" data-panel="agent" hidden>
           <div class="view-header agent-view-header">
-            <div><small>ADB VISION AGENT</small><h2>AI 指挥的手机自动化</h2><p>复用 BTR2 本地大模型协议，通过 ADB 截图观察界面，并用受限的 tap、swipe、keyevent、文本输入和应用启动动作完成任务。</p></div>
+            <div><small>ADB VISION AGENT</small><h2>AI 指挥的手机自动化</h2><p>使用可切换的主流多模态模型观察 ADB 截图，并用受限的 tap、swipe、keyevent、文本输入和应用启动动作完成任务；局域网千问是默认配置而非协议绑定。</p></div>
             <span class="agent-status-badge idle" id="agent-status-badge"><i></i><span><strong>等待任务</strong><small id="agent-status-detail">选择 Android 设备后开始</small></span></span>
           </div>
 
           <div class="agent-layout">
             <section class="panel agent-config-panel">
-              <div class="panel-heading"><div><small>TASK &amp; MODEL</small><h2>任务配置</h2></div><span class="data-source">BTR2 OpenAI-compatible API</span></div>
+              <div class="panel-heading"><div><small>TASK &amp; MODEL</small><h2>任务配置</h2></div><span class="data-source">MULTIMODAL PROVIDERS</span></div>
               <form id="adb-agent-form" class="agent-form">
                 <div class="form-field">
                   <label for="agent-workflow-name-input">流程名称</label>
@@ -137,10 +137,19 @@
                   <div class="agent-task-list" id="agent-task-list"></div>
                   <small class="field-hint">每个任务独立设置目标、注意事项、步骤/时间上限和失败策略；遇到验证码、账号授权、支付或不可逆操作会请求人工接管。</small>
                 </section>
+                <div class="form-field">
+                  <label for="agent-model-provider-input">模型协议</label>
+                  <select id="agent-model-provider-input" required>
+                    <option value="openai_compatible">OpenAI-compatible</option>
+                    <option value="anthropic">Anthropic Claude</option>
+                    <option value="gemini">Google Gemini</option>
+                  </select>
+                  <small class="field-hint" id="agent-model-provider-hint">兼容 OpenAI、Azure 完整端点、vLLM、Ollama 与兼容网关；默认连接局域网千问。</small>
+                </div>
                 <div class="form-row agent-model-row">
                   <div class="form-field">
-                    <label for="agent-api-base-input">BTR2 模型 API</label>
-                    <input id="agent-api-base-input" type="url" autocomplete="off" placeholder="http://192.168.31.237:8000" required>
+                    <label for="agent-api-base-input">多模态模型 API</label>
+                    <input id="agent-api-base-input" type="url" autocomplete="off" placeholder="http://192.168.31.237:8000 或完整 API URL" required>
                   </div>
                   <div class="form-field">
                     <label for="agent-model-input">模型</label>
@@ -148,12 +157,13 @@
                   </div>
                 </div>
                 <div class="form-field">
-                  <label for="agent-api-key-input">API Key <span>本地 vLLM 可留空</span></label>
+                  <label for="agent-api-key-input">API Key <span id="agent-api-key-hint">本地模型可留空</span></label>
                   <input id="agent-api-key-input" type="password" autocomplete="new-password" placeholder="不会保存到浏览器或运行记录">
                 </div>
                 <details class="agent-advanced-settings">
-                  <summary><span><strong>执行参数</strong><small>动作间隔和单次模型请求超时</small></span><em>展开</em></summary>
+                  <summary><span><strong>执行参数</strong><small>认证头、动作间隔和单次模型请求超时</small></span><em>展开</em></summary>
                   <div class="agent-advanced-grid">
+                    <div class="form-field"><label for="agent-api-key-mode-input">认证方式</label><select id="agent-api-key-mode-input"><option value="bearer">Authorization: Bearer</option><option value="api-key">api-key</option><option value="x-api-key">x-api-key</option><option value="x-goog-api-key">x-goog-api-key</option><option value="none">不发送认证头</option></select></div>
                     <div class="form-field"><label for="agent-step-delay-input">动作后等待</label><div class="input-with-unit"><input id="agent-step-delay-input" type="number" min="0.2" max="30" step="0.1" value="1.2"><span>秒</span></div></div>
                     <div class="form-field"><label for="agent-timeout-input">单次模型超时</label><div class="input-with-unit"><input id="agent-timeout-input" type="number" min="5" max="600" step="1" value="90"><span>秒</span></div></div>
                   </div>

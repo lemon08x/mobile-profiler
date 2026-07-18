@@ -7,8 +7,10 @@ test sessions across Android, HarmonyOS, and iOS. Android uses ADB, native
 HarmonyOS uses DevEco Studio's HDC, and both run inside the standard-library
 core collector. iOS support is implemented through an optional, separately
 installed `pymobiledevice3` sidecar. The profiler has no Python import or
-runtime dependency on the BTR2 repository. Its optional ADB vision agent can
-reuse BTR2's separately deployed OpenAI-compatible model endpoint.
+runtime dependency on the BTR2 repository. Its optional ADB vision agent has a
+provider-neutral model layer for OpenAI-compatible endpoints, Anthropic Claude,
+and Google Gemini. The temporary default remains BTR2's separately deployed
+LAN Qwen endpoint.
 
 ## Why this exists
 
@@ -49,9 +51,9 @@ is easier to audit after a one-hour robotic workflow:
   two-run comparison, and source-project portable builds.
 - An Android ADB vision-agent block with a versioned/editable system prompt and
   ordered task-card orchestration. It sends each fresh device screenshot to the
-  BTR2 vLLM/OpenAI-compatible endpoint, receives one native `phone_action`,
-  executes a validated ADB action, and advances tasks under per-task step,
-  timeout, and failure policies.
+  selected multimodal endpoint, translates its native tool/function response
+  into one `phone_action`, executes a validated ADB action, and advances tasks
+  under per-task step, timeout, and failure policies.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -142,17 +144,28 @@ comparison, and source-only Windows portable packaging. These operations call
 the same existing CLI or evidence workflows, so UI and command-line artifacts
 stay identical.
 
-### ADB vision agent using the BTR2 model API
+### Provider-neutral ADB vision agent
 
 The **AI Automation** view is an independent MVP workflow for Android. Select
 an authorized ADB device, arrange one or more natural-language task cards,
-confirm the BTR2 model endpoint/model, and start the workflow. Each task has its
-own objective, attention prompt, step/time limit, and stop-or-continue failure
-policy. Reusable templates cover returning home, opening Settings, brightness
-initialization, and read-only smoke browsing. The current BTR2 defaults are
+select a multimodal protocol and endpoint/model, and start the workflow. Each
+task has its own objective, attention prompt, step/time limit, and
+stop-or-continue failure policy. Reusable templates cover returning home,
+opening Settings, brightness initialization, and read-only smoke browsing.
+
+The adapter layer currently supports:
+
+- OpenAI-compatible Chat Completions, including OpenAI, a complete Azure
+  deployment URL, local vLLM/Ollama, and compatible model gateways.
+- Anthropic Messages API with native image blocks and `tool_use`.
+- Google Gemini `generateContent` with native inline images and function calls.
+
+The temporary defaults are still the LAN Qwen deployment at
 `http://192.168.31.237:8000` and `qwen3.6-27b`; both fields remain editable and
-can also be supplied through `BTR2_LLM_ENDPOINT`, `BTR2_LLM_MODEL`, and
-`BTR2_LLM_TOKEN`.
+can be supplied through `MOBILE_PROFILER_MODEL_PROVIDER`,
+`MOBILE_PROFILER_MODEL_ENDPOINT`, `MOBILE_PROFILER_MODEL_NAME`, and
+`MOBILE_PROFILER_MODEL_API_KEY`. The original `BTR2_LLM_*` environment names
+remain backward-compatible aliases.
 
 Each step performs this closed loop:
 
@@ -161,8 +174,8 @@ adb exec-out screencap -p
         -> editable ADB system prompt
         -> current task + attention rules + workflow summary
         -> screenshot + recent action results
-        -> BTR2 OpenAI-compatible /v1/chat/completions
-        -> one native phone_action tool call (0-999 coordinates)
+        -> selected OpenAI-compatible / Anthropic / Gemini adapter
+        -> one native tool/function call translated to phone_action
         -> validated adb input / keyevent / monkey action
         -> next screenshot
 ```

@@ -138,6 +138,9 @@
     agentTemplateSignature: "",
     agentDefaultSystemPrompt: "",
     agentEditorSessionId: "",
+    agentProviderSignature: "",
+    agentProviderProfiles: new Map(),
+    agentPresentedProvider: "",
   };
 
   const platformProfiles = {
@@ -5394,6 +5397,48 @@
     ].join("");
   }
 
+  function populateAgentModelProviders(providers) {
+    const items = Array.isArray(providers) ? providers : [];
+    const signature = JSON.stringify(items);
+    if (signature === app.agentProviderSignature) return;
+    app.agentProviderSignature = signature;
+    app.agentProviderProfiles = new Map(items.map(item => [String(item.id), item]));
+    if (items.length) {
+      $("#agent-model-provider-input").innerHTML = items
+        .map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label || item.id)}</option>`)
+        .join("");
+    }
+  }
+
+  function applyAgentProviderPresentation({ replaceDefaults = false } = {}) {
+    const provider = $("#agent-model-provider-input").value;
+    const profile = app.agentProviderProfiles.get(provider) || {};
+    const previous = app.agentProviderProfiles.get(app.agentPresentedProvider) || {};
+    const apiInput = $("#agent-api-base-input");
+    const modelInput = $("#agent-model-input");
+    const keyModeInput = $("#agent-api-key-mode-input");
+    if (replaceDefaults) {
+      const endpointIsPreviousDefault = !apiInput.value.trim()
+        || apiInput.value.trim() === String(previous.default_api_base_url || "");
+      const modelIsPreviousDefault = !modelInput.value.trim()
+        || modelInput.value.trim() === String(previous.default_model || "");
+      if (endpointIsPreviousDefault && profile.default_api_base_url) {
+        apiInput.value = String(profile.default_api_base_url);
+      }
+      if (modelIsPreviousDefault) modelInput.value = String(profile.default_model || "");
+      keyModeInput.value = String(profile.default_api_key_mode || "bearer");
+    }
+    apiInput.placeholder = String(profile.api_placeholder || "填写模型 API 地址或完整端点");
+    modelInput.placeholder = String(profile.model_placeholder || "支持图像与工具调用的模型名称");
+    $("#agent-model-provider-hint").textContent = String(
+      profile.description || "选择模型供应商使用的多模态工具调用协议。"
+    );
+    $("#agent-api-key-hint").textContent = provider === "openai_compatible"
+      ? "本地模型可留空"
+      : "仅保留在当前进程内存";
+    app.agentPresentedProvider = provider;
+  }
+
   function renderAgentTaskResults(agent) {
     const tasks = Array.isArray(agent.tasks) ? agent.tasks : [];
     const results = Array.isArray(agent.task_results) ? agent.task_results : [];
@@ -5443,6 +5488,7 @@
     const sessionSource = agent.session_id ? agent : defaults;
     app.agentDefaultSystemPrompt = String(defaults.system_prompt || app.agentDefaultSystemPrompt || "");
     populateAgentTaskTemplates(defaults.task_templates);
+    populateAgentModelProviders(defaults.model_providers);
     const agentSessionChanged = Boolean(
       agent.session_id && String(agent.session_id) !== app.agentEditorSessionId
     );
@@ -5453,6 +5499,13 @@
           ? (localStorage.getItem(key) || String(fallback ?? ""))
           : String(fallback ?? "")
       );
+      const requestedProvider = storedValue(
+        "mobile-profiler-agent-model-provider",
+        sessionSource.model_provider || defaults.model_provider || "openai_compatible",
+      );
+      $("#agent-model-provider-input").value = app.agentProviderProfiles.has(requestedProvider)
+        ? requestedProvider
+        : String(defaults.model_provider || "openai_compatible");
       $("#agent-api-base-input").value = storedValue(
         "mobile-profiler-agent-api-base",
         sessionSource.api_base_url,
@@ -5469,6 +5522,11 @@
         "mobile-profiler-agent-timeout",
         sessionSource.request_timeout_s || 90,
       );
+      $("#agent-api-key-mode-input").value = storedValue(
+        "mobile-profiler-agent-api-key-mode",
+        sessionSource.api_key_mode || defaults.api_key_mode || "bearer",
+      );
+      applyAgentProviderPresentation();
       $("#agent-workflow-name-input").value = String(sessionSource.workflow_name || "ADB 测试流程");
       $("#agent-system-prompt-input").value = String(sessionSource.system_prompt || defaults.system_prompt || "");
       $("#agent-system-prompt-version").textContent = `${sessionSource.system_prompt_version || defaults.system_prompt_version || "custom"} · 坐标协议、动作边界与安全规则`;
@@ -5522,10 +5580,13 @@
     $("#agent-current-task-value").textContent = agent.current_task?.name || "尚未开始";
     $("#agent-step-value").textContent = `${agent.step || 0} / ${agent.max_steps || defaults.max_steps || 0}`;
     $("#agent-phase-value").textContent = String(agent.phase || "idle").toUpperCase();
+    const activeProvider = String(agent.model_provider || defaults.model_provider || "openai_compatible");
+    const activeProviderLabel = app.agentProviderProfiles.get(activeProvider)?.label || activeProvider;
     $("#agent-model-value").textContent = agent.model || defaults.model || "--";
+    $("#agent-model-value").title = activeProviderLabel;
     $("#agent-latency-value").textContent = finite(agent.latest_request_s)
       ? `最近 ${Number(agent.latest_request_s).toFixed(1)} 秒`
-      : "等待请求";
+      : `${activeProviderLabel} · 等待请求`;
     $("#agent-token-value").textContent = `${agent.prompt_tokens || 0} / ${agent.completion_tokens || 0}`;
     $("#agent-elapsed-value").textContent = formatDuration(agent.elapsed_s || 0);
     $("#agent-device-value").textContent = agent.device || selectedDevice() || "未选择设备";
@@ -5734,6 +5795,10 @@
       void applyBrightnessValue();
     });
 
+    $("#agent-model-provider-input").addEventListener("change", () => {
+      applyAgentProviderPresentation({ replaceDefaults: true });
+    });
+
     $("#agent-add-task-button").addEventListener("click", () => appendAgentTask());
     $("#agent-add-template-button").addEventListener("click", () => {
       const templateId = $("#agent-task-template-select").value;
@@ -5795,9 +5860,11 @@
         workflow_name: $("#agent-workflow-name-input").value.trim() || "ADB 测试流程",
         tasks,
         system_prompt: systemPrompt,
+        model_provider: $("#agent-model-provider-input").value,
         api_base_url: $("#agent-api-base-input").value.trim(),
         model: $("#agent-model-input").value.trim(),
         api_key: $("#agent-api-key-input").value,
+        api_key_mode: $("#agent-api-key-mode-input").value,
         step_delay_s: Number($("#agent-step-delay-input").value),
         request_timeout_s: Number($("#agent-timeout-input").value),
       };
@@ -5808,15 +5875,19 @@
           method: "POST",
           body: JSON.stringify(payload),
         });
+        localStorage.setItem("mobile-profiler-agent-model-provider", payload.model_provider);
         localStorage.setItem("mobile-profiler-agent-api-base", payload.api_base_url);
         localStorage.setItem("mobile-profiler-agent-model", payload.model);
+        localStorage.setItem("mobile-profiler-agent-api-key-mode", payload.api_key_mode);
         localStorage.setItem("mobile-profiler-agent-step-delay", String(payload.step_delay_s));
         localStorage.setItem("mobile-profiler-agent-timeout", String(payload.request_timeout_s));
         $("#agent-api-key-input").value = "";
         app.agentNotificationKey = "";
         app.state = { ...(app.state || {}), adb_agent: result };
         renderAdbAgent(app.state);
-        notify("ADB 测试流程已启动", `${tasks.length} 个子任务 · ${device} · ${payload.model}`, "success", 5000);
+        const providerLabel = app.agentProviderProfiles.get(payload.model_provider)?.label
+          || payload.model_provider;
+        notify("ADB 测试流程已启动", `${tasks.length} 个子任务 · ${providerLabel} · ${payload.model}`, "success", 5000);
       } catch (error) {
         notify("无法启动 ADB Agent", error.message, "error", 9000);
       } finally {

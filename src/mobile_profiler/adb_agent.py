@@ -1,8 +1,9 @@
-"""Vision-language-model agent that operates Android devices through ADB.
+"""Provider-neutral vision-language-model agent that operates Android via ADB.
 
-The model protocol mirrors BTR2's OpenAI-compatible native tool calling, while
-the execution layer is deliberately limited to a small, validated ADB action
-surface.  No model-provided shell command is ever executed.
+The orchestration and validated ADB executor are independent from the selected
+multimodal-model provider.  Native adapters translate one ``phone_action``
+contract to OpenAI-compatible, Anthropic, or Gemini request/response formats.
+No model-provided shell command is ever executed.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from .adb_agent_prompts import (
@@ -32,12 +33,41 @@ from .adb_agent_prompts import (
 )
 
 
-DEFAULT_BTR2_API_BASE_URL = os.environ.get(
-    "BTR2_LLM_ENDPOINT",
-    "http://192.168.31.237:8000",
+MODEL_PROVIDER_OPENAI_COMPATIBLE = "openai_compatible"
+MODEL_PROVIDER_ANTHROPIC = "anthropic"
+MODEL_PROVIDER_GEMINI = "gemini"
+SUPPORTED_MODEL_PROVIDERS = {
+    MODEL_PROVIDER_OPENAI_COMPATIBLE,
+    MODEL_PROVIDER_ANTHROPIC,
+    MODEL_PROVIDER_GEMINI,
+}
+DEFAULT_MODEL_PROVIDER = (
+    os.environ.get("MOBILE_PROFILER_MODEL_PROVIDER")
+    or os.environ.get("BTR2_LLM_PROVIDER")
+    or MODEL_PROVIDER_OPENAI_COMPATIBLE
+).strip().lower()
+if DEFAULT_MODEL_PROVIDER not in SUPPORTED_MODEL_PROVIDERS:
+    DEFAULT_MODEL_PROVIDER = MODEL_PROVIDER_OPENAI_COMPATIBLE
+DEFAULT_MODEL_API_BASE_URL = (
+    os.environ.get("MOBILE_PROFILER_MODEL_ENDPOINT")
+    or os.environ.get("BTR2_LLM_ENDPOINT")
+    or "http://192.168.31.237:8000"
 ).strip()
-DEFAULT_BTR2_MODEL = os.environ.get("BTR2_LLM_MODEL", "qwen3.6-27b").strip()
-DEFAULT_BTR2_API_KEY = os.environ.get("BTR2_LLM_TOKEN", "").strip()
+DEFAULT_MODEL = (
+    os.environ.get("MOBILE_PROFILER_MODEL_NAME")
+    or os.environ.get("BTR2_LLM_MODEL")
+    or "qwen3.6-27b"
+).strip()
+DEFAULT_MODEL_API_KEY = (
+    os.environ.get("MOBILE_PROFILER_MODEL_API_KEY")
+    or os.environ.get("BTR2_LLM_TOKEN")
+    or ""
+).strip()
+
+# Backward-compatible configuration exports.
+DEFAULT_BTR2_API_BASE_URL = DEFAULT_MODEL_API_BASE_URL
+DEFAULT_BTR2_MODEL = DEFAULT_MODEL
+DEFAULT_BTR2_API_KEY = DEFAULT_MODEL_API_KEY
 MAX_AGENT_LOGS = 240
 MAX_AGENT_HISTORY = 20
 MAX_AGENT_TASKS = 50
@@ -117,6 +147,72 @@ PHONE_ACTION_TOOL: Dict[str, object] = {
         },
     },
 }
+
+
+MODEL_PROVIDER_DEFINITIONS: List[Dict[str, str]] = [
+    {
+        "id": MODEL_PROVIDER_OPENAI_COMPATIBLE,
+        "label": "OpenAI-compatible",
+        "description": "OpenAI、Azure 完整端点、vLLM、Ollama 与兼容网关；当前默认局域网千问",
+        "default_api_base_url": (
+            DEFAULT_MODEL_API_BASE_URL
+            if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_OPENAI_COMPATIBLE
+            else "https://api.openai.com"
+        ),
+        "default_model": (
+            DEFAULT_MODEL
+            if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_OPENAI_COMPATIBLE
+            else ""
+        ),
+        "api_placeholder": "http://192.168.31.237:8000 或完整 chat/completions URL",
+        "model_placeholder": "支持图像和工具调用的模型名称",
+        "default_api_key_mode": "bearer",
+    },
+    {
+        "id": MODEL_PROVIDER_ANTHROPIC,
+        "label": "Anthropic Claude",
+        "description": "Anthropic Messages API 原生图像与 tool_use",
+        "default_api_base_url": (
+            DEFAULT_MODEL_API_BASE_URL
+            if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_ANTHROPIC
+            else "https://api.anthropic.com"
+        ),
+        "default_model": (
+            DEFAULT_MODEL if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_ANTHROPIC else ""
+        ),
+        "api_placeholder": "https://api.anthropic.com",
+        "model_placeholder": "支持视觉与工具调用的 Claude 模型",
+        "default_api_key_mode": "x-api-key",
+    },
+    {
+        "id": MODEL_PROVIDER_GEMINI,
+        "label": "Google Gemini",
+        "description": "Google Generative Language generateContent 原生函数调用",
+        "default_api_base_url": (
+            DEFAULT_MODEL_API_BASE_URL
+            if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_GEMINI
+            else "https://generativelanguage.googleapis.com/v1beta"
+        ),
+        "default_model": (
+            DEFAULT_MODEL if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_GEMINI else ""
+        ),
+        "api_placeholder": "https://generativelanguage.googleapis.com/v1beta",
+        "model_placeholder": "支持视觉与函数调用的 Gemini 模型",
+        "default_api_key_mode": "x-goog-api-key",
+    },
+]
+
+
+def model_provider_definitions_snapshot() -> List[Dict[str, str]]:
+    return [dict(item) for item in MODEL_PROVIDER_DEFINITIONS]
+
+
+def model_provider_definition(provider: str) -> Dict[str, str]:
+    normalized = normalize_model_provider(provider)
+    for item in MODEL_PROVIDER_DEFINITIONS:
+        if item["id"] == normalized:
+            return item
+    raise ValueError(f"不支持的多模态模型协议：{provider}")
 
 
 @dataclass
@@ -247,18 +343,85 @@ def _workflow_summary(results: Sequence[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def chat_completions_url(api_base_url: str) -> str:
-    """Return the chat-completions URL for a BTR2/OpenAI-compatible base URL."""
+def normalize_model_provider(value: object) -> str:
+    provider = str(value or DEFAULT_MODEL_PROVIDER).strip().lower().replace("-", "_")
+    aliases = {
+        "openai": MODEL_PROVIDER_OPENAI_COMPATIBLE,
+        "openai_compatible": MODEL_PROVIDER_OPENAI_COMPATIBLE,
+        "vllm": MODEL_PROVIDER_OPENAI_COMPATIBLE,
+        "claude": MODEL_PROVIDER_ANTHROPIC,
+        "anthropic": MODEL_PROVIDER_ANTHROPIC,
+        "google": MODEL_PROVIDER_GEMINI,
+        "gemini": MODEL_PROVIDER_GEMINI,
+    }
+    normalized = aliases.get(provider, provider)
+    if normalized not in SUPPORTED_MODEL_PROVIDERS:
+        raise ValueError(f"不支持的多模态模型协议：{value}")
+    return normalized
 
+
+def _parsed_http_endpoint(api_base_url: str):
     value = str(api_base_url or "").strip().rstrip("/")
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("API 地址必须是有效的 http:// 或 https:// URL")
-    if value.endswith("/chat/completions"):
-        return value
-    if value.endswith("/v1"):
-        return value + "/chat/completions"
-    return value + "/v1/chat/completions"
+    sensitive_query_keys = {"key", "api_key", "apikey", "token", "access_token"}
+    if any(
+        name.strip().lower() in sensitive_query_keys
+        for name, _value in parse_qsl(parsed.query, keep_blank_values=True)
+    ):
+        raise ValueError("不要把 API Key 或 Token 写入 URL；请使用独立的 API Key 字段")
+    return parsed._replace(path=parsed.path.rstrip("/"), fragment="")
+
+
+def chat_completions_url(api_base_url: str) -> str:
+    """Return an OpenAI-compatible chat-completions URL, preserving queries."""
+
+    parsed = _parsed_http_endpoint(api_base_url)
+    path = parsed.path
+    if not path.endswith("/chat/completions"):
+        path = (
+            path + "/chat/completions"
+            if path.endswith("/v1")
+            else path + "/v1/chat/completions"
+        )
+    return urlunparse(parsed._replace(path=path))
+
+
+def anthropic_messages_url(api_base_url: str) -> str:
+    parsed = _parsed_http_endpoint(api_base_url)
+    path = parsed.path
+    if not path.endswith("/messages"):
+        path = path + "/messages" if path.endswith("/v1") else path + "/v1/messages"
+    return urlunparse(parsed._replace(path=path))
+
+
+def gemini_generate_content_url(api_base_url: str, model: str) -> str:
+    parsed = _parsed_http_endpoint(api_base_url)
+    path = parsed.path
+    if not path.endswith(":generateContent"):
+        model_name = str(model or "").strip()
+        if model_name.startswith("models/"):
+            model_name = model_name[len("models/") :]
+        if not model_name:
+            raise ValueError("模型名称不能为空")
+        encoded_model = quote(model_name, safe="._-/")
+        if path.endswith("/models"):
+            path = f"{path}/{encoded_model}:generateContent"
+        elif re.search(r"/v\d+(?:beta\d*)?$", path):
+            path = f"{path}/models/{encoded_model}:generateContent"
+        else:
+            path = f"{path}/v1beta/models/{encoded_model}:generateContent"
+    return urlunparse(parsed._replace(path=path))
+
+
+def model_endpoint_url(provider: str, api_base_url: str, model: str) -> str:
+    normalized = normalize_model_provider(provider)
+    if normalized == MODEL_PROVIDER_ANTHROPIC:
+        return anthropic_messages_url(api_base_url)
+    if normalized == MODEL_PROVIDER_GEMINI:
+        return gemini_generate_content_url(api_base_url, model)
+    return chat_completions_url(api_base_url)
 
 
 def png_dimensions(payload: bytes) -> tuple[int, int]:
@@ -289,8 +452,20 @@ def _json_object_from_text(content: str) -> Optional[Dict[str, object]]:
     return None
 
 
-def parse_model_decision(payload: Dict[str, object]) -> ModelDecision:
-    """Parse one native ``phone_action`` tool call from a chat response."""
+def _content_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    texts: List[str] = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            texts.append(str(item["text"]))
+    return "\n".join(texts)
+
+
+def parse_openai_model_decision(payload: Dict[str, object]) -> ModelDecision:
+    """Parse one native ``phone_action`` call from Chat Completions JSON."""
 
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -302,7 +477,7 @@ def parse_model_decision(payload: Dict[str, object]) -> ModelDecision:
         message.get("reasoning_content") or message.get("reasoning") or "",
         3000,
     )
-    content = str(message.get("content") or "")
+    content = _content_text(message.get("content"))
     action: Optional[Dict[str, object]] = None
     tool_calls = message.get("tool_calls")
     if isinstance(tool_calls, list):
@@ -351,8 +526,222 @@ def parse_model_decision(payload: Dict[str, object]) -> ModelDecision:
     )
 
 
-class OpenAICompatibleVisionClient:
-    """Small stdlib-only client for BTR2's local vLLM endpoint."""
+def parse_model_decision(payload: Dict[str, object]) -> ModelDecision:
+    """Backward-compatible alias for the OpenAI-compatible response parser."""
+
+    return parse_openai_model_decision(payload)
+
+
+def parse_anthropic_model_decision(payload: Dict[str, object]) -> ModelDecision:
+    content_blocks = payload.get("content")
+    if not isinstance(content_blocks, list):
+        raise RuntimeError("Anthropic 响应缺少 content")
+    action: Optional[Dict[str, object]] = None
+    text_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "tool_use" and block.get("name") == "phone_action":
+            tool_input = block.get("input")
+            if isinstance(tool_input, dict) and action is None:
+                action = dict(tool_input)
+        elif block_type in {"thinking", "redacted_thinking"}:
+            thinking = block.get("thinking") or block.get("text")
+            if isinstance(thinking, str):
+                reasoning_parts.append(thinking)
+        elif block_type == "text" and isinstance(block.get("text"), str):
+            text_parts.append(str(block["text"]))
+    content = "\n".join(text_parts)
+    if action is None:
+        fallback = _json_object_from_text(content)
+        if fallback is not None and "action" in fallback:
+            action = fallback
+    if action is None or not str(action.get("action") or "").strip():
+        raise RuntimeError("Anthropic 模型没有返回 phone_action 工具调用")
+    usage = payload.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    return ModelDecision(
+        action=action,
+        reasoning=_short_text("\n".join(reasoning_parts) or content, 3000),
+        content=_short_text(content, 3000),
+        prompt_tokens=(
+            _integer(usage.get("input_tokens"), 0)
+            if usage.get("input_tokens") is not None
+            else None
+        ),
+        completion_tokens=(
+            _integer(usage.get("output_tokens"), 0)
+            if usage.get("output_tokens") is not None
+            else None
+        ),
+    )
+
+
+def parse_gemini_model_decision(payload: Dict[str, object]) -> ModelDecision:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise RuntimeError("Gemini 响应缺少 candidates[0]")
+    content = candidates[0].get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+        raise RuntimeError("Gemini 响应缺少 content.parts")
+    action: Optional[Dict[str, object]] = None
+    text_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    for part in content["parts"]:  # type: ignore[index]
+        if not isinstance(part, dict):
+            continue
+        function_call = part.get("functionCall") or part.get("function_call")
+        if isinstance(function_call, dict) and function_call.get("name") == "phone_action":
+            arguments = function_call.get("args") or function_call.get("arguments")
+            if isinstance(arguments, dict) and action is None:
+                action = dict(arguments)
+        text = part.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+            if part.get("thought") is True:
+                reasoning_parts.append(text)
+    content_text = "\n".join(text_parts)
+    if action is None:
+        fallback = _json_object_from_text(content_text)
+        if fallback is not None and "action" in fallback:
+            action = fallback
+    if action is None or not str(action.get("action") or "").strip():
+        raise RuntimeError("Gemini 模型没有返回 phone_action 函数调用")
+    usage = payload.get("usageMetadata") or payload.get("usage_metadata")
+    usage = usage if isinstance(usage, dict) else {}
+    prompt_tokens = usage.get("promptTokenCount")
+    if prompt_tokens is None:
+        prompt_tokens = usage.get("prompt_token_count")
+    completion_tokens = usage.get("candidatesTokenCount")
+    if completion_tokens is None:
+        completion_tokens = usage.get("candidates_token_count")
+    return ModelDecision(
+        action=action,
+        reasoning=_short_text("\n".join(reasoning_parts) or content_text, 3000),
+        content=_short_text(content_text, 3000),
+        prompt_tokens=(
+            _integer(prompt_tokens, 0) if prompt_tokens is not None else None
+        ),
+        completion_tokens=(
+            _integer(completion_tokens, 0) if completion_tokens is not None else None
+        ),
+    )
+
+
+def _phone_action_function() -> Dict[str, object]:
+    function = PHONE_ACTION_TOOL.get("function")
+    if not isinstance(function, dict):
+        raise RuntimeError("phone_action schema is invalid")
+    return function
+
+
+def _history_text(history: Sequence[Dict[str, object]]) -> str:
+    if not history:
+        return "尚无历史动作。"
+    lines: List[str] = []
+    for item in history[-12:]:
+        action_text = json.dumps(
+            item.get("action"), ensure_ascii=False, separators=(",", ":")
+        )
+        result = _short_text(item.get("result"), 180)
+        lines.append(f"步骤 {item.get('step')}: {action_text} -> {result}")
+    return "\n".join(lines)
+
+
+def build_agent_user_text(
+    *,
+    task: str,
+    step: int,
+    max_steps: int,
+    width: int,
+    height: int,
+    history: Sequence[Dict[str, object]],
+    task_name: str = "",
+    attention_prompt: str = "",
+    workflow_summary: str = "",
+    task_elapsed_s: float = 0.0,
+    task_timeout_s: float = 0.0,
+) -> str:
+    attention_block = (
+        f"\n\n当前子任务注意事项：\n{attention_prompt}"
+        if str(attention_prompt or "").strip()
+        else ""
+    )
+    timeout_block = (
+        f"{task_elapsed_s:.1f}/{task_timeout_s:.1f} 秒"
+        if task_timeout_s > 0
+        else f"{task_elapsed_s:.1f} 秒"
+    )
+    return (
+        f"当前测试子任务：{task_name or '未命名任务'}\n"
+        f"任务目标：\n{task}{attention_block}\n\n"
+        f"当前子任务步骤：{step}/{max_steps}\n"
+        f"当前子任务用时：{timeout_block}\n"
+        f"ADB 截图尺寸：{width}x{height}；工具坐标仍使用 0-999。\n\n"
+        f"已完成子任务摘要：\n{workflow_summary or '尚无已完成的子任务。'}\n\n"
+        f"最近动作与结果：\n{_history_text(history)}\n\n"
+        "只处理当前子任务。观察最新截图，调用一次 phone_action；"
+        "finish 只表示当前子任务完成。"
+    )
+
+
+def _api_key_headers(provider: str, api_key: str, api_key_mode: str) -> Dict[str, str]:
+    key = str(api_key or "").strip()
+    if not key or key == "EMPTY":
+        return {}
+    mode = str(api_key_mode or "auto").strip().lower().replace("_", "-")
+    if mode == "auto":
+        mode = {
+            MODEL_PROVIDER_ANTHROPIC: "x-api-key",
+            MODEL_PROVIDER_GEMINI: "x-goog-api-key",
+        }.get(provider, "bearer")
+    if mode == "bearer":
+        return {"Authorization": f"Bearer {key}"}
+    if mode in {"api-key", "x-api-key", "x-goog-api-key"}:
+        return {mode: key}
+    if mode == "none":
+        return {}
+    raise ValueError(f"不支持的 API Key 认证方式：{api_key_mode}")
+
+
+def _request_json(
+    url: str,
+    payload: Dict[str, object],
+    headers: Dict[str, str],
+    timeout_s: float,
+) -> Dict[str, object]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        **headers,
+    }
+    request = Request(url, data=body, headers=request_headers, method="POST")
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            response_body = response.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:4000]
+        raise RuntimeError(f"模型 API 返回 HTTP {exc.code}: {detail or exc.reason}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"无法连接模型 API: {exc}") from exc
+    try:
+        decoded = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("模型 API 返回了无效 JSON") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("模型 API 响应必须是 JSON 对象")
+    if isinstance(decoded.get("error"), dict):
+        raise RuntimeError(
+            f"模型 API 错误: {_short_text(decoded['error'].get('message'), 2000)}"
+        )
+    return decoded
+
+
+class VisionModelClient:
+    provider = "base"
 
     def __init__(
         self,
@@ -361,26 +750,43 @@ class OpenAICompatibleVisionClient:
         api_key: str = "",
         request_timeout_s: float = 90.0,
         system_prompt: str = DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+        api_key_mode: str = "auto",
     ) -> None:
-        self.url = chat_completions_url(api_base_url)
         self.model = str(model or "").strip()
         if not self.model:
             raise ValueError("模型名称不能为空")
+        self.url = model_endpoint_url(self.provider, api_base_url, self.model)
         self.api_key = str(api_key or "").strip()
+        self.api_key_mode = str(api_key_mode or "auto").strip()
         self.request_timeout_s = request_timeout_s
         self.system_prompt = str(system_prompt or DEFAULT_ADB_AGENT_SYSTEM_PROMPT).strip()
 
-    @staticmethod
-    def _history_text(history: Sequence[Dict[str, object]]) -> str:
-        if not history:
-            return "尚无历史动作。"
-        lines: List[str] = []
-        for item in history[-12:]:
-            action = item.get("action")
-            action_text = json.dumps(action, ensure_ascii=False, separators=(",", ":"))
-            result = _short_text(item.get("result"), 180)
-            lines.append(f"步骤 {item.get('step')}: {action_text} -> {result}")
-        return "\n".join(lines)
+    def decide(self, **kwargs: object) -> ModelDecision:
+        raise NotImplementedError
+
+
+class OpenAICompatibleVisionClient(VisionModelClient):
+    """OpenAI Chat Completions compatible multimodal/tool adapter."""
+
+    provider = MODEL_PROVIDER_OPENAI_COMPATIBLE
+
+    def __init__(
+        self,
+        api_base_url: str,
+        model: str,
+        api_key: str = "",
+        request_timeout_s: float = 90.0,
+        system_prompt: str = DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+        api_key_mode: str = "auto",
+    ) -> None:
+        super().__init__(
+            api_base_url,
+            model,
+            api_key,
+            request_timeout_s,
+            system_prompt,
+            api_key_mode,
+        )
 
     def decide(
         self,
@@ -399,25 +805,18 @@ class OpenAICompatibleVisionClient:
         task_timeout_s: float = 0.0,
     ) -> ModelDecision:
         encoded = base64.b64encode(screenshot_png).decode("ascii")
-        attention_block = (
-            f"\n\n当前子任务注意事项：\n{attention_prompt}"
-            if str(attention_prompt or "").strip()
-            else ""
-        )
-        timeout_block = (
-            f"{task_elapsed_s:.1f}/{task_timeout_s:.1f} 秒"
-            if task_timeout_s > 0
-            else f"{task_elapsed_s:.1f} 秒"
-        )
-        user_text = (
-            f"当前测试子任务：{task_name or '未命名任务'}\n"
-            f"任务目标：\n{task}{attention_block}\n\n"
-            f"当前子任务步骤：{step}/{max_steps}\n"
-            f"当前子任务用时：{timeout_block}\n"
-            f"ADB 截图尺寸：{width}x{height}；工具坐标仍使用 0-999。\n\n"
-            f"已完成子任务摘要：\n{workflow_summary or '尚无已完成的子任务。'}\n\n"
-            f"最近动作与结果：\n{self._history_text(history)}\n\n"
-            "只处理当前子任务。观察最新截图，调用一次 phone_action；finish 只表示当前子任务完成。"
+        user_text = build_agent_user_text(
+            task=task,
+            step=step,
+            max_steps=max_steps,
+            width=width,
+            height=height,
+            history=history,
+            task_name=task_name,
+            attention_prompt=attention_prompt,
+            workflow_summary=workflow_summary,
+            task_elapsed_s=task_elapsed_s,
+            task_timeout_s=task_timeout_s,
         )
         request_payload: Dict[str, object] = {
             "model": self.model,
@@ -436,37 +835,198 @@ class OpenAICompatibleVisionClient:
             ],
             "tools": [PHONE_ACTION_TOOL],
             "tool_choice": "required",
+            "stream": False,
+        }
+        decoded = _request_json(
+            self.url,
+            request_payload,
+            _api_key_headers(self.provider, self.api_key, self.api_key_mode),
+            self.request_timeout_s,
+        )
+        return parse_openai_model_decision(decoded)
+
+
+class AnthropicVisionClient(VisionModelClient):
+    provider = MODEL_PROVIDER_ANTHROPIC
+
+    def decide(
+        self,
+        *,
+        task: str,
+        step: int,
+        max_steps: int,
+        screenshot_png: bytes,
+        width: int,
+        height: int,
+        history: Sequence[Dict[str, object]],
+        task_name: str = "",
+        attention_prompt: str = "",
+        workflow_summary: str = "",
+        task_elapsed_s: float = 0.0,
+        task_timeout_s: float = 0.0,
+    ) -> ModelDecision:
+        encoded = base64.b64encode(screenshot_png).decode("ascii")
+        user_text = build_agent_user_text(
+            task=task,
+            step=step,
+            max_steps=max_steps,
+            width=width,
+            height=height,
+            history=history,
+            task_name=task_name,
+            attention_prompt=attention_prompt,
+            workflow_summary=workflow_summary,
+            task_elapsed_s=task_elapsed_s,
+            task_timeout_s=task_timeout_s,
+        )
+        function = _phone_action_function()
+        request_payload: Dict[str, object] = {
+            "model": self.model,
             "max_tokens": 1000,
             "temperature": 0.1,
-            "top_p": 0.8,
-            "frequency_penalty": 0.2,
-            "stream": False,
-            "chat_template_kwargs": {"reasoning_budget": 96},
+            "system": self.system_prompt,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": encoded,
+                            },
+                        },
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "name": function["name"],
+                    "description": function.get("description"),
+                    "input_schema": function["parameters"],
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "phone_action"},
         }
-        body = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.api_key and self.api_key != "EMPTY":
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = Request(self.url, data=body, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=self.request_timeout_s) as response:
-                response_body = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:4000]
-            raise RuntimeError(f"模型 API 返回 HTTP {exc.code}: {detail or exc.reason}") from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"无法连接模型 API: {exc}") from exc
-        try:
-            decoded = json.loads(response_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("模型 API 返回了无效 JSON") from exc
-        if not isinstance(decoded, dict):
-            raise RuntimeError("模型 API 响应必须是 JSON 对象")
-        if isinstance(decoded.get("error"), dict):
-            raise RuntimeError(
-                f"模型 API 错误: {_short_text(decoded['error'].get('message'), 2000)}"
-            )
-        return parse_model_decision(decoded)
+        headers = _api_key_headers(self.provider, self.api_key, self.api_key_mode)
+        headers["anthropic-version"] = "2023-06-01"
+        decoded = _request_json(
+            self.url, request_payload, headers, self.request_timeout_s
+        )
+        return parse_anthropic_model_decision(decoded)
+
+
+def _gemini_schema(value: object) -> object:
+    if isinstance(value, dict):
+        converted: Dict[str, object] = {}
+        for key, item in value.items():
+            if key == "additionalProperties":
+                continue
+            if key == "type" and isinstance(item, str):
+                converted[key] = item.upper()
+            else:
+                converted[key] = _gemini_schema(item)
+        return converted
+    if isinstance(value, list):
+        return [_gemini_schema(item) for item in value]
+    return value
+
+
+class GeminiVisionClient(VisionModelClient):
+    provider = MODEL_PROVIDER_GEMINI
+
+    def decide(
+        self,
+        *,
+        task: str,
+        step: int,
+        max_steps: int,
+        screenshot_png: bytes,
+        width: int,
+        height: int,
+        history: Sequence[Dict[str, object]],
+        task_name: str = "",
+        attention_prompt: str = "",
+        workflow_summary: str = "",
+        task_elapsed_s: float = 0.0,
+        task_timeout_s: float = 0.0,
+    ) -> ModelDecision:
+        encoded = base64.b64encode(screenshot_png).decode("ascii")
+        user_text = build_agent_user_text(
+            task=task,
+            step=step,
+            max_steps=max_steps,
+            width=width,
+            height=height,
+            history=history,
+            task_name=task_name,
+            attention_prompt=attention_prompt,
+            workflow_summary=workflow_summary,
+            task_elapsed_s=task_elapsed_s,
+            task_timeout_s=task_timeout_s,
+        )
+        function = _phone_action_function()
+        request_payload: Dict[str, object] = {
+            "systemInstruction": {"parts": [{"text": self.system_prompt}]},
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": user_text},
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": encoded,
+                            }
+                        },
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": function["name"],
+                            "description": function.get("description"),
+                            "parameters": _gemini_schema(function["parameters"]),
+                        }
+                    ]
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["phone_action"],
+                }
+            },
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1000},
+        }
+        decoded = _request_json(
+            self.url,
+            request_payload,
+            _api_key_headers(self.provider, self.api_key, self.api_key_mode),
+            self.request_timeout_s,
+        )
+        return parse_gemini_model_decision(decoded)
+
+
+def create_vision_model_client(config: Dict[str, object]) -> VisionModelClient:
+    provider = normalize_model_provider(config.get("model_provider"))
+    client_type = {
+        MODEL_PROVIDER_OPENAI_COMPATIBLE: OpenAICompatibleVisionClient,
+        MODEL_PROVIDER_ANTHROPIC: AnthropicVisionClient,
+        MODEL_PROVIDER_GEMINI: GeminiVisionClient,
+    }[provider]
+    return client_type(
+        str(config["api_base_url"]),
+        str(config["model"]),
+        str(config.get("api_key") or ""),
+        _number(config.get("request_timeout_s"), 90.0),
+        str(config.get("system_prompt") or DEFAULT_ADB_AGENT_SYSTEM_PROMPT),
+        str(config.get("api_key_mode") or "auto"),
+    )
 
 
 def _creation_flags() -> int:
@@ -673,14 +1233,8 @@ class AdbAgentController:
         self._screenshot_revision = 0
 
     @staticmethod
-    def _default_client_factory(config: Dict[str, object]) -> OpenAICompatibleVisionClient:
-        return OpenAICompatibleVisionClient(
-            str(config["api_base_url"]),
-            str(config["model"]),
-            str(config.get("api_key") or ""),
-            _number(config.get("request_timeout_s"), 90.0),
-            str(config.get("system_prompt") or DEFAULT_ADB_AGENT_SYSTEM_PROMPT),
-        )
+    def _default_client_factory(config: Dict[str, object]) -> VisionModelClient:
+        return create_vision_model_client(config)
 
     def _log_locked(self, level: str, message: str) -> None:
         self._logs.append(
@@ -763,13 +1317,29 @@ class AdbAgentController:
             if system_prompt == DEFAULT_ADB_AGENT_SYSTEM_PROMPT
             else "custom"
         )
+        model_provider = normalize_model_provider(payload.get("model_provider"))
+        provider_definition = model_provider_definition(model_provider)
+        provider_is_default = model_provider == DEFAULT_MODEL_PROVIDER
         api_base_url = str(
-            payload.get("api_base_url") or DEFAULT_BTR2_API_BASE_URL
+            payload.get("api_base_url")
+            or (
+                DEFAULT_MODEL_API_BASE_URL
+                if provider_is_default
+                else provider_definition["default_api_base_url"]
+            )
         ).strip()
-        chat_completions_url(api_base_url)
-        model = str(payload.get("model") or DEFAULT_BTR2_MODEL).strip()
+        model = str(
+            payload.get("model") or (DEFAULT_MODEL if provider_is_default else "")
+        ).strip()
         if not model or len(model) > 300:
             raise ValueError("请输入有效的模型名称")
+        model_endpoint_url(model_provider, api_base_url, model)
+        api_key_mode = str(
+            payload.get("api_key_mode")
+            or provider_definition["default_api_key_mode"]
+            or "auto"
+        ).strip()
+        _api_key_headers(model_provider, "validation-key", api_key_mode)
         config: Dict[str, object] = {
             "device": device,
             "workflow_name": workflow_name,
@@ -777,9 +1347,14 @@ class AdbAgentController:
             "task": tasks[0]["prompt"],
             "system_prompt": system_prompt,
             "system_prompt_version": system_prompt_version,
+            "model_provider": model_provider,
             "api_base_url": api_base_url,
             "model": model,
-            "api_key": str(payload.get("api_key") or DEFAULT_BTR2_API_KEY).strip(),
+            "api_key": str(
+                payload.get("api_key")
+                or (DEFAULT_MODEL_API_KEY if provider_is_default else "")
+            ).strip(),
+            "api_key_mode": api_key_mode,
             "step_delay_s": _bounded_float(payload.get("step_delay_s"), 0.2, 30.0, 1.2),
             "request_timeout_s": _bounded_float(
                 payload.get("request_timeout_s"), 5.0, 600.0, 90.0
@@ -817,8 +1392,10 @@ class AdbAgentController:
                 "total_steps": 0,
                 "system_prompt": system_prompt,
                 "system_prompt_version": system_prompt_version,
+                "model_provider": model_provider,
                 "api_base_url": api_base_url,
                 "model": model,
+                "api_key_mode": api_key_mode,
                 "api_key_configured": bool(config.get("api_key")),
                 "max_steps": tasks[0]["max_steps"],
                 "step_delay_s": config["step_delay_s"],
@@ -873,13 +1450,18 @@ class AdbAgentController:
     def snapshot(self) -> Dict[str, object]:
         with self._lock:
             defaults = {
-                "api_base_url": DEFAULT_BTR2_API_BASE_URL,
-                "model": DEFAULT_BTR2_MODEL,
+                "model_provider": DEFAULT_MODEL_PROVIDER,
+                "model_providers": model_provider_definitions_snapshot(),
+                "api_base_url": DEFAULT_MODEL_API_BASE_URL,
+                "model": DEFAULT_MODEL,
+                "api_key_mode": model_provider_definition(DEFAULT_MODEL_PROVIDER)[
+                    "default_api_key_mode"
+                ],
                 "max_steps": 30,
                 "task_timeout_s": 300,
                 "step_delay_s": 1.2,
                 "request_timeout_s": 90,
-                "api_key_configured": bool(DEFAULT_BTR2_API_KEY),
+                "api_key_configured": bool(DEFAULT_MODEL_API_KEY),
                 "system_prompt": DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
                 "system_prompt_version": ADB_AGENT_SYSTEM_PROMPT_VERSION,
                 "task_templates": task_templates_snapshot(),
@@ -933,7 +1515,11 @@ class AdbAgentController:
     ) -> None:
         try:
             client = self._client_factory(config)
-            self._log("info", f"已连接 BTR2 模型协议：{config['model']}")
+            provider = model_provider_definition(str(config["model_provider"]))
+            self._log(
+                "info",
+                f"已连接多模态模型：{provider['label']} · {config['model']}",
+            )
             tasks = config.get("tasks")
             if not isinstance(tasks, list) or not tasks:
                 raise RuntimeError("Agent workflow has no tasks")
