@@ -16,6 +16,7 @@ mobile-profiler/
 |-- tools/
 |   `-- build-portable.ps1
 |-- tests/
+|   |-- test_adb_agent.py
 |   |-- test_profiler.py
 |   `-- test_ui.py
 `-- src/mobile_profiler/
@@ -32,6 +33,8 @@ mobile-profiler/
     |-- report.py
     |-- comparison.py
     |-- evidence.py
+    |-- adb_agent.py
+    |-- adb_agent_prompts.py
     |-- ui.py
     |-- web/
     |   |-- index.html
@@ -42,7 +45,10 @@ mobile-profiler/
 
 ## External workflow boundary
 
-The profiler and BTR2 are independent processes and repositories.
+The profiler and BTR2 are independent processes and repositories. BTR2 exposes
+an optional offline timestamped-log boundary for power-run alignment. The ADB
+vision agent separately accepts any configured supported multimodal endpoint;
+the temporary default happens to be BTR2's LAN OpenAI-compatible Qwen server.
 
 ```text
 Android device  <-- ADB -->+
@@ -52,13 +58,19 @@ HarmonyOS phone <-- HDC -->+--> Mobile Profiler --> run directory
 robot/camera
              |
             BTR2 ------------------------> timestamped text log
-                                                |
-                                                `-- optional offline import
+              `--> default LAN Qwen                |
+                       ^                            `-- optional offline import
+                       |
+Android device <-- ADB screenshot/action --> Mobile Profiler ADB agent
+                       |
+                       `--> OpenAI-compatible / Anthropic / Gemini
 ```
 
-There is no shared Python module, callback, socket, database, or lifecycle API.
-The only optional correlation surface is a timestamped text file interpreted by
-a user-selected JSON regex rule file.
+There is no shared Python module, callback, database, or lifecycle API. Model
+endpoints are stateless provider boundaries; the profiler owns screenshots,
+provider translation, action validation, ADB execution, session state, and
+artifacts. Power-run correlation remains an offline timestamped text file
+interpreted by a user-selected JSON regex rule file.
 
 ## Platform sidecar boundary
 
@@ -204,6 +216,12 @@ Browser <-- local JSON/HTML --> ui.py --> python -m mobile_profiler record
                                       |--> compare
                                       |--> evidence archive
                                       |--> source-only portable build script
+                                      |--> adb_agent.py --> model adapter factory
+                                      |                       |--> OpenAI-compatible
+                                      |                       |--> Anthropic Messages
+                                      |                       `--> Gemini generateContent
+                                      |<-- unified phone_action
+                                      |--> validated ADB screenshot/action loop
                                       `--> run journals and snapshot tails
 ```
 
@@ -218,6 +236,72 @@ BTR2 import, and comparison; evidence archives reuse `evidence.py` directly.
 Maintenance work is serialized, and an active run directory cannot be rebuilt,
 recovered, imported, or archived. Portable builds are additionally disabled
 while any real recording is active.
+
+### Android ADB vision-agent lifecycle
+
+`AdbAgentController` owns at most one daemon session. Starting a session first
+revalidates that the selected device is a ready Android ADB target, creates an
+isolated directory below `agent-runs/`, and returns immediately so the HTTP UI
+can continue polling.
+
+The session configuration has three prompt/orchestration layers:
+
+1. A versioned, editable global system prompt defines the ADB screenshot and
+   0-999 coordinate protocol, supported actions, one-action-per-observation
+   behavior, verification rules, loop prevention, and sensitive-operation
+   takeover boundaries.
+2. Each task defines `id`, `name`, `prompt`, `attention_prompt`, `max_steps`,
+   `timeout_s`, and `on_failure` (`stop` or `continue`). Legacy `{task,
+   max_steps}` payloads are normalized into a one-task workflow.
+3. The controller orchestrates tasks sequentially and adds the current task,
+   elapsed time, limits, completed-task summary, and task-local action history
+   to each multimodal request.
+
+The model transport is a fourth, independent layer. `model_provider` selects
+one of three standard-library adapters:
+
+- `openai_compatible` sends Chat Completions image content and the native
+  function-tool schema. A complete Azure deployment URL with its query string
+  is preserved; local vLLM/Ollama endpoints can use an empty key.
+- `anthropic` converts the screenshot to a base64 image content block, converts
+  the common JSON Schema to `input_schema`, forces `phone_action` through
+  `tool_choice`, and parses `tool_use`.
+- `gemini` converts the screenshot to `inlineData`, converts the common schema
+  to `functionDeclarations`, configures `ANY` function calling for
+  `phone_action`, and parses `functionCall`.
+
+All adapters return the same `ModelDecision`; the orchestrator and ADB executor
+contain no provider-specific branch. Provider-specific request bodies and
+response JSON never enter the action layer.
+
+For each task step the worker:
+
+1. Captures a raw PNG with `adb exec-out screencap -p` and reads its IHDR size.
+2. Sends the current task, screenshot, and compact task-local action results
+   through the selected model adapter using the provider-neutral 0-999
+   coordinate convention and common `phone_action` schema.
+3. Translates one provider-native tool/function call into `ModelDecision` and
+   maps normalized coordinates into the current framebuffer pixel size.
+4. Executes only a fixed allowlist: `input tap`, `input swipe`, validated
+   keyevents, printable-ASCII `input text`, or a validated package launch with
+   `monkey`. There is no generic shell action.
+5. Persists the pre-action screenshot and event JSON, waits for the configured
+   settle interval, and observes the next frame.
+
+`finish` is terminal only for the current task. The controller writes a task
+result and advances to the next item. `take_over` stops the whole workflow.
+Timeout and max-step failures either produce `task_failed` immediately or are
+recorded and skipped; a workflow that reaches the end after skips returns
+`completed_with_warnings`. User stop is cooperative: an in-flight HTTP request
+finishes or times out, after which no further ADB action is issued.
+
+Screenshots use `task-NN-step-NNN.png`. `events.jsonl` records `task_start`,
+`action`, and `task_end` events, while `config.json` stores the exact tasks and
+system prompt needed to reproduce the run. `/api/state` returns only
+serializable status and recent logs; the PNG is served independently by
+`/api/ai-agent/screenshot` to avoid embedding large base64 images in every
+one-second dashboard poll. API keys exist only in the in-memory client
+configuration and are excluded from state and disk.
 
 The `/api/tcpip` workflow is also guarded against active recording. It reads
 global IPv4 interfaces before restarting adbd, prioritizes `wlan*`/`wifi*`,

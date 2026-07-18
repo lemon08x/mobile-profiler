@@ -6,8 +6,11 @@ A standalone mobile power and performance profiler for long, multi-application
 test sessions across Android, HarmonyOS, and iOS. Android uses ADB, native
 HarmonyOS uses DevEco Studio's HDC, and both run inside the standard-library
 core collector. iOS support is implemented through an optional, separately
-installed `pymobiledevice3` sidecar. The profiler has no Python import, API, or
-runtime dependency on BTR2.
+installed `pymobiledevice3` sidecar. The profiler has no Python import or
+runtime dependency on the BTR2 repository. Its optional ADB vision agent has a
+provider-neutral model layer for OpenAI-compatible endpoints, Anthropic Claude,
+and Google Gemini. The temporary default remains BTR2's separately deployed
+LAN Qwen endpoint.
 
 ## Why this exists
 
@@ -46,6 +49,11 @@ is easier to audit after a one-hour robotic workflow:
 - A local runtime dashboard for device Probe, recording control, live telemetry,
   collector logs, report history, log import, recovery, evidence packaging,
   two-run comparison, and source-project portable builds.
+- An Android ADB vision-agent block with a versioned/editable system prompt and
+  ordered task-card orchestration. It sends each fresh device screenshot to the
+  selected multimodal endpoint, translates its native tool/function response
+  into one `phone_action`, executes a validated ADB action, and advances tasks
+  under per-task step, timeout, and failure policies.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -135,6 +143,65 @@ recovery, evidence ZIP creation with optional attachments, two-phone
 comparison, and source-only Windows portable packaging. These operations call
 the same existing CLI or evidence workflows, so UI and command-line artifacts
 stay identical.
+
+### Provider-neutral ADB vision agent
+
+The **AI Automation** view is an independent MVP workflow for Android. Select
+an authorized ADB device, arrange one or more natural-language task cards,
+select a multimodal protocol and endpoint/model, and start the workflow. Each
+task has its own objective, attention prompt, step/time limit, and
+stop-or-continue failure policy. Reusable templates cover returning home,
+opening Settings, brightness initialization, and read-only smoke browsing.
+
+The adapter layer currently supports:
+
+- OpenAI-compatible Chat Completions, including OpenAI, a complete Azure
+  deployment URL, local vLLM/Ollama, and compatible model gateways.
+- Anthropic Messages API with native image blocks and `tool_use`.
+- Google Gemini `generateContent` with native inline images and function calls.
+
+The temporary defaults are still the LAN Qwen deployment at
+`http://192.168.31.237:8000` and `qwen3.6-27b`; both fields remain editable and
+can be supplied through `MOBILE_PROFILER_MODEL_PROVIDER`,
+`MOBILE_PROFILER_MODEL_ENDPOINT`, `MOBILE_PROFILER_MODEL_NAME`, and
+`MOBILE_PROFILER_MODEL_API_KEY`. The original `BTR2_LLM_*` environment names
+remain backward-compatible aliases.
+
+Each step performs this closed loop:
+
+```text
+adb exec-out screencap -p
+        -> editable ADB system prompt
+        -> current task + attention rules + workflow summary
+        -> screenshot + recent action results
+        -> selected OpenAI-compatible / Anthropic / Gemini adapter
+        -> one native tool/function call translated to phone_action
+        -> validated adb input / keyevent / monkey action
+        -> next screenshot
+```
+
+Tasks run sequentially. `finish` completes only the current task and advances
+the orchestrator; `take_over` stops the whole workflow. A timeout or exhausted
+step budget either stops with `task_failed` or is recorded and skipped,
+according to the task's failure policy. The editable system prompt defines the
+ADB screenshot/coordinate protocol, one-action-per-frame behavior, popup and
+input handling, loop prevention, and takeover boundaries. Its built-in version
+is exposed by `/api/state` so the UI can restore the default safely.
+
+The model cannot provide arbitrary shell commands. The server only accepts
+tap, double-tap, long-press, swipe, key events, printable-ASCII text input,
+package launch, wait, finish, and takeover. Account authorization, CAPTCHA,
+payment, destructive actions, and other ambiguous irreversible steps are
+explicit takeover boundaries. Every run writes `config.json`, step screenshots,
+and `events.jsonl` below `profiler-runs/agent-runs/`; API keys are neither
+returned by `/api/state` nor persisted in those artifacts.
+
+This first PR keeps the agent block separate from power recording. A power run
+and an agent may already coexist at the ADB level, but automatic shared
+start/stop, timeline markers, power-aware orchestration, and external-API tools
+are intentionally reserved for the next integration stage. The task-card and
+prompt contracts are designed to host additional phone-initialization recipes
+without changing the allowlisted ADB executor.
 
 The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
 test profile. It filters the device picker and changes connection controls,

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-41">
-  <script src="/app.js?v=platform-ui-41" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-43">
+  <script src="/app.js?v=platform-ui-43" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -24,6 +24,10 @@
         <button class="nav-item" type="button" data-view="config">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h7M15 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="13" cy="18" r="2"/></svg>
           <span>测试配置</span>
+        </button>
+        <button class="nav-item" type="button" data-view="agent">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="7" width="14" height="11" rx="3"/><path d="M9 3h6M12 3v4M8.5 12h.01M15.5 12h.01M9 15h6M3 11v4M21 11v4"/></svg>
+          <span>AI 自动化</span>
         </button>
         <button class="nav-item" type="button" data-view="device">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M10 18.5h4"/></svg>
@@ -44,7 +48,7 @@
     <section class="workspace">
       <header class="topbar">
         <div class="page-title">
-          <p>MOBILE PROFILING LAB <span class="app-version-badge" id="app-version-badge" title="Mobile Profiler 0.7.2">v0.7.2</span></p>
+          <p>MOBILE PROFILING LAB <span class="app-version-badge" id="app-version-badge" title="Mobile Profiler 1.0.0">v1.0.0</span></p>
           <h1 id="page-heading">实时监控</h1>
         </div>
         <div class="topbar-actions">
@@ -104,6 +108,131 @@
                 <div id="config-app-picker-content"></div>
               </aside>
             </div>
+          </div>
+        </section>
+
+        <section class="view" data-panel="agent" hidden>
+          <div class="view-header agent-view-header">
+            <div><small>ADB VISION AGENT</small><h2>AI 指挥的手机自动化</h2><p>使用可切换的主流多模态模型观察 ADB 截图，并用受限的 tap、swipe、keyevent、文本输入和应用启动动作完成任务；局域网千问是默认配置而非协议绑定。</p></div>
+            <span class="agent-status-badge idle" id="agent-status-badge"><i></i><span><strong>等待任务</strong><small id="agent-status-detail">选择 Android 设备后开始</small></span></span>
+          </div>
+
+          <div class="agent-layout">
+            <section class="panel agent-config-panel">
+              <div class="panel-heading"><div><small>AGENT CONTROL</small><h2 id="agent-config-panel-title">测试任务编排</h2></div><span class="data-source" id="agent-config-panel-source">WORKFLOW</span></div>
+              <form id="adb-agent-form" class="agent-form" novalidate>
+                <nav class="agent-config-tabs" role="tablist" aria-label="AI 自动化配置">
+                  <button class="active" id="agent-config-tab-workflow" type="button" role="tab" aria-selected="true" aria-controls="agent-config-view-workflow" data-agent-config-tab="workflow"><i>01</i><span><strong>任务编排</strong><small id="agent-config-tab-task-meta">1 个任务</small></span></button>
+                  <button id="agent-config-tab-model" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-model" data-agent-config-tab="model"><i>02</i><span><strong>模型调度</strong><small id="agent-config-tab-model-meta">局域网千问</small></span></button>
+                  <button id="agent-config-tab-prompt" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-prompt" data-agent-config-tab="prompt"><i>03</i><span><strong>Agent 规则</strong><small id="agent-config-tab-prompt-meta">内置 v3</small></span></button>
+                </nav>
+
+                <div class="agent-config-views">
+                  <section class="agent-config-view active" id="agent-config-view-workflow" role="tabpanel" aria-labelledby="agent-config-tab-workflow" data-agent-config-view="workflow">
+                    <div class="agent-config-view-heading"><small>WORKFLOW DESIGN</small><h3>任务编排</h3><p>把完整流程拆成可验证的子任务；模型调用 finish 后才进入下一项。</p></div>
+                    <div class="form-field">
+                      <label for="agent-workflow-name-input">流程名称</label>
+                      <input id="agent-workflow-name-input" type="text" maxlength="160" placeholder="例如：续航测试前手机初始化" value="ADB 测试流程">
+                    </div>
+                    <section class="agent-task-editor" aria-labelledby="agent-task-editor-title">
+                      <div class="agent-task-editor-heading">
+                        <div><strong id="agent-task-editor-title">测试任务</strong><small id="agent-task-count-label">按顺序执行；finish 只完成当前子任务</small></div>
+                        <button class="button ghost compact" id="agent-add-task-button" type="button">＋ 空白任务</button>
+                      </div>
+                      <div class="agent-template-toolbar">
+                        <select id="agent-task-template-select" aria-label="任务模板"><option value="">选择任务模板</option></select>
+                        <button class="button secondary compact" id="agent-add-template-button" type="button">添加模板</button>
+                      </div>
+                      <div class="agent-task-list" id="agent-task-list"></div>
+                      <small class="field-hint">每项独立设置目标、注意事项、步骤/时间上限和失败策略。</small>
+                    </section>
+                  </section>
+
+                  <section class="agent-config-view" id="agent-config-view-model" role="tabpanel" aria-labelledby="agent-config-tab-model" data-agent-config-view="model" hidden>
+                    <div class="agent-config-view-heading"><small>MODEL ROUTING</small><h3>模型调度</h3><p>Agent 与 ADB 动作保持不变，只在这里切换多模态协议、端点和认证方式。</p></div>
+                    <div class="form-field">
+                      <label for="agent-model-provider-input">模型协议</label>
+                      <select id="agent-model-provider-input">
+                        <option value="openai_compatible">OpenAI-compatible</option>
+                        <option value="anthropic">Anthropic Claude</option>
+                        <option value="gemini">Google Gemini</option>
+                      </select>
+                      <small class="field-hint" id="agent-model-provider-hint">兼容 OpenAI、Azure 完整端点、vLLM、Ollama 与兼容网关；默认连接局域网千问。</small>
+                    </div>
+                    <div class="form-row agent-model-row">
+                      <div class="form-field"><label for="agent-api-base-input">多模态模型 API</label><input id="agent-api-base-input" type="url" autocomplete="off" placeholder="http://192.168.31.237:8000 或完整 API URL"></div>
+                      <div class="form-field"><label for="agent-model-input">模型</label><input id="agent-model-input" type="text" autocomplete="off" placeholder="qwen3.6-27b"></div>
+                    </div>
+                    <div class="form-field"><label for="agent-api-key-input">API Key <span id="agent-api-key-hint">本地模型可留空</span></label><input id="agent-api-key-input" type="password" autocomplete="new-password" placeholder="不会保存到浏览器或运行记录"></div>
+                    <section class="agent-settings-group" aria-labelledby="agent-runtime-settings-title">
+                      <div><strong id="agent-runtime-settings-title">请求与执行参数</strong><small>认证头、动作稳定时间与模型请求超时</small></div>
+                      <div class="agent-advanced-grid">
+                        <div class="form-field"><label for="agent-api-key-mode-input">认证方式</label><select id="agent-api-key-mode-input"><option value="bearer">Authorization: Bearer</option><option value="api-key">api-key</option><option value="x-api-key">x-api-key</option><option value="x-goog-api-key">x-goog-api-key</option><option value="none">不发送认证头</option></select></div>
+                        <div class="form-field"><label for="agent-step-delay-input">动作后等待</label><div class="input-with-unit"><input id="agent-step-delay-input" type="number" min="0.2" max="30" step="0.1" value="1.2"><span>秒</span></div></div>
+                        <div class="form-field"><label for="agent-timeout-input">单次模型超时</label><div class="input-with-unit"><input id="agent-timeout-input" type="number" min="5" max="600" step="1" value="90"><span>秒</span></div></div>
+                      </div>
+                    </section>
+                  </section>
+
+                  <section class="agent-config-view" id="agent-config-view-prompt" role="tabpanel" aria-labelledby="agent-config-tab-prompt" data-agent-config-view="prompt" hidden>
+                    <div class="agent-config-view-heading"><small>AGENT POLICY</small><h3>ADB Agent 规则</h3><p id="agent-system-prompt-version">坐标协议、动作边界与安全规则</p></div>
+                    <div class="agent-system-prompt-editor">
+                      <textarea id="agent-system-prompt-input" rows="18" maxlength="24000" spellcheck="false" aria-label="ADB Agent System Prompt"></textarea>
+                      <div><small>完整 prompt 会随运行配置保存；API Key 不会写入运行记录。</small><button class="button ghost compact" id="agent-reset-system-prompt-button" type="button">恢复默认</button></div>
+                    </div>
+                    <p class="agent-policy-callout"><strong>人工接管边界</strong><span>验证码、账号授权、支付、发送、删除和其他不可逆操作不会由模型自行确认。</span></p>
+                  </section>
+                </div>
+
+                <footer class="agent-control-dock">
+                  <div class="agent-control-summary">
+                    <span><small>WORKFLOW</small><strong id="agent-dock-workflow">1 个子任务</strong></span>
+                    <span><small>MODEL</small><strong id="agent-dock-model">qwen3.6-27b</strong></span>
+                  </div>
+                  <div class="agent-form-actions">
+                    <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
+                    <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
+                  </div>
+                  <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单 ADB 动作。</p>
+                </footer>
+              </form>
+            </section>
+
+            <section class="panel agent-screen-panel">
+              <div class="panel-heading"><div><small>LIVE OBSERVATION</small><h2>最新 ADB 截图</h2></div><span class="data-source" id="agent-screen-meta">尚未截图</span></div>
+              <div class="agent-phone-stage">
+                <div class="agent-phone-frame">
+                  <img id="agent-screen-image" alt="ADB Agent 最新手机截图" hidden>
+                  <div class="agent-screen-placeholder" id="agent-screen-placeholder"><span>ADB</span><strong>等待第一张截图</strong><small>任务启动后显示模型实际看到的手机画面</small></div>
+                </div>
+              </div>
+              <div class="agent-runtime-stats">
+                <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
+                <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
+                <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
+                <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
+                <article><small>ELAPSED</small><strong id="agent-elapsed-value">00:00</strong><span id="agent-device-value">未选择设备</span></article>
+              </div>
+            </section>
+
+            <section class="panel agent-decision-panel">
+              <div class="panel-heading"><div><small>MODEL DECISION</small><h2>最近决策</h2></div><span class="data-source" id="agent-action-state">等待模型</span></div>
+              <div class="agent-decision-grid">
+                <article><small>REASONING</small><p id="agent-reasoning-output">任务启动后显示模型的简短判断。</p></article>
+                <article><small>PHONE ACTION</small><pre id="agent-action-output">--</pre><p id="agent-action-result">尚未执行动作</p></article>
+              </div>
+              <div class="agent-completion-message" id="agent-completion-message" hidden></div>
+            </section>
+
+            <section class="panel agent-task-progress-panel">
+              <div class="panel-heading"><div><small>WORKFLOW PROGRESS</small><h2>子任务执行结果</h2></div><span class="data-source" id="agent-task-progress-summary">尚未启动流程</span></div>
+              <div class="agent-task-results" id="agent-task-results"><div class="agent-log-empty">编排任务后启动流程</div></div>
+            </section>
+
+            <section class="panel agent-log-panel">
+              <div class="panel-heading"><div><small>AGENT JOURNAL</small><h2>闭环日志</h2></div><span class="data-source" id="agent-output-directory">运行后保存截图与 events.jsonl</span></div>
+              <div class="agent-log" id="agent-log-output" aria-live="polite"><div class="agent-log-empty">等待任务启动</div></div>
+            </section>
           </div>
         </section>
 

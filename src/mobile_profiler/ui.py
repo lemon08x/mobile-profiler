@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from . import __version__ as APP_VERSION
+from .adb_agent import AdbAgentController
 from .analysis import (
     analyze_brightness_throttling,
     analyze_memory_frequency,
@@ -2274,6 +2275,7 @@ class DashboardManager:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.demo_mode = demo_mode
         self.active: Optional[ActiveRun] = None
+        self.adb_agent = AdbAgentController(self.adb, self.output_root)
         self.probe_cache: Dict[str, Dict[str, object]] = {}
         self._android_icon_cache: Dict[str, Optional[str]] = {}
         self._starting = False
@@ -2585,6 +2587,33 @@ class DashboardManager:
             "devices": devices,
             "device_error": error,
         }
+
+    def start_adb_agent(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        devices, error = self.devices(
+            force=True,
+            refresh_android=True,
+            refresh_ios=False,
+            refresh_harmony=False,
+        )
+        if error and not devices:
+            raise RuntimeError(error)
+        selected = next(
+            (
+                item
+                for item in devices
+                if item.get("serial") == device
+                and item.get("state") == "device"
+                and item.get("platform") == "android"
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Android ADB device {device!r} is not ready")
+        return self.adb_agent.start(payload)
+
+    def stop_adb_agent(self) -> Dict[str, object]:
+        return self.adb_agent.stop()
 
     def connect_harmony(self, payload: Dict[str, object]) -> Dict[str, object]:
         address = str(payload.get("address") or "").strip()
@@ -4431,6 +4460,7 @@ class DashboardManager:
             "ios_error": self._ios_error,
             "probes": probes,
             "active": self.active_snapshot(),
+            "adb_agent": self.adb_agent.snapshot(),
             "history": self.history(),
             "tooling": self.tooling_state(),
             "demo_mode": self.demo_mode,
@@ -4906,6 +4936,7 @@ class DashboardManager:
         }
 
     def close(self) -> None:
+        self.adb_agent.stop()
         with self._lock:
             active = self.active
         if active is None or not active.running:
@@ -5005,6 +5036,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send_json({"ok": True, "time": time.time()})
             return
+        if path == "/api/ai-agent/screenshot":
+            screenshot = self.server.manager.adb_agent.latest_screenshot()
+            if screenshot is None:
+                self._send_json(
+                    {"error": "Agent screenshot not available"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._send_bytes(screenshot, "image/png")
+            return
         match = re.fullmatch(r"/runs/([^/]+)/report\.html", path)
         if match:
             report = self.server.manager.report_path(match.group(1))
@@ -5041,6 +5082,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.probe(payload)
             elif path == "/api/apps":
                 result = self.server.manager.scan_android_apps(payload)
+            elif path == "/api/ai-agent/start":
+                result = self.server.manager.start_adb_agent(payload)
+            elif path == "/api/ai-agent/stop":
+                result = self.server.manager.stop_adb_agent()
             elif path == "/api/connect":
                 result = self.server.manager.connect_device(payload)
             elif path == "/api/harmony/connect":
