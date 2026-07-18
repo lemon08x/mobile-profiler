@@ -33,6 +33,8 @@
   });
   const storedPlatform = localStorage.getItem("mobile-profiler-platform");
   const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1";
+  const agentConfigTabStorageKey = "mobile-profiler-agent-config-tab";
+  const agentConfigTabs = ["workflow", "model", "prompt"];
   const maxUiLogLines = 500;
   const uiErrorDedupWindowS = 2;
   const liveTimelineLayoutDefinitions = [
@@ -141,6 +143,10 @@
     agentProviderSignature: "",
     agentProviderProfiles: new Map(),
     agentPresentedProvider: "",
+    agentConfigTab: agentConfigTabs.includes(localStorage.getItem(agentConfigTabStorageKey))
+      ? localStorage.getItem(agentConfigTabStorageKey)
+      : "workflow",
+    agentDefaultSystemPromptVersion: "",
   };
 
   const platformProfiles = {
@@ -5292,6 +5298,53 @@
     };
   }
 
+  function setAgentConfigTab(tab, { persist = true } = {}) {
+    const nextTab = agentConfigTabs.includes(tab) ? tab : "workflow";
+    const presentation = {
+      workflow: { title: "测试任务编排", source: "WORKFLOW" },
+      model: { title: "模型调度", source: "MODEL ROUTING" },
+      prompt: { title: "Agent 规则", source: "SYSTEM PROMPT" },
+    }[nextTab];
+    app.agentConfigTab = nextTab;
+    $$('[data-agent-config-tab]').forEach(button => {
+      const active = button.dataset.agentConfigTab === nextTab;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    $$('[data-agent-config-view]').forEach(view => {
+      const active = view.dataset.agentConfigView === nextTab;
+      view.hidden = !active;
+      view.classList.toggle("active", active);
+    });
+    $("#agent-config-panel-title").textContent = presentation.title;
+    $("#agent-config-panel-source").textContent = presentation.source;
+    if (persist) localStorage.setItem(agentConfigTabStorageKey, nextTab);
+  }
+
+  function refreshAgentModelSummary() {
+    const providerInput = $("#agent-model-provider-input");
+    const profile = app.agentProviderProfiles.get(providerInput.value) || {};
+    const providerLabel = String(
+      profile.label
+      || providerInput.selectedOptions[0]?.textContent
+      || providerInput.value
+      || "未配置协议"
+    );
+    const model = $("#agent-model-input").value.trim()
+      || String(profile.default_model || "")
+      || "未配置模型";
+    $("#agent-config-tab-model-meta").textContent = providerLabel;
+    $("#agent-dock-model").textContent = model;
+  }
+
+  function refreshAgentPromptSummary(label = "") {
+    const prompt = $("#agent-system-prompt-input").value.trim();
+    $("#agent-config-tab-prompt-meta").textContent = prompt
+      ? (label || "自定义规则")
+      : "未配置";
+  }
+
   function agentTaskCardMarkup(rawTask, index) {
     const task = defaultAgentTask(rawTask || {});
     const taskId = String(task.id || `task-${Date.now()}-${index + 1}`);
@@ -5314,7 +5367,7 @@
           </div>
           <div class="form-field agent-task-prompt-field">
             <label>任务目标</label>
-            <textarea rows="4" maxlength="6000" data-agent-task-field="prompt" placeholder="说明当前子任务需要在手机上完成并验证的目标" required>${escapeHtml(task.prompt || "")}</textarea>
+            <textarea rows="4" maxlength="6000" data-agent-task-field="prompt" placeholder="说明当前子任务需要在手机上完成并验证的目标">${escapeHtml(task.prompt || "")}</textarea>
           </div>
           <div class="form-field agent-task-attention-field">
             <label>注意事项 <span>可选</span></label>
@@ -5342,6 +5395,8 @@
     });
     const label = $("#agent-task-count-label");
     if (label) label.textContent = `${cards.length} 个子任务 · 按顺序执行；finish 只完成当前子任务`;
+    $("#agent-config-tab-task-meta").textContent = `${cards.length} 个任务`;
+    $("#agent-dock-workflow").textContent = `${cards.length} 个子任务`;
   }
 
   function renderAgentTaskEditor(tasks) {
@@ -5437,6 +5492,7 @@
       ? "本地模型可留空"
       : "仅保留在当前进程内存";
     app.agentPresentedProvider = provider;
+    refreshAgentModelSummary();
   }
 
   function renderAgentTaskResults(agent) {
@@ -5487,6 +5543,9 @@
     const defaults = agent.defaults || {};
     const sessionSource = agent.session_id ? agent : defaults;
     app.agentDefaultSystemPrompt = String(defaults.system_prompt || app.agentDefaultSystemPrompt || "");
+    app.agentDefaultSystemPromptVersion = String(
+      defaults.system_prompt_version || app.agentDefaultSystemPromptVersion || "内置规则"
+    );
     populateAgentTaskTemplates(defaults.task_templates);
     populateAgentModelProviders(defaults.model_providers);
     const agentSessionChanged = Boolean(
@@ -5529,7 +5588,11 @@
       applyAgentProviderPresentation();
       $("#agent-workflow-name-input").value = String(sessionSource.workflow_name || "ADB 测试流程");
       $("#agent-system-prompt-input").value = String(sessionSource.system_prompt || defaults.system_prompt || "");
-      $("#agent-system-prompt-version").textContent = `${sessionSource.system_prompt_version || defaults.system_prompt_version || "custom"} · 坐标协议、动作边界与安全规则`;
+      const systemPromptVersion = String(
+        sessionSource.system_prompt_version || defaults.system_prompt_version || "custom"
+      );
+      $("#agent-system-prompt-version").textContent = `${systemPromptVersion} · 坐标协议、动作边界与安全规则`;
+      refreshAgentPromptSummary(systemPromptVersion);
       const sessionTasks = Array.isArray(agent.tasks) && agent.tasks.length
         ? agent.tasks
         : (agent.task ? [defaultAgentTask({ name: "任务 1", prompt: agent.task, max_steps: agent.max_steps })] : []);
@@ -5798,6 +5861,22 @@
     $("#agent-model-provider-input").addEventListener("change", () => {
       applyAgentProviderPresentation({ replaceDefaults: true });
     });
+    $("#agent-model-input").addEventListener("input", refreshAgentModelSummary);
+    $$("[data-agent-config-tab]").forEach(button => {
+      button.addEventListener("click", () => setAgentConfigTab(button.dataset.agentConfigTab));
+      button.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const currentIndex = agentConfigTabs.indexOf(button.dataset.agentConfigTab);
+        const nextIndex = event.key === "Home"
+          ? 0
+          : (event.key === "End"
+            ? agentConfigTabs.length - 1
+            : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + agentConfigTabs.length) % agentConfigTabs.length);
+        setAgentConfigTab(agentConfigTabs[nextIndex]);
+        $(`[data-agent-config-tab="${agentConfigTabs[nextIndex]}"]`).focus();
+      });
+    });
 
     $("#agent-add-task-button").addEventListener("click", () => appendAgentTask());
     $("#agent-add-template-button").addEventListener("click", () => {
@@ -5829,7 +5908,13 @@
     });
     $("#agent-reset-system-prompt-button").addEventListener("click", () => {
       $("#agent-system-prompt-input").value = app.agentDefaultSystemPrompt;
+      $("#agent-system-prompt-version").textContent = `${app.agentDefaultSystemPromptVersion} · 坐标协议、动作边界与安全规则`;
+      refreshAgentPromptSummary(app.agentDefaultSystemPromptVersion);
       notify("已恢复默认 System Prompt", "本次启动时将使用内置 ADB 操作与安全规则。", "success", 4000);
+    });
+    $("#agent-system-prompt-input").addEventListener("input", () => {
+      $("#agent-system-prompt-version").textContent = "custom · 坐标协议、动作边界与安全规则";
+      refreshAgentPromptSummary();
     });
 
     $("#adb-agent-form").addEventListener("submit", async event => {
@@ -5841,16 +5926,50 @@
         return;
       }
       const tasks = readAgentTasks();
+      const invalidTaskControl = $$(
+        '#agent-task-list input[type="number"], #agent-task-list select'
+      ).find(control => !control.checkValidity());
+      if (invalidTaskControl) {
+        setAgentConfigTab("workflow");
+        notify("任务参数无效", "请检查子任务的步骤上限、超时时间和失败策略。", "error");
+        invalidTaskControl.focus();
+        return;
+      }
       const missingTaskIndex = tasks.findIndex(task => !task.prompt);
       if (missingTaskIndex >= 0) {
+        setAgentConfigTab("workflow");
         notify("任务目标不能为空", `请填写第 ${missingTaskIndex + 1} 个子任务的目标。`, "error");
         $$("#agent-task-list .agent-task-card")[missingTaskIndex]
           ?.querySelector('[data-agent-task-field="prompt"]')
           ?.focus();
         return;
       }
+      const apiInput = $("#agent-api-base-input");
+      const modelInput = $("#agent-model-input");
+      const invalidModelControl = [
+        apiInput,
+        $("#agent-step-delay-input"),
+        $("#agent-timeout-input"),
+      ].find(control => !control.checkValidity());
+      if (!apiInput.value.trim() || invalidModelControl) {
+        setAgentConfigTab("model");
+        notify(
+          "模型 API 配置无效",
+          apiInput.value.trim() ? "请检查 API 地址、动作等待和请求超时。" : "请填写多模态模型 API 地址。",
+          "error",
+        );
+        (invalidModelControl || apiInput).focus();
+        return;
+      }
+      if (!modelInput.value.trim()) {
+        setAgentConfigTab("model");
+        notify("模型不能为空", "请填写支持截图理解与工具调用的多模态模型。", "error");
+        modelInput.focus();
+        return;
+      }
       const systemPrompt = $("#agent-system-prompt-input").value.trim();
       if (!systemPrompt) {
+        setAgentConfigTab("prompt");
         notify("System Prompt 不能为空", "请恢复默认 prompt 或填写自定义 ADB Agent 规则。", "error");
         $("#agent-system-prompt-input").focus();
         return;
@@ -6668,6 +6787,7 @@
 
   mountConfigurationView();
   bindEvents();
+  setAgentConfigTab(app.agentConfigTab, { persist: false });
   setPlatform(app.platform, { initial: true });
   setTestMode("power", { initial: true });
   switchView(app.activeView);

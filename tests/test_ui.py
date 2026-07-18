@@ -1915,9 +1915,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-42", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-43", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-42", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-43", timeout=5) as response:
                     javascript = response.read().decode("utf-8").replace("\r\n", "\n")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -1954,8 +1954,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-42', html)
-            self.assertIn('/app.js?v=platform-ui-42', html)
+            self.assertIn('/app.css?v=platform-ui-43', html)
+            self.assertIn('/app.js?v=platform-ui-43', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2288,6 +2288,12 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="agent-screen-image"', html)
             self.assertIn('id="agent-task-list"', html)
             self.assertIn('id="agent-task-template-select"', html)
+            self.assertIn('id="agent-config-tab-model"', html)
+            self.assertIn('data-agent-config-tab="model"', html)
+            self.assertIn('data-agent-config-view="model"', html)
+            self.assertIn('data-agent-config-view="prompt"', html)
+            self.assertIn('class="agent-control-dock"', html)
+            self.assertIn('class="agent-form" novalidate', html)
             self.assertIn('id="agent-model-provider-input"', html)
             self.assertIn('id="agent-api-key-mode-input"', html)
             self.assertIn('id="agent-system-prompt-input"', html)
@@ -2296,12 +2302,20 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('api("/api/ai-agent/stop"', javascript)
             self.assertIn("function renderAdbAgent", javascript)
             self.assertIn("function readAgentTasks", javascript)
+            self.assertIn("function setAgentConfigTab", javascript)
+            self.assertIn('setAgentConfigTab("model")', javascript)
             self.assertIn("workflow_name:", javascript)
             self.assertIn("model_provider:", javascript)
             self.assertIn("api_key_mode:", javascript)
             self.assertIn("function applyAgentProviderPresentation", javascript)
             self.assertIn("system_prompt: systemPrompt", javascript)
             self.assertIn("tasks,", javascript)
+            self.assertIn(".agent-config-tabs", css)
+            self.assertIn(".agent-config-view[hidden]", css)
+            self.assertIn(".agent-control-dock", css)
+            self.assertIn("height: calc(100vh - 188px)", css)
+            self.assertIn(".agent-config-panel {\n  position: relative;", css)
+            self.assertNotIn(".agent-config-panel {\n  position: sticky;", css)
             self.assertIn("模型不能下发任意 shell", html)
             self.assertIn("局域网千问是默认配置而非协议绑定", html)
             self.assertIn("测试配置", html)
