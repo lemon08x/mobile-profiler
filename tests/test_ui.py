@@ -1928,7 +1928,7 @@ class UiServerTests(unittest.TestCase):
                 thread.join(timeout=5)
 
             self.assertIn("Mobile Profiler", html)
-            self.assertIn("v0.7.2", html)
+            self.assertIn("v1.0.0", html)
             self.assertIn('class="app-version-badge"', html)
             self.assertEqual(state["version"], __version__)
             self.assertIn("TEST PLATFORM", html)
