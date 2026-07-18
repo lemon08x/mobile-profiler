@@ -16,6 +16,7 @@ mobile-profiler/
 |-- tools/
 |   `-- build-portable.ps1
 |-- tests/
+|   |-- test_adb_agent.py
 |   |-- test_profiler.py
 |   `-- test_ui.py
 `-- src/mobile_profiler/
@@ -32,6 +33,7 @@ mobile-profiler/
     |-- report.py
     |-- comparison.py
     |-- evidence.py
+    |-- adb_agent.py
     |-- ui.py
     |-- web/
     |   |-- index.html
@@ -42,7 +44,10 @@ mobile-profiler/
 
 ## External workflow boundary
 
-The profiler and BTR2 are independent processes and repositories.
+The profiler and BTR2 are independent processes and repositories. They expose
+two optional integration boundaries: offline timestamped logs for power-run
+alignment, and BTR2's separately deployed OpenAI-compatible model endpoint for
+the Android ADB vision agent.
 
 ```text
 Android device  <-- ADB -->+
@@ -52,13 +57,17 @@ HarmonyOS phone <-- HDC -->+--> Mobile Profiler --> run directory
 robot/camera
              |
             BTR2 ------------------------> timestamped text log
-                                                |
-                                                `-- optional offline import
+              `--> OpenAI-compatible VLM          |
+                       ^                           `-- optional offline import
+                       |
+Android device <-- ADB screenshot/action --> Mobile Profiler ADB agent
 ```
 
-There is no shared Python module, callback, socket, database, or lifecycle API.
-The only optional correlation surface is a timestamped text file interpreted by
-a user-selected JSON regex rule file.
+There is no shared Python module, callback, database, or lifecycle API. The
+model endpoint is a stateless OpenAI-compatible chat-completions boundary; the
+profiler owns screenshots, action validation, ADB execution, session state, and
+artifacts. Power-run correlation remains an offline timestamped text file
+interpreted by a user-selected JSON regex rule file.
 
 ## Platform sidecar boundary
 
@@ -204,6 +213,10 @@ Browser <-- local JSON/HTML --> ui.py --> python -m mobile_profiler record
                                       |--> compare
                                       |--> evidence archive
                                       |--> source-only portable build script
+                                      |--> adb_agent.py --> BTR2 model API
+                                      |                       |
+                                      |<-- native phone_action-+
+                                      |--> validated ADB screenshot/action loop
                                       `--> run journals and snapshot tails
 ```
 
@@ -218,6 +231,34 @@ BTR2 import, and comparison; evidence archives reuse `evidence.py` directly.
 Maintenance work is serialized, and an active run directory cannot be rebuilt,
 recovered, imported, or archived. Portable builds are additionally disabled
 while any real recording is active.
+
+### Android ADB vision-agent lifecycle
+
+`AdbAgentController` owns at most one daemon session. Starting a session first
+revalidates that the selected device is a ready Android ADB target, creates an
+isolated directory below `agent-runs/`, and returns immediately so the HTTP UI
+can continue polling.
+
+For each step the worker:
+
+1. Captures a raw PNG with `adb exec-out screencap -p` and reads its IHDR size.
+2. Sends the user task, screenshot, and compact recent action results to an
+   OpenAI-compatible `/v1/chat/completions` endpoint using BTR2's normalized
+   0-999 coordinate convention and native `phone_action` tool schema.
+3. Parses exactly one tool call and maps normalized coordinates into the
+   current framebuffer pixel size.
+4. Executes only a fixed allowlist: `input tap`, `input swipe`, validated
+   keyevents, printable-ASCII `input text`, or a validated package launch with
+   `monkey`. There is no generic shell action.
+5. Persists the pre-action screenshot and event JSON, waits for the configured
+   settle interval, and observes the next frame.
+
+`finish` and `take_over` are terminal model actions. User stop is cooperative:
+an in-flight HTTP request finishes or times out, after which no further ADB
+action is issued. `/api/state` returns only serializable status and recent logs;
+the PNG is served independently by `/api/ai-agent/screenshot` to avoid embedding
+large base64 images in every one-second dashboard poll. API keys exist only in
+the in-memory client configuration and are excluded from state and disk.
 
 The `/api/tcpip` workflow is also guarded against active recording. It reads
 global IPv4 interfaces before restarting adbd, prioritizes `wlan*`/`wifi*`,

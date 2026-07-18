@@ -131,6 +131,9 @@
     liveRangeSummary: null,
     liveRangeSummaryRequestId: 0,
     liveRangePresentationFrame: 0,
+    agentDefaultsApplied: false,
+    agentScreenshotRevision: -1,
+    agentNotificationKey: "",
   };
 
   const platformProfiles = {
@@ -2111,10 +2114,11 @@
     const requested = legacySystem
       ? "live"
       : legacyTools ? "history" : view;
-    const target = ["live", "config", "device", "history"].includes(requested)
+    const target = ["live", "config", "agent", "device", "history"].includes(requested)
       ? requested
       : "live";
     app.activeView = target;
+    document.body.dataset.view = target;
     if (legacyTools || legacySystem) {
       window.history.replaceState(null, "", `#${target}`);
     } else if (location.hash !== `#${target}`) {
@@ -2138,6 +2142,7 @@
     $("#page-heading").textContent = {
       live: "实时监控",
       config: "测试配置",
+      agent: "AI 自动化",
       device: "设备能力",
       history: "历史报告与交付",
     }[target];
@@ -5266,6 +5271,150 @@
     }
   }
 
+  function renderAdbAgent(state) {
+    const agent = state?.adb_agent || {};
+    const defaults = agent.defaults || {};
+    const sessionSource = agent.session_id ? agent : defaults;
+    if (!app.agentDefaultsApplied) {
+      const storedValue = (key, fallback) => localStorage.getItem(key) || String(fallback ?? "");
+      $("#agent-api-base-input").value = storedValue(
+        "mobile-profiler-agent-api-base",
+        sessionSource.api_base_url,
+      );
+      $("#agent-model-input").value = storedValue(
+        "mobile-profiler-agent-model",
+        sessionSource.model,
+      );
+      $("#agent-max-steps-input").value = storedValue(
+        "mobile-profiler-agent-max-steps",
+        sessionSource.max_steps || 30,
+      );
+      $("#agent-step-delay-input").value = storedValue(
+        "mobile-profiler-agent-step-delay",
+        sessionSource.step_delay_s || 1.2,
+      );
+      $("#agent-timeout-input").value = storedValue(
+        "mobile-profiler-agent-timeout",
+        sessionSource.request_timeout_s || 90,
+      );
+      if (agent.task && !$("#agent-task-input").value.trim()) {
+        $("#agent-task-input").value = String(agent.task);
+      }
+      app.agentDefaultsApplied = true;
+    }
+
+    const status = String(agent.status || "idle");
+    const statusPresentation = {
+      idle: ["等待任务", "选择 Android 设备后开始"],
+      starting: ["正在启动", agent.message || "准备截图与模型客户端"],
+      running: ["任务运行中", agent.message || "截图、决策与 ADB 动作闭环"],
+      stopping: ["正在停止", "当前模型请求返回后安全退出"],
+      completed: ["任务已完成", agent.message || "模型确认目标已达成"],
+      stopped: ["任务已停止", agent.message || "用户已停止任务"],
+      take_over: ["需要人工接管", agent.message || "模型无法安全继续"],
+      max_steps: ["达到步骤上限", agent.message || "任务未确认完成"],
+      error: ["运行失败", agent.error || agent.message || "请查看闭环日志"],
+    }[status] || [status.toUpperCase(), agent.message || "--"];
+    const badge = $("#agent-status-badge");
+    badge.className = `agent-status-badge ${escapeHtml(status)}`;
+    badge.querySelector("strong").textContent = statusPresentation[0];
+    $("#agent-status-detail").textContent = statusPresentation[1];
+
+    const revision = Number(agent.screenshot_revision || 0);
+    const image = $("#agent-screen-image");
+    const placeholder = $("#agent-screen-placeholder");
+    if (agent.screenshot_available && agent.screenshot_url) {
+      if (revision !== app.agentScreenshotRevision) {
+        app.agentScreenshotRevision = revision;
+        image.src = `${agent.screenshot_url}?revision=${encodeURIComponent(revision)}`;
+      }
+      image.hidden = false;
+      placeholder.hidden = true;
+      $("#agent-screen-meta").textContent = `${agent.screenshot_width || "--"} × ${agent.screenshot_height || "--"} · revision ${revision}`;
+    } else {
+      app.agentScreenshotRevision = -1;
+      image.hidden = true;
+      image.removeAttribute("src");
+      placeholder.hidden = false;
+      $("#agent-screen-meta").textContent = "尚未截图";
+    }
+
+    $("#agent-step-value").textContent = `${agent.step || 0} / ${agent.max_steps || defaults.max_steps || 0}`;
+    $("#agent-phase-value").textContent = String(agent.phase || "idle").toUpperCase();
+    $("#agent-model-value").textContent = agent.model || defaults.model || "--";
+    $("#agent-latency-value").textContent = finite(agent.latest_request_s)
+      ? `最近 ${Number(agent.latest_request_s).toFixed(1)} 秒`
+      : "等待请求";
+    $("#agent-token-value").textContent = `${agent.prompt_tokens || 0} / ${agent.completion_tokens || 0}`;
+    $("#agent-elapsed-value").textContent = formatDuration(agent.elapsed_s || 0);
+    $("#agent-device-value").textContent = agent.device || selectedDevice() || "未选择设备";
+    $("#agent-reasoning-output").textContent = agent.latest_reasoning || "任务启动后显示模型的简短判断。";
+    $("#agent-action-output").textContent = agent.latest_action
+      ? JSON.stringify(agent.latest_action, null, 2)
+      : "--";
+    $("#agent-action-result").textContent = agent.latest_action_result || "尚未执行动作";
+    $("#agent-action-state").textContent = status === "idle"
+      ? "等待模型"
+      : `${status.toUpperCase()} · ${String(agent.phase || "--").toUpperCase()}`;
+
+    const terminal = ["completed", "stopped", "take_over", "max_steps", "error"].includes(status);
+    const completion = $("#agent-completion-message");
+    completion.hidden = !terminal;
+    completion.classList.toggle("error", ["take_over", "max_steps", "error"].includes(status));
+    completion.textContent = status === "error"
+      ? `${agent.message || "ADB Agent 运行失败"}${agent.error ? `：${agent.error}` : ""}`
+      : agent.message || statusPresentation[0];
+
+    const logs = Array.isArray(agent.logs) ? agent.logs : [];
+    $("#agent-log-output").innerHTML = logs.length
+      ? logs.map(entry => {
+        const level = String(entry.level || "info");
+        const timestamp = finite(entry.time)
+          ? new Date(Number(entry.time) * 1000).toLocaleTimeString("zh-CN", { hour12: false })
+          : "--:--:--";
+        return `<div class="agent-log-line ${escapeHtml(level)}"><time>${escapeHtml(timestamp)}</time><em>${escapeHtml(level.toUpperCase())}</em><p>${escapeHtml(entry.message || "")}</p></div>`;
+      }).join("")
+      : '<div class="agent-log-empty">等待任务启动</div>';
+    const outputDirectory = $("#agent-output-directory");
+    outputDirectory.textContent = agent.output_dir
+      ? `证据目录 · ${agent.output_dir}`
+      : "运行后保存截图与 events.jsonl";
+    outputDirectory.title = agent.output_dir || "";
+
+    const selected = (state?.devices || []).find(item => item.serial === selectedDevice());
+    const androidReady = Boolean(
+      selected
+      && devicePlatform(selected) === "android"
+      && selected.state === "device"
+    );
+    const running = Boolean(agent.running || ["starting", "stopping"].includes(status));
+    $("#agent-start-button").disabled = running || !androidReady;
+    $("#agent-start-button").title = androidReady
+      ? ""
+      : "请先在右上角选择已授权的 Android ADB 设备";
+    $("#agent-stop-button").disabled = !running || status === "stopping";
+    $$("#adb-agent-form input, #adb-agent-form textarea, #adb-agent-form details").forEach(control => {
+      if (control.tagName === "DETAILS") {
+        control.classList.toggle("disabled", running);
+      } else {
+        control.disabled = running;
+      }
+    });
+
+    if (terminal && agent.session_id) {
+      const notificationKey = `${agent.session_id}:${status}`;
+      if (notificationKey !== app.agentNotificationKey) {
+        app.agentNotificationKey = notificationKey;
+        notify(
+          statusPresentation[0],
+          status === "error" ? (agent.error || agent.message || "运行失败") : (agent.message || "任务结束"),
+          ["completed", "stopped"].includes(status) ? "success" : "error",
+          9000,
+        );
+      }
+    }
+  }
+
   function render(state) {
     app.state = state;
     const version = String(state?.version || "").trim().replace(/^v/i, "");
@@ -5291,6 +5440,7 @@
     renderProbe(state);
     renderHistory(state);
     renderTools(state);
+    renderAdbAgent(state);
   }
 
   async function refreshState() {
@@ -5374,6 +5524,7 @@
       }
       renderDevices(app.state);
       renderProbe(app.state);
+      renderAdbAgent(app.state);
       updateCaptureFeatureControls();
     });
     $("#unplugged-input").addEventListener("change", () => {
@@ -5390,6 +5541,69 @@
       if (event.key !== "Enter") return;
       event.preventDefault();
       void applyBrightnessValue();
+    });
+
+    $("#adb-agent-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const device = selectedDevice();
+      const selected = (app.state?.devices || []).find(item => item.serial === device);
+      if (!device || !selected || devicePlatform(selected) !== "android" || selected.state !== "device") {
+        notify("请选择 Android ADB 设备", "AI 自动化基础闭环当前只支持已授权的 Android 设备。", "error");
+        return;
+      }
+      const task = $("#agent-task-input").value.trim();
+      if (!task) {
+        notify("请输入任务", "描述希望模型在手机上完成的目标。", "error");
+        $("#agent-task-input").focus();
+        return;
+      }
+      const payload = {
+        device,
+        task,
+        api_base_url: $("#agent-api-base-input").value.trim(),
+        model: $("#agent-model-input").value.trim(),
+        api_key: $("#agent-api-key-input").value,
+        max_steps: Number($("#agent-max-steps-input").value),
+        step_delay_s: Number($("#agent-step-delay-input").value),
+        request_timeout_s: Number($("#agent-timeout-input").value),
+      };
+      $("#agent-start-button").disabled = true;
+      $("#agent-start-button").textContent = "正在启动...";
+      try {
+        const result = await api("/api/ai-agent/start", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        localStorage.setItem("mobile-profiler-agent-api-base", payload.api_base_url);
+        localStorage.setItem("mobile-profiler-agent-model", payload.model);
+        localStorage.setItem("mobile-profiler-agent-max-steps", String(payload.max_steps));
+        localStorage.setItem("mobile-profiler-agent-step-delay", String(payload.step_delay_s));
+        localStorage.setItem("mobile-profiler-agent-timeout", String(payload.request_timeout_s));
+        $("#agent-api-key-input").value = "";
+        app.agentNotificationKey = "";
+        app.state = { ...(app.state || {}), adb_agent: result };
+        renderAdbAgent(app.state);
+        notify("ADB Agent 已启动", `${device} · ${payload.model}`, "success", 5000);
+      } catch (error) {
+        notify("无法启动 ADB Agent", error.message, "error", 9000);
+      } finally {
+        $("#agent-start-button").textContent = "启动闭环任务";
+        if (app.state) renderAdbAgent(app.state);
+      }
+    });
+
+    $("#agent-stop-button").addEventListener("click", async () => {
+      $("#agent-stop-button").disabled = true;
+      try {
+        const result = await api("/api/ai-agent/stop", {
+          method: "POST",
+          body: "{}",
+        });
+        app.state = { ...(app.state || {}), adb_agent: result };
+        renderAdbAgent(app.state);
+      } catch (error) {
+        notify("停止 ADB Agent 失败", error.message, "error", 8000);
+      }
     });
 
     $("#capture-preset-input").addEventListener("change", () => {

@@ -1915,10 +1915,10 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-41", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-42", timeout=5) as response:
                     css = response.read().decode("utf-8")
-                with urlopen(base + "/app.js?v=platform-ui-41", timeout=5) as response:
-                    javascript = response.read().decode("utf-8")
+                with urlopen(base + "/app.js?v=platform-ui-42", timeout=5) as response:
+                    javascript = response.read().decode("utf-8").replace("\r\n", "\n")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
             finally:
@@ -1954,8 +1954,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-41', html)
-            self.assertIn('/app.js?v=platform-ui-41', html)
+            self.assertIn('/app.css?v=platform-ui-42', html)
+            self.assertIn('/app.js?v=platform-ui-42', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2282,6 +2282,14 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("内存频率", html)
             self.assertNotIn('data-view="thermal"', html)
             self.assertIn('data-view="config"', html)
+            self.assertIn('data-view="agent"', html)
+            self.assertIn('data-panel="agent"', html)
+            self.assertIn('id="adb-agent-form"', html)
+            self.assertIn('id="agent-screen-image"', html)
+            self.assertIn('api("/api/ai-agent/start"', javascript)
+            self.assertIn('api("/api/ai-agent/stop"', javascript)
+            self.assertIn("function renderAdbAgent", javascript)
+            self.assertIn("模型不能下发任意 shell", html)
             self.assertIn("测试配置", html)
             self.assertNotIn('data-view="tools"', html)
             self.assertNotIn('data-panel="tools"', html)
@@ -2338,7 +2346,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn(".home-start-panel", css)
             self.assertIn('const legacyTools = view === "tools"', javascript)
             self.assertIn('const legacySystem = view === "system" || view === "thermal"', javascript)
-            self.assertIn('const target = ["live", "config", "device", "history"].includes(requested)', javascript)
+            self.assertIn('const target = ["live", "config", "agent", "device", "history"].includes(requested)', javascript)
             self.assertNotIn('system: "性能上下文"', javascript)
             self.assertIn('window.history.replaceState(null, "", `#${target}`)', javascript)
             self.assertIn("historyTools.open = true", javascript)

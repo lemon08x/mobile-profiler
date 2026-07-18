@@ -6,8 +6,9 @@ A standalone mobile power and performance profiler for long, multi-application
 test sessions across Android, HarmonyOS, and iOS. Android uses ADB, native
 HarmonyOS uses DevEco Studio's HDC, and both run inside the standard-library
 core collector. iOS support is implemented through an optional, separately
-installed `pymobiledevice3` sidecar. The profiler has no Python import, API, or
-runtime dependency on BTR2.
+installed `pymobiledevice3` sidecar. The profiler has no Python import or
+runtime dependency on the BTR2 repository. Its optional ADB vision agent can
+reuse BTR2's separately deployed OpenAI-compatible model endpoint.
 
 ## Why this exists
 
@@ -46,6 +47,10 @@ is easier to audit after a one-hour robotic workflow:
 - A local runtime dashboard for device Probe, recording control, live telemetry,
   collector logs, report history, log import, recovery, evidence packaging,
   two-run comparison, and source-project portable builds.
+- An Android ADB vision-agent block that sends each fresh device screenshot to
+  the BTR2 vLLM/OpenAI-compatible endpoint, receives one native `phone_action`
+  tool call, executes a validated ADB action, and repeats until completion,
+  takeover, stop, error, or the configured step limit.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -135,6 +140,40 @@ recovery, evidence ZIP creation with optional attachments, two-phone
 comparison, and source-only Windows portable packaging. These operations call
 the same existing CLI or evidence workflows, so UI and command-line artifacts
 stay identical.
+
+### ADB vision agent using the BTR2 model API
+
+The **AI Automation** view is an independent MVP workflow for Android. Select
+an authorized ADB device, enter a natural-language task, confirm the BTR2 model
+endpoint/model, and start the loop. The current BTR2 defaults are
+`http://192.168.31.237:8000` and `qwen3.6-27b`; both fields remain editable and
+can also be supplied through `BTR2_LLM_ENDPOINT`, `BTR2_LLM_MODEL`, and
+`BTR2_LLM_TOKEN`.
+
+Each step performs this closed loop:
+
+```text
+adb exec-out screencap -p
+        -> screenshot + task + recent action results
+        -> BTR2 OpenAI-compatible /v1/chat/completions
+        -> one native phone_action tool call (0-999 coordinates)
+        -> validated adb input / keyevent / monkey action
+        -> next screenshot
+```
+
+The model cannot provide arbitrary shell commands. The server only accepts
+tap, double-tap, long-press, swipe, key events, printable-ASCII text input,
+package launch, wait, finish, and takeover. Account authorization, CAPTCHA,
+payment, destructive actions, and other ambiguous irreversible steps are
+explicit takeover boundaries. Every run writes `config.json`, step screenshots,
+and `events.jsonl` below `profiler-runs/agent-runs/`; API keys are neither
+returned by `/api/state` nor persisted in those artifacts.
+
+This first PR keeps the agent block separate from power recording. A power run
+and an agent may already coexist at the ADB level, but automatic shared
+start/stop, timeline markers, workflow templates, phone-initialization recipes,
+and external-API tools are intentionally reserved for the next integration
+stage.
 
 The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
 test profile. It filters the device picker and changes connection controls,
