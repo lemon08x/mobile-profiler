@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .adb_agent import (
     AUTOMATION_ENGINE_HYBRID,
@@ -18,6 +18,7 @@ from .adb_agent import (
     DEFAULT_MODEL_API_BASE_URL,
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_MODEL_THINKING_MODE,
+    SUPPORTED_PHONE_ACTIONS,
     normalize_automation_engine,
 )
 from .features import capture_feature_names, capture_preset_names
@@ -148,6 +149,90 @@ def _resolve_path(value: object, label: str, base_dir: Path) -> Path:
 
 
 @dataclass(frozen=True)
+class AgentActionLimitConfig:
+    actions: tuple[str, ...]
+    maximum: int = 1
+    maximum_per_signature: Optional[int] = None
+    label: str = ""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: object,
+        *,
+        task_index: int,
+        limit_index: int,
+    ) -> "AgentActionLimitConfig":
+        data = _mapping(
+            value,
+            f"task {task_index} action limit {limit_index}",
+        )
+        actions = tuple(
+            action.lower()
+            for action in _string_tuple(
+                data.get("actions"),
+                f"task {task_index} action limit {limit_index} actions",
+            )
+        )
+        if not actions:
+            raise ValueError(
+                f"task {task_index} action limit {limit_index} must contain actions"
+            )
+        unsupported = [
+            action for action in actions if action not in SUPPORTED_PHONE_ACTIONS
+        ]
+        if unsupported:
+            raise ValueError(
+                f"task {task_index} action limit {limit_index} contains unsupported "
+                f"actions: {', '.join(unsupported)}"
+            )
+        maximum_label = f"task {task_index} action limit {limit_index} maximum"
+        try:
+            maximum = int(data.get("maximum", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{maximum_label} must be an integer") from exc
+        if maximum < 0 or maximum > 200:
+            raise ValueError(
+                f"{maximum_label} must be between 0 and 200"
+            )
+        raw_maximum_per_signature = data.get("maximum_per_signature")
+        maximum_per_signature: Optional[int] = None
+        if raw_maximum_per_signature is not None:
+            signature_label = (
+                f"task {task_index} action limit {limit_index} "
+                "maximum_per_signature"
+            )
+            try:
+                maximum_per_signature = int(raw_maximum_per_signature)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{signature_label} must be an integer") from exc
+            if maximum_per_signature <= 0 or maximum_per_signature > 200:
+                raise ValueError(
+                    f"{signature_label} must be between 1 and 200"
+                )
+        return cls(
+            actions=actions,
+            maximum=maximum,
+            maximum_per_signature=maximum_per_signature,
+            label=_text(
+                data.get("label"),
+                f"task {task_index} action limit {limit_index} label",
+                limit=120,
+            ),
+        )
+
+    def payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "actions": list(self.actions),
+            "maximum": self.maximum,
+            "label": self.label,
+        }
+        if self.maximum_per_signature is not None:
+            payload["maximum_per_signature"] = self.maximum_per_signature
+        return payload
+
+
+@dataclass(frozen=True)
 class AgentTaskConfig:
     task_id: str
     name: str
@@ -156,6 +241,7 @@ class AgentTaskConfig:
     max_steps: int = 12
     timeout_s: float = 120.0
     on_failure: str = "stop"
+    action_limits: tuple[AgentActionLimitConfig, ...] = ()
 
     @classmethod
     def from_mapping(
@@ -186,6 +272,20 @@ class AgentTaskConfig:
             max_steps=_positive_int(data.get("max_steps"), f"task {index} max_steps", 12),
             timeout_s=_positive_float(data.get("timeout_s"), f"task {index} timeout_s", 120.0),
             on_failure=on_failure,
+            action_limits=tuple(
+                AgentActionLimitConfig.from_mapping(
+                    item,
+                    task_index=index,
+                    limit_index=limit_index,
+                )
+                for limit_index, item in enumerate(
+                    _sequence(
+                        data.get("action_limits"),
+                        f"task {index} action_limits",
+                    ),
+                    1,
+                )
+            ),
         )
 
     def payload(self, prompt_prefix: str = "", attention_prefix: str = "") -> dict[str, object]:
@@ -201,6 +301,7 @@ class AgentTaskConfig:
             "max_steps": self.max_steps,
             "timeout_s": self.timeout_s,
             "on_failure": self.on_failure,
+            "action_limits": [limit.payload() for limit in self.action_limits],
         }
 
 
@@ -499,15 +600,145 @@ class PreparationStageConfig:
 
 
 @dataclass(frozen=True)
+class ActionRequirementConfig:
+    actions: tuple[str, ...]
+    minimum: int = 1
+    label: str = ""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: object,
+        *,
+        workflow_name: str,
+        index: int,
+    ) -> "ActionRequirementConfig":
+        data = _mapping(value, f"{workflow_name} required action {index}")
+        actions = _string_tuple(
+            data.get("actions"),
+            f"{workflow_name} required action {index} actions",
+        )
+        if not actions:
+            raise ValueError(
+                f"{workflow_name} required action {index} must list actions"
+            )
+        allowed_actions = {
+            "back",
+            "enter",
+            "input_text",
+            "long_press",
+            "swipe",
+            "swipe_fast",
+            "tap",
+            "tap_element",
+        }
+        unknown = set(actions) - allowed_actions
+        if unknown:
+            raise ValueError(
+                f"{workflow_name} required action {index} has unknown actions: "
+                + ", ".join(sorted(unknown))
+            )
+        return cls(
+            actions=actions,
+            minimum=_positive_int(
+                data.get("minimum"),
+                f"{workflow_name} required action {index} minimum",
+                1,
+            ),
+            label=_text(
+                data.get("label"),
+                f"{workflow_name} required action {index} label",
+                limit=200,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowContractConfig:
+    """Host-enforced operating envelope for one application workflow."""
+
+    entry_state: str = ""
+    success_evidence: str = ""
+    forbidden_states: tuple[str, ...] = ()
+    login_policy: str = "forbidden"
+    allowed_foreground_packages: tuple[str, ...] = ()
+    required_actions: tuple[ActionRequirementConfig, ...] = ()
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: object,
+        *,
+        workflow_name: str,
+        package: str,
+    ) -> "WorkflowContractConfig":
+        data = _mapping(value, f"{workflow_name} contract")
+        raw_packages = _string_tuple(
+            data.get("allowed_foreground_packages"),
+            f"{workflow_name} contract allowed_foreground_packages",
+        )
+        allowed_packages = raw_packages or (package,)
+        for index, allowed_package in enumerate(allowed_packages, 1):
+            _package(
+                allowed_package,
+                f"{workflow_name} contract allowed_foreground_packages[{index}]",
+            )
+        return cls(
+            entry_state=_text(
+                data.get("entry_state"),
+                f"{workflow_name} contract entry_state",
+                limit=1500,
+            ),
+            success_evidence=_text(
+                data.get("success_evidence"),
+                f"{workflow_name} contract success_evidence",
+                limit=1500,
+            ),
+            forbidden_states=_string_tuple(
+                data.get("forbidden_states"),
+                f"{workflow_name} contract forbidden_states",
+            ),
+            login_policy=_choice(
+                data.get("login_policy"),
+                f"{workflow_name} contract login_policy",
+                choices={"forbidden", "existing_session_only", "operator_required"},
+                default="forbidden",
+            ),
+            allowed_foreground_packages=allowed_packages,
+            required_actions=tuple(
+                ActionRequirementConfig.from_mapping(
+                    item,
+                    workflow_name=workflow_name,
+                    index=index,
+                )
+                for index, item in enumerate(
+                    _sequence(
+                        data.get("required_actions"),
+                        f"{workflow_name} contract required_actions",
+                    ),
+                    1,
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class WorkflowConfig:
     workflow_id: str
     name: str
     package: str
     tasks: tuple[AgentTaskConfig, ...]
+    initialization_tasks: tuple[AgentTaskConfig, ...] = ()
+    contract: WorkflowContractConfig = field(default_factory=WorkflowContractConfig)
+    automation_engine: str = ""
     required: bool = True
     home_after: bool = True
+    force_stop_before_launch: bool = False
+    repeat_after_success: bool = True
     launch_wait_s: float = 2.0
     idle_after_s: float = 10.0
+    quarantine_after_failures: int = 2
+    retry_cooldown_s: float = 60.0
 
     @classmethod
     def from_mapping(cls, value: object, index: int) -> "WorkflowConfig":
@@ -521,15 +752,59 @@ class WorkflowConfig:
         )
         if not tasks:
             raise ValueError(f"{name} must contain at least one task")
+        package = _package(data.get("package"), f"workflow {index} package")
+        raw_engine = _text(
+            data.get("automation_engine"),
+            f"{name} automation_engine",
+            limit=40,
+        )
+        required = _bool(data.get("required"), True)
         return cls(
             workflow_id=_text(data.get("id") or f"workflow-{index}", f"workflow {index} id", required=True, limit=64),
             name=name,
-            package=_package(data.get("package"), f"workflow {index} package"),
+            package=package,
             tasks=tasks,
-            required=_bool(data.get("required"), True),
+            initialization_tasks=tuple(
+                AgentTaskConfig.from_mapping(
+                    item,
+                    task_index,
+                    default_on_failure="stop",
+                )
+                for task_index, item in enumerate(
+                    _sequence(
+                        data.get("initialization_tasks"),
+                        f"{name} initialization_tasks",
+                    ),
+                    1,
+                )
+            ),
+            contract=WorkflowContractConfig.from_mapping(
+                data.get("contract"),
+                workflow_name=name,
+                package=package,
+            ),
+            automation_engine=(
+                normalize_automation_engine(raw_engine) if raw_engine else ""
+            ),
+            required=required,
             home_after=_bool(data.get("home_after"), True),
+            force_stop_before_launch=_bool(
+                data.get("force_stop_before_launch"),
+                False,
+            ),
+            repeat_after_success=_bool(data.get("repeat_after_success"), required),
             launch_wait_s=_non_negative_float(data.get("launch_wait_s"), f"{name} launch_wait_s", 2.0),
             idle_after_s=_non_negative_float(data.get("idle_after_s"), f"{name} idle_after_s", 10.0),
+            quarantine_after_failures=_positive_int(
+                data.get("quarantine_after_failures"),
+                f"{name} quarantine_after_failures",
+                2,
+            ),
+            retry_cooldown_s=_non_negative_float(
+                data.get("retry_cooldown_s"),
+                f"{name} retry_cooldown_s",
+                60.0,
+            ),
         )
 
 

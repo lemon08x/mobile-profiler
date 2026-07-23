@@ -67,6 +67,8 @@ class CampaignController:
         self._screenshot_key = ""
         self._catalog_state_key = ""
         self._catalog_state_cache: Dict[str, object] = {}
+        self._stage_config_cache_key = ""
+        self._stage_config_cache: Dict[str, object] = {}
         self._installing_package = ""
 
     @property
@@ -147,6 +149,577 @@ class CampaignController:
         if raw_status in {"operator_stopped", "stopped"}:
             return "stopped"
         return "failed"
+
+    @staticmethod
+    def _task_config_snapshot(task: AgentTaskConfig) -> Dict[str, object]:
+        return {
+            "id": task.task_id,
+            "name": task.name,
+            "max_steps": task.max_steps,
+            "timeout_s": task.timeout_s,
+            "on_failure": task.on_failure,
+            "action_limits": [limit.payload() for limit in task.action_limits],
+        }
+
+    @staticmethod
+    def _task_payload_snapshot(task: AgentTaskConfig) -> Dict[str, object]:
+        return {
+            "id": task.task_id,
+            "name": task.name,
+            "prompt": task.prompt,
+            "attention_prompt": task.attention_prompt,
+            "max_steps": task.max_steps,
+            "timeout_s": task.timeout_s,
+            "on_failure": task.on_failure,
+            "action_limits": [limit.payload() for limit in task.action_limits],
+        }
+
+    @staticmethod
+    def _workflow_group_id(
+        workflow_id: str,
+        *,
+        required: bool,
+        software_type: str,
+    ) -> str:
+        if required:
+            return "required_baseline"
+        key = workflow_id.lower()
+        if software_type == "game":
+            return "games"
+        if any(token in key for token in ("calculator", "wps", "edge")):
+            return "tools"
+        if "feed" in key:
+            return "public_content"
+        if any(token in key for token in ("map", "navigation", "browser")):
+            return "browser_maps"
+        return "other_scenarios"
+
+    def stage_config_snapshot(self) -> Dict[str, object]:
+        """Return a UI-oriented, read-only view derived from campaign JSON."""
+
+        if not self.available or self.config_path is None:
+            return {
+                "available": False,
+                "source_path": str(self.config_path or ""),
+                "stages": {},
+                "error": "内置两阶段 Campaign 配置不可用",
+            }
+        try:
+            stat = self.config_path.stat()
+            cache_key = f"{self.config_path}:{stat.st_mtime_ns}:{stat.st_size}"
+            config_revision = f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+        except OSError:
+            cache_key = str(self.config_path)
+            config_revision = "unavailable"
+        with self._lock:
+            if cache_key == self._stage_config_cache_key:
+                return dict(self._stage_config_cache)
+
+        try:
+            config = self._catalog_config()
+        except Exception as exc:
+            return {
+                "available": False,
+                "source_path": str(self.config_path),
+                "stages": {},
+                "error": str(exc),
+            }
+
+        workflows_by_package: dict[str, list[str]] = {}
+        for workflow in config.test.workflows:
+            workflows_by_package.setdefault(workflow.package, []).append(
+                workflow.workflow_id
+            )
+
+        setting_labels = {
+            "window_animation_scale": "窗口动画",
+            "transition_animation_scale": "过渡动画",
+            "animator_duration_scale": "动画时长",
+            "stay_on_while_plugged_in": "外部供电保持亮屏",
+            "low_power": "低电量模式",
+            "screen_brightness_mode": "亮度模式",
+            "screen_brightness": "屏幕亮度",
+            "screen_off_timeout": "自动锁屏",
+            "accelerometer_rotation": "自动旋转",
+            "user_rotation": "固定方向",
+        }
+        setting_group_meta = {
+            "global": (
+                "系统全局基线",
+                "关闭动画、禁用省电并保持外部供电时亮屏。",
+            ),
+            "system": (
+                "显示与交互基线",
+                "固定亮度、锁屏时间和屏幕方向，减少轮次间变量。",
+            ),
+        }
+        setting_groups: list[Dict[str, object]] = []
+        for namespace in ("global", "system"):
+            items = [
+                {
+                    "id": f"{setting.namespace}.{setting.key}",
+                    "name": setting_labels.get(setting.key, setting.key),
+                    "key": setting.key,
+                    "value": setting.value,
+                    "required": setting.required,
+                }
+                for setting in config.preparation.settings
+                if setting.namespace == namespace
+            ]
+            if not items:
+                continue
+            label, purpose = setting_group_meta.get(
+                namespace,
+                (namespace, "写入白名单设置并回读验证。"),
+            )
+            setting_groups.append(
+                {
+                    "id": namespace,
+                    "label": label,
+                    "purpose": purpose,
+                    "items": items,
+                    "count": len(items),
+                }
+            )
+
+        install_sets = [
+            {
+                "name": item.name,
+                "package": item.package,
+                "source": str(item.source),
+                "source_name": item.source.name,
+                "required": item.required,
+                "replace": item.replace,
+            }
+            for item in config.preparation.install_sets
+        ]
+
+        preparation_apps: list[Dict[str, object]] = []
+        for app in config.preparation.apps:
+            workflow_ids = workflows_by_package.get(app.package, [])
+            preparation_apps.append(
+                {
+                    "name": app.name,
+                    "package": app.package,
+                    "required": app.required,
+                    "software_type": app.software_type,
+                    "install_mode": app.install_mode,
+                    "install_channel": app.install_channel,
+                    "install_source": app.install_source,
+                    "allow_terms_acceptance": app.allow_terms_acceptance,
+                    "permissions": [
+                        {
+                            "name": permission.name,
+                            "required": permission.required,
+                        }
+                        for permission in app.permissions
+                    ],
+                    "setup_tasks": [
+                        self._task_config_snapshot(task)
+                        for task in app.setup_tasks
+                    ],
+                    "workflow_ids": workflow_ids,
+                    "workflow_mapped": bool(workflow_ids),
+                }
+            )
+
+        preparation_group_meta = {
+            "required_project": (
+                "必需项目安装包",
+                "固定版本的开源基线；任一项失败都会使预备阶段失败。",
+            ),
+            "optional_project": (
+                "可选项目安装包",
+                "固定版本的扩展游戏场景；失败记录为告警。",
+            ),
+            "external_apps": (
+                "商店 / 官网应用",
+                "缺失时按配置安装，随后完成首启和主流程复验。",
+            ),
+            "external_games": (
+                "大型外部游戏",
+                "只建立已有安装与登录态入口，不处理账号、实名或支付。",
+            ),
+        }
+
+        def preparation_group_id(app: Mapping[str, object]) -> str:
+            if app.get("install_mode") == "project":
+                return "required_project" if app.get("required") else "optional_project"
+            return (
+                "external_games"
+                if app.get("software_type") == "game"
+                else "external_apps"
+            )
+
+        app_groups: list[Dict[str, object]] = []
+        for group_id in (
+            "required_project",
+            "optional_project",
+            "external_apps",
+            "external_games",
+        ):
+            items = [
+                item
+                for item in preparation_apps
+                if preparation_group_id(item) == group_id
+            ]
+            if not items:
+                continue
+            label, purpose = preparation_group_meta[group_id]
+            app_groups.append(
+                {
+                    "id": group_id,
+                    "label": label,
+                    "purpose": purpose,
+                    "items": items,
+                    "count": len(items),
+                }
+            )
+
+        unmapped_apps = [
+            app for app in preparation_apps if not app["workflow_mapped"]
+        ]
+        raw_installer_apps = [
+            app
+            for app, configured in zip(
+                preparation_apps,
+                config.preparation.apps,
+            )
+            if configured.install_prompt
+            and any(
+                token in configured.install_prompt
+                for token in ("APK", "官方下载", "官方页面下载", "官网下载")
+            )
+        ]
+        all_files_apps = [
+            app
+            for app, configured in zip(
+                preparation_apps,
+                config.preparation.apps,
+            )
+            if "管理所有文件"
+            in "\n".join(
+                task.prompt + "\n" + task.attention_prompt
+                for task in configured.setup_tasks
+            )
+        ]
+        preparation_warnings: list[Dict[str, object]] = []
+        if unmapped_apps:
+            preparation_warnings.append(
+                {
+                    "severity": "warning",
+                    "title": "预备应用没有正式 workflow",
+                    "detail": "仍会安装和首启，但无法完成正常流程复验。",
+                    "items": [app["name"] for app in unmapped_apps],
+                }
+            )
+        if raw_installer_apps:
+            preparation_warnings.append(
+                {
+                    "severity": "danger",
+                    "title": "存在浏览器下载 / APK 安装路径",
+                    "detail": "这些安装提示可能离开应用商店并进入系统安装器。",
+                    "items": [app["name"] for app in raw_installer_apps],
+                }
+            )
+        if all_files_apps:
+            preparation_warnings.append(
+                {
+                    "severity": "danger",
+                    "title": "存在“管理所有文件”权限流程",
+                    "detail": "该权限会扩大 Agent 可见和可操作的本机文件范围。",
+                    "items": [app["name"] for app in all_files_apps],
+                }
+            )
+
+        app_type_by_package = {
+            app.package: app.software_type for app in config.preparation.apps
+        }
+        workflow_items: list[Dict[str, object]] = []
+        for workflow in config.test.workflows:
+            workflow_items.append(
+                {
+                    "id": workflow.workflow_id,
+                    "name": workflow.name,
+                    "package": workflow.package,
+                    "required": workflow.required,
+                    "automation_engine": (
+                        workflow.automation_engine
+                        or config.model.automation_engine
+                    ),
+                    "repeat_after_success": workflow.repeat_after_success,
+                    "force_stop_before_launch": workflow.force_stop_before_launch,
+                    "initialization_tasks": [
+                        self._task_config_snapshot(task)
+                        for task in workflow.initialization_tasks
+                    ],
+                    "tasks": [
+                        self._task_config_snapshot(task) for task in workflow.tasks
+                    ],
+                    "contract": {
+                        "entry_state": workflow.contract.entry_state,
+                        "success_evidence": workflow.contract.success_evidence,
+                        "forbidden_states": list(
+                            workflow.contract.forbidden_states
+                        ),
+                        "login_policy": workflow.contract.login_policy,
+                        "allowed_foreground_packages": list(
+                            workflow.contract.allowed_foreground_packages
+                        ),
+                        "required_actions": [
+                            {
+                                "label": requirement.label,
+                                "actions": list(requirement.actions),
+                                "minimum": requirement.minimum,
+                            }
+                            for requirement in workflow.contract.required_actions
+                        ],
+                    },
+                    "quarantine_after_failures": workflow.quarantine_after_failures,
+                    "retry_cooldown_s": workflow.retry_cooldown_s,
+                    "idle_after_s": workflow.idle_after_s,
+                    "group_id": self._workflow_group_id(
+                        workflow.workflow_id,
+                        required=workflow.required,
+                        software_type=app_type_by_package.get(
+                            workflow.package,
+                            "app",
+                        ),
+                    ),
+                }
+            )
+
+        workflow_group_meta = {
+            "required_baseline": (
+                "必需开源基线",
+                "决定整轮是否满足 required 覆盖的四个核心场景。",
+            ),
+            "games": (
+                "单机与大型游戏",
+                "使用视觉状态变化验证移动、转向和镜头操作。",
+            ),
+            "tools": (
+                "工具与文档",
+                "验证计算、公开网页导航和临时文档放弃保存。",
+            ),
+            "public_content": (
+                "免登录公开内容",
+                "只滚动公开信息流，不点赞、搜索、发送或购买。",
+            ),
+            "browser_maps": (
+                "浏览器与地图",
+                "执行可撤销的输入、取消或地图平移，不提交外部内容。",
+            ),
+            "other_scenarios": (
+                "其他受限场景",
+                "按软件契约和登录策略执行最小可验证动作。",
+            ),
+        }
+        workflow_groups: list[Dict[str, object]] = []
+        for group_id in (
+            "required_baseline",
+            "games",
+            "tools",
+            "public_content",
+            "browser_maps",
+            "other_scenarios",
+        ):
+            items = [
+                item for item in workflow_items if item["group_id"] == group_id
+            ]
+            if not items:
+                continue
+            label, purpose = workflow_group_meta[group_id]
+            workflow_groups.append(
+                {
+                    "id": group_id,
+                    "label": label,
+                    "purpose": purpose,
+                    "items": items,
+                    "count": len(items),
+                }
+            )
+
+        required_workflow_count = sum(
+            workflow.required for workflow in config.test.workflows
+        )
+        repeat_workflow_count = sum(
+            workflow.repeat_after_success for workflow in config.test.workflows
+        )
+        mapped_app_count = len(preparation_apps) - len(unmapped_apps)
+        snapshot: Dict[str, object] = {
+            "available": True,
+            "campaign_id": config.campaign_id,
+            "version": config.version,
+            "revision": config_revision,
+            "source_path": str(config.source_path),
+            "source_name": config.source_path.name,
+            "stages": {
+                "prepare": {
+                    "id": "prepare",
+                    "label": "阶段 1 · 预备环境",
+                    "kicker": "PREPARATION",
+                    "purpose": "建立可重复的设备与软件基线，并在正式计时前证明每个场景可进入、可操作、可验收。",
+                    "metrics": [
+                        {
+                            "label": "系统设置",
+                            "value": len(config.preparation.settings),
+                            "detail": "逐项写入并回读",
+                        },
+                        {
+                            "label": "固定安装包",
+                            "value": len(config.preparation.install_sets),
+                            "detail": "本地 APK / APKS",
+                        },
+                        {
+                            "label": "预备应用",
+                            "value": len(config.preparation.apps),
+                            "detail": "安装、首启、权限",
+                        },
+                        {
+                            "label": "已映射 workflow",
+                            "value": mapped_app_count,
+                            "detail": f"{len(unmapped_apps)} 项未映射",
+                        },
+                    ],
+                    "flow": [
+                        {
+                            "id": "device_ready",
+                            "label": "设备就绪",
+                            "purpose": "确认在线、解锁并可交互；设备号由启动时显式选择。",
+                        },
+                        {
+                            "id": "settings",
+                            "label": "系统基线",
+                            "purpose": f"写入并回读 {len(config.preparation.settings)} 项白名单设置。",
+                        },
+                        {
+                            "id": "install_sets",
+                            "label": "固定版本",
+                            "purpose": f"检查并安装 {len(config.preparation.install_sets)} 个项目 APK/APKS。",
+                        },
+                        {
+                            "id": "app_setup",
+                            "label": "逐应用初始化",
+                            "purpose": f"处理 {len(config.preparation.apps)} 个应用的安装、权限和首启入口。",
+                        },
+                        {
+                            "id": "validation",
+                            "label": "功能复验",
+                            "purpose": f"按阶段 2 的契约复验 {mapped_app_count} 个已映射场景。",
+                        },
+                        {
+                            "id": "result",
+                            "label": "预备结论",
+                            "purpose": "必需项失败则阻断；可选项失败记录告警。",
+                        },
+                    ],
+                    "setting_groups": setting_groups,
+                    "install_sets": install_sets,
+                    "app_groups": app_groups,
+                    "warnings": preparation_warnings,
+                    "policies": [
+                        "JSON 不保存设备号；启动时必须显式选择 USB ADB 设备。",
+                        "运行时权限只允许配置中逐项声明的权限。",
+                        "允许接受协议不等于允许登录、验证码、实名、支付或发送。",
+                        "每个应用首启后必须再通过对应阶段 2 workflow 的严格复验。",
+                    ],
+                    "acceptance": [
+                        "所有 required 设置、安装包和应用均成功。",
+                        "应用完成稳定入口初始化，并通过正常流程动作证据验证。",
+                        "optional 失败只产生 completed_with_warnings，不伪装为全部通过。",
+                    ],
+                    "tasks": self._tasks_for_stage("prepare", config),
+                },
+                "test": {
+                    "id": "test",
+                    "label": "阶段 2 · 两小时测试",
+                    "kicker": "TWO-HOUR TEST",
+                    "purpose": "在统一录制窗口内循环执行可验证的真实软件动作，持续两小时并以宿主严格条件验收整轮。",
+                    "metrics": [
+                        {
+                            "label": "单轮时长",
+                            "value": f"{config.test.cycle_duration_s / 60:g}",
+                            "detail": "分钟",
+                        },
+                        {
+                            "label": "workflow",
+                            "value": len(config.test.workflows),
+                            "detail": f"{required_workflow_count} required",
+                        },
+                        {
+                            "label": "成功后继续循环",
+                            "value": repeat_workflow_count,
+                            "detail": "其余严格成功一次后停",
+                        },
+                        {
+                            "label": "录制采样",
+                            "value": f"{config.test.recording.interval_s:g}",
+                            "detail": "秒 / sample",
+                        },
+                    ],
+                    "flow": [
+                        {
+                            "id": "round_start",
+                            "label": "轮次与录制",
+                            "purpose": "建立 7200 秒硬截止并启动低开销 profiler 录制。",
+                        },
+                        {
+                            "id": "select_workflow",
+                            "label": "选择场景",
+                            "purpose": "按 JSON 顺序跳过已隔离、冷却或已满足一次成功的场景。",
+                        },
+                        {
+                            "id": "initialize",
+                            "label": "入口初始化",
+                            "purpose": "只恢复契约入口，不提前执行主验证动作。",
+                        },
+                        {
+                            "id": "validate",
+                            "label": "主动作验证",
+                            "purpose": "制造本轮新状态变化，并保留动作前后证据。",
+                        },
+                        {
+                            "id": "host_guard",
+                            "label": "宿主验收",
+                            "purpose": "核对动作下限、动作上限与前台白名单；失败进入冷却或隔离。",
+                        },
+                        {
+                            "id": "round_end",
+                            "label": "循环与收尾",
+                            "purpose": "回桌面继续编排，截止后验证录制、覆盖和 Agent-only 条件。",
+                        },
+                    ],
+                    "workflow_groups": workflow_groups,
+                    "warnings": [],
+                    "policies": [
+                        f"设备持续离线 {config.test.offline_grace_s:g} 秒后按关机条件收尾。",
+                        "required workflow 默认循环；optional 默认严格成功一次后停止。",
+                        "每个 workflow 有独立失败计数、冷却时间和隔离阈值。",
+                        "Agent 运行中离开允许前台包会立即停止并隔离该场景。",
+                    ],
+                    "acceptance": [
+                        "达到两小时硬截止，或在单遍模式下完成全部可用 workflow。",
+                        "profiler 正常退出，最终工件完整且样本数达到理论值的 80%。",
+                        "所有可用与 required workflow 均至少严格完成一次。",
+                        "无人工接管、无隔离 workflow、设备与交互状态正常。",
+                    ],
+                    "recording": {
+                        "enabled": config.test.recording.enabled,
+                        "test_mode": config.test.recording.test_mode,
+                        "capture_preset": config.test.recording.capture_preset,
+                        "interval_s": config.test.recording.interval_s,
+                        "checkpoint_interval_s": config.test.recording.checkpoint_interval_s,
+                        "require_unplugged": config.test.recording.require_unplugged,
+                    },
+                    "tasks": self._tasks_for_stage("test", config),
+                },
+            },
+        }
+        with self._lock:
+            self._stage_config_cache_key = cache_key
+            self._stage_config_cache = dict(snapshot)
+        return snapshot
 
     def software_catalog_snapshot(self) -> Dict[str, object]:
         try:
@@ -427,13 +1000,62 @@ class CampaignController:
             with self._lock:
                 self._installing_package = ""
 
-    @staticmethod
-    def _tasks_for_stage(stage: str) -> list[Dict[str, object]]:
-        template = _campaign_template(stage)
-        raw_tasks = template.get("tasks")
-        if not isinstance(raw_tasks, list):
-            return []
-        return [dict(item) for item in raw_tasks if isinstance(item, Mapping)]
+    def _tasks_for_stage(
+        self,
+        stage: str,
+        config: Optional[CampaignConfig] = None,
+    ) -> list[Dict[str, object]]:
+        """Build the dashboard task list from the current campaign JSON.
+
+        The prompt templates module still supplies campaign labels and fallback
+        metadata, but it must never become a second source of campaign prompts.
+        """
+
+        selected = config or self._catalog_config()
+        tasks: list[AgentTaskConfig] = []
+        if stage == "prepare":
+            workflows_by_package: dict[str, list[object]] = {}
+            for workflow in selected.test.workflows:
+                workflows_by_package.setdefault(workflow.package, []).append(workflow)
+            for app in selected.preparation.apps:
+                if app.install_prompt:
+                    tasks.append(
+                        AgentTaskConfig(
+                            task_id=f"store-install-{app.package}",
+                            name=f"安装 {app.name}",
+                            prompt=app.install_prompt,
+                            attention_prompt=(
+                                f"只安装目标应用 {app.name}（期望包名 {app.package}）。"
+                                "允许确认系统安装器和应用商店的安装按钮；"
+                                "不得登录、付费或安装推荐应用。"
+                            ),
+                            max_steps=40,
+                            timeout_s=600.0,
+                            on_failure="stop",
+                        )
+                    )
+                tasks.extend(app.setup_tasks)
+                for workflow in workflows_by_package.get(app.package, []):
+                    tasks.extend(workflow.initialization_tasks)
+                    tasks.extend(workflow.tasks)
+        elif stage == "test":
+            for workflow in selected.test.workflows:
+                tasks.extend(workflow.initialization_tasks)
+                tasks.extend(workflow.tasks)
+        else:
+            raise ValueError("campaign stage must be prepare or test")
+
+        # A setup task can intentionally be reused as a workflow initializer.
+        # Show and override the first occurrence only; the runner resolves the
+        # same task id consistently wherever it is used.
+        snapshots: list[Dict[str, object]] = []
+        seen: set[str] = set()
+        for task in tasks:
+            if task.task_id in seen:
+                continue
+            seen.add(task.task_id)
+            snapshots.append(self._task_payload_snapshot(task))
+        return snapshots
 
     def start(self, payload: Dict[str, object]) -> Dict[str, object]:
         stage = str(payload.get("stage") or "").strip().lower()
@@ -449,26 +1071,59 @@ class CampaignController:
             for key in _MODEL_OVERRIDE_KEYS
             if key in payload and payload[key] is not None
         }
+        runtime_system_prompt_override = _boolean(
+            payload.get("runtime_system_prompt_override"),
+            False,
+        )
+        if not runtime_system_prompt_override:
+            model_overrides.pop("system_prompt", None)
         template = _campaign_template(stage)
+        baseline_tasks = self._tasks_for_stage(stage, config)
+        runtime_task_overrides = _boolean(
+            payload.get("runtime_task_overrides"),
+            False,
+        )
         raw_tasks = payload.get("tasks")
-        tasks = normalize_agent_tasks(
-            {"tasks": raw_tasks if isinstance(raw_tasks, list) else self._tasks_for_stage(stage)}
-        )
-        task_overrides = {
-            str(task["id"]): AgentTaskConfig(
-                task_id=str(task["id"]),
-                name=str(task["name"]),
-                prompt=str(task["prompt"]),
-                attention_prompt=str(task["attention_prompt"]),
-                max_steps=int(task["max_steps"]),
-                timeout_s=float(task["timeout_s"]),
-                on_failure=str(task["on_failure"]),
+        if runtime_task_overrides:
+            if not isinstance(raw_tasks, list):
+                raise ValueError("runtime task overrides require a tasks array")
+            tasks = normalize_agent_tasks({"tasks": raw_tasks})
+            task_overrides = {
+                str(task["id"]): AgentTaskConfig.from_mapping(
+                    task,
+                    index,
+                    default_on_failure=str(task["on_failure"]),
+                )
+                for index, task in enumerate(tasks, 1)
+            }
+            task_order = [str(task["id"]) for task in tasks]
+        else:
+            tasks = baseline_tasks
+            task_overrides = {}
+            task_order = []
+
+        repeat_workflows = (
+            _boolean(
+                payload.get("repeat_workflows", payload.get("loop_enabled")),
+                True,
             )
-            for task in tasks
-        }
-        loop_enabled = (
-            _boolean(payload.get("loop_enabled"), True) if stage == "test" else False
+            if stage == "test"
+            else False
         )
+        if stage == "test":
+            run_until_shutdown = _boolean(payload.get("run_until_shutdown"), False)
+            if run_until_shutdown:
+                max_rounds: Optional[int] = None
+            else:
+                raw_max_rounds = payload.get("max_rounds", 1)
+                try:
+                    max_rounds = int(raw_max_rounds)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("max_rounds must be a positive integer") from exc
+                if max_rounds <= 0:
+                    raise ValueError("max_rounds must be a positive integer")
+        else:
+            max_rounds = None
         now = time.time()
         session_id = uuid.uuid4().hex
 
@@ -486,8 +1141,8 @@ class CampaignController:
                 self.output_root,
                 model_payload_overrides=model_overrides,
                 task_overrides=task_overrides,
-                task_order=[str(task["id"]) for task in tasks],
-                repeat_workflows=loop_enabled,
+                task_order=task_order,
+                repeat_workflows=repeat_workflows,
             )
             self._session = {
                 "session_id": session_id,
@@ -503,7 +1158,11 @@ class CampaignController:
                 "task_index": 1 if tasks else 0,
                 "current_task": tasks[0] if tasks else None,
                 "task_results": [],
-                "loop_enabled": loop_enabled,
+                "loop_enabled": repeat_workflows,
+                "repeat_workflows": repeat_workflows,
+                "max_rounds": max_rounds,
+                "runtime_task_overrides": runtime_task_overrides,
+                "runtime_system_prompt_override": runtime_system_prompt_override,
                 "step": 0,
                 "max_steps": tasks[0].get("max_steps", 0) if tasks else 0,
                 "status": "starting",
@@ -548,9 +1207,14 @@ class CampaignController:
                 "预备阶段已创建"
                 if stage == "prepare"
                 else (
-                    "实际测试阶段已创建：循环执行至设备关机"
-                    if loop_enabled
-                    else "实际测试阶段已创建：整套任务只执行一遍"
+                    (
+                        "实际测试阶段已创建：单轮内循环 workflow，"
+                        f"最多 {max_rounds} 轮"
+                    )
+                    if repeat_workflows and max_rounds is not None
+                    else "实际测试阶段已创建：循环至设备关机"
+                    if repeat_workflows
+                    else f"实际测试阶段已创建：每轮整套任务只执行一遍，最多 {max_rounds} 轮"
                 ),
             )
             self._thread = threading.Thread(
@@ -570,7 +1234,12 @@ class CampaignController:
     ) -> list[Dict[str, object]]:
         actual_by_id: dict[str, Mapping[str, object]] = {}
 
-        def collect_agent(agent: object) -> None:
+        def collect_agent(
+            agent: object,
+            *,
+            host_status: str = "",
+            host_message: str = "",
+        ) -> None:
             if not isinstance(agent, Mapping):
                 return
             task_results = agent.get("task_results")
@@ -578,7 +1247,44 @@ class CampaignController:
                 return
             for item in task_results:
                 if isinstance(item, Mapping) and item.get("id"):
-                    actual_by_id[str(item["id"])] = item
+                    effective = dict(item)
+                    if host_status and str(effective.get("status") or "") == "completed":
+                        effective["status"] = host_status
+                        effective["message"] = (
+                            host_message
+                            or f"宿主严格验收未通过：{host_status}"
+                        )
+                    actual_by_id[str(item["id"])] = effective
+
+        def workflow_failure_message(workflow_result: Mapping[str, object]) -> str:
+            status = str(workflow_result.get("status") or "")
+            action_evidence = workflow_result.get("action_evidence")
+            if status == "incomplete_action_evidence" and isinstance(
+                action_evidence, Mapping
+            ):
+                requirements = action_evidence.get("requirements")
+                if isinstance(requirements, list):
+                    missing = [
+                        (
+                            f"{item.get('label')}: "
+                            f"{item.get('observed', 0)}/{item.get('minimum', 0)}"
+                        )
+                        for item in requirements
+                        if isinstance(item, Mapping) and item.get("satisfied") is not True
+                    ]
+                    if missing:
+                        return "宿主动作证据不足：" + "；".join(missing)
+            agent = workflow_result.get("agent")
+            initialization_agent = workflow_result.get("initialization_agent")
+            return str(
+                (agent.get("message") if isinstance(agent, Mapping) else "")
+                or (
+                    initialization_agent.get("message")
+                    if isinstance(initialization_agent, Mapping)
+                    else ""
+                )
+                or status
+            )
 
         if stage == "prepare":
             app_results = result.get("app_results")
@@ -594,7 +1300,33 @@ class CampaignController:
                     if isinstance(workflow_validations, list):
                         for validation in workflow_validations:
                             if isinstance(validation, Mapping):
-                                collect_agent(validation.get("agent"))
+                                host_status = (
+                                    str(validation.get("status") or "")
+                                    if validation.get("succeeded") is not True
+                                    else ""
+                                )
+                                host_message = (
+                                    workflow_failure_message(validation)
+                                    if host_status
+                                    else ""
+                                )
+                                collect_agent(
+                                    validation.get("initialization_agent"),
+                                    host_status=(
+                                        host_status
+                                        if validation.get(
+                                            "initialization_evidence_complete"
+                                        )
+                                        is False
+                                        else ""
+                                    ),
+                                    host_message=host_message,
+                                )
+                                collect_agent(
+                                    validation.get("agent"),
+                                    host_status=host_status,
+                                    host_message=host_message,
+                                )
         else:
             rounds = result.get("rounds")
             if isinstance(rounds, list):
@@ -606,7 +1338,33 @@ class CampaignController:
                         continue
                     for workflow_result in workflow_results:
                         if isinstance(workflow_result, Mapping):
-                            collect_agent(workflow_result.get("agent"))
+                            host_status = (
+                                str(workflow_result.get("status") or "")
+                                if workflow_result.get("evidence_complete") is False
+                                else ""
+                            )
+                            host_message = (
+                                workflow_failure_message(workflow_result)
+                                if host_status
+                                else ""
+                            )
+                            collect_agent(
+                                workflow_result.get("initialization_agent"),
+                                host_status=(
+                                    host_status
+                                    if workflow_result.get(
+                                        "initialization_evidence_complete"
+                                    )
+                                    is False
+                                    else ""
+                                ),
+                                host_message=host_message,
+                            )
+                            collect_agent(
+                                workflow_result.get("agent"),
+                                host_status=host_status,
+                                host_message=host_message,
+                            )
 
         results: list[Dict[str, object]] = []
         overall_status = str(result.get("status") or "")
@@ -668,6 +1426,17 @@ class CampaignController:
             detail = f"（{raw_message}）" if raw_message else ""
             return "completed", f"设备持续离线，已按关机条件完成测试并收尾{detail}"
         if raw_status == "max_rounds":
+            acceptance = result.get("acceptance")
+            if (
+                isinstance(acceptance, Mapping)
+                and acceptance.get("passed") is False
+            ):
+                accepted = acceptance.get("accepted_round_count", 0)
+                total = acceptance.get("round_count", 0)
+                return (
+                    "completed_with_warnings",
+                    f"指定轮次已结束，但严格验收仅通过 {accepted}/{total} 轮",
+                )
             return "completed", raw_message or "已完成指定测试轮次"
         if raw_status == "operator_stopped":
             return "stopped", raw_message or "实际测试阶段已由用户停止"
@@ -680,10 +1449,10 @@ class CampaignController:
     def _run(self, session_id: str, stage: str) -> None:
         with self._lock:
             runner = self._runner
-            loop_enabled = bool(
-                self._session.get("loop_enabled")
+            max_rounds = (
+                self._session.get("max_rounds")
                 if self._session is not None
-                else False
+                else None
             )
             if self._session is not None and self._session.get("session_id") == session_id:
                 self._session.update(
@@ -699,7 +1468,9 @@ class CampaignController:
             result = (
                 runner.prepare()
                 if stage == "prepare"
-                else runner.run_test(max_rounds=None if loop_enabled else 1)
+                else runner.run_test(
+                    max_rounds=(int(max_rounds) if max_rounds is not None else None)
+                )
             )
             status, message = self._presentation_status(stage, result)
             with self._lock:
@@ -782,6 +1553,7 @@ class CampaignController:
                 "screenshot_revision": 0,
                 "screenshot_available": False,
                 "config_path": str(self.config_path or ""),
+                "stage_config": self.stage_config_snapshot(),
                 "software_catalog": self.software_catalog_snapshot(),
             }
 
@@ -826,6 +1598,7 @@ class CampaignController:
                 "screenshot_available": screenshot_available,
                 "screenshot_url": "/api/campaign/screenshot" if screenshot_available else None,
                 "config_path": str(self.config_path or ""),
+                "stage_config": self.stage_config_snapshot(),
                 "software_catalog": self.software_catalog_snapshot(),
             }
         )

@@ -40,7 +40,7 @@
   const agentSelectedTemplateStorageKey = "mobile-profiler-agent-selected-template-v1";
   const agentSystemPromptStorageKey = "mobile-profiler-agent-system-prompt-v1";
   const agentTemporarySessionStorageKey = "mobile-profiler-agent-temporary-session-v1";
-  const agentConfigTabs = ["workflow", "software", "model", "prompt"];
+  const agentConfigTabs = ["workflow", "campaign", "software", "model", "prompt"];
   const agentPromptTabs = ["task", "system"];
   const maxUiLogLines = 500;
   const uiErrorDedupWindowS = 2;
@@ -172,6 +172,8 @@
     agentTemplateInitialized: false,
     agentTemplateLoading: false,
     agentCampaignStage: "",
+    agentCampaignConfigStage: "prepare",
+    agentCampaignRuntimeOverrides: false,
     agentPromptTaskId: "",
     agentDefaultSystemPrompt: "",
     agentSavedSystemPrompt: localStorage.getItem(agentSystemPromptStorageKey) || "",
@@ -5342,8 +5344,28 @@
       max_steps: Number(defaults.max_steps || 30),
       timeout_s: Number(defaults.task_timeout_s || 300),
       on_failure: "stop",
+      action_limits: [],
       ...overrides,
     };
+  }
+
+  function normalizeAgentActionLimits(value) {
+    const parsed = typeof value === "string"
+      ? (() => { try { return JSON.parse(value); } catch (_error) { return []; } })()
+      : value;
+    return (Array.isArray(parsed) ? parsed : []).map(item => ({
+      actions: [...new Set((Array.isArray(item?.actions) ? item.actions : [])
+        .map(action => String(action || "").trim().toLowerCase())
+        .filter(Boolean))],
+      maximum: Math.max(0, Math.min(200, Number(item?.maximum ?? 1))),
+      ...(item?.maximum_per_signature == null ? {} : {
+        maximum_per_signature: Math.max(
+          1,
+          Math.min(200, Number(item.maximum_per_signature || 1)),
+        ),
+      }),
+      label: String(item?.label || "").trim(),
+    })).filter(item => item.actions.length);
   }
 
   function setAgentTemporaryTaskMenu(open, { focusInput = false, returnFocus = false } = {}) {
@@ -5363,6 +5385,7 @@
     const nextTab = agentConfigTabs.includes(tab) ? tab : "workflow";
     const presentation = {
       workflow: { title: "任务启动", source: "TASK LAUNCH" },
+      campaign: { title: "阶段配置", source: "CAMPAIGN JSON" },
       software: { title: "应用与游戏", source: "SUPPORTED SOFTWARE" },
       model: { title: "模型调度", source: "MODEL ROUTING" },
       prompt: {
@@ -5384,6 +5407,9 @@
     });
     $("#agent-config-panel-title").textContent = presentation.title;
     $("#agent-config-panel-source").textContent = presentation.source;
+    if (nextTab === "campaign") {
+      renderAgentCampaignConfig(app.state?.campaign?.stage_config || {});
+    }
     if (nextTab === "prompt") setAgentPromptTab(app.agentPromptTab, { persist: false });
     if (persist) localStorage.setItem(agentConfigTabStorageKey, nextTab);
   }
@@ -5482,11 +5508,13 @@
     const task = defaultAgentTask(rawTask || {});
     const taskId = String(task.id || `task-${Date.now()}-${index + 1}`);
     const failure = task.on_failure === "continue" ? "continue" : "stop";
+    const actionLimits = normalizeAgentActionLimits(task.action_limits);
+    const constraintNote = actionLimits.length ? ` · ${actionLimits.length} 组宿主动作上限` : "";
     return `
       <article class="agent-task-card" data-agent-task-id="${escapeHtml(taskId)}">
         <header>
           <span class="agent-task-index" data-agent-task-number>${index + 1}</span>
-          <div><strong>${escapeHtml(task.name || `任务 ${index + 1}`)}</strong><small data-agent-task-prompt-summary>${task.prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务</small></div>
+          <div><strong>${escapeHtml(task.name || `任务 ${index + 1}`)}</strong><small data-agent-task-prompt-summary>${task.prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务${constraintNote}</small></div>
           <nav aria-label="调整任务顺序">
             <button type="button" title="上移" data-agent-task-action="up">↑</button>
             <button type="button" title="下移" data-agent-task-action="down">↓</button>
@@ -5501,6 +5529,7 @@
           <div class="agent-task-prompt-storage" aria-hidden="true">
             <textarea tabindex="-1" data-agent-task-field="prompt">${escapeHtml(task.prompt || "")}</textarea>
             <textarea tabindex="-1" data-agent-task-field="attention_prompt">${escapeHtml(task.attention_prompt || "")}</textarea>
+            <textarea tabindex="-1" data-agent-task-field="action_limits">${escapeHtml(JSON.stringify(actionLimits))}</textarea>
           </div>
           <div class="agent-task-limits">
             <div class="form-field"><label>最大步骤</label><input type="number" min="1" max="200" step="1" data-agent-task-field="max_steps" value="${escapeHtml(task.max_steps)}"></div>
@@ -5578,8 +5607,11 @@
     card.querySelector('[data-agent-task-field="prompt"]').value = $("#agent-task-prompt-input").value;
     card.querySelector('[data-agent-task-field="attention_prompt"]').value = $("#agent-task-attention-input").value;
     const configured = Boolean($("#agent-task-prompt-input").value.trim());
+    const actionLimits = normalizeAgentActionLimits(
+      card.querySelector('[data-agent-task-field="action_limits"]')?.value || "[]"
+    );
     card.classList.toggle("prompt-missing", !configured);
-    card.querySelector("[data-agent-task-prompt-summary]").textContent = `${configured ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务`;
+    card.querySelector("[data-agent-task-prompt-summary]").textContent = `${configured ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务${actionLimits.length ? ` · ${actionLimits.length} 组宿主动作上限` : ""}`;
     const state = $("#agent-task-prompt-state");
     state.textContent = configured ? "Prompt 已配置" : "Prompt 未填写";
     state.classList.toggle("ready", configured);
@@ -5603,9 +5635,12 @@
       const title = card.querySelector("header strong");
       const name = card.querySelector('[data-agent-task-field="name"]')?.value.trim();
       const prompt = card.querySelector('[data-agent-task-field="prompt"]')?.value.trim();
+      const actionLimits = normalizeAgentActionLimits(
+        card.querySelector('[data-agent-task-field="action_limits"]')?.value || "[]"
+      );
       title.textContent = name || `任务 ${index + 1}`;
       card.classList.toggle("prompt-missing", !prompt);
-      card.querySelector("[data-agent-task-prompt-summary]").textContent = `${prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务`;
+      card.querySelector("[data-agent-task-prompt-summary]").textContent = `${prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务${actionLimits.length ? ` · ${actionLimits.length} 组宿主动作上限` : ""}`;
       card.querySelector('[data-agent-task-action="up"]').disabled = index === 0;
       card.querySelector('[data-agent-task-action="down"]').disabled = index === cards.length - 1;
       card.querySelector('[data-agent-task-action="remove"]').disabled = (
@@ -5658,11 +5693,31 @@
       max_steps: Number(card.querySelector('[data-agent-task-field="max_steps"]').value),
       timeout_s: Number(card.querySelector('[data-agent-task-field="timeout_s"]').value),
       on_failure: card.querySelector('[data-agent-task-field="on_failure"]').value,
+      action_limits: normalizeAgentActionLimits(
+        card.querySelector('[data-agent-task-field="action_limits"]')?.value || "[]"
+      ),
     }));
   }
 
-  function populateAgentTaskTemplates(templates) {
-    app.agentServerTemplates = Array.isArray(templates) ? templates : [];
+  function campaignAwareAgentTemplates(templates, stageConfig) {
+    const stages = stageConfig?.stages && typeof stageConfig.stages === "object"
+      ? stageConfig.stages
+      : {};
+    const revision = String(stageConfig?.revision || "campaign-json");
+    return (Array.isArray(templates) ? templates : []).map(template => {
+      if (template?.kind !== "campaign") return template;
+      const stage = stages[String(template.campaign_stage || "")];
+      if (!stage || !Array.isArray(stage.tasks) || !stage.tasks.length) return template;
+      return {
+        ...template,
+        revision: `${revision}-${template.campaign_stage}`,
+        tasks: stage.tasks.map(task => ({ ...task })),
+      };
+    });
+  }
+
+  function populateAgentTaskTemplates(templates, stageConfig = null) {
+    app.agentServerTemplates = campaignAwareAgentTemplates(templates, stageConfig);
     const items = [...app.agentServerTemplates, ...app.agentCustomTemplates];
     const signature = JSON.stringify(items.map(item => [
       item.id,
@@ -5758,6 +5813,11 @@
       $("#agent-system-prompt-input").focus();
       return false;
     }
+    if (app.agentCampaignStage) {
+      app.agentCampaignRuntimeOverrides = true;
+      const editButton = $("#agent-edit-template-button");
+      if (editButton) editButton.textContent = "正在运行时覆盖";
+    }
     saveCurrentAgentTemplateDraft();
     app.agentSavedSystemPrompt = systemPrompt;
     localStorage.setItem(agentSystemPromptStorageKey, systemPrompt);
@@ -5810,7 +5870,9 @@
       ? app.agentTemplateDrafts[templateId]
       : null;
     const templateRevision = String(template.revision || "");
+    const campaignTemplate = template.kind === "campaign";
     const draft = useDraft
+      && (!campaignTemplate || app.agentCampaignRuntimeOverrides)
       && storedDraft
       && (!templateRevision || String(storedDraft.template_revision || "") === templateRevision)
       ? storedDraft
@@ -5829,6 +5891,7 @@
       || template.label
       || "ADB 测试流程"
     );
+    if (campaignTemplate && !draft) app.agentCampaignRuntimeOverrides = false;
     setAgentTemplateMode(template);
     if (app.agentCampaignStage === "test") {
       $("#agent-loop-workflow-input").checked = draft?.loop_enabled === undefined
@@ -5852,6 +5915,18 @@
   function editCurrentAgentTemplate() {
     const template = agentTemplateById(app.agentSelectedTemplateId);
     if (!template) return;
+    if (template.kind === "campaign" && !app.agentCampaignRuntimeOverrides) {
+      app.agentCampaignRuntimeOverrides = true;
+      applyAgentTemplate(template, { useDraft: true });
+      app.agentCampaignRuntimeOverrides = true;
+      setAgentTemplateMode(template);
+      notify(
+        "已启用本次运行覆盖",
+        "保存后，当前任务与 System Prompt 才会覆盖 JSON/内置基线；重新选择阶段可恢复基线。",
+        "warning",
+        7000,
+      );
+    }
     setAgentConfigTab("prompt");
     setAgentPromptTab("task");
     refreshAgentTaskPromptSelector();
@@ -5872,6 +5947,10 @@
       ? String(template.campaign_stage || "")
       : "";
     app.agentCampaignStage = ["prepare", "test"].includes(campaignStage) ? campaignStage : "";
+    if (app.agentCampaignStage) {
+      app.agentCampaignConfigStage = app.agentCampaignStage;
+      renderAgentCampaignConfig(app.state?.campaign?.stage_config || {});
+    }
     app.agentSelectedTemplateId = String(template?.id || "");
     if (app.agentSelectedTemplateId) {
       localStorage.setItem(agentSelectedTemplateStorageKey, app.agentSelectedTemplateId);
@@ -5890,14 +5969,16 @@
       loopHint.textContent = app.agentCampaignStage === "prepare"
         ? "预备阶段固定执行一次；系统设置、本地安装和权限步骤由宿主按配置完成。"
         : app.agentCampaignStage === "test"
-          ? "开启后重复当前任务并继续下一轮，直到设备关机或手动停止；关闭后整套任务只执行一遍。"
+          ? "开启后在本次 7200 秒轮次内持续循环可重试 workflow；本次固定只跑 1 轮。"
           : "当前任务固定执行一次。";
     }
     const hint = $("#agent-template-selection-hint");
     if (hint) {
-      hint.textContent = template
-        ? `${template.description || "当前模板已载入。"} 顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。`
-        : "选择任务后即可启动；顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。";
+      hint.textContent = app.agentCampaignStage
+        ? `${template?.description || "当前 Campaign 阶段已载入。"} 阶段基线来自 JSON；只有点击“运行时覆盖”并保存后，浏览器草稿才覆盖本次运行。`
+        : template
+          ? `${template.description || "当前模板已载入。"} 顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。`
+          : "选择任务后即可启动；顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。";
       hint.classList.toggle("campaign", Boolean(app.agentCampaignStage));
     }
     $("#agent-task-list")?.classList.toggle("campaign-preview", Boolean(app.agentCampaignStage));
@@ -5911,7 +5992,12 @@
       configurationButton.disabled = selected || agentSoftwareAutomationRunning();
     }
     const editButton = $("#agent-edit-template-button");
-    if (editButton) editButton.disabled = !app.agentSelectedTemplateId;
+    if (editButton) {
+      editButton.disabled = !app.agentSelectedTemplateId;
+      editButton.textContent = app.agentCampaignStage
+        ? (app.agentCampaignRuntimeOverrides ? "正在运行时覆盖" : "运行时覆盖")
+        : "编辑模板";
+    }
     refreshAgentTaskOrder();
   }
 
@@ -6449,6 +6535,233 @@
     void loadAgentSoftwareAssets(catalog);
   }
 
+  function agentCampaignConfigBadges(items = []) {
+    return items
+      .filter(item => item && item.label)
+      .map(item => `<span class="${escapeHtml(item.tone || "")}">${escapeHtml(item.label)}</span>`)
+      .join("");
+  }
+
+  function agentCampaignTaskSummary(tasks = []) {
+    const items = Array.isArray(tasks) ? tasks : [];
+    if (!items.length) return "无独立 Agent 子任务";
+    return items.map(task => String(task.name || task.id || "未命名任务")).join("、");
+  }
+
+  function agentPreparationConfigMarkup(stage) {
+    const settingGroups = (stage.setting_groups || []).map(group => `
+      <details class="agent-campaign-config-group" open>
+        <summary><span><small>ANDROID SETTINGS</small><strong>${escapeHtml(group.label)}</strong><em>${escapeHtml(group.purpose)}</em></span><b>${escapeHtml(group.count)} 项</b></summary>
+        <div class="agent-campaign-setting-list">
+          ${(group.items || []).map(item => `
+            <article>
+              <div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.id)}</code></div>
+              <span>${escapeHtml(item.value)}</span>
+              <em class="${item.required ? "required" : "optional"}">${item.required ? "必需" : "可选"}</em>
+            </article>`).join("")}
+        </div>
+      </details>`).join("");
+
+    const installSets = Array.isArray(stage.install_sets) ? stage.install_sets : [];
+    const installMarkup = `
+      <details class="agent-campaign-config-group" open>
+        <summary><span><small>PROJECT PACKAGES</small><strong>固定版本安装包</strong><em>已安装则跳过；缺失时由宿主使用本地 APK / APKS。</em></span><b>${installSets.length} 项</b></summary>
+        <div class="agent-campaign-config-items compact">
+          ${installSets.map(item => `
+            <article class="agent-campaign-config-item">
+              <header><div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.package)}</code></div>${agentCampaignConfigBadges([{ label: item.required ? "required" : "optional", tone: item.required ? "required" : "" }])}</header>
+              <p>${escapeHtml(item.source_name || item.source)}</p>
+            </article>`).join("")}
+        </div>
+      </details>`;
+
+    const appGroups = (stage.app_groups || []).map((group, index) => `
+      <details class="agent-campaign-config-group"${index === 0 ? " open" : ""}>
+        <summary><span><small>SOFTWARE BASELINE</small><strong>${escapeHtml(group.label)}</strong><em>${escapeHtml(group.purpose)}</em></span><b>${escapeHtml(group.count)} 项</b></summary>
+        <div class="agent-campaign-config-items">
+          ${(group.items || []).map(item => {
+            const setupTasks = agentCampaignTaskSummary(item.setup_tasks);
+            const workflowIds = (item.workflow_ids || []).join("、");
+            const permissions = Array.isArray(item.permissions) ? item.permissions.length : 0;
+            return `
+              <article class="agent-campaign-config-item${item.workflow_mapped ? "" : " warning"}">
+                <header>
+                  <div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.package)}</code></div>
+                  <div class="agent-campaign-config-badges">${agentCampaignConfigBadges([
+                    { label: item.required ? "required" : "optional", tone: item.required ? "required" : "" },
+                    { label: item.workflow_mapped ? `${item.workflow_ids.length} workflow` : "未映射", tone: item.workflow_mapped ? "verified" : "warning" },
+                  ])}</div>
+                </header>
+                <p>${escapeHtml(item.install_source || item.install_channel || "未声明安装来源")}</p>
+                <dl>
+                  <div><dt>首启目的</dt><dd>${escapeHtml(setupTasks)}</dd></div>
+                  <div><dt>功能复验</dt><dd>${escapeHtml(workflowIds || "没有对应阶段 2 workflow")}</dd></div>
+                  <div><dt>授权边界</dt><dd>${item.allow_terms_acceptance ? "允许接受应用协议" : "不允许代为接受协议"} · ${permissions ? `${permissions} 项显式权限` : "不授予运行时权限"}</dd></div>
+                </dl>
+              </article>`;
+          }).join("")}
+        </div>
+      </details>`).join("");
+
+    return `${settingGroups}${installMarkup}${appGroups}`;
+  }
+
+  function agentTestConfigMarkup(stage) {
+    return (stage.workflow_groups || []).map((group, index) => `
+      <details class="agent-campaign-config-group"${index === 0 ? " open" : ""}>
+        <summary><span><small>WORKFLOW GROUP</small><strong>${escapeHtml(group.label)}</strong><em>${escapeHtml(group.purpose)}</em></span><b>${escapeHtml(group.count)} 项</b></summary>
+        <div class="agent-campaign-config-items">
+          ${(group.items || []).map(item => {
+            const contract = item.contract || {};
+            const requiredActions = (contract.required_actions || [])
+              .map(action => `${action.label || action.actions?.join("/") || "动作"} ≥ ${action.minimum || 1}`)
+              .join("；");
+            const actionLimits = [
+              ...(item.initialization_tasks || []).flatMap(task =>
+                (task.action_limits || []).map(limit => ({ ...limit, phase: "初始化" }))
+              ),
+              ...(item.tasks || []).flatMap(task =>
+                (task.action_limits || []).map(limit => ({ ...limit, phase: "主任务" }))
+              ),
+            ].map(limit => {
+              const label = limit.label || limit.actions?.join("/") || "动作";
+              const maximum = Number.isFinite(Number(limit.maximum)) ? Number(limit.maximum) : 0;
+              const signatureMaximum = Number(limit.maximum_per_signature || 0);
+              const signatureNote = signatureMaximum > 0
+                ? ` · 同参数 ≤ ${signatureMaximum}`
+                : "";
+              return `${limit.phase}：${label} ≤ ${maximum}${signatureNote}`;
+            }).join("；");
+            return `
+              <article class="agent-campaign-config-item workflow">
+                <header>
+                  <div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.id)} · ${escapeHtml(item.package)}</code></div>
+                  <div class="agent-campaign-config-badges">${agentCampaignConfigBadges([
+                    { label: item.required ? "required" : "optional", tone: item.required ? "required" : "" },
+                    { label: item.automation_engine || "默认引擎", tone: "engine" },
+                    { label: item.repeat_after_success ? "持续循环" : "成功一次", tone: item.repeat_after_success ? "repeat" : "" },
+                  ])}</div>
+                </header>
+                <dl>
+                  <div><dt>入口目的</dt><dd>${escapeHtml(contract.entry_state || agentCampaignTaskSummary(item.initialization_tasks))}</dd></div>
+                  <div><dt>成功证据</dt><dd>${escapeHtml(contract.success_evidence || "以任务 Prompt 和最新截图为准")}</dd></div>
+                  <div><dt>动作下限</dt><dd>${escapeHtml(requiredActions || "未声明成功动作下限")}</dd></div>
+                  <div><dt>动作上限</dt><dd>${escapeHtml(actionLimits || "未声明任务动作上限")}</dd></div>
+                  <div><dt>失败编排</dt><dd>${escapeHtml(`冷却 ${item.retry_cooldown_s}s · 连续 ${item.quarantine_after_failures} 次后隔离 · 登录策略 ${contract.login_policy || "forbidden"}`)}</dd></div>
+                </dl>
+              </article>`;
+          }).join("")}
+        </div>
+      </details>`).join("");
+  }
+
+  function agentCampaignWarningsMarkup(warnings = []) {
+    const items = Array.isArray(warnings) ? warnings : [];
+    if (!items.length) {
+      return `
+        <section class="agent-campaign-side-section verified">
+          <header><small>CONFIG AUDIT</small><strong>未发现阶段级配置冲突</strong></header>
+          <p>运行结果仍以实时宿主验收为准。</p>
+        </section>`;
+    }
+    return `
+      <section class="agent-campaign-side-section">
+        <header><small>CONFIG AUDIT</small><strong>当前配置待处理项</strong></header>
+        <div class="agent-campaign-warning-list">
+          ${items.map(item => `
+            <article class="${escapeHtml(item.severity || "warning")}">
+              <strong>${escapeHtml(item.title)}</strong>
+              <p>${escapeHtml(item.detail)}</p>
+              <span>${escapeHtml((item.items || []).join("、"))}</span>
+            </article>`).join("")}
+        </div>
+      </section>`;
+  }
+
+  function agentCampaignListMarkup(kicker, title, items = [], tone = "") {
+    return `
+      <section class="agent-campaign-side-section ${escapeHtml(tone)}">
+        <header><small>${escapeHtml(kicker)}</small><strong>${escapeHtml(title)}</strong></header>
+        <ol>${(items || []).map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ol>
+      </section>`;
+  }
+
+  function renderAgentCampaignConfig(overview = {}) {
+    const sourceName = $("#agent-campaign-config-source-name");
+    const sourcePath = $("#agent-campaign-config-source-path");
+    const sourceState = $("#agent-campaign-config-source-state");
+    const panel = $("#agent-campaign-stage-panel");
+    if (!sourceName || !sourcePath || !sourceState || !panel) return;
+    sourceName.textContent = overview.available
+      ? `${overview.source_name || "Campaign JSON"} · v${overview.version || "?"}`
+      : "Campaign JSON 不可用";
+    sourcePath.textContent = String(overview.source_path || "--");
+    sourceState.textContent = overview.available ? "JSON BASELINE" : "CONFIG ERROR";
+    sourceState.classList.toggle("error", !overview.available);
+    const stages = overview.stages || {};
+    const fallbackStage = stages.prepare ? "prepare" : (stages.test ? "test" : "");
+    const stageId = stages[app.agentCampaignConfigStage]
+      ? app.agentCampaignConfigStage
+      : fallbackStage;
+    app.agentCampaignConfigStage = stageId || "prepare";
+    $$('[data-agent-campaign-stage]').forEach(button => {
+      const active = button.dataset.agentCampaignStage === stageId;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    const prepareStage = stages.prepare || {};
+    const testStage = stages.test || {};
+    const prepareAppCount = Number(
+      (prepareStage.metrics || []).find(item => item.label === "预备应用")?.value || 0
+    );
+    const testWorkflowCount = Number(
+      (testStage.metrics || []).find(item => item.label === "workflow")?.value || 0
+    );
+    $("#agent-campaign-stage-prepare-meta").textContent = `${prepareAppCount} 应用 · 设置 / 安装 / 复验`;
+    $("#agent-campaign-stage-test-meta").textContent = `${testWorkflowCount} workflow · 循环 / 录制 / 验收`;
+    $("#agent-config-tab-campaign-meta").textContent = overview.available
+      ? `${prepareAppCount} → ${testWorkflowCount}`
+      : "配置不可用";
+    if (!overview.available || !stageId || !stages[stageId]) {
+      panel.innerHTML = `<p class="agent-campaign-config-empty">${escapeHtml(overview.error || "无法读取两阶段 Campaign JSON。")}</p>`;
+      return;
+    }
+
+    const stage = stages[stageId];
+    const configGroups = stageId === "prepare"
+      ? agentPreparationConfigMarkup(stage)
+      : agentTestConfigMarkup(stage);
+    panel.setAttribute(
+      "aria-labelledby",
+      stageId === "prepare" ? "agent-campaign-stage-tab-prepare" : "agent-campaign-stage-tab-test",
+    );
+    panel.innerHTML = `
+      <section class="agent-campaign-stage-purpose">
+        <div><small>${escapeHtml(stage.kicker || "CAMPAIGN STAGE")}</small><strong>${escapeHtml(stage.label)}</strong><p>${escapeHtml(stage.purpose)}</p></div>
+        <span>JSON 只读基线</span>
+      </section>
+      <section class="agent-campaign-metrics" aria-label="${escapeHtml(stage.label)}配置摘要">
+        ${(stage.metrics || []).map(metric => `
+          <article><small>${escapeHtml(metric.label)}</small><strong>${escapeHtml(metric.value)}</strong><span>${escapeHtml(metric.detail)}</span></article>`).join("")}
+      </section>
+      <section class="agent-campaign-flow" aria-labelledby="agent-campaign-flow-title">
+        <header><small>EXECUTION FLOW</small><strong id="agent-campaign-flow-title">执行链路与每步目的</strong></header>
+        <ol>
+          ${(stage.flow || []).map((item, index) => `
+            <li><i>${index + 1}</i><div><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(item.purpose)}</p></div></li>`).join("")}
+        </ol>
+      </section>
+      <div class="agent-campaign-config-layout">
+        <section class="agent-campaign-config-groups" aria-label="${escapeHtml(stage.label)}配置分组">${configGroups}</section>
+        <aside class="agent-campaign-config-sidebar">
+          ${agentCampaignWarningsMarkup(stage.warnings)}
+          ${agentCampaignListMarkup("OPERATING BOUNDARY", "执行边界", stage.policies)}
+          ${agentCampaignListMarkup("STRICT ACCEPTANCE", "验收条件", stage.acceptance, "acceptance")}
+        </aside>
+      </div>`;
+  }
+
   function renderAdbAgent(state) {
     const adbAgent = state?.adb_agent || {};
     const campaign = state?.campaign || {};
@@ -6460,7 +6773,7 @@
     app.agentDefaultSystemPromptVersion = String(
       defaults.system_prompt_version || app.agentDefaultSystemPromptVersion || "内置规则"
     );
-    populateAgentTaskTemplates(defaults.task_templates);
+    populateAgentTaskTemplates(defaults.task_templates, campaign.stage_config || {});
     populateAgentAutomationEngines(defaults.automation_engines);
     populateAgentModelProviders(defaults.model_providers);
     const installAgentStatus = String(adbAgent.status || "idle");
@@ -6473,6 +6786,7 @@
       app.agentSoftwareInstallingPackage = "";
       app.agentSoftwareAssetsSignature = "";
     }
+    renderAgentCampaignConfig(campaign.stage_config || {});
     renderAgentSoftwareCatalog(campaign.software_catalog || {});
     const editorSessionId = agent.session_id
       ? `${automationSurface}:${String(agent.session_id)}`
@@ -6552,9 +6866,12 @@
         : (agent.task ? [defaultAgentTask({ name: "任务 1", prompt: agent.task, max_steps: agent.max_steps })] : []);
       renderAgentTaskEditor(sessionTasks);
       if (agentSessionChanged && automationSurface === "campaign") {
-        const campaignTemplate = (defaults.task_templates || []).find(item => (
+        const campaignTemplate = app.agentServerTemplates.find(item => (
           item.kind === "campaign" && String(item.campaign_stage) === String(agent.campaign_stage)
         ));
+        app.agentCampaignRuntimeOverrides = Boolean(
+          agent.runtime_task_overrides || agent.runtime_system_prompt_override
+        );
         setAgentTemplateMode(campaignTemplate || {
           kind: "campaign",
           campaign_stage: agent.campaign_stage,
@@ -6887,6 +7204,7 @@
     workflowName,
     campaignStage = "",
     loopEnabled = false,
+    runtimeOverrides = false,
     temporary = false,
   }) {
     const modelConfig = readAgentExecutionModelConfig();
@@ -6894,11 +7212,20 @@
     const payload = {
       device,
       workflow_name: workflowName,
-      tasks,
       ...modelConfig,
       loop_enabled: Boolean(loopEnabled),
     };
-    if (campaignStage) payload.stage = campaignStage;
+    if (campaignStage) {
+      payload.stage = campaignStage;
+      payload.repeat_workflows = campaignStage === "test" && Boolean(loopEnabled);
+      payload.max_rounds = 1;
+      payload.runtime_task_overrides = Boolean(runtimeOverrides);
+      payload.runtime_system_prompt_override = Boolean(runtimeOverrides);
+      if (runtimeOverrides) payload.tasks = tasks;
+      else delete payload.system_prompt;
+    } else {
+      payload.tasks = tasks;
+    }
     if (temporary) payload.temporary_task = true;
     const startButton = $("#agent-start-button");
     const temporaryButton = $("#agent-run-temporary-task-button");
@@ -6939,7 +7266,7 @@
             ? (campaignStage === "prepare" ? "预备阶段已启动" : "实际测试阶段已启动")
             : phoneConfiguration ? "手机配置检查已启动" : "ADB 测试流程已启动",
         campaignStage === "test"
-          ? `${payload.loop_enabled ? "循环至设备关机" : "整套任务执行一遍"} · ${engineLabel} · ${providerLabel} · ${payload.model}`
+          ? `${payload.repeat_workflows ? "单轮内循环 workflow" : "单轮内整套任务执行一遍"} · 1 × 7200 秒 · ${engineLabel} · ${providerLabel} · ${payload.model}`
           : `${temporary ? "固定执行一次" : `${tasks.length} 个子任务`} · ${engineLabel} · ${providerLabel} · ${payload.model}`,
         "success",
         6000,
@@ -7049,6 +7376,26 @@
         $(`[data-agent-config-tab="${agentConfigTabs[nextIndex]}"]`).focus();
       });
     });
+    $$('[data-agent-campaign-stage]').forEach(button => {
+      button.addEventListener("click", () => {
+        app.agentCampaignConfigStage = String(button.dataset.agentCampaignStage || "prepare");
+        renderAgentCampaignConfig(app.state?.campaign?.stage_config || {});
+      });
+      button.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const stages = ["prepare", "test"];
+        const currentIndex = stages.indexOf(String(button.dataset.agentCampaignStage || "prepare"));
+        const nextIndex = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? stages.length - 1
+            : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + stages.length) % stages.length;
+        app.agentCampaignConfigStage = stages[nextIndex];
+        renderAgentCampaignConfig(app.state?.campaign?.stage_config || {});
+        $(`[data-agent-campaign-stage="${stages[nextIndex]}"]`)?.focus();
+      });
+    });
     $("#agent-software-search-input").addEventListener("input", () => {
       renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
     });
@@ -7085,6 +7432,7 @@
         return;
       }
       if (app.agentPromptDirty && !confirm("当前 Prompt 有未保存修改，确认切换到预备验证任务？")) return;
+      app.agentCampaignRuntimeOverrides = false;
       applyAgentTemplate(template);
       $("#agent-task-template-select").value = String(template.id || "");
       setAgentConfigTab("workflow");
@@ -7142,6 +7490,7 @@
       }
       const template = agentTemplateById(templateId);
       if (!template) return;
+      if (template.kind === "campaign") app.agentCampaignRuntimeOverrides = false;
       applyAgentTemplate(template, { notifyUser: true });
       renderAdbAgent(app.state);
     });
@@ -7219,6 +7568,7 @@
         workflowName: $("#agent-workflow-name-input").value.trim() || "ADB 测试流程",
         campaignStage: app.agentCampaignStage,
         loopEnabled: Boolean($("#agent-loop-workflow-input").checked),
+        runtimeOverrides: Boolean(app.agentCampaignRuntimeOverrides),
       });
     });
 

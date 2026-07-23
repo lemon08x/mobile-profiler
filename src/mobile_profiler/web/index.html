@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-63">
-  <script src="/app.js?v=platform-ui-63" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-64">
+  <script src="/app.js?v=platform-ui-64" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -140,56 +140,96 @@
               <form id="adb-agent-form" class="agent-form" novalidate>
                 <nav class="agent-config-tabs" role="tablist" aria-label="AI 自动化配置">
                   <button class="active" id="agent-config-tab-workflow" type="button" role="tab" aria-selected="true" aria-controls="agent-config-view-workflow" data-agent-config-tab="workflow"><i>01</i><span><strong>任务启动</strong><small id="agent-config-tab-task-meta">选择任务</small></span></button>
-                  <button id="agent-config-tab-software" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-software" data-agent-config-tab="software"><i>02</i><span><strong>应用与游戏</strong><small id="agent-config-tab-software-meta">支持目录</small></span></button>
-                  <button id="agent-config-tab-model" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-model" data-agent-config-tab="model"><i>03</i><span><strong>模型调度</strong><small id="agent-config-tab-model-meta">局域网千问</small></span></button>
-                  <button id="agent-config-tab-prompt" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-prompt" data-agent-config-tab="prompt"><i>04</i><span><strong>Prompt 编辑</strong><small id="agent-config-tab-prompt-meta">1 个任务</small></span></button>
+                  <button id="agent-config-tab-campaign" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-campaign" data-agent-config-tab="campaign"><i>02</i><span><strong>阶段配置</strong><small id="agent-config-tab-campaign-meta">JSON 基线</small></span></button>
+                  <button id="agent-config-tab-software" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-software" data-agent-config-tab="software"><i>03</i><span><strong>应用与游戏</strong><small id="agent-config-tab-software-meta">支持目录</small></span></button>
+                  <button id="agent-config-tab-model" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-model" data-agent-config-tab="model"><i>04</i><span><strong>模型调度</strong><small id="agent-config-tab-model-meta">局域网千问</small></span></button>
+                  <button id="agent-config-tab-prompt" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-prompt" data-agent-config-tab="prompt"><i>05</i><span><strong>Prompt 编辑</strong><small id="agent-config-tab-prompt-meta">1 个任务</small></span></button>
                 </nav>
 
                 <div class="agent-config-views">
                   <section class="agent-config-view active" id="agent-config-view-workflow" role="tabpanel" aria-labelledby="agent-config-tab-workflow" data-agent-config-view="workflow">
                     <div class="agent-config-view-heading"><small>TASK LAUNCH</small><h3>任务启动</h3><p>选择本次要运行的任务，确认循环方式和当前进度，然后开始或停止执行。</p></div>
-                    <section class="agent-launch-selection" aria-labelledby="agent-launch-selection-title">
-                      <div class="agent-task-editor-heading">
-                        <div><strong id="agent-launch-selection-title">选择运行任务</strong><small>此处只决定启动哪个模板；具体步骤、顺序和 Prompt 在“Prompt 编辑”中修改</small></div>
+                    <div class="agent-launch-workspace">
+                      <div class="agent-launch-controls">
+                        <section class="agent-launch-selection" aria-labelledby="agent-launch-selection-title">
+                          <div class="agent-task-editor-heading">
+                            <div><strong id="agent-launch-selection-title">选择运行任务</strong><small>此处只决定启动哪个模板；具体步骤、顺序和 Prompt 在“Prompt 编辑”中修改</small></div>
+                          </div>
+                          <div class="agent-template-toolbar">
+                            <select id="agent-task-template-select" aria-label="当前任务模板"></select>
+                            <button class="button ghost compact" id="agent-new-template-button" type="button">新建</button>
+                            <button class="button secondary compact" id="agent-edit-template-button" type="button" disabled>编辑模板</button>
+                          </div>
+                          <small class="agent-template-selection-hint" id="agent-template-selection-hint">选择任务后即可启动；需要修改执行细节时进入 Prompt 编辑。</small>
+                        </section>
+                        <section class="agent-phone-configuration-launcher" id="agent-phone-configuration-launcher" aria-labelledby="agent-phone-configuration-title">
+                          <div class="agent-phone-configuration-copy">
+                            <small>PHONE CONFIGURATION CHECK</small>
+                            <strong id="agent-phone-configuration-title">续航测试 5.0 · 手机配置检查</strong>
+                            <p>按 A0 初始化、A1 重点设置、A2 关闭项、A3 厂商特性和 B 应用配置逐项执行。包装、扫码、短信、系统升级等无法安全完成的项目会跳过并在结束后统一说明原因。</p>
+                            <div><span>A0 初始化</span><span>A1 特别关注</span><span>A2 功能开关</span><span>A3 特殊功能</span><span>B 应用配置</span></div>
+                          </div>
+                          <button class="button secondary compact" id="agent-select-phone-configuration-button" type="button">选择配置检查</button>
+                        </section>
+                        <label class="compact-check option-with-help agent-loop-control" id="agent-loop-control">
+                          <input id="agent-loop-workflow-input" type="checkbox">
+                          <span><strong>单轮内循环 workflow</strong><small id="agent-loop-workflow-hint">正式测试固定一轮 7200 秒；勾选后在该轮内持续调度可重试场景。</small></span>
+                        </label>
+                        <section class="agent-launch-progress" aria-labelledby="agent-launch-progress-title">
+                          <div class="agent-launch-progress-heading">
+                            <div><small>LIVE PROGRESS</small><strong id="agent-launch-progress-title">当前执行进度</strong></div>
+                            <em id="agent-launch-state">等待启动</em>
+                          </div>
+                          <div class="agent-launch-progress-grid">
+                            <article><small>CURRENT TASK</small><strong id="agent-launch-current-task">尚未开始</strong><span id="agent-launch-task-position">0 / 0</span></article>
+                            <article><small>CURRENT STEP</small><strong id="agent-launch-current-step">0 / 0</strong><span id="agent-launch-step-state">IDLE</span></article>
+                          </div>
+                          <p id="agent-launch-progress-detail">选择 Android 设备和任务后即可开始。</p>
+                        </section>
+                        <footer class="agent-control-dock agent-launch-control-dock">
+                          <div class="agent-form-actions">
+                            <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
+                            <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
+                          </div>
+                          <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单 ADB 动作。</p>
+                        </footer>
                       </div>
-                      <div class="agent-template-toolbar">
-                        <select id="agent-task-template-select" aria-label="当前任务模板"></select>
-                        <button class="button ghost compact" id="agent-new-template-button" type="button">新建</button>
-                        <button class="button secondary compact" id="agent-edit-template-button" type="button" disabled>编辑模板</button>
-                      </div>
-                      <small class="agent-template-selection-hint" id="agent-template-selection-hint">选择任务后即可启动；需要修改执行细节时进入 Prompt 编辑。</small>
+
+                      <section class="agent-launch-observation" aria-labelledby="agent-launch-observation-title">
+                        <header class="agent-launch-observation-heading">
+                          <div><small>LIVE OBSERVATION</small><h4 id="agent-launch-observation-title">最新 ADB 截图</h4><p>Agent 每轮决策实际看到的最新设备画面。</p></div>
+                          <span class="data-source" id="agent-screen-meta">尚未截图</span>
+                        </header>
+                        <div class="agent-phone-stage">
+                          <div class="agent-phone-frame">
+                            <img id="agent-screen-image" alt="ADB Agent 最新手机截图" hidden>
+                            <div class="agent-screen-placeholder" id="agent-screen-placeholder"><span>ADB</span><strong>等待第一张截图</strong><small>任务启动后显示模型实际看到的手机画面</small></div>
+                          </div>
+                        </div>
+                        <div class="agent-runtime-stats">
+                          <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
+                          <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
+                          <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
+                          <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
+                          <article><small>ELAPSED</small><strong id="agent-elapsed-value">00:00</strong><span id="agent-device-value">未选择设备</span></article>
+                        </div>
+                      </section>
+                    </div>
+                  </section>
+
+                  <section class="agent-config-view" id="agent-config-view-campaign" role="tabpanel" aria-labelledby="agent-config-tab-campaign" data-agent-config-view="campaign" hidden>
+                    <div class="agent-config-view-heading"><small>CAMPAIGN CONFIG</small><h3>两阶段配置</h3><p>直接读取 Campaign JSON，分别说明预备阶段与两小时测试的目的、执行链路、软件分组、安全边界和验收条件。</p></div>
+                    <section class="agent-campaign-config-source" aria-label="Campaign 配置来源">
+                      <div><small>CONFIG SOURCE</small><strong id="agent-campaign-config-source-name">等待 Campaign JSON</strong><code id="agent-campaign-config-source-path">--</code></div>
+                      <span id="agent-campaign-config-source-state">JSON BASELINE</span>
                     </section>
-                    <section class="agent-phone-configuration-launcher" id="agent-phone-configuration-launcher" aria-labelledby="agent-phone-configuration-title">
-                      <div class="agent-phone-configuration-copy">
-                        <small>PHONE CONFIGURATION CHECK</small>
-                        <strong id="agent-phone-configuration-title">续航测试 5.0 · 手机配置检查</strong>
-                        <p>按 A0 初始化、A1 重点设置、A2 关闭项、A3 厂商特性和 B 应用配置逐项执行。包装、扫码、短信、系统升级等无法安全完成的项目会跳过并在结束后统一说明原因。</p>
-                        <div><span>A0 初始化</span><span>A1 特别关注</span><span>A2 功能开关</span><span>A3 特殊功能</span><span>B 应用配置</span></div>
-                      </div>
-                      <button class="button secondary compact" id="agent-select-phone-configuration-button" type="button">选择配置检查</button>
+                    <nav class="agent-campaign-stage-tabs" role="tablist" aria-label="Campaign 阶段配置">
+                      <button class="active" id="agent-campaign-stage-tab-prepare" type="button" role="tab" aria-selected="true" aria-controls="agent-campaign-stage-panel" data-agent-campaign-stage="prepare"><i>1</i><span><strong>预备环境</strong><small id="agent-campaign-stage-prepare-meta">设置 · 安装 · 复验</small></span></button>
+                      <button id="agent-campaign-stage-tab-test" type="button" role="tab" aria-selected="false" aria-controls="agent-campaign-stage-panel" data-agent-campaign-stage="test"><i>2</i><span><strong>两小时测试</strong><small id="agent-campaign-stage-test-meta">循环 · 录制 · 验收</small></span></button>
+                    </nav>
+                    <section class="agent-campaign-stage-panel" id="agent-campaign-stage-panel" role="tabpanel" aria-live="polite">
+                      <p class="agent-campaign-config-empty">正在读取两阶段 Campaign 配置…</p>
                     </section>
-                    <label class="compact-check option-with-help agent-loop-control" id="agent-loop-control">
-                      <input id="agent-loop-workflow-input" type="checkbox">
-                      <span><strong>完成整套任务后循环</strong><small id="agent-loop-workflow-hint">实际测试可循环至设备关机；其他任务固定执行一次。</small></span>
-                    </label>
-                    <section class="agent-launch-progress" aria-labelledby="agent-launch-progress-title">
-                      <div class="agent-launch-progress-heading">
-                        <div><small>LIVE PROGRESS</small><strong id="agent-launch-progress-title">当前执行进度</strong></div>
-                        <em id="agent-launch-state">等待启动</em>
-                      </div>
-                      <div class="agent-launch-progress-grid">
-                        <article><small>CURRENT TASK</small><strong id="agent-launch-current-task">尚未开始</strong><span id="agent-launch-task-position">0 / 0</span></article>
-                        <article><small>CURRENT STEP</small><strong id="agent-launch-current-step">0 / 0</strong><span id="agent-launch-step-state">IDLE</span></article>
-                      </div>
-                      <p id="agent-launch-progress-detail">选择 Android 设备和任务后即可开始。</p>
-                    </section>
-                    <footer class="agent-control-dock agent-launch-control-dock">
-                      <div class="agent-form-actions">
-                        <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
-                        <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
-                      </div>
-                      <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单 ADB 动作。</p>
-                    </footer>
                   </section>
 
                   <section class="agent-config-view" id="agent-config-view-software" role="tabpanel" aria-labelledby="agent-config-tab-software" data-agent-config-view="software" hidden>
@@ -318,23 +358,6 @@
                 </div>
 
               </form>
-            </section>
-
-            <section class="panel agent-screen-panel">
-              <div class="panel-heading"><div><small>LIVE OBSERVATION</small><h2>最新 ADB 截图</h2></div><span class="data-source" id="agent-screen-meta">尚未截图</span></div>
-              <div class="agent-phone-stage">
-                <div class="agent-phone-frame">
-                  <img id="agent-screen-image" alt="ADB Agent 最新手机截图" hidden>
-                  <div class="agent-screen-placeholder" id="agent-screen-placeholder"><span>ADB</span><strong>等待第一张截图</strong><small>任务启动后显示模型实际看到的手机画面</small></div>
-                </div>
-              </div>
-              <div class="agent-runtime-stats">
-                <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
-                <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
-                <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
-                <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
-                <article><small>ELAPSED</small><strong id="agent-elapsed-value">00:00</strong><span id="agent-device-value">未选择设备</span></article>
-              </div>
             </section>
 
             <section class="panel agent-decision-panel">
