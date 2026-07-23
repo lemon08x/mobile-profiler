@@ -29,6 +29,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="7" width="14" height="11" rx="3"/><path d="M9 3h6M12 3v4M8.5 12h.01M15.5 12h.01M9 15h6M3 11v4M21 11v4"/></svg>
           <span>AI 自动化</span>
         </button>
+        <button class="nav-item" type="button" data-view="opensource">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="9" cy="18" r="2.5"/><path d="M8.3 6.5l7.2 1M7.1 8.2l1.3 7.3M16.3 10l-5.6 6.1"/></svg>
+          <span>开源自动化</span>
+        </button>
         <button class="nav-item" type="button" data-view="device">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M10 18.5h4"/></svg>
           <span>设备能力</span>
@@ -365,6 +369,139 @@
               <div class="panel-heading"><div><small>AGENT JOURNAL</small><h2>闭环日志</h2></div><span class="data-source" id="agent-output-directory">运行后保存截图与 events.jsonl</span></div>
               <div class="agent-log" id="agent-log-output" aria-live="polite"><div class="agent-log-empty">等待任务启动</div></div>
             </section>
+          </div>
+        </section>
+
+        <section class="view" data-panel="opensource" hidden>
+          <div class="view-header opensource-view-header">
+            <div><small>OPEN SOURCE AUTOMATION HUB</small><h2>开源自动化</h2><p>下拉选择一个已接入项目。MaaEnd 页面动态读取用户安装包中的全部 ADB 任务、选项和预设，并只改写本项目专用实例，不复制上游 Pipeline 与图片资源。</p></div>
+            <span class="agent-status-badge opensource-status-badge idle" id="opensource-status-badge"><i></i><span><strong id="opensource-status-label">读取项目目录</strong><small id="opensource-status-detail">等待服务端状态</small></span></span>
+          </div>
+
+          <div class="opensource-layout">
+            <section class="panel opensource-project-switcher">
+              <label class="opensource-project-select-label" for="opensource-project-select"><span><small>AUTOMATION PROJECT</small><strong>开源项目</strong></span><select id="opensource-project-select" aria-label="选择开源自动化项目"><option>正在加载项目</option></select></label>
+              <div class="opensource-project-identity"><i id="opensource-project-mark">--</i><span><small id="opensource-project-game">读取游戏信息</small><strong id="opensource-project-name">开源自动化</strong><em id="opensource-project-summary">等待项目目录</em></span></div>
+              <span class="opensource-project-runtime-state" id="opensource-project-count">正在加载项目</span>
+              <a class="data-source" id="opensource-project-source" href="#" target="_blank" rel="noreferrer" hidden>源代码 ↗</a>
+            </section>
+
+            <section class="panel opensource-feature-panel">
+              <div class="panel-heading"><div><small>GAME AUTOMATION</small><h2 id="opensource-feature-title">游戏功能</h2></div><span class="data-source" id="opensource-feature-count">读取功能目录</span></div>
+              <div class="opensource-feature-groups" id="opensource-feature-groups" aria-live="polite"><div class="opensource-empty">选择项目后显示其功能</div></div>
+            </section>
+
+            <aside class="panel opensource-selection-panel">
+              <div class="panel-heading"><div><small>RUNTIME PROFILE</small><h2>运行方案</h2></div><span class="data-source" id="opensource-selection-state">读取配置</span></div>
+              <form class="opensource-selection-form" id="opensource-selection-form">
+                <div class="opensource-selection-metrics">
+                  <article><small>CURRENT PROJECT</small><strong id="opensource-selected-project-count">--</strong><span>当前项目</span></article>
+                  <article><small>FEATURES</small><strong id="opensource-selected-feature-count">0</strong><span>已选功能</span></article>
+                </div>
+                <div class="opensource-selection-summary" id="opensource-selection-summary"><div class="opensource-empty">先从左侧选择需要的功能</div></div>
+                <div class="opensource-execution-callout">
+                  <i aria-hidden="true">!</i>
+                  <span><strong id="opensource-execution-state">等待选择功能</strong><small id="opensource-execution-detail">这里只保存已有执行适配器的功能；完成运行时配置后即可预检和运行。</small></span>
+                </div>
+                <button class="button primary" id="opensource-save-selection-button" type="submit" disabled>保存功能方案</button>
+              </form>
+              <section class="opensource-runtime-console" id="opensource-runtime-console">
+                <div class="opensource-runtime-console-head">
+                  <span><small>SELECTED FEATURE RUNTIME</small><strong id="opensource-runtime-title">功能运行控制</strong></span>
+                  <em id="opensource-runtime-status">WAITING</em>
+                </div>
+                <p id="opensource-runtime-detail">选择并保存一个已接入功能后，可对顶部当前 Android 真机运行预检。</p>
+                <div class="opensource-runtime-facts">
+                  <span><small>DEVICE</small><strong id="opensource-runtime-device">未选择</strong></span>
+                  <span><small>SCREEN</small><strong id="opensource-runtime-screen">未预检</strong></span>
+                  <span><small>UPSTREAM</small><strong id="opensource-runtime-upstream">检查中</strong></span>
+                  <span><small>DISK</small><strong id="opensource-runtime-disk">--</strong></span>
+                </div>
+                <div class="opensource-runtime-options" id="opensource-runtime-options"><div class="opensource-empty">选择功能后显示运行参数</div></div>
+                <div class="opensource-runtime-warning"><i>!</i><span>第三方游戏自动化可能违反游戏规则并带来账号处罚风险；启动前请自行确认。</span></div>
+                <div class="opensource-runtime-actions">
+                  <button class="button" id="opensource-configure-button" type="button" hidden disabled>载入目录 / 保存任务</button>
+                  <button class="button" id="opensource-preflight-button" type="button" disabled>运行预检</button>
+                  <button class="button primary" id="opensource-start-button" type="button" disabled>启动所选功能</button>
+                  <button class="button danger" id="opensource-stop-button" type="button" disabled>停止</button>
+                </div>
+                <div class="opensource-runtime-log" id="opensource-runtime-log-output"><div class="opensource-empty">等待运行时事件</div></div>
+              </section>
+            </aside>
+
+            <details class="panel opensource-diagnostics-panel">
+              <summary>
+                <span><small>ADAPTER DIAGNOSTICS</small><strong>适配诊断</strong><em>查看可选图像运行时、确定性视觉验证、状态图与证据</em></span>
+                <span class="data-source" id="opensource-diagnostics-summary">检查运行时</span>
+              </summary>
+              <div class="opensource-diagnostics-grid">
+                <section class="opensource-overview-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>OPEN SOURCE RUNTIME</small><h2>独立运行时与边界</h2></div><a class="data-source opensource-upstream-link" href="https://github.com/moesnow/March7thAssistant" target="_blank" rel="noreferrer">上游项目 ↗</a></div>
+                  <div class="opensource-runtime-grid">
+                    <article><small>IMAGE ENGINE</small><strong id="opensource-dependency-value">检查中</strong><span id="opensource-dependency-detail">OpenCV / NumPy 为可选依赖</span></article>
+                    <article><small>DISK COST</small><strong id="opensource-disk-value">约 160 MiB</strong><span id="opensource-disk-detail">核心项目仍保持轻量</span></article>
+                    <article><small>RESOURCE BUNDLE</small><strong id="opensource-bundle-value">读取中</strong><span id="opensource-bundle-detail">状态图与模板策略</span></article>
+                    <article><small>DEVICE GATEWAY</small><strong id="opensource-gateway-value">未接真机</strong><span id="opensource-gateway-detail">当前只运行主机侧验证</span></article>
+                  </div>
+                  <div class="opensource-install-callout" id="opensource-install-callout">
+                    <div><small>OPTIONAL INSTALL</small><strong>只在使用视觉适配诊断时安装图像依赖</strong><code id="opensource-install-command">python -m pip install -e ".[image]"</code></div>
+                    <span id="opensource-install-state">等待依赖检查</span>
+                  </div>
+                  <div class="opensource-safety-strip" aria-label="执行安全边界">
+                    <span><i></i>宿主控制使用强类型 JSON</span>
+                    <span><i></i>宿主不使用 eval / exec</span>
+                    <span><i></i>网页不开放任意 shell</span>
+                    <span class="pending"><i></i>外部运行时按上游权限运行</span>
+                  </div>
+                </section>
+
+                <section class="opensource-demo-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>SYNTHETIC VERIFICATION</small><h2>运行合成验证</h2></div><span class="data-source" id="opensource-demo-state">等待运行</span></div>
+                  <form class="opensource-demo-form" id="opensource-demo-form">
+                    <label for="opensource-iterations-input"><span><strong>匹配迭代</strong><small>分别统计缓存画面和每次变化的新截图</small></span><div class="input-with-unit"><input id="opensource-iterations-input" type="number" min="1" max="100" step="1" value="50"><span>次</span></div></label>
+                    <button class="button primary" id="opensource-run-demo-button" type="submit" disabled>运行合成验证</button>
+                  </form>
+                  <div class="opensource-result-grid">
+                    <article><small>MATCH SCORE</small><strong id="opensource-score-value">--</strong><span id="opensource-threshold-value">阈值 --</span></article>
+                    <article><small>COORDINATES</small><strong id="opensource-coordinate-value">--</strong><span id="opensource-coordinate-state">等待坐标证据</span></article>
+                    <article><small>FRESH MEAN</small><strong id="opensource-mean-value">--</strong><span>新截图平均耗时</span></article>
+                    <article><small>FRESH P95</small><strong id="opensource-p95-value">--</strong><span>新截图 P95 耗时</span></article>
+                  </div>
+                  <p class="opensource-demo-detail" id="opensource-demo-detail">生成一张 720 × 1280 合成手机画面，在限定 ROI 中查找 PLAY 模板并核对精确坐标。</p>
+                </section>
+
+                <section class="opensource-graph-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>TYPED SCREEN GRAPH</small><h2>状态图资源包</h2></div><span class="data-source" id="opensource-graph-summary">等待资源包</span></div>
+                  <div class="opensource-graph" id="opensource-graph-view"><div class="opensource-empty">正在读取示例状态图</div></div>
+                  <p class="opensource-panel-note" id="opensource-graph-detail">每条 transition 只接受声明过的动作名和参数，不接受 Python 调用字符串。</p>
+                </section>
+
+                <section class="opensource-evidence-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>VISUAL EVIDENCE</small><h2>识别证据</h2></div><span class="data-source" id="opensource-evidence-state">尚未生成</span></div>
+                  <div class="opensource-evidence-grid">
+                    <figure class="primary"><figcaption><span><small>OVERLAY</small><strong>匹配框与分数</strong></span><em>最终证据</em></figcaption><div><img id="opensource-overlay-image" alt="模板匹配标注图" hidden><span class="opensource-evidence-placeholder" id="opensource-overlay-placeholder">运行验证后显示标注截图</span></div></figure>
+                    <figure><figcaption><span><small>FRAME</small><strong>合成手机画面</strong></span></figcaption><div><img id="opensource-frame-image" alt="合成手机截图" hidden><span class="opensource-evidence-placeholder" id="opensource-frame-placeholder">FRAME</span></div></figure>
+                    <figure><figcaption><span><small>TEMPLATE</small><strong>PLAY 模板</strong></span></figcaption><div><img id="opensource-template-image" alt="PLAY 模板图片" hidden><span class="opensource-evidence-placeholder" id="opensource-template-placeholder">TEMPLATE</span></div></figure>
+                  </div>
+                </section>
+
+                <section class="opensource-alignment-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>ADAPTER CAPABILITY CHECK</small><h2>适配能力对齐</h2></div><span class="data-source">诊断底座，不代表项目功能已经可执行</span></div>
+                  <div class="opensource-alignment-table-wrap">
+                    <table class="opensource-alignment-table">
+                      <thead><tr><th>能力</th><th>上游前端</th><th>本分支当前实现</th><th>状态</th></tr></thead>
+                      <tbody id="opensource-alignment-body"><tr><td colspan="4">正在核对功能</td></tr></tbody>
+                    </table>
+                  </div>
+                  <p class="opensource-panel-note"><strong>当前边界：</strong>这里验证不依赖模型的视觉识别底座；真正运行所选功能仍需接入项目专属配置、资源和动作适配器。</p>
+                </section>
+
+                <section class="opensource-log-panel opensource-diagnostic-section">
+                  <div class="panel-heading"><div><small>MODULE JOURNAL</small><h2>模块日志</h2></div><span class="data-source" id="opensource-log-summary">等待模块事件</span></div>
+                  <div class="opensource-log" id="opensource-log-output" aria-live="polite"><div class="opensource-empty">等待服务端状态</div></div>
+                </section>
+              </div>
+            </details>
           </div>
         </section>
 

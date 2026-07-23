@@ -188,6 +188,17 @@
     agentSoftwareAssetsLoading: false,
     agentSoftwareInstallingPackage: "",
     agentSoftwareInstallSessionId: "",
+    openSourceSelectionDraft: null,
+    openSourceSelectionDirty: false,
+    openSourceSelectionSaving: false,
+    openSourceSelectionServerSignature: "",
+    openSourceCatalogRenderSignature: "",
+    openSourceActiveProjectId: "",
+    openSourceRuntimeAction: "",
+    maaEndConfigDraft: null,
+    maaEndConfigDirty: false,
+    maaEndConfigSaving: false,
+    maaEndConfigServerSignature: "",
     agentConfigTab: agentConfigTabs.includes(localStorage.getItem(agentConfigTabStorageKey))
       ? localStorage.getItem(agentConfigTabStorageKey)
       : "workflow",
@@ -2175,7 +2186,7 @@
     const requested = legacySystem
       ? "live"
       : legacyTools ? "history" : view;
-    const target = ["live", "config", "agent", "device", "history"].includes(requested)
+    const target = ["live", "config", "agent", "opensource", "device", "history"].includes(requested)
       ? requested
       : "live";
     app.activeView = target;
@@ -2204,6 +2215,7 @@
       live: "实时监控",
       config: "测试配置",
       agent: "AI 自动化",
+      opensource: "开源自动化",
       device: "设备能力",
       history: "历史报告与交付",
     }[target];
@@ -6731,6 +6743,1370 @@
     }
   }
 
+  function normalizeOpenSourceSelection(selection = {}) {
+    const uniqueIds = value => Array.from(new Set(
+      (Array.isArray(value) ? value : [])
+        .map(item => String(item || "").trim())
+        .filter(Boolean),
+    ));
+    const nestedProjects = Array.isArray(selection.projects) ? selection.projects : [];
+    const nestedProjectIds = uniqueIds(nestedProjects.map(item => item?.project_id));
+    const nestedFeatureIds = uniqueIds(nestedProjects.flatMap(item => (
+      Array.isArray(item?.feature_ids) ? item.feature_ids : []
+    )));
+    return {
+      projectIds: uniqueIds(
+        nestedProjectIds.length ? nestedProjectIds : selection.project_ids,
+      ),
+      featureIds: uniqueIds(
+        nestedProjects.length ? nestedFeatureIds : selection.feature_ids,
+      ),
+    };
+  }
+
+  function openSourceNestedSelection(projects, selection) {
+    const selectedProjects = new Set(selection.projectIds || []);
+    const selectedFeatures = new Set(selection.featureIds || []);
+    return projects
+      .filter(project => selectedProjects.has(String(project?.id || "")))
+      .map(project => ({
+        project_id: String(project?.id || ""),
+        feature_ids: (Array.isArray(project?.features) ? project.features : [])
+          .map(feature => String(feature?.id || ""))
+          .filter(featureId => selectedFeatures.has(featureId)),
+      }));
+  }
+
+  function openSourceSelectionSignature(selection) {
+    return JSON.stringify({
+      projectIds: Array.isArray(selection?.projectIds) ? selection.projectIds : [],
+      featureIds: Array.isArray(selection?.featureIds) ? selection.featureIds : [],
+    });
+  }
+
+  function currentOpenSourceSelection(moduleState = {}) {
+    const serverSelection = normalizeOpenSourceSelection(moduleState.selection || {});
+    const serverSignature = openSourceSelectionSignature(serverSelection);
+    if (
+      !app.openSourceSelectionDraft
+      || (!app.openSourceSelectionDirty && app.openSourceSelectionServerSignature !== serverSignature)
+    ) {
+      app.openSourceSelectionDraft = {
+        projectIds: [...serverSelection.projectIds],
+        featureIds: [...serverSelection.featureIds],
+      };
+    }
+    app.openSourceSelectionServerSignature = serverSignature;
+    return app.openSourceSelectionDraft;
+  }
+
+  function integratedOpenSourceFeatures(project) {
+    return (Array.isArray(project?.features) ? project.features : [])
+      .filter(feature => String(feature?.adapter_id || "").trim());
+  }
+
+  function activeOpenSourceProject(projects, selection) {
+    const integratedProjects = projects.filter(project => (
+      project?.selectable === true && integratedOpenSourceFeatures(project).length
+    ));
+    const selected = new Set(selection.projectIds.map(item => String(item || "")));
+    const active = integratedProjects.find(project => (
+      String(project?.id || "") === app.openSourceActiveProjectId
+      && selected.has(String(project?.id || ""))
+    )) || integratedProjects.find(project => selected.has(String(project?.id || "")))
+      || integratedProjects[0]
+      || null;
+    if (active) app.openSourceActiveProjectId = String(active.id || "");
+    return active;
+  }
+
+  function renderOpenSourceProjectSelector(projects, selection) {
+    const target = $("#opensource-project-select");
+    const active = activeOpenSourceProject(projects, selection);
+    const integratedProjects = projects.filter(project => (
+      project?.selectable === true && integratedOpenSourceFeatures(project).length
+    ));
+    target.innerHTML = integratedProjects.length
+      ? integratedProjects.map(project => {
+        const projectId = String(project?.id || "");
+        return `<option value="${escapeHtml(projectId)}" ${project === active ? "selected" : ""}>${escapeHtml(project?.game || project?.name || projectId)}</option>`;
+      }).join("")
+      : '<option value="">暂无已接入项目</option>';
+    target.disabled = app.openSourceSelectionSaving || !integratedProjects.length;
+    $("#opensource-project-mark").textContent = active?.short_name || "--";
+    $("#opensource-project-game").textContent = active?.game || "尚未选择游戏";
+    $("#opensource-project-name").textContent = active?.name || "开源自动化";
+    $("#opensource-project-summary").textContent = active?.summary || "等待项目说明";
+    $("#opensource-project-count").textContent = active?.adapter_label
+      || active?.status_label
+      || "适配器已接入";
+    const source = $("#opensource-project-source");
+    if (active?.source_url) {
+      source.href = active.source_url;
+      source.hidden = false;
+    } else {
+      source.removeAttribute("href");
+      source.hidden = true;
+    }
+  }
+
+  function openSourceCatalogSummary(value, maximum = 220) {
+    const text = String(value || "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/[`*_#~>-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
+  }
+
+  function copyMaaEndValue(value, fallback = {}) {
+    try {
+      return JSON.parse(JSON.stringify(value ?? fallback));
+    } catch (_error) {
+      return JSON.parse(JSON.stringify(fallback));
+    }
+  }
+
+  function maaEndManagedProfile(adapter = {}) {
+    const profiles = Array.isArray(adapter?.profiles) ? adapter.profiles : [];
+    const managed = profiles.find(profile => profile?.managed === true);
+    if (managed) return managed;
+    const configured = adapter?.configured_profile;
+    return configured && configured?.managed === true ? configured : {};
+  }
+
+  function maaEndTaskConfigSignature(tasks = []) {
+    return JSON.stringify(tasks.map(task => ({
+      name: String(task?.name || ""),
+      enabled: task?.enabled === true,
+      option_values: task?.option_values || {},
+    })));
+  }
+
+  function currentMaaEndConfigDraft(adapter = {}, catalog = {}) {
+    const adbTasks = (Array.isArray(catalog?.tasks) ? catalog.tasks : [])
+      .filter(task => task?.adb_supported === true);
+    const taskByName = new Map(adbTasks.map(task => [String(task?.name || ""), task]));
+    const managed = maaEndManagedProfile(adapter);
+    const configuredRows = (Array.isArray(managed?.task_configurations)
+      ? managed.task_configurations
+      : [])
+      .filter(row => taskByName.has(String(row?.name || "")));
+    const serverSignature = JSON.stringify({
+      runtimePath: String(adapter?.upstream?.path || ""),
+      version: String(catalog?.version || ""),
+      device: String(managed?.saved_device || ""),
+      tasks: configuredRows,
+    });
+    if (
+      !app.maaEndConfigDraft
+      || (!app.maaEndConfigDirty && app.maaEndConfigServerSignature !== serverSignature)
+    ) {
+      let seedRows = configuredRows;
+      let seededFromPreset = false;
+      if (!seedRows.length) {
+        const preset = (Array.isArray(catalog?.presets) ? catalog.presets : [])
+          .find(item => item?.name === "QuickDaily" && item?.adb_compatible === true);
+        if (preset && Array.isArray(preset.adb_task_configurations)) {
+          seedRows = preset.adb_task_configurations;
+          seededFromPreset = seedRows.length > 0;
+        }
+      }
+      const configuredByName = new Map(
+        seedRows.map(row => [String(row?.name || ""), row]),
+      );
+      const orderedNames = [
+        ...seedRows.map(row => String(row?.name || "")).filter(name => taskByName.has(name)),
+        ...adbTasks.map(task => String(task?.name || "")).filter(name => !configuredByName.has(name)),
+      ];
+      app.maaEndConfigDraft = {
+        tasks: orderedNames.map(name => {
+          const task = taskByName.get(name) || {};
+          const configured = configuredByName.get(name) || {};
+          return {
+            name,
+            enabled: configuredByName.has(name)
+              ? configured?.enabled !== false
+              : task?.default_check === true,
+            option_values: {
+              ...copyMaaEndValue(task?.default_option_values, {}),
+              ...copyMaaEndValue(configured?.option_values, {}),
+            },
+          };
+        }),
+        seededFromPreset,
+      };
+      app.maaEndConfigDirty = seededFromPreset && !configuredRows.length;
+    }
+    app.maaEndConfigServerSignature = serverSignature;
+    return app.maaEndConfigDraft;
+  }
+
+  function maaEndOptionValue(taskConfig, option) {
+    const optionId = String(option?.id || option?.name || "");
+    return taskConfig?.option_values?.[optionId]
+      || copyMaaEndValue(option?.default_value, {});
+  }
+
+  function maaEndSelectedCase(option, value) {
+    const cases = Array.isArray(option?.cases) ? option.cases : [];
+    if (String(option?.type || "select") === "switch") {
+      const names = value?.value === true
+        ? new Set(["Yes", "yes", "Y", "y"])
+        : new Set(["No", "no", "N", "n"]);
+      return cases.find(item => names.has(String(item?.name || ""))) || null;
+    }
+    return cases.find(item => String(item?.name || "") === String(value?.caseName || "")) || null;
+  }
+
+  function renderMaaEndOptionEditor(taskConfig, optionId, options, depth = 0, trail = new Set()) {
+    const option = options?.[optionId];
+    if (!option || option?.adb_applicable !== true || trail.has(optionId) || depth > 12) return "";
+    const nextTrail = new Set(trail);
+    nextTrail.add(optionId);
+    const kind = String(option?.type || "select");
+    const value = maaEndOptionValue(taskConfig, option);
+    const taskName = String(taskConfig?.name || "");
+    const data = `data-maaend-task-name="${escapeHtml(taskName)}" data-maaend-option-id="${escapeHtml(optionId)}"`;
+    const label = escapeHtml(option?.label || optionId);
+    const description = openSourceCatalogSummary(option?.description || "", 280);
+    let control = "";
+    let nested = "";
+    if (kind === "switch") {
+      control = `<label class="maaend-option-switch"><input type="checkbox" data-maaend-option-kind="switch" ${data} ${value?.value === true ? "checked" : ""}><i></i><span>${value?.value === true ? "开启" : "关闭"}</span></label>`;
+      const selectedCase = maaEndSelectedCase(option, value);
+      nested = (Array.isArray(selectedCase?.option_ids) ? selectedCase.option_ids : [])
+        .map(childId => renderMaaEndOptionEditor(taskConfig, String(childId), options, depth + 1, nextTrail))
+        .join("");
+    } else if (kind === "checkbox") {
+      const selectedNames = new Set(Array.isArray(value?.caseNames) ? value.caseNames.map(String) : []);
+      control = `<div class="maaend-option-checkboxes">${(Array.isArray(option?.cases) ? option.cases : []).map(item => {
+        const caseName = String(item?.name || "");
+        return `<label><input type="checkbox" data-maaend-option-kind="checkbox" ${data} data-maaend-case-name="${escapeHtml(caseName)}" ${selectedNames.has(caseName) ? "checked" : ""}><span>${escapeHtml(item?.label || caseName)}</span></label>`;
+      }).join("")}</div>`;
+    } else if (kind === "input" || kind === "hotkey") {
+      const values = value?.values && typeof value.values === "object" ? value.values : {};
+      control = `<div class="maaend-option-fields">${(Array.isArray(option?.fields) ? option.fields : []).map(field => {
+        const fieldName = String(field?.name || "");
+        const fieldValue = String(values[fieldName] ?? field?.default ?? "");
+        const inputType = field?.input_type === "time" ? "time" : "text";
+        return `<label><span><strong>${escapeHtml(field?.label || fieldName)}</strong>${field?.description ? `<small>${escapeHtml(openSourceCatalogSummary(field.description, 220))}</small>` : ""}</span><input type="${inputType}" data-maaend-option-kind="${escapeHtml(kind)}" ${data} data-maaend-field-name="${escapeHtml(fieldName)}" value="${escapeHtml(fieldValue)}" placeholder="${escapeHtml(field?.placeholder || "")}" autocomplete="off"></label>`;
+      }).join("")}</div>`;
+    } else {
+      const selectedName = String(value?.caseName || "");
+      control = `<select data-maaend-option-kind="select" ${data}>${(Array.isArray(option?.cases) ? option.cases : []).map(item => {
+        const caseName = String(item?.name || "");
+        return `<option value="${escapeHtml(caseName)}" ${caseName === selectedName ? "selected" : ""}>${escapeHtml(item?.label || caseName)}</option>`;
+      }).join("")}</select>`;
+      const selectedCase = maaEndSelectedCase(option, value);
+      nested = (Array.isArray(selectedCase?.option_ids) ? selectedCase.option_ids : [])
+        .map(childId => renderMaaEndOptionEditor(taskConfig, String(childId), options, depth + 1, nextTrail))
+        .join("");
+    }
+    return `<section class="maaend-option-row ${depth ? "nested" : ""}" style="--maaend-option-depth:${depth}"><div class="maaend-option-heading"><span><strong>${label}</strong><small>${escapeHtml(description || optionId)}</small></span>${control}</div>${nested ? `<div class="maaend-nested-options">${nested}</div>` : ""}</section>`;
+  }
+
+  function renderMaaEndGameFeatures(target, moduleState, project) {
+    const adapter = moduleState.adapters?.["maaend-profile"] || {};
+    const catalog = adapter?.game_catalog && typeof adapter.game_catalog === "object"
+      ? adapter.game_catalog
+      : {};
+    const upstreamTasks = (Array.isArray(catalog.tasks) ? catalog.tasks : [])
+      .filter(task => task?.adb_supported === true);
+    const groups = Array.isArray(catalog.groups) ? catalog.groups : [];
+    const options = catalog?.options && typeof catalog.options === "object"
+      ? catalog.options
+      : {};
+    const draft = currentMaaEndConfigDraft(adapter, catalog);
+    const draftTasks = Array.isArray(draft?.tasks) ? draft.tasks : [];
+    const configByName = new Map(draftTasks.map(row => [String(row?.name || ""), row]));
+    const enabledTaskNames = new Set(
+      draftTasks.filter(row => row?.enabled === true).map(row => String(row?.name || "")),
+    );
+    const enabledOrder = new Map(
+      draftTasks.filter(row => row?.enabled === true).map((row, index) => [String(row?.name || ""), index + 1]),
+    );
+    const managedProfile = maaEndManagedProfile(adapter);
+    const isValidated = Boolean(
+      adapter?.preflight?.screen?.game_ready === true
+      && adapter?.preflight?.profile?.managed === true
+    );
+    $("#opensource-feature-title").textContent = "明日方舟：终末地功能";
+    $("#opensource-feature-count").textContent = upstreamTasks.length
+      ? `${upstreamTasks.length} 项 ADB 任务 · ${enabledTaskNames.size} 项启用`
+      : "安装 MaaEnd 后读取功能";
+
+    if (!upstreamTasks.length) {
+      const error = openSourceCatalogSummary(catalog.error || adapter?.last_error || "");
+      target.innerHTML = `
+        <div class="maaend-game-catalog">
+          <section class="maaend-game-hero">
+            <div><small>ARKNIGHTS: ENDFIELD</small><h3>${escapeHtml(project?.game || "明日方舟：终末地")}</h3><p>填写官方 MaaEnd 发布目录后，本页会从 Project Interface 动态读取全部 ADB 任务、选项和预设。Pipeline、图片和 Agent 仍由用户安装的 MaaEnd 管理。</p></div>
+            <div class="maaend-game-metrics"><span><strong>--</strong><small>ADB TASKS</small></span><span><strong>--</strong><small>ENABLED</small></span><span><strong>PI V2</strong><small>SOURCE</small></span></div>
+          </section>
+          <div class="opensource-feature-empty"><i>END</i><strong>连接 MaaEnd 功能目录</strong><p>${escapeHtml(error || "在右侧填写 MaaEnd 发布目录，选择 USB 真机后点击“载入目录 / 保存任务”。")}</p></div>
+        </div>`;
+      return;
+    }
+
+    const heroMarkup = `<section class="maaend-game-hero">
+      <div><small>ARKNIGHTS: ENDFIELD · ${escapeHtml(catalog.version || "PI V2")}</small><h3>${escapeHtml(project?.game || "明日方舟：终末地")}</h3><p>以下 ${upstreamTasks.length} 项均来自当前 MaaEnd 安装包，且 Project Interface 明确声明支持 ADB。可在本页启停任务、应用上游预设并编辑 ADB 适用选项；保存时只更新 Mobile Profiler 专用实例。</p></div>
+      <div class="maaend-game-metrics"><span><strong>${upstreamTasks.length}</strong><small>ADB TASKS</small></span><span><strong>${enabledTaskNames.size}</strong><small>ENABLED</small></span><span><strong>${isValidated ? "READY" : "CHECK"}</strong><small>PREFLIGHT</small></span></div>
+    </section>`;
+
+    const presets = (Array.isArray(catalog.presets) ? catalog.presets : [])
+      .filter(preset => preset?.adb_compatible === true && Array.isArray(preset?.adb_task_configurations));
+    const presetMarkup = presets.length ? `<section class="maaend-catalog-section maaend-preset-section"><header><span><small>UPSTREAM ADB PRESETS</small><strong>上游 ADB 预设</strong></span><em>应用后仍需保存</em></header><div class="maaend-preset-grid">${presets.map(preset => `<button type="button" class="maaend-preset-card" data-maaend-preset="${escapeHtml(preset?.name || "")}"><span><strong>${escapeHtml(preset?.label || preset?.name || "预设")}</strong><em>ADB READY</em></span><p>${escapeHtml(openSourceCatalogSummary(preset?.description || "上游预设", 260))}</p><small>${Number(preset?.adb_task_count || 0)} 项任务 · ${escapeHtml(preset?.name || "")}</small></button>`).join("")}</div></section>` : "";
+
+    const knownGroups = new Set(groups.map(group => String(group?.id || "")));
+    const displayGroups = groups.filter(group => upstreamTasks.some(task => (
+      String(task?.primary_group || "") === String(group?.id || "")
+    )));
+    if (upstreamTasks.some(task => !knownGroups.has(String(task?.primary_group || "")))) {
+      displayGroups.push({ id: "__other__", name: "其他功能" });
+    }
+    const groupMarkup = displayGroups.map(group => {
+      const groupId = String(group?.id || "__other__");
+      const rows = groupId === "__other__"
+        ? upstreamTasks.filter(task => !knownGroups.has(String(task?.primary_group || "")))
+        : upstreamTasks.filter(task => String(task?.primary_group || "") === groupId);
+      if (!rows.length) return "";
+      return `<details class="maaend-task-group" ${group?.default_expand === true ? "open" : ""}><summary><strong>${escapeHtml(group?.name || groupId)}</strong><span>${rows.length} 项 ADB 任务</span></summary><div class="maaend-task-grid">${rows.map(task => {
+        const taskName = String(task?.name || "");
+        const taskConfig = configByName.get(taskName) || { name: taskName, enabled: false, option_values: {} };
+        const enabled = taskConfig?.enabled === true;
+        const optionCount = Number(task?.option_count || 0);
+        const optionMarkup = (Array.isArray(task?.option_ids) ? task.option_ids : [])
+          .map(optionId => renderMaaEndOptionEditor(taskConfig, String(optionId), options))
+          .join("");
+        return `<article class="maaend-task-card adb-supported ${enabled ? "profile-enabled" : ""}"><header><label class="maaend-task-toggle"><input type="checkbox" data-maaend-task-toggle="${escapeHtml(taskName)}" ${enabled ? "checked" : ""}><i></i><span><strong>${escapeHtml(task?.label || taskName)}</strong><small>${escapeHtml(taskName)}</small></span></label><em>${enabled ? `#${String(enabledOrder.get(taskName) || 0).padStart(2, "0")}` : "未启用"}</em></header><p>${escapeHtml(openSourceCatalogSummary(task?.description || "上游未提供功能说明"))}</p>${optionMarkup ? `<details class="maaend-task-options"><summary><span>配置 ADB 选项</span><em>${optionCount} 个顶层选项</em></summary><div>${optionMarkup}</div></details>` : ""}<footer><span>ADB</span><span>${optionCount ? `${optionCount} 个顶层选项` : "无需额外配置"}</span></footer></article>`;
+      }).join("")}</div></details>`;
+    }).join("");
+
+    const profileState = managedProfile?.name
+      ? `${managedProfile.name} · ${Number(managedProfile.task_count || 0)} 项已保存启用`
+      : draft?.seededFromPreset ? "尚未创建专用实例 · 已载入快速日常草稿" : "尚未创建专用实例";
+    const saveDisabled = app.maaEndConfigSaving || !app.maaEndConfigDirty || enabledTaskNames.size < 1;
+
+    target.innerHTML = `<div class="maaend-game-catalog">
+      ${heroMarkup}
+      ${presetMarkup}
+      <section class="maaend-config-toolbar"><span><small>MANAGED MXU PROFILE</small><strong>${escapeHtml(profileState)}</strong><em>${app.maaEndConfigDirty ? "有未保存修改" : "任务配置已同步"}</em></span><button type="button" class="button primary" data-maaend-save ${saveDisabled ? "disabled" : ""}>${app.maaEndConfigSaving ? "正在保存..." : "保存 MaaEnd ADB 任务"}</button></section>
+      <section class="maaend-catalog-section"><header><span><small>ALL SUPPORTED ADB TASKS</small><strong>全部 ADB 自动化任务</strong></span><em>桌面专用任务已排除</em></header>${groupMarkup}</section>
+    </div>`;
+  }
+
+  function renderOpenSourceFeatures(projects, selection, moduleState) {
+    const target = $("#opensource-feature-groups");
+    const selectedFeatures = new Set(selection.featureIds);
+    const activeProject = activeOpenSourceProject(projects, selection);
+    const activeProjects = activeProject ? [activeProject] : [];
+    const categoryOrder = ["battle", "daily", "weekly", "rewards", "tools"];
+    const categoryFallback = {
+      battle: "战斗",
+      daily: "每日",
+      weekly: "周常",
+      rewards: "奖励",
+      tools: "工具",
+    };
+    const availableFeatures = activeProjects.flatMap(integratedOpenSourceFeatures);
+    if (String(activeProject?.id || "") === "maaend") {
+      renderMaaEndGameFeatures(target, moduleState, activeProject);
+      return;
+    }
+    $("#opensource-feature-title").textContent = activeProject?.game
+      ? `${activeProject.game}功能`
+      : "游戏功能";
+    $("#opensource-feature-count").textContent = activeProjects.length
+      ? `${selectedFeatures.size} / ${availableFeatures.length} 项已选`
+      : "选择项目后配置";
+    if (!activeProjects.length) {
+      target.innerHTML = '<div class="opensource-feature-empty"><i>01</i><strong>先选择一个开源项目</strong><p>从顶部下拉框选择项目后，这里会显示对应游戏功能。</p></div>';
+      return;
+    }
+    target.innerHTML = activeProjects.map((project, projectIndex) => {
+      const features = integratedOpenSourceFeatures(project);
+      const categories = Array.from(new Set(features.map(feature => String(feature?.category || "tools"))))
+        .sort((left, right) => {
+          const leftIndex = categoryOrder.indexOf(left);
+          const rightIndex = categoryOrder.indexOf(right);
+          return (leftIndex < 0 ? categoryOrder.length : leftIndex)
+            - (rightIndex < 0 ? categoryOrder.length : rightIndex);
+        });
+      const categoryMarkup = categories.map(category => {
+        const rows = features.filter(feature => String(feature?.category || "tools") === category);
+        const label = String(rows[0]?.category_label || categoryFallback[category] || category);
+        return `
+          <section class="opensource-feature-category">
+            <header><strong>${escapeHtml(label)}</strong><span>${rows.length} 项</span></header>
+            <div class="opensource-feature-grid">${rows.map((feature, featureIndex) => {
+              const featureId = String(feature?.id || `${project?.id}-feature-${featureIndex + 1}`);
+              const selected = selectedFeatures.has(featureId);
+              const implementationStatus = String(feature?.implementation_status || "planned");
+              const implementationLabel = String(feature?.implementation_label || "待适配");
+              return `
+                <label class="opensource-feature-card ${selected ? "selected" : ""} ${feature?.featured ? "featured" : ""} status-${escapeHtml(implementationStatus)}">
+                  <input class="opensource-feature-checkbox" type="checkbox" data-open-source-feature="${escapeHtml(featureId)}" data-open-source-project="${escapeHtml(project?.id || "")}" ${selected ? "checked" : ""}>
+                  <i aria-hidden="true"></i>
+                  <span><span class="opensource-feature-meta"><small>${feature?.featured ? "推荐功能" : escapeHtml(label)}</small><em class="${escapeHtml(implementationStatus)}">${escapeHtml(implementationLabel)}</em></span><strong>${escapeHtml(feature?.name || featureId)}</strong><p>${escapeHtml(feature?.description || "等待功能说明")}</p></span>
+                </label>`;
+            }).join("")}</div>
+          </section>`;
+      }).join("");
+      return `
+        <section class="opensource-feature-project">
+          <div class="opensource-feature-project-head"><span>${escapeHtml(project?.short_name || String(projectIndex + 1).padStart(2, "0"))}</span><div><small>${escapeHtml(project?.game || "开源项目")}</small><strong>${escapeHtml(project?.name || project?.id || "项目")}</strong></div></div>
+          ${categoryMarkup}
+        </section>`;
+    }).join("");
+  }
+
+  function renderOpenSourceSelectionSummary(moduleState, projects, selection) {
+    const selectedProjects = projects.filter(project => selection.projectIds.includes(String(project?.id || "")));
+    const selectedFeatureIds = new Set(selection.featureIds);
+    const selectedFeatures = selectedProjects.flatMap(project => (
+      integratedOpenSourceFeatures(project)
+        .filter(feature => selectedFeatureIds.has(String(feature?.id || "")))
+        .map(feature => ({ ...feature, project }))
+    ));
+    $("#opensource-selected-project-count").textContent = selectedProjects[0]?.short_name || "--";
+    $("#opensource-selected-feature-count").textContent = String(selectedFeatures.length);
+    const target = $("#opensource-selection-summary");
+    target.innerHTML = selectedProjects.length
+      ? selectedProjects.map(project => {
+        const projectFeatures = selectedFeatures.filter(row => row.project === project);
+        return `<div class="opensource-selection-project"><span><i>${escapeHtml(project?.short_name || "OS")}</i><strong>${escapeHtml(project?.name || project?.id || "项目")}</strong></span><div>${projectFeatures.length
+          ? projectFeatures.map(row => `<em class="${row?.can_execute ? "ready" : "pending"}">${escapeHtml(row?.name || row?.id || "功能")}</em>`).join("")
+          : "<small>尚未选择该项目的功能</small>"}</div></div>`;
+      }).join("")
+      : '<div class="opensource-empty">尚未选择项目与功能</div>';
+
+    const savedAt = Number(moduleState.selection?.saved_at || 0);
+    $("#opensource-selection-state").textContent = app.openSourceSelectionDirty
+      ? "有未保存修改"
+      : savedAt > 0
+        ? `已保存 ${new Date(savedAt * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })}`
+        : "默认方案";
+    const saveButton = $("#opensource-save-selection-button");
+    saveButton.disabled = app.openSourceSelectionSaving || !app.openSourceSelectionDirty;
+    saveButton.textContent = app.openSourceSelectionSaving ? "正在保存..." : "保存功能方案";
+    const execution = moduleState.execution || {};
+    const hasFeatures = selectedFeatures.length > 0;
+    const runnableCount = selectedFeatures.filter(feature => feature?.can_execute === true).length;
+    $("#opensource-execution-state").textContent = app.openSourceSelectionDirty
+      ? "保存后应用本次修改"
+      : hasFeatures ? (execution.label || (runnableCount ? "功能可预检" : "等待运行时配置")) : "等待选择功能";
+    $("#opensource-execution-detail").textContent = app.openSourceSelectionDirty
+      ? `当前草稿包含 ${selectedFeatures.length} 项功能，其中 ${runnableCount} 项已接入。`
+      : hasFeatures
+        ? (execution.detail || `当前 ${runnableCount} 项功能已接入执行适配器。`)
+        : "至少选择一项已接入功能，保存后形成当前项目的执行方案。";
+  }
+
+  function renderOpenSourceCatalog(moduleState = {}) {
+    const projects = Array.isArray(moduleState.projects) ? moduleState.projects : [];
+    const selection = currentOpenSourceSelection(moduleState);
+    const maaendAdapter = moduleState.adapters?.["maaend-profile"] || {};
+    const maaendCatalog = maaendAdapter?.game_catalog || {};
+    const renderSignature = JSON.stringify({
+      catalogVersion: Number(moduleState.catalog_version || 0),
+      activeProjectId: app.openSourceActiveProjectId,
+      projectShape: projects.map(project => [
+        String(project?.id || ""),
+        String(project?.adapter_status || project?.status || ""),
+        (Array.isArray(project?.features) ? project.features : []).map(feature => [
+          String(feature?.id || ""),
+          String(feature?.implementation_status || ""),
+          feature?.can_execute === true,
+        ]),
+      ]),
+      maaendShape: {
+        source: String(maaendCatalog?.source || ""),
+        version: String(maaendCatalog?.version || ""),
+        groups: (Array.isArray(maaendCatalog?.groups) ? maaendCatalog.groups : [])
+          .map(group => [group?.id, group?.name]),
+        tasks: (Array.isArray(maaendCatalog?.tasks) ? maaendCatalog.tasks : [])
+          .map(task => [
+            task?.name,
+            task?.label,
+            task?.description,
+            task?.primary_group,
+            task?.adb_supported === true,
+            task?.option_count,
+          ]),
+        optionCount: Object.keys(maaendCatalog?.options || {}).length,
+        presets: (Array.isArray(maaendCatalog?.presets) ? maaendCatalog.presets : [])
+          .map(preset => [preset?.name, preset?.adb_compatible, preset?.adb_task_count]),
+        configuredProfile: maaendAdapter?.configured_profile || {},
+        managedProfile: maaEndManagedProfile(maaendAdapter),
+        validatedProfile: maaendAdapter?.profile || {},
+        preflightReady: maaendAdapter?.preflight?.screen?.game_ready === true,
+        profileConfigError: String(maaendAdapter?.profile_config_error || ""),
+        lastError: String(maaendAdapter?.last_error || ""),
+        draft: maaEndTaskConfigSignature(app.maaEndConfigDraft?.tasks || []),
+        dirty: app.maaEndConfigDirty,
+        saving: app.maaEndConfigSaving,
+      },
+      selection,
+      execution: moduleState.execution || {},
+      savedAt: Number(moduleState.selection?.saved_at || 0),
+      dirty: app.openSourceSelectionDirty,
+      saving: app.openSourceSelectionSaving,
+    });
+    if (app.openSourceCatalogRenderSignature !== renderSignature) {
+      renderOpenSourceProjectSelector(projects, selection);
+      renderOpenSourceFeatures(projects, selection, moduleState);
+      renderOpenSourceSelectionSummary(moduleState, projects, selection);
+      app.openSourceCatalogRenderSignature = renderSignature;
+    }
+    const featureCount = selection.featureIds.length;
+    const execution = moduleState.execution || {};
+    const selectedFeatureSet = new Set(selection.featureIds);
+    const draftRunnableCount = projects
+      .flatMap(project => (Array.isArray(project?.features) ? project.features : []))
+      .filter(feature => (
+        selectedFeatureSet.has(String(feature?.id || ""))
+        && feature?.can_execute === true
+      )).length;
+    const executionStatus = String(execution.status || "not_configured");
+    const badgeStatus = app.openSourceSelectionDirty
+      ? "unavailable"
+      : executionStatus === "running"
+        ? "running"
+        : ["ready", "preflight_required"].includes(executionStatus)
+          ? "ready"
+          : "unavailable";
+    const badge = $("#opensource-status-badge");
+    badge.className = `agent-status-badge opensource-status-badge ${badgeStatus}`;
+    const activeProject = activeOpenSourceProject(projects, selection);
+    $("#opensource-status-label").textContent = app.openSourceSelectionDirty
+      ? "功能方案待保存"
+      : featureCount ? (execution.label || "功能方案已配置") : "选择自动化功能";
+    $("#opensource-status-detail").textContent = featureCount
+      ? `${activeProject?.game || "当前项目"} · ${featureCount} 项运行入口 · ${app.openSourceSelectionDirty ? draftRunnableCount : Number(execution.runnable_feature_ids?.length || 0)} 项运行时就绪`
+      : "项目单选，功能随当前项目切换";
+  }
+
+  function updateOpenSourceSelectionFromInput(event) {
+    const featureInput = event.target.closest(".opensource-feature-checkbox");
+    if (!featureInput) return;
+    const moduleState = app.state?.open_source_automation || {};
+    const selection = currentOpenSourceSelection(moduleState);
+    const featureId = String(featureInput.dataset.openSourceFeature || "");
+    if (featureInput.checked) {
+      if (!selection.featureIds.includes(featureId)) selection.featureIds.push(featureId);
+    } else {
+      selection.featureIds = selection.featureIds.filter(id => id !== featureId);
+    }
+    app.openSourceSelectionDirty = openSourceSelectionSignature(selection)
+      !== app.openSourceSelectionServerSignature;
+    renderOpenSourceAutomation(app.state);
+  }
+
+  function updateMaaEndConfigFromInput(event) {
+    const taskToggle = event.target.closest("[data-maaend-task-toggle]");
+    const optionInput = event.target.closest("[data-maaend-option-id]");
+    if (!taskToggle && !optionInput) return false;
+    const adapter = app.state?.open_source_automation?.adapters?.["maaend-profile"] || {};
+    const catalog = adapter?.game_catalog || {};
+    const draft = currentMaaEndConfigDraft(adapter, catalog);
+    const taskName = String(
+      taskToggle?.dataset?.maaendTaskToggle
+      || optionInput?.dataset?.maaendTaskName
+      || "",
+    );
+    const taskConfig = (Array.isArray(draft?.tasks) ? draft.tasks : [])
+      .find(task => String(task?.name || "") === taskName);
+    if (!taskConfig) return true;
+    if (taskToggle) {
+      taskConfig.enabled = taskToggle.checked === true;
+    } else {
+      const optionId = String(optionInput.dataset.maaendOptionId || "");
+      const kind = String(optionInput.dataset.maaendOptionKind || "select");
+      const option = catalog?.options?.[optionId] || {};
+      taskConfig.option_values ||= {};
+      if (kind === "switch") {
+        taskConfig.option_values[optionId] = { type: "switch", value: optionInput.checked === true };
+      } else if (kind === "checkbox") {
+        const current = taskConfig.option_values[optionId];
+        const selected = new Set(Array.isArray(current?.caseNames) ? current.caseNames.map(String) : []);
+        const caseName = String(optionInput.dataset.maaendCaseName || "");
+        if (optionInput.checked) selected.add(caseName);
+        else selected.delete(caseName);
+        const order = (Array.isArray(option?.cases) ? option.cases : []).map(item => String(item?.name || ""));
+        taskConfig.option_values[optionId] = {
+          type: "checkbox",
+          caseNames: order.filter(name => selected.has(name)),
+        };
+      } else if (kind === "input" || kind === "hotkey") {
+        const current = taskConfig.option_values[optionId];
+        const defaults = option?.default_value?.values || {};
+        const values = {
+          ...copyMaaEndValue(defaults, {}),
+          ...(current?.type === kind && current?.values ? current.values : {}),
+        };
+        values[String(optionInput.dataset.maaendFieldName || "")] = optionInput.value;
+        taskConfig.option_values[optionId] = { type: kind, values };
+      } else {
+        taskConfig.option_values[optionId] = { type: "select", caseName: optionInput.value };
+      }
+    }
+    app.maaEndConfigDirty = true;
+    app.openSourceCatalogRenderSignature = "";
+    renderOpenSourceAutomation(app.state);
+    return true;
+  }
+
+  function applyMaaEndPreset(presetName) {
+    const adapter = app.state?.open_source_automation?.adapters?.["maaend-profile"] || {};
+    const catalog = adapter?.game_catalog || {};
+    const preset = (Array.isArray(catalog?.presets) ? catalog.presets : [])
+      .find(item => String(item?.name || "") === String(presetName || "") && item?.adb_compatible === true);
+    if (!preset) return;
+    const adbTasks = (Array.isArray(catalog?.tasks) ? catalog.tasks : [])
+      .filter(task => task?.adb_supported === true);
+    const taskByName = new Map(adbTasks.map(task => [String(task?.name || ""), task]));
+    const presetRows = Array.isArray(preset?.adb_task_configurations)
+      ? preset.adb_task_configurations.filter(row => taskByName.has(String(row?.name || "")))
+      : [];
+    const presetByName = new Map(presetRows.map(row => [String(row?.name || ""), row]));
+    const orderedNames = [
+      ...presetRows.map(row => String(row?.name || "")),
+      ...adbTasks.map(task => String(task?.name || "")).filter(name => !presetByName.has(name)),
+    ];
+    app.maaEndConfigDraft = {
+      tasks: orderedNames.map(name => {
+        const task = taskByName.get(name) || {};
+        const row = presetByName.get(name) || {};
+        return {
+          name,
+          enabled: presetByName.has(name) && row?.enabled !== false,
+          option_values: {
+            ...copyMaaEndValue(task?.default_option_values, {}),
+            ...copyMaaEndValue(row?.option_values, {}),
+          },
+        };
+      }),
+      seededFromPreset: false,
+    };
+    app.maaEndConfigDirty = true;
+    app.openSourceCatalogRenderSignature = "";
+    renderOpenSourceAutomation(app.state);
+    notify("已应用 MaaEnd 预设", `${preset?.label || presetName} 已载入草稿，请保存后生效。`, "success", 6000);
+  }
+
+  async function saveMaaEndConfiguration() {
+    if (app.maaEndConfigSaving || app.openSourceRuntimeAction) return;
+    const moduleState = app.state?.open_source_automation || {};
+    const adapter = moduleState.adapters?.["maaend-profile"] || {};
+    const catalog = adapter?.game_catalog || {};
+    const savedFeatures = new Set(
+      Array.isArray(moduleState.selection?.feature_ids)
+        ? moduleState.selection.feature_ids.map(String)
+        : [],
+    );
+    if (!savedFeatures.has("maaend-profile")) {
+      notify("请先保存 MaaEnd 功能方案", "当前项目功能方案尚未包含 MaaEnd 运行入口。", "warning", 6500);
+      return;
+    }
+    const device = selectedDevice();
+    const deviceRow = (app.state?.devices || []).find(item => item.serial === device);
+    if (!device || devicePlatform(deviceRow) !== "android" || deviceConnectionType(deviceRow) !== "usb") {
+      notify("请选择 USB Android 真机", "MaaEnd 专用实例只绑定顶部当前选择的 USB ADB 序列号。", "warning", 7000);
+      return;
+    }
+    const draft = currentMaaEndConfigDraft(adapter, catalog);
+    const tasks = Array.isArray(draft?.tasks) ? draft.tasks : [];
+    if (tasks.length && !tasks.some(task => task?.enabled === true)) {
+      notify("至少启用一项任务", "MaaEnd 专用实例不能保存为空运行方案。", "warning", 6500);
+      return;
+    }
+    app.maaEndConfigSaving = true;
+    app.openSourceRuntimeAction = "configure";
+    app.openSourceCatalogRenderSignature = "";
+    renderOpenSourceAutomation(app.state);
+    try {
+      const runtimeOptions = openSourceRuntimeOptionPayload();
+      const body = {
+        feature_id: "maaend-profile",
+        device,
+        ...runtimeOptions,
+      };
+      if (tasks.length) body.tasks = tasks;
+      else body.preset_name = "QuickDaily";
+      const updated = await api("/api/open-source-automation/configure", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      app.maaEndConfigDirty = false;
+      app.maaEndConfigDraft = null;
+      app.maaEndConfigServerSignature = "";
+      app.state = { ...(app.state || {}), open_source_automation: updated };
+      app.openSourceCatalogRenderSignature = "";
+      renderOpenSourceAutomation(app.state);
+      const profile = maaEndManagedProfile(updated.adapters?.["maaend-profile"] || {});
+      notify(
+        "MaaEnd ADB 任务已保存",
+        `专用实例已绑定 ${device}，当前启用 ${Number(profile?.task_count || 0)} 项任务。`,
+        "success",
+        8000,
+      );
+    } catch (error) {
+      notify("无法保存 MaaEnd ADB 任务", error.message || "未知错误", "error", 10000);
+      await refreshState();
+    } finally {
+      app.maaEndConfigSaving = false;
+      app.openSourceRuntimeAction = "";
+      app.openSourceCatalogRenderSignature = "";
+      if (app.state) renderOpenSourceAutomation(app.state);
+    }
+  }
+
+  async function selectOpenSourceProject(event) {
+    if (app.openSourceSelectionSaving) return;
+    const moduleState = app.state?.open_source_automation || {};
+    const projects = Array.isArray(moduleState.projects) ? moduleState.projects : [];
+    const projectId = String(event?.target?.value || "");
+    const project = projects.find(item => (
+      String(item?.id || "") === projectId
+      && item?.selectable === true
+      && integratedOpenSourceFeatures(item).length
+    ));
+    if (!project) return;
+    const selection = currentOpenSourceSelection(moduleState);
+    const featureIds = integratedOpenSourceFeatures(project)
+      .map(feature => String(feature?.id || ""))
+      .filter(Boolean);
+    const retainedFeatureIds = selection.featureIds.filter(id => featureIds.includes(id));
+    const defaultFeature = integratedOpenSourceFeatures(project)
+      .find(feature => feature?.featured === true) || integratedOpenSourceFeatures(project)[0];
+    selection.projectIds = [projectId];
+    selection.featureIds = retainedFeatureIds.length
+      ? retainedFeatureIds
+      : defaultFeature ? [String(defaultFeature.id || "")] : [];
+    app.openSourceActiveProjectId = projectId;
+    app.openSourceSelectionDirty = openSourceSelectionSignature(selection)
+      !== app.openSourceSelectionServerSignature;
+    renderOpenSourceAutomation(app.state);
+    if (app.openSourceSelectionDirty) await saveOpenSourceAutomationSelection();
+  }
+
+  async function saveOpenSourceAutomationSelection(event) {
+    if (event?.preventDefault) event.preventDefault();
+    if (app.openSourceSelectionSaving || !app.openSourceSelectionDirty) return;
+    const moduleState = app.state?.open_source_automation || {};
+    const projects = Array.isArray(moduleState.projects) ? moduleState.projects : [];
+    const selection = currentOpenSourceSelection(moduleState);
+    app.openSourceSelectionSaving = true;
+    renderOpenSourceAutomation(app.state);
+    try {
+      const updated = await api("/api/open-source-automation/selection", {
+        method: "POST",
+        body: JSON.stringify({
+          projects: openSourceNestedSelection(projects, selection),
+        }),
+      });
+      app.openSourceSelectionDirty = false;
+      app.openSourceSelectionDraft = null;
+      app.openSourceSelectionServerSignature = "";
+      app.state = { ...(app.state || {}), open_source_automation: updated };
+      renderOpenSourceAutomation(app.state);
+      const selectedCount = Number(updated.execution?.selected_feature_count || 0);
+      notify(
+        "功能方案已保存",
+        selectedCount
+          ? `已保存当前项目的 ${selectedCount} 项功能，其中 ${Number(updated.execution?.runnable_feature_ids?.length || 0)} 项运行时就绪。`
+          : "已清空开源自动化功能方案。",
+        "success",
+        6500,
+      );
+    } catch (error) {
+      notify("无法保存功能方案", error.message || "未知错误", "error", 9000);
+    } finally {
+      app.openSourceSelectionSaving = false;
+      if (app.state) renderOpenSourceAutomation(app.state);
+    }
+  }
+
+  function openSourceStatusPresentation(status, available) {
+    const normalized = String(status || (available ? "ready" : "unavailable")).toLowerCase();
+    const presentations = {
+      ready: ["运行时就绪", "可以运行主机侧合成验证", "ready"],
+      unavailable: ["缺少图像依赖", "安装 image extra 后启用", "unavailable"],
+      running: ["正在验证", "模板匹配基准运行中", "running"],
+      completed: ["验证通过", "证据与耗时已经更新", "completed"],
+      error: ["验证异常", "查看模块日志和依赖状态", "error"],
+    };
+    return presentations[normalized] || presentations[available ? "ready" : "unavailable"];
+  }
+
+  function renderOpenSourceGraph(bundle = {}) {
+    const target = $("#opensource-graph-view");
+    const states = Array.isArray(bundle.states) ? bundle.states : [];
+    const transitions = Array.isArray(bundle.transitions) ? bundle.transitions : [];
+    const graphId = String(bundle.graph_id || "").trim();
+    $("#opensource-graph-summary").textContent = bundle.available
+      ? `${states.length} states · ${transitions.length} transitions`
+      : "资源包不可用";
+    $("#opensource-graph-detail").textContent = bundle.available
+      ? `${graphId || "未命名状态图"} · transition 上限 ${Number(bundle.max_transitions || 0) || "--"}；动作仅接受声明过的 JSON 名称和参数。`
+      : (bundle.error || "未找到 examples/deterministic-visual-spike.json");
+    if (!states.length) {
+      target.innerHTML = '<div class="opensource-empty">当前没有可展示的状态节点</div>';
+      return;
+    }
+    const visibleStates = states.slice(0, 5);
+    const route = [];
+    visibleStates.forEach((state, index) => {
+      const stateId = String(state?.id || state?.state_id || `state-${index + 1}`);
+      const templateId = String(state?.template || state?.template_id || "template");
+      route.push(`<article class="opensource-graph-node"><i>${String(index + 1).padStart(2, "0")}</i><strong>${escapeHtml(stateId)}</strong><small title="${escapeHtml(templateId)}">${escapeHtml(templateId)}</small></article>`);
+      if (index >= visibleStates.length - 1) return;
+      const nextState = visibleStates[index + 1];
+      const nextId = String(nextState?.id || nextState?.state_id || "");
+      const transition = transitions.find(item => (
+        String(item?.from || item?.source || "") === stateId
+        && String(item?.to || item?.target || "") === nextId
+      ));
+      const actionName = String(transition?.action?.name || transition?.action_name || "transition");
+      route.push(`<span class="opensource-graph-transition"><small title="${escapeHtml(actionName)}">${escapeHtml(actionName)}</small></span>`);
+    });
+    target.innerHTML = `<div class="opensource-graph-route">${route.join("")}</div>`;
+  }
+
+  function renderOpenSourceEvidenceImage(kind, url) {
+    const image = $(`#opensource-${kind}-image`);
+    const placeholder = $(`#opensource-${kind}-placeholder`);
+    if (!url) {
+      image.hidden = true;
+      image.removeAttribute("src");
+      delete image.dataset.evidenceUrl;
+      placeholder.hidden = false;
+      return;
+    }
+    if (image.dataset.evidenceUrl === url && image.complete && image.naturalWidth > 0) {
+      image.hidden = false;
+      placeholder.hidden = true;
+      return;
+    }
+    if (image.dataset.evidenceUrl === url) return;
+    image.dataset.evidenceUrl = url;
+    image.hidden = true;
+    placeholder.hidden = false;
+    placeholder.textContent = "正在加载证据...";
+    image.onload = () => {
+      image.hidden = false;
+      placeholder.hidden = true;
+    };
+    image.onerror = () => {
+      image.hidden = true;
+      placeholder.hidden = false;
+      placeholder.textContent = "证据图片加载失败";
+    };
+    image.src = url;
+  }
+
+  function renderOpenSourceAlignment(rows = []) {
+    const labels = {
+      ready: "已对齐",
+      partial: "部分对齐",
+      planned: "待实现",
+      demo: "验证态",
+    };
+    $("#opensource-alignment-body").innerHTML = rows.length
+      ? rows.map(item => {
+        const status = String(item?.status || "planned").toLowerCase();
+        return `<tr><td>${escapeHtml(item?.feature || "--")}</td><td>${escapeHtml(item?.upstream || "--")}</td><td>${escapeHtml(item?.current || "--")}</td><td><span class="opensource-alignment-state ${escapeHtml(status)}">${escapeHtml(labels[status] || status)}</span></td></tr>`;
+      }).join("")
+      : '<tr><td colspan="4">服务端尚未返回功能对齐信息</td></tr>';
+  }
+
+  function renderOpenSourceLogs(logs = []) {
+    const target = $("#opensource-log-output");
+    const rows = Array.isArray(logs) ? logs.slice().reverse() : [];
+    $("#opensource-log-summary").textContent = rows.length
+      ? `${rows.length} 条模块事件 · 最新在前`
+      : "尚无模块事件";
+    target.innerHTML = rows.length
+      ? rows.map(item => {
+        const date = finite(item?.time) ? new Date(Number(item.time) * 1000) : null;
+        const clock = date ? date.toLocaleTimeString("zh-CN", { hour12: false }) : "--:--:--";
+        const status = String(item?.status || "info").toLowerCase();
+        return `<div class="opensource-log-line ${escapeHtml(status)}"><time>${escapeHtml(clock)}</time><span>${escapeHtml(status)}</span><p>${escapeHtml(item?.message || "")}</p></div>`;
+      }).join("")
+      : '<div class="opensource-empty">等待模块事件</div>';
+  }
+
+  function openSourceScreenLabel(value) {
+    const labels = {
+      resource_downloading: "资源下载中",
+      start_screen: "开始游戏界面",
+      in_game: "游戏内",
+      universe_ui: "模拟宇宙界面",
+      wrong_app: "目标游戏未在前台",
+      device_asleep: "真机未亮屏",
+      wrong_orientation: "游戏不是横屏",
+      vision_error: "识别失败",
+      maaend_profile_ready: "MaaEnd 实例就绪",
+      maaend_launch_ready: "可由 MaaEnd 启动游戏",
+      profile_missing: "MaaEnd 实例不存在",
+      profile_incompatible: "实例不兼容 ADB",
+      unsafe_profile: "实例含前置程序",
+      device_mismatch: "实例设备不匹配",
+      runtime_missing: "运行时未安装",
+      unknown: "未知画面",
+    };
+    return labels[String(value || "")] || "未预检";
+  }
+
+  function renderOpenSourceRuntimeOptions(featureId, adapter = {}, disabled = false) {
+    const target = $("#opensource-runtime-options");
+    const options = Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [];
+    const signature = JSON.stringify({
+      featureId,
+      adapterId: String(adapter?.adapter_id || ""),
+      options: options.map(option => ({
+        id: String(option?.id || ""),
+        type: String(option?.type || "text"),
+        value: option?.value,
+        choices: option?.options,
+      })),
+    });
+    if (target.dataset.signature !== signature) {
+      target.dataset.signature = signature;
+      target.innerHTML = options.length
+        ? options.map((option, index) => {
+          const optionId = String(option?.id || `option-${index + 1}`);
+          const type = String(option?.type || "text");
+          const label = escapeHtml(option?.label || optionId);
+          const description = escapeHtml(option?.description || "运行时参数");
+          const data = `data-runtime-option-id="${escapeHtml(optionId)}" data-runtime-option-type="${escapeHtml(type)}"`;
+          if (type === "checkbox") {
+            return `<label class="opensource-runtime-option-checkbox"><input type="checkbox" ${data} ${option?.value === true ? "checked" : ""}><span><strong>${label}</strong><small>${description}</small></span></label>`;
+          }
+          if (type === "select") {
+            const selectedValue = String(option?.value ?? "");
+            const choices = Array.isArray(option?.options) ? option.options : [];
+            return `<label class="opensource-runtime-option-select"><span><strong>${label}</strong><small>${description}</small></span><select ${data}>${choices.map(choice => {
+              const value = String(choice?.value ?? "");
+              return `<option value="${escapeHtml(value)}" ${value === selectedValue ? "selected" : ""}>${escapeHtml(choice?.label || value)}</option>`;
+            }).join("")}</select></label>`;
+          }
+          return `<label class="opensource-runtime-option-text"><span><strong>${label}</strong><small>${description}</small></span><input type="text" ${data} value="${escapeHtml(option?.value ?? "")}" ${option?.required === true ? "required" : ""} autocomplete="off"></label>`;
+        }).join("")
+        : '<div class="opensource-empty">该功能没有额外运行参数</div>';
+    }
+    $$("#opensource-runtime-options input, #opensource-runtime-options select").forEach(input => {
+      input.disabled = disabled;
+    });
+  }
+
+  function openSourceRuntimeOptionPayload() {
+    const payload = {};
+    $$("#opensource-runtime-options [data-runtime-option-id]").forEach(input => {
+      const optionId = String(input.dataset.runtimeOptionId || "").trim();
+      if (!optionId) return;
+      payload[optionId] = input.dataset.runtimeOptionType === "checkbox"
+        ? input.checked === true
+        : input.value;
+    });
+    return payload;
+  }
+
+  function renderOpenSourceRuntimeConsole(moduleState = {}) {
+    const adapters = moduleState.adapters && typeof moduleState.adapters === "object"
+      ? moduleState.adapters
+      : {};
+    const projects = Array.isArray(moduleState.projects) ? moduleState.projects : [];
+    const selection = currentOpenSourceSelection(moduleState);
+    const runningIds = Object.entries(adapters)
+      .filter(([, adapter]) => adapter?.running === true)
+      .map(([featureId]) => featureId);
+    const adapterFeatureIds = selection.featureIds.filter(featureId => adapters[featureId]);
+    const featureId = runningIds[0] || adapterFeatureIds[0] || "";
+    const adapter = featureId ? (adapters[featureId] || {}) : {};
+    const feature = projects
+      .flatMap(project => (Array.isArray(project?.features) ? project.features : []))
+      .find(item => String(item?.id || "") === featureId);
+    const preflight = adapter?.preflight && typeof adapter.preflight === "object"
+      ? adapter.preflight
+      : {};
+    const screen = preflight?.screen && typeof preflight.screen === "object"
+      ? preflight.screen
+      : {};
+    const checkedDevice = preflight?.device && typeof preflight.device === "object"
+      ? String(preflight.device.serial || "")
+      : "";
+    const device = selectedDevice();
+    const selectedDeviceRow = (app.state?.devices || []).find(item => item.serial === device);
+    const androidReady = Boolean(
+      selectedDeviceRow
+      && devicePlatform(selectedDeviceRow) === "android"
+      && selectedDeviceRow.state === "device"
+    );
+    const available = adapter?.available === true;
+    const running = adapter?.running === true;
+    const mxuApi = adapter?.mxu_api && typeof adapter.mxu_api === "object"
+      ? adapter.mxu_api
+      : {};
+    const mxuTasks = Array.isArray(mxuApi?.tasks) ? mxuApi.tasks : [];
+    const mxuSucceeded = mxuTasks.filter(task => String(task?.status || "") === "succeeded").length;
+    const mxuPhaseLabels = {
+      idle: "等待启动",
+      starting_service: "启动 v2.20 服务",
+      discovering_device: "扫描 USB ADB",
+      connecting: "连接 USB 控制器",
+      loading_resource: "加载 ADB 资源",
+      submitting_tasks: "提交任务",
+      running: "执行任务",
+      stopping: "停止任务",
+      stopped: "已停止",
+      completed: "全部成功",
+      error: "执行失败",
+    };
+    const gameReady = screen.game_ready === true && checkedDevice === device;
+    const busy = Boolean(app.openSourceRuntimeAction);
+    const capabilities = adapter?.capabilities && typeof adapter.capabilities === "object"
+      ? adapter.capabilities
+      : {};
+    const canConfigureMissing = capabilities.configure_when_unavailable === true;
+    const savedFeatureIds = new Set(
+      Array.isArray(moduleState.selection?.feature_ids)
+        ? moduleState.selection.feature_ids.map(item => String(item || ""))
+        : [],
+    );
+    const saved = Boolean(featureId && savedFeatureIds.has(featureId));
+    const status = String(adapter?.status || (featureId ? "not_installed" : "waiting"));
+    const statusLabels = {
+      waiting: "WAITING",
+      not_installed: "NOT INSTALLED",
+      installed: "INSTALLED",
+      configuring: "CONFIGURING",
+      preflighting: "PREFLIGHT",
+      waiting_for_game: "WAITING GAME",
+      ready: "READY",
+      running: "RUNNING",
+      stopping: "STOPPING",
+      stopped: "STOPPED",
+      completed: "COMPLETED",
+      error: "ERROR",
+    };
+    const consoleElement = $("#opensource-runtime-console");
+    consoleElement.dataset.status = running ? "running" : status;
+    $("#opensource-runtime-title").textContent = feature?.name || "功能运行控制";
+    $("#opensource-runtime-status").textContent = statusLabels[status] || status.toUpperCase();
+    $("#opensource-runtime-device").textContent = device || "未选择";
+    $("#opensource-runtime-device").title = device || "";
+    $("#opensource-runtime-screen").textContent = openSourceScreenLabel(screen.screen_state);
+    const upstream = adapter?.upstream || {};
+    const profile = preflight?.profile && typeof preflight.profile === "object"
+      ? preflight.profile
+      : adapter?.profile || {};
+    $("#opensource-runtime-upstream").textContent = upstream.version
+      ? String(upstream.version)
+      : profile.name
+        ? String(profile.name)
+        : upstream.map_count
+          ? `${Number(upstream.map_count)} 张地图`
+          : available ? "已安装" : "未安装";
+    $("#opensource-runtime-upstream").title = upstream.repository || upstream.path || "";
+    $("#opensource-runtime-disk").textContent = finite(upstream.disk_mib)
+      ? `${Number(upstream.disk_mib).toFixed(1)} MiB`
+      : "--";
+    const errorLines = String(adapter?.last_error || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    const errorSummary = String(errorLines[errorLines.length - 1] || "").slice(-320);
+    if (!featureId) {
+      $("#opensource-runtime-detail").textContent = selection.featureIds.length
+        ? "当前所选功能尚待适配；请选择一个标记为“已接入”的功能。"
+        : "选择并保存一个已接入功能后，可对顶部当前 Android 真机运行预检。";
+    } else if (!available || status === "error") {
+      $("#opensource-runtime-detail").textContent = errorSummary
+        || (available
+          ? "运行时操作失败，请查看下方日志。"
+          : canConfigureMissing
+            ? "填写外部运行时目录与实例名，然后运行预检。"
+            : "外部运行时尚未安装，功能方案仍可保存。");
+    } else if (running) {
+      const phase = mxuPhaseLabels[String(mxuApi?.phase || "")] || String(mxuApi?.phase || "运行中");
+      const progress = mxuTasks.length ? `；逐任务成功 ${mxuSucceeded}/${mxuTasks.length}` : "";
+      $("#opensource-runtime-detail").textContent = `MXU API：${phase}${progress}；状态仅来自 /api/maa/state。`;
+    } else if (status === "completed" && mxuTasks.length) {
+      $("#opensource-runtime-detail").textContent = `MXU API 已确认 ${mxuSucceeded}/${mxuTasks.length} 项任务全部 succeeded。`;
+    } else if (gameReady) {
+      $("#opensource-runtime-detail").textContent = "预检已确认当前设备和外部运行时配置，可以启动所选功能。";
+    } else if (screen.screen_state) {
+      $("#opensource-runtime-detail").textContent = `预检结果：${openSourceScreenLabel(screen.screen_state)}；修正配置或设备状态后重新预检。`;
+    } else {
+      $("#opensource-runtime-detail").textContent = "运行预检会核对当前真机、外部发布包、实例配置和任务兼容性。";
+    }
+
+    const preflightButton = $("#opensource-preflight-button");
+    const configureButton = $("#opensource-configure-button");
+    const startButton = $("#opensource-start-button");
+    const stopButton = $("#opensource-stop-button");
+    const isMaaEnd = featureId === "maaend-profile";
+    const usbReady = androidReady && deviceConnectionType(selectedDeviceRow) === "usb";
+    const maaEndDirty = isMaaEnd && app.maaEndConfigDirty;
+    configureButton.hidden = !isMaaEnd;
+    configureButton.disabled = !isMaaEnd || busy || running || !saved || !usbReady || app.openSourceSelectionDirty;
+    configureButton.textContent = app.openSourceRuntimeAction === "configure"
+      ? "正在保存..."
+      : (Array.isArray(adapter?.game_catalog?.tasks) && adapter.game_catalog.tasks.length
+        ? "保存 MaaEnd 任务"
+        : "载入目录 / 保存任务");
+    preflightButton.disabled = busy || running || (!available && !canConfigureMissing) || !saved || !(isMaaEnd ? usbReady : androidReady) || app.openSourceSelectionDirty || maaEndDirty;
+    startButton.disabled = busy || running || !available || !saved || !gameReady || app.openSourceSelectionDirty || maaEndDirty;
+    stopButton.disabled = busy || !running;
+    preflightButton.textContent = app.openSourceRuntimeAction === "preflight" ? "正在预检..." : "运行预检";
+    startButton.textContent = app.openSourceRuntimeAction === "start" ? "正在启动..." : "启动所选功能";
+    stopButton.textContent = app.openSourceRuntimeAction === "stop" ? "正在停止..." : "停止";
+    renderOpenSourceRuntimeOptions(featureId, adapter, running || busy);
+
+    const logs = Array.isArray(adapter?.logs) ? adapter.logs.slice().reverse() : [];
+    const adapterLogMarkup = logs.slice(0, 8).map(item => {
+        const date = finite(item?.time) ? new Date(Number(item.time) * 1000) : null;
+        const clock = date ? date.toLocaleTimeString("zh-CN", { hour12: false }) : "--:--:--";
+        const logStatus = String(item?.status || "info");
+        return `<div class="opensource-runtime-log-line ${escapeHtml(logStatus)}"><time>${escapeHtml(clock)}</time><span>${escapeHtml(item?.message || "")}</span></div>`;
+      }).join("");
+    const mxuStatusLabels = {
+      pending: "等待",
+      running: "执行",
+      succeeded: "成功",
+      failed: "失败",
+    };
+    const mxuTaskMarkup = mxuTasks.slice().reverse().map(task => {
+      const taskStatus = String(task?.status || "pending");
+      const taskId = finite(task?.maa_task_id) ? ` #${Number(task.maa_task_id)}` : "";
+      return `<div class="opensource-runtime-log-line ${escapeHtml(taskStatus)}"><time>API</time><span>${escapeHtml(mxuStatusLabels[taskStatus] || taskStatus)} · ${escapeHtml(task?.name || task?.id || "MaaEnd task")}${escapeHtml(taskId)}</span></div>`;
+    }).join("");
+    const runtimeLines = Array.isArray(adapter?.runtime_output?.lines)
+      ? adapter.runtime_output.lines.slice(-6).reverse()
+      : [];
+    const debugLines = Array.isArray(adapter?.upstream_debug?.lines)
+      ? adapter.upstream_debug.lines.slice(-6).reverse()
+      : [];
+    const upstreamMarkup = [
+      ...runtimeLines.map(line => `<div class="opensource-runtime-log-line upstream"><time>STDOUT</time><span>${escapeHtml(line)}</span></div>`),
+      ...debugLines.map(line => `<div class="opensource-runtime-log-line upstream"><time>MAA</time><span>${escapeHtml(line)}</span></div>`),
+    ].join("");
+    $("#opensource-runtime-log-output").innerHTML = adapterLogMarkup || upstreamMarkup
+      ? `${mxuTaskMarkup}${adapterLogMarkup}${upstreamMarkup}`
+      : mxuTaskMarkup
+        ? mxuTaskMarkup
+      : '<div class="opensource-empty">等待运行时事件</div>';
+  }
+
+  async function runOpenSourceFeatureAction(action) {
+    const moduleState = app.state?.open_source_automation || {};
+    if (app.openSourceSelectionDirty) {
+      notify("请先保存功能方案", "保存后才能对所选功能运行预检或启动。", "warning", 6500);
+      return;
+    }
+    const adapters = moduleState.adapters && typeof moduleState.adapters === "object"
+      ? moduleState.adapters
+      : {};
+    const execution = moduleState.execution || {};
+    const candidates = action === "stop"
+      ? (Array.isArray(execution.running_feature_ids) ? execution.running_feature_ids : [])
+      : action === "preflight"
+        ? (Array.isArray(execution.preflight_feature_ids)
+          ? execution.preflight_feature_ids
+          : execution.runnable_feature_ids || [])
+        : (Array.isArray(execution.runnable_feature_ids) ? execution.runnable_feature_ids : []);
+    const featureId = String(candidates[0] || "");
+    if (!featureId || !adapters[featureId]) {
+      notify("当前没有可运行功能", "已选功能仍在等待项目适配器。", "warning", 6500);
+      return;
+    }
+    const device = selectedDevice();
+    if (action !== "stop" && !device) {
+      notify("请选择 Android 真机", "请先在顶部设备选择器中选择已授权设备。", "warning", 6500);
+      return;
+    }
+    app.openSourceRuntimeAction = action;
+    renderOpenSourceRuntimeConsole(moduleState);
+    try {
+      const updated = await api(`/api/open-source-automation/${action}`, {
+        method: "POST",
+        body: JSON.stringify({
+          feature_id: featureId,
+          device,
+          ...openSourceRuntimeOptionPayload(),
+        }),
+      });
+      app.state = { ...(app.state || {}), open_source_automation: updated };
+      renderOpenSourceAutomation(app.state);
+      if (action === "preflight") {
+        const result = updated.adapters?.[featureId]?.preflight?.screen || {};
+        notify(
+          result.game_ready ? "预检通过" : "预检未通过",
+          result.game_ready
+            ? "真机与外部运行时配置均已就绪。"
+            : `当前状态：${openSourceScreenLabel(result.screen_state)}。`,
+          result.game_ready ? "success" : "warning",
+          8000,
+        );
+      } else {
+        notify(
+          action === "start" ? "功能已启动" : "已请求停止",
+          action === "start" ? "所选外部运行时已交由后台执行。" : "正在停止外部运行时并释放设备状态。",
+          action === "start" ? "success" : "warning",
+          8000,
+        );
+      }
+    } catch (error) {
+      notify("开源自动化操作失败", error.message || "未知错误", "error", 9000);
+      await refreshState();
+    } finally {
+      app.openSourceRuntimeAction = "";
+      if (app.state) renderOpenSourceRuntimeConsole(app.state.open_source_automation || {});
+    }
+  }
+
+  function renderOpenSourceAutomation(state) {
+    const moduleState = state?.open_source_automation || {};
+    renderOpenSourceCatalog(moduleState);
+    renderOpenSourceRuntimeConsole(moduleState);
+    const dependency = moduleState.dependency || {};
+    const demo = moduleState.demo || {};
+    const result = demo.result || null;
+    const available = dependency.available === true;
+    const status = String(moduleState.status || (available ? "ready" : "unavailable"));
+    const presentation = openSourceStatusPresentation(status, available);
+    $("#opensource-diagnostics-summary").textContent = finite(dependency.estimated_additional_mib)
+      ? `${presentation[0]} · 约 ${Number(dependency.estimated_additional_mib).toFixed(1)} MiB`
+      : presentation[0];
+
+    $("#opensource-dependency-value").textContent = available ? "OpenCV 就绪" : "未安装";
+    $("#opensource-dependency-detail").textContent = dependency.detail || "OpenCV / NumPy 为可选依赖";
+    $("#opensource-disk-value").textContent = finite(dependency.estimated_additional_mib)
+      ? `约 ${Number(dependency.estimated_additional_mib).toFixed(1)} MiB`
+      : "约 160 MiB";
+    $("#opensource-disk-detail").textContent = available
+      ? "图像 extra 已存在；核心代码仍为 KB 级"
+      : "安装 NumPy + OpenCV headless 的实测增量";
+    const bundle = moduleState.bundle || {};
+    const states = Array.isArray(bundle.states) ? bundle.states : [];
+    const transitions = Array.isArray(bundle.transitions) ? bundle.transitions : [];
+    $("#opensource-bundle-value").textContent = bundle.available
+      ? (bundle.graph_id || "已加载")
+      : "未找到";
+    $("#opensource-bundle-detail").textContent = bundle.available
+      ? `${states.length} 状态 · ${transitions.length} transition`
+      : (bundle.error || "示例资源包不可用");
+    const gatewayReady = moduleState.boundary?.device_gateway === true;
+    $("#opensource-gateway-value").textContent = gatewayReady ? "已接入" : "未接真机";
+    $("#opensource-gateway-detail").textContent = moduleState.boundary?.device_gateway_detail
+      || "当前只运行主机侧验证";
+
+    $("#opensource-install-command").textContent = dependency.install_command
+      || 'python -m pip install -e ".[image]"';
+    $("#opensource-install-state").textContent = available ? "已经安装" : "按需安装";
+    $("#opensource-install-callout").classList.toggle("available", available);
+    const input = $("#opensource-iterations-input");
+    input.max = String(Number(demo.max_iterations || 100));
+    if (!input.dataset.initialized && finite(demo.default_iterations)) {
+      input.value = String(Number(demo.default_iterations));
+      input.dataset.initialized = "true";
+    }
+    const running = moduleState.running === true || status === "running";
+    const runButton = $("#opensource-run-demo-button");
+    runButton.disabled = running || !available;
+    runButton.textContent = running ? "正在验证..." : "运行合成验证";
+    $("#opensource-demo-state").textContent = running
+      ? "RUNNING"
+      : result ? (result.matched ? "PASSED" : "FAILED") : available ? "READY" : "UNAVAILABLE";
+
+    if (result) {
+      const bounds = Array.isArray(result.bounds) ? result.bounds : [];
+      const frame = result.frame || {};
+      $("#opensource-score-value").textContent = finite(result.score)
+        ? Number(result.score).toFixed(4)
+        : "--";
+      $("#opensource-threshold-value").textContent = finite(result.threshold)
+        ? `阈值 ${Number(result.threshold).toFixed(2)} · scale ${formatNumber(result.scale, 2)}`
+        : "阈值 --";
+      $("#opensource-coordinate-value").textContent = bounds.length === 4
+        ? `${bounds[0]}, ${bounds[1]}`
+        : "--";
+      $("#opensource-coordinate-state").textContent = result.coordinate_exact
+        ? `精确命中 ${bounds.join(", ")}`
+        : `检测框 ${bounds.join(", ") || "不可用"}`;
+      $("#opensource-mean-value").textContent = finite(result.mean_ms)
+        ? `${Number(result.mean_ms).toFixed(2)} ms`
+        : "--";
+      $("#opensource-p95-value").textContent = finite(result.p95_ms)
+        ? `${Number(result.p95_ms).toFixed(2)} ms`
+        : "--";
+      $("#opensource-demo-detail").textContent = `${Number(result.iterations || 0)} 次 · ${Number(frame.width || 0)} × ${Number(frame.height || 0)} · 总耗时 ${formatNumber(result.duration_s, 2)} s · ${result.coordinate_exact ? "坐标与预期完全一致" : "坐标仍需核对"}`;
+      const evidence = result.evidence || {};
+      renderOpenSourceEvidenceImage("overlay", evidence.overlay || "");
+      renderOpenSourceEvidenceImage("frame", evidence.frame || "");
+      renderOpenSourceEvidenceImage("template", evidence.template || "");
+      $("#opensource-evidence-state").textContent = result.matched ? "证据已生成" : "匹配未通过";
+    } else {
+      $("#opensource-score-value").textContent = "--";
+      $("#opensource-threshold-value").textContent = "阈值 --";
+      $("#opensource-coordinate-value").textContent = "--";
+      $("#opensource-coordinate-state").textContent = "等待坐标证据";
+      $("#opensource-mean-value").textContent = "--";
+      $("#opensource-p95-value").textContent = "--";
+      $("#opensource-demo-detail").textContent = demo.error
+        || "生成一张 720 × 1280 合成手机画面，在限定 ROI 中查找 PLAY 模板并核对精确坐标。";
+      renderOpenSourceEvidenceImage("overlay", "");
+      renderOpenSourceEvidenceImage("frame", "");
+      renderOpenSourceEvidenceImage("template", "");
+      $("#opensource-evidence-state").textContent = "尚未生成";
+    }
+    renderOpenSourceGraph(bundle);
+    renderOpenSourceAlignment(Array.isArray(moduleState.alignment) ? moduleState.alignment : []);
+    renderOpenSourceLogs(moduleState.logs);
+  }
+
+  async function runOpenSourceAutomationDemo(event) {
+    event.preventDefault();
+    const input = $("#opensource-iterations-input");
+    const iterations = Number(input.value);
+    const maximum = Number(input.max || 100);
+    if (!Number.isInteger(iterations) || iterations < 1 || iterations > maximum) {
+      notify("迭代次数无效", `请输入 1 到 ${maximum} 之间的整数。`, "error");
+      input.focus();
+      return;
+    }
+    const button = $("#opensource-run-demo-button");
+    button.disabled = true;
+    button.textContent = "正在验证...";
+    $("#opensource-demo-state").textContent = "RUNNING";
+    try {
+      const moduleState = await api("/api/open-source-automation/demo", {
+        method: "POST",
+        body: JSON.stringify({ iterations }),
+      });
+      app.state = { ...(app.state || {}), open_source_automation: moduleState };
+      renderOpenSourceAutomation(app.state);
+      const result = moduleState.demo?.result || {};
+      notify(
+        result.matched ? "合成验证通过" : "合成验证未通过",
+        finite(result.score)
+          ? `score ${Number(result.score).toFixed(4)} · P95 ${formatNumber(result.p95_ms, 2)} ms`
+          : "请查看模块日志",
+        result.matched ? "success" : "error",
+        7000,
+      );
+    } catch (error) {
+      notify("无法运行开源自动化验证", error.message || "未知错误", "error", 9000);
+      await refreshState();
+    } finally {
+      if (!app.state?.open_source_automation?.running) {
+        button.textContent = "运行合成验证";
+      }
+    }
+  }
+
   function render(state) {
     app.state = state;
     const version = String(state?.version || "").trim().replace(/^v/i, "");
@@ -6757,6 +8133,7 @@
     renderHistory(state);
     renderTools(state);
     renderAdbAgent(state);
+    renderOpenSourceAutomation(state);
   }
 
   async function refreshState() {
@@ -6964,6 +8341,40 @@
 
   function bindEvents() {
     $$(".nav-item").forEach(button => button.addEventListener("click", () => switchView(button.dataset.view)));
+    $("#opensource-project-select").addEventListener("change", event => {
+      void selectOpenSourceProject(event);
+    });
+    $("#opensource-feature-groups").addEventListener("change", event => {
+      if (!updateMaaEndConfigFromInput(event)) updateOpenSourceSelectionFromInput(event);
+    });
+    $("#opensource-feature-groups").addEventListener("click", event => {
+      const preset = event.target.closest("[data-maaend-preset]");
+      if (preset) {
+        applyMaaEndPreset(preset.dataset.maaendPreset);
+        return;
+      }
+      if (event.target.closest("[data-maaend-save]")) {
+        void saveMaaEndConfiguration();
+      }
+    });
+    $("#opensource-selection-form").addEventListener("submit", event => {
+      void saveOpenSourceAutomationSelection(event);
+    });
+    $("#opensource-preflight-button").addEventListener("click", () => {
+      void runOpenSourceFeatureAction("preflight");
+    });
+    $("#opensource-configure-button").addEventListener("click", () => {
+      void saveMaaEndConfiguration();
+    });
+    $("#opensource-start-button").addEventListener("click", () => {
+      void runOpenSourceFeatureAction("start");
+    });
+    $("#opensource-stop-button").addEventListener("click", () => {
+      void runOpenSourceFeatureAction("stop");
+    });
+    $("#opensource-demo-form").addEventListener("submit", event => {
+      void runOpenSourceAutomationDemo(event);
+    });
     $$(".platform-switch [data-platform]").forEach(button => button.addEventListener("click", () => {
       setPlatform(button.dataset.platform);
     }));

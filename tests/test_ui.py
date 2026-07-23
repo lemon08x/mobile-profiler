@@ -2026,6 +2026,15 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("v1.0.0", html)
             self.assertIn('class="app-version-badge"', html)
             self.assertEqual(state["version"], __version__)
+            self.assertIn("open_source_automation", state)
+            self.assertEqual(
+                state["open_source_automation"]["dependency"]["estimated_additional_mib"],
+                159.6,
+            )
+            self.assertEqual(
+                state["open_source_automation"]["bundle"]["graph_id"],
+                "canvas-game-smoke",
+            )
             self.assertIn("TEST PLATFORM", html)
             self.assertIn("ADB / gfxinfo", html)
             self.assertIn("DVT / RemoteXPC", html)
@@ -2379,6 +2388,30 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('data-view="config"', html)
             self.assertIn('data-view="agent"', html)
             self.assertIn('data-panel="agent"', html)
+            self.assertIn('data-view="opensource"', html)
+            self.assertIn('data-panel="opensource"', html)
+            self.assertIn('id="opensource-demo-form"', html)
+            self.assertIn('id="opensource-run-demo-button"', html)
+            self.assertIn('id="opensource-alignment-body"', html)
+            self.assertIn('id="opensource-overlay-image"', html)
+            self.assertIn('id="opensource-graph-view"', html)
+            self.assertIn('id="opensource-project-select"', html)
+            self.assertIn('id="opensource-feature-groups"', html)
+            self.assertIn('id="opensource-selection-form"', html)
+            self.assertIn('id="opensource-save-selection-button"', html)
+            self.assertIn('id="opensource-runtime-console"', html)
+            self.assertIn('id="opensource-runtime-options"', html)
+            self.assertIn('id="opensource-configure-button"', html)
+            self.assertIn('id="opensource-preflight-button"', html)
+            self.assertIn('id="opensource-start-button"', html)
+            self.assertIn('id="opensource-stop-button"', html)
+            self.assertIn("开源自动化", html)
+            self.assertIn("选择项目", html)
+            self.assertIn("当前项目", html)
+            self.assertIn("全部 ADB 任务、选项和预设", html)
+            self.assertIn("适配能力对齐", html)
+            self.assertIn("第三方游戏自动化可能违反游戏规则", html)
+            self.assertIn("约 160 MiB", html)
             self.assertIn('id="adb-agent-form"', html)
             self.assertIn('id="agent-screen-image"', html)
             self.assertIn('id="agent-task-list"', html)
@@ -2473,7 +2506,28 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('"/api/campaign/stop"', javascript)
             self.assertIn('"/api/campaign/software/assets"', javascript)
             self.assertIn('"/api/campaign/software/install"', javascript)
+            self.assertIn('"/api/open-source-automation/demo"', javascript)
+            self.assertIn('"/api/open-source-automation/selection"', javascript)
+            self.assertIn('"/api/open-source-automation/configure"', javascript)
+            self.assertIn('`/api/open-source-automation/${action}`', javascript)
             self.assertIn("function renderAdbAgent", javascript)
+            self.assertIn("function renderOpenSourceAutomation", javascript)
+            self.assertIn("function renderOpenSourceProjectSelector", javascript)
+            self.assertIn("function selectOpenSourceProject", javascript)
+            self.assertIn("function renderMaaEndGameFeatures", javascript)
+            self.assertIn("function renderMaaEndOptionEditor", javascript)
+            self.assertIn("async function saveMaaEndConfiguration", javascript)
+            self.assertIn("function renderOpenSourceRuntimeOptions", javascript)
+            self.assertIn("function openSourceRuntimeOptionPayload", javascript)
+            self.assertIn("execution.preflight_feature_ids", javascript)
+            self.assertNotIn('$("#opensource-runtime-speed")', javascript)
+            self.assertNotIn('$("#opensource-runtime-bonus")', javascript)
+            self.assertIn("function renderOpenSourceFeatures", javascript)
+            self.assertIn("function saveOpenSourceAutomationSelection", javascript)
+            self.assertIn("function renderOpenSourceRuntimeConsole", javascript)
+            self.assertIn("function runOpenSourceFeatureAction", javascript)
+            self.assertIn("function renderOpenSourceAlignment", javascript)
+            self.assertIn("function runOpenSourceAutomationDemo", javascript)
             self.assertIn("function renderAgentSoftwareCatalog", javascript)
             self.assertIn("function renderAgentWorkflowReport", javascript)
             self.assertIn("function agentSoftwareCardMarkup", javascript)
@@ -2538,6 +2592,18 @@ class UiServerTests(unittest.TestCase):
             self.assertIn(".agent-phone-configuration-launcher", css)
             self.assertIn(".agent-workflow-report", css)
             self.assertIn(".agent-task-result.skipped", css)
+            self.assertIn(".opensource-layout", css)
+            self.assertIn(".opensource-project-card", css)
+            self.assertIn(".opensource-feature-card", css)
+            self.assertIn(".maaend-game-catalog", css)
+            self.assertIn(".maaend-task-card", css)
+            self.assertIn(".maaend-option-row", css)
+            self.assertIn(".maaend-config-toolbar", css)
+            self.assertIn(".opensource-selection-panel", css)
+            self.assertIn(".opensource-runtime-console", css)
+            self.assertIn(".opensource-diagnostics-panel", css)
+            self.assertIn(".opensource-alignment-table", css)
+            self.assertIn(".opensource-evidence-grid", css)
             self.assertIn("模型不能下发任意 shell", html)
             self.assertIn("局域网千问是默认配置而非协议绑定", html)
             self.assertIn("测试配置", html)
@@ -2596,7 +2662,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn(".home-start-panel", css)
             self.assertIn('const legacyTools = view === "tools"', javascript)
             self.assertIn('const legacySystem = view === "system" || view === "thermal"', javascript)
-            self.assertIn('const target = ["live", "config", "agent", "device", "history"].includes(requested)', javascript)
+            self.assertIn('const target = ["live", "config", "agent", "opensource", "device", "history"].includes(requested)', javascript)
             self.assertNotIn('system: "性能上下文"', javascript)
             self.assertIn('window.history.replaceState(null, "", `#${target}`)', javascript)
             self.assertIn("historyTools.open = true", javascript)
@@ -2671,6 +2737,113 @@ class UiServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("adb", Path(directory))
             self.assertIsNone(manager.report_path("..%2Foutside"))
+
+    def test_open_source_automation_demo_and_evidence_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("missing-adb", Path(directory))
+            manager.run_open_source_automation_demo = Mock(
+                return_value={"status": "completed", "demo": {"result": {"matched": True}}}
+            )
+            manager.update_open_source_automation_selection = Mock(
+                return_value={
+                    "selection": {
+                        "project_ids": ["march7th-assistant"],
+                        "feature_ids": ["m7a-universe"],
+                    },
+                    "execution": {"status": "adapter_pending"},
+                }
+            )
+            manager.preflight_open_source_automation = Mock(
+                return_value={"execution": {"status": "ready"}}
+            )
+            manager.configure_open_source_automation = Mock(
+                return_value={"execution": {"status": "configured"}}
+            )
+            manager.start_open_source_automation = Mock(
+                return_value={"execution": {"status": "running"}}
+            )
+            manager.stop_open_source_automation = Mock(
+                return_value={"execution": {"status": "stopped"}}
+            )
+            manager.open_source_automation.latest_evidence = Mock(
+                return_value=b"\x89PNG\r\n\x1a\nsynthetic"
+            )
+            server = DashboardHTTPServer(("127.0.0.1", 0), manager)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                request = Request(
+                    base + "/api/open-source-automation/demo",
+                    data=json.dumps({"iterations": 7}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=5) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                selection_payload = {
+                    "project_ids": ["march7th-assistant"],
+                    "feature_ids": ["m7a-universe"],
+                }
+                selection_request = Request(
+                    base + "/api/open-source-automation/selection",
+                    data=json.dumps(selection_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(selection_request, timeout=5) as response:
+                    selection = json.loads(response.read().decode("utf-8"))
+                runtime_payload = {
+                    "project_id": "march7th-assistant",
+                    "feature_id": "m7a-universe",
+                    "device": "USB-DEVICE",
+                }
+                runtime_results = {}
+                for action in ("configure", "preflight", "start", "stop"):
+                    runtime_request = Request(
+                        base + f"/api/open-source-automation/{action}",
+                        data=json.dumps(runtime_payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urlopen(runtime_request, timeout=5) as response:
+                        runtime_results[action] = json.loads(
+                            response.read().decode("utf-8")
+                        )
+                with urlopen(
+                    base + "/api/open-source-automation/evidence/overlay?revision=1",
+                    timeout=5,
+                ) as response:
+                    evidence = response.read()
+                    content_type = response.headers.get_content_type()
+            finally:
+                server.shutdown()
+                server.server_close()
+                manager.close()
+                thread.join(timeout=5)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(selection["execution"]["status"], "adapter_pending")
+            self.assertEqual(runtime_results["configure"]["execution"]["status"], "configured")
+            self.assertEqual(runtime_results["preflight"]["execution"]["status"], "ready")
+            self.assertEqual(runtime_results["start"]["execution"]["status"], "running")
+            self.assertEqual(runtime_results["stop"]["execution"]["status"], "stopped")
+            self.assertEqual(evidence, b"\x89PNG\r\n\x1a\nsynthetic")
+            self.assertEqual(content_type, "image/png")
+            manager.run_open_source_automation_demo.assert_called_once_with(
+                {"iterations": 7}
+            )
+            manager.update_open_source_automation_selection.assert_called_once_with(
+                selection_payload
+            )
+            manager.preflight_open_source_automation.assert_called_once_with(
+                runtime_payload
+            )
+            manager.start_open_source_automation.assert_called_once_with(runtime_payload)
+            manager.stop_open_source_automation.assert_called_once_with(runtime_payload)
+            manager.open_source_automation.latest_evidence.assert_called_once_with(
+                "overlay"
+            )
 
     def test_tool_api_and_comparison_report_routes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
