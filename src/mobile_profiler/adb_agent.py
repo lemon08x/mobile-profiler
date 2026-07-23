@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
@@ -26,6 +27,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from .automation import (
+    Observation,
+    ObservationRequest,
+    Uiautomator2Provider,
+    format_ui_hierarchy,
+    uiautomator2_dependency_status,
+)
 from .adb_agent_prompts import (
     ADB_AGENT_SYSTEM_PROMPT_VERSION,
     DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
@@ -63,6 +71,41 @@ DEFAULT_MODEL_API_KEY = (
     or os.environ.get("BTR2_LLM_TOKEN")
     or ""
 ).strip()
+MODEL_THINKING_AUTO = "auto"
+MODEL_THINKING_DISABLED = "disabled"
+MODEL_THINKING_ENABLED = "enabled"
+SUPPORTED_MODEL_THINKING_MODES = {
+    MODEL_THINKING_AUTO,
+    MODEL_THINKING_DISABLED,
+    MODEL_THINKING_ENABLED,
+}
+_configured_thinking_mode = os.environ.get("MOBILE_PROFILER_MODEL_THINKING_MODE")
+if _configured_thinking_mode:
+    DEFAULT_MODEL_THINKING_MODE = _configured_thinking_mode.strip().lower()
+elif (
+    DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_OPENAI_COMPATIBLE
+    and re.search(r"(?:^|[/_.-])(qwen|deepseek)", DEFAULT_MODEL, re.IGNORECASE)
+):
+    DEFAULT_MODEL_THINKING_MODE = MODEL_THINKING_DISABLED
+else:
+    DEFAULT_MODEL_THINKING_MODE = MODEL_THINKING_AUTO
+if DEFAULT_MODEL_THINKING_MODE not in SUPPORTED_MODEL_THINKING_MODES:
+    DEFAULT_MODEL_THINKING_MODE = MODEL_THINKING_AUTO
+
+AUTOMATION_ENGINE_VISION = "vision"
+AUTOMATION_ENGINE_UIAUTOMATOR2 = "uiautomator2"
+AUTOMATION_ENGINE_HYBRID = "hybrid"
+SUPPORTED_AUTOMATION_ENGINES = {
+    AUTOMATION_ENGINE_VISION,
+    AUTOMATION_ENGINE_UIAUTOMATOR2,
+    AUTOMATION_ENGINE_HYBRID,
+}
+DEFAULT_AUTOMATION_ENGINE = (
+    os.environ.get("MOBILE_PROFILER_AUTOMATION_ENGINE")
+    or AUTOMATION_ENGINE_VISION
+).strip().lower()
+if DEFAULT_AUTOMATION_ENGINE not in SUPPORTED_AUTOMATION_ENGINES:
+    DEFAULT_AUTOMATION_ENGINE = AUTOMATION_ENGINE_VISION
 
 # Backward-compatible configuration exports.
 DEFAULT_BTR2_API_BASE_URL = DEFAULT_MODEL_API_BASE_URL
@@ -70,7 +113,13 @@ DEFAULT_BTR2_MODEL = DEFAULT_MODEL
 DEFAULT_BTR2_API_KEY = DEFAULT_MODEL_API_KEY
 MAX_AGENT_LOGS = 240
 MAX_AGENT_HISTORY = 20
-MAX_AGENT_TASKS = 50
+MAX_AGENT_TASKS = 100
+MAX_AGENT_REASONING_CHARS = 120
+MAX_AGENT_FINISH_MESSAGE_CHARS = 80
+MAX_AGENT_TAKE_OVER_MESSAGE_CHARS = 120
+MAX_AGENT_SKIP_MESSAGE_CHARS = 120
+MAX_OPENAI_COMPATIBLE_OUTPUT_TOKENS = 1000
+MAX_OPENAI_COMPATIBLE_REPAIR_TOKENS = 512
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ANDROID_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 
@@ -104,9 +153,11 @@ PHONE_ACTION_TOOL: Dict[str, object] = {
                         "enter",
                         "delete",
                         "input_text",
+                        "input_secret",
                         "launch_app",
                         "wait",
                         "finish",
+                        "skip",
                         "take_over",
                     ],
                 },
@@ -139,14 +190,102 @@ PHONE_ACTION_TOOL: Dict[str, object] = {
                     "maximum": 30,
                 },
                 "text": {"type": "string", "maxLength": 500},
+                "secret_id": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+                    "maxLength": 64,
+                },
                 "package": {"type": "string", "maxLength": 200},
-                "message": {"type": "string", "maxLength": 1000},
+                "message": {
+                    "type": "string",
+                    "maxLength": MAX_AGENT_TAKE_OVER_MESSAGE_CHARS,
+                },
             },
             "required": ["action"],
             "additionalProperties": False,
         },
     },
 }
+
+
+def automation_engine_definitions_snapshot() -> List[Dict[str, object]]:
+    uia_available, uia_detail = uiautomator2_dependency_status()
+    return [
+        {
+            "id": AUTOMATION_ENGINE_VISION,
+            "label": "视觉截图",
+            "description": "模型比较前后 ADB 截图并使用归一化坐标操作",
+            "available": True,
+            "detail": "内置 ADB screencap + 坐标动作",
+        },
+        {
+            "id": AUTOMATION_ENGINE_UIAUTOMATOR2,
+            "label": "uiautomator2 语义控件",
+            "description": "模型读取控件树并按 revision 绑定的元素编号操作；不向模型发送截图",
+            "available": uia_available,
+            "detail": uia_detail,
+        },
+        {
+            "id": AUTOMATION_ENGINE_HYBRID,
+            "label": "视觉 + uiautomator2",
+            "description": "模型同时比较截图与控件树；语义元素缺失时可使用视觉坐标",
+            "available": uia_available,
+            "detail": uia_detail,
+        },
+    ]
+
+
+def normalize_automation_engine(value: object) -> str:
+    text = str(value or DEFAULT_AUTOMATION_ENGINE).strip().lower().replace("-", "_")
+    aliases = {
+        "adb": AUTOMATION_ENGINE_VISION,
+        "screenshot": AUTOMATION_ENGINE_VISION,
+        "visual": AUTOMATION_ENGINE_VISION,
+        "uia": AUTOMATION_ENGINE_UIAUTOMATOR2,
+        "ui_automator2": AUTOMATION_ENGINE_UIAUTOMATOR2,
+        "semantic": AUTOMATION_ENGINE_UIAUTOMATOR2,
+        "combined": AUTOMATION_ENGINE_HYBRID,
+        "mixed": AUTOMATION_ENGINE_HYBRID,
+        "vision_uiautomator2": AUTOMATION_ENGINE_HYBRID,
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in SUPPORTED_AUTOMATION_ENGINES:
+        raise ValueError(f"不支持的手机操作引擎：{value}")
+    return normalized
+
+
+def phone_action_tool(automation_engine: object = AUTOMATION_ENGINE_VISION) -> Dict[str, object]:
+    engine = normalize_automation_engine(automation_engine)
+    tool = deepcopy(PHONE_ACTION_TOOL)
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        raise RuntimeError("phone_action schema is invalid")
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict):
+        raise RuntimeError("phone_action parameter schema is invalid")
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        raise RuntimeError("phone_action properties are invalid")
+    action = properties.get("action")
+    if not isinstance(action, dict) or not isinstance(action.get("enum"), list):
+        raise RuntimeError("phone_action action enum is invalid")
+    if engine in {AUTOMATION_ENGINE_UIAUTOMATOR2, AUTOMATION_ENGINE_HYBRID}:
+        action["enum"] = ["tap_element", *action["enum"]]
+        properties["element_id"] = {
+            "type": "string",
+            "pattern": "^e[0-9]+$",
+            "maxLength": 32,
+        }
+        properties["observation_revision"] = {
+            "type": "string",
+            "maxLength": 80,
+        }
+        function["description"] = (
+            "Perform exactly one validated Android UI action through uiautomator2. "
+            "Prefer tap_element with the exact current observation_revision; "
+            "normalized 0-999 coordinates remain available as a fallback."
+        )
+    return tool
 
 
 MODEL_PROVIDER_DEFINITIONS: List[Dict[str, str]] = [
@@ -167,6 +306,11 @@ MODEL_PROVIDER_DEFINITIONS: List[Dict[str, str]] = [
         "api_placeholder": "http://192.168.31.237:8000 或完整 chat/completions URL",
         "model_placeholder": "支持图像和工具调用的模型名称",
         "default_api_key_mode": "bearer",
+        "default_thinking_mode": (
+            DEFAULT_MODEL_THINKING_MODE
+            if DEFAULT_MODEL_PROVIDER == MODEL_PROVIDER_OPENAI_COMPATIBLE
+            else MODEL_THINKING_AUTO
+        ),
     },
     {
         "id": MODEL_PROVIDER_ANTHROPIC,
@@ -183,6 +327,7 @@ MODEL_PROVIDER_DEFINITIONS: List[Dict[str, str]] = [
         "api_placeholder": "https://api.anthropic.com",
         "model_placeholder": "支持视觉与工具调用的 Claude 模型",
         "default_api_key_mode": "x-api-key",
+        "default_thinking_mode": MODEL_THINKING_AUTO,
     },
     {
         "id": MODEL_PROVIDER_GEMINI,
@@ -199,6 +344,7 @@ MODEL_PROVIDER_DEFINITIONS: List[Dict[str, str]] = [
         "api_placeholder": "https://generativelanguage.googleapis.com/v1beta",
         "model_placeholder": "支持视觉与函数调用的 Gemini 模型",
         "default_api_key_mode": "x-goog-api-key",
+        "default_thinking_mode": MODEL_THINKING_AUTO,
     },
 ]
 
@@ -343,6 +489,54 @@ def _workflow_summary(results: Sequence[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _device_identity_attention(config: Dict[str, object]) -> str:
+    fields = [
+        ("品牌", _short_text(config.get("device_brand"), 80)),
+        ("型号", _short_text(config.get("device_model"), 120)),
+        ("产品", _short_text(config.get("device_product"), 120)),
+        ("代号", _short_text(config.get("device_codename"), 120)),
+    ]
+    identity = "，".join(f"{label} {value}" for label, value in fields if value)
+    if not identity:
+        return ""
+    return (
+        f"当前真机设备标识（宿主已通过 ADB 确认）：{identity}。"
+        "选择厂商专属应用、应用商店包名或系统设置路径时必须以此为准；"
+        "禁止猜测或尝试其他厂商的包名。"
+    )
+
+
+def _normalize_input_secrets(value: object) -> Dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("input_secrets must be an object of secret aliases")
+    normalized: Dict[str, str] = {}
+    for raw_name, raw_secret in value.items():
+        name = str(raw_name or "").strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name):
+            raise ValueError(
+                "input secret aliases must use uppercase letters, numbers, and underscores"
+            )
+        secret = str(raw_secret or "")
+        if not secret or len(secret) > 500 or any(ord(character) < 32 for character in secret):
+            raise ValueError(f"input secret {name} is empty or contains unsupported characters")
+        normalized[name] = secret
+    return normalized
+
+
+def _secret_alias_attention(config: Dict[str, object]) -> str:
+    secret_ids = config.get("input_secret_ids")
+    if not isinstance(secret_ids, list) or not secret_ids:
+        return ""
+    aliases = "、".join(str(value) for value in secret_ids)
+    return (
+        f"宿主为本次会话配置了敏感输入别名：{aliases}。"
+        "需要填写对应字段时只能调用 input_secret 并原样使用 secret_id；"
+        "不要猜测、复述或使用 input_text 输入这些值。"
+    )
+
+
 def normalize_model_provider(value: object) -> str:
     provider = str(value or DEFAULT_MODEL_PROVIDER).strip().lower().replace("-", "_")
     aliases = {
@@ -357,6 +551,35 @@ def normalize_model_provider(value: object) -> str:
     normalized = aliases.get(provider, provider)
     if normalized not in SUPPORTED_MODEL_PROVIDERS:
         raise ValueError(f"不支持的多模态模型协议：{value}")
+    return normalized
+
+
+def default_model_thinking_mode(provider: str, model: str) -> str:
+    normalized_provider = normalize_model_provider(provider)
+    if normalized_provider != MODEL_PROVIDER_OPENAI_COMPATIBLE:
+        return MODEL_THINKING_AUTO
+    if re.search(r"(?:^|[/_.-])(qwen|deepseek)", str(model or ""), re.IGNORECASE):
+        return MODEL_THINKING_DISABLED
+    return MODEL_THINKING_AUTO
+
+
+def normalize_model_thinking_mode(value: object) -> str:
+    mode = str(value or MODEL_THINKING_AUTO).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": MODEL_THINKING_AUTO,
+        "default": MODEL_THINKING_AUTO,
+        "off": MODEL_THINKING_DISABLED,
+        "disable": MODEL_THINKING_DISABLED,
+        "disabled": MODEL_THINKING_DISABLED,
+        "false": MODEL_THINKING_DISABLED,
+        "on": MODEL_THINKING_ENABLED,
+        "enable": MODEL_THINKING_ENABLED,
+        "enabled": MODEL_THINKING_ENABLED,
+        "true": MODEL_THINKING_ENABLED,
+    }
+    normalized = aliases.get(mode, mode)
+    if normalized not in SUPPORTED_MODEL_THINKING_MODES:
+        raise ValueError(f"不支持的模型思考模式：{value}")
     return normalized
 
 
@@ -475,7 +698,10 @@ def parse_openai_model_decision(payload: Dict[str, object]) -> ModelDecision:
         raise RuntimeError("模型响应缺少 message")
     reasoning = _short_text(
         message.get("reasoning_content") or message.get("reasoning") or "",
-        3000,
+        MAX_AGENT_REASONING_CHARS,
+    )
+    reasoning_content = str(
+        message.get("reasoning_content") or message.get("reasoning") or ""
     )
     content = _content_text(message.get("content"))
     action: Optional[Dict[str, object]] = None
@@ -497,14 +723,18 @@ def parse_openai_model_decision(payload: Dict[str, object]) -> ModelDecision:
             if action is not None:
                 break
     if action is None:
-        fallback = _json_object_from_text(content)
-        if fallback is not None:
+        for candidate in (content, reasoning_content):
+            fallback = _json_object_from_text(candidate)
+            if fallback is None:
+                continue
             if fallback.get("name") == "phone_action" and isinstance(
                 fallback.get("arguments"), dict
             ):
                 action = dict(fallback["arguments"])  # type: ignore[arg-type]
             elif "action" in fallback:
                 action = fallback
+            if action is not None:
+                break
     if action is None or not str(action.get("action") or "").strip():
         raise RuntimeError("模型没有返回 phone_action 工具调用")
     usage = payload.get("usage")
@@ -564,7 +794,10 @@ def parse_anthropic_model_decision(payload: Dict[str, object]) -> ModelDecision:
     usage = usage if isinstance(usage, dict) else {}
     return ModelDecision(
         action=action,
-        reasoning=_short_text("\n".join(reasoning_parts) or content, 3000),
+        reasoning=_short_text(
+            "\n".join(reasoning_parts) or content,
+            MAX_AGENT_REASONING_CHARS,
+        ),
         content=_short_text(content, 3000),
         prompt_tokens=(
             _integer(usage.get("input_tokens"), 0)
@@ -619,7 +852,10 @@ def parse_gemini_model_decision(payload: Dict[str, object]) -> ModelDecision:
         completion_tokens = usage.get("candidates_token_count")
     return ModelDecision(
         action=action,
-        reasoning=_short_text("\n".join(reasoning_parts) or content_text, 3000),
+        reasoning=_short_text(
+            "\n".join(reasoning_parts) or content_text,
+            MAX_AGENT_REASONING_CHARS,
+        ),
         content=_short_text(content_text, 3000),
         prompt_tokens=(
             _integer(prompt_tokens, 0) if prompt_tokens is not None else None
@@ -630,8 +866,10 @@ def parse_gemini_model_decision(payload: Dict[str, object]) -> ModelDecision:
     )
 
 
-def _phone_action_function() -> Dict[str, object]:
-    function = PHONE_ACTION_TOOL.get("function")
+def _phone_action_function(
+    automation_engine: object = AUTOMATION_ENGINE_VISION,
+) -> Dict[str, object]:
+    function = phone_action_tool(automation_engine).get("function")
     if not isinstance(function, dict):
         raise RuntimeError("phone_action schema is invalid")
     return function
@@ -650,6 +888,60 @@ def _history_text(history: Sequence[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _repeatable_action_signature(action: Dict[str, object]) -> str:
+    name = str(action.get("action") or "").strip().lower()
+    if name not in {
+        "tap",
+        "tap_element",
+        "double_tap",
+        "long_press",
+        "swipe",
+        "swipe_fast",
+        "back",
+        "home",
+        "recent",
+        "enter",
+        "delete",
+        "input_text",
+        "input_secret",
+        "launch_app",
+    }:
+        return ""
+    stable = {
+        key: value
+        for key, value in action.items()
+        if key not in {"message", "observation_revision"}
+    }
+    return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _observation_state_token(revision: object) -> str:
+    text = str(revision or "").strip()
+    return text.rsplit("-", 1)[-1] if "-" in text else text
+
+
+def _matching_action_state_count(
+    history: Sequence[Dict[str, object]],
+    action: Dict[str, object],
+    observation_revision: object,
+) -> int:
+    signature = _repeatable_action_signature(action)
+    state_token = _observation_state_token(observation_revision)
+    if not signature or not state_token:
+        return 0
+    count = 0
+    for item in history[-8:]:
+        historical_action = item.get("action")
+        if not isinstance(historical_action, dict):
+            continue
+        if (
+            _observation_state_token(item.get("observation_revision")) == state_token
+            and _repeatable_action_signature(historical_action) == signature
+        ):
+            count += 1
+    return count
+
+
 def build_agent_user_text(
     *,
     task: str,
@@ -663,7 +955,13 @@ def build_agent_user_text(
     workflow_summary: str = "",
     task_elapsed_s: float = 0.0,
     task_timeout_s: float = 0.0,
+    previous_frame_available: bool = False,
+    automation_engine: str = AUTOMATION_ENGINE_VISION,
+    ui_hierarchy_text: str = "",
+    previous_ui_hierarchy_text: str = "",
+    observation_revision: str = "",
 ) -> str:
+    engine = normalize_automation_engine(automation_engine)
     attention_block = (
         f"\n\n当前子任务注意事项：\n{attention_prompt}"
         if str(attention_prompt or "").strip()
@@ -674,12 +972,60 @@ def build_agent_user_text(
         if task_timeout_s > 0
         else f"{task_elapsed_s:.1f} 秒"
     )
+    if engine == AUTOMATION_ENGINE_HYBRID:
+        semantic_current = str(ui_hierarchy_text or "").strip() or "当前没有可用语义控件。"
+        semantic_previous = str(previous_ui_hierarchy_text or "").strip()
+        frame_block = (
+            "本次附带上一动作前和动作后的两张截图。"
+            if previous_frame_available
+            else "本次只附带最新截图；动作后必须等待下一轮截图再判断变化。"
+        )
+        evidence_block = (
+            "操作引擎：视觉 + uiautomator2 混合辅助。模型同时收到截图与语义控件树。\n"
+            f"当前 observation_revision：{observation_revision or 'unknown'}。"
+            "有准确语义元素时优先 tap_element 并原样填写当前 revision；"
+            "标记为 canvas 的大画布元素只代表整块渲染区域，不能代替内部棋子或按钮；"
+            "操作画布内部目标时必须依据截图使用归一化坐标。\n"
+            f"截图证据：{frame_block} 必须让截图和语义证据相互校验；冲突时不能 finish。\n\n"
+            + (
+                f"上一动作前语义树：\n{semantic_previous}\n\n"
+                if semantic_previous
+                else "上一动作前没有语义树。\n\n"
+            )
+            + f"最新语义树：\n{semantic_current}"
+        )
+    elif engine == AUTOMATION_ENGINE_UIAUTOMATOR2:
+        semantic_current = str(ui_hierarchy_text or "").strip() or "当前没有可用语义控件。"
+        semantic_previous = str(previous_ui_hierarchy_text or "").strip()
+        evidence_block = (
+            "操作引擎：uiautomator2 语义控件；本轮不向模型发送截图。\n"
+            f"当前 observation_revision：{observation_revision or 'unknown'}。"
+            "优先使用 tap_element，并原样填写元素编号和当前 observation_revision；"
+            "只有语义树没有合适元素时才使用归一化坐标。\n"
+            + (
+                "本次附带上一动作前和动作后的两份语义树，必须比较文字、选中状态、"
+                "控件数量、bounds 或前台 Activity 的变化；没有变化就不能 finish。\n\n"
+                f"上一动作前语义树：\n{semantic_previous}\n\n"
+                if semantic_previous
+                else "本次只有最新语义树；动作后必须等待下一轮语义树再判断变化。\n\n"
+            )
+            + f"最新语义树：\n{semantic_current}"
+        )
+    else:
+        frame_block = (
+            "本次附带两张截图：第一张是上一动作执行前的画面，第二张是执行后的最新画面。"
+            "涉及位置、棋子、数值或列表变化时必须逐项比较两张图；目标未变化就不能 finish。"
+            if previous_frame_available
+            else "本次只附带最新截图；执行动作后必须等待下一轮截图再判断变化。"
+        )
+        evidence_block = f"操作引擎：视觉截图。\n截图证据：{frame_block}"
     return (
         f"当前测试子任务：{task_name or '未命名任务'}\n"
         f"任务目标：\n{task}{attention_block}\n\n"
         f"当前子任务步骤：{step}/{max_steps}\n"
         f"当前子任务用时：{timeout_block}\n"
         f"ADB 截图尺寸：{width}x{height}；工具坐标仍使用 0-999。\n\n"
+        f"{evidence_block}\n\n"
         f"已完成子任务摘要：\n{workflow_summary or '尚无已完成的子任务。'}\n\n"
         f"最近动作与结果：\n{_history_text(history)}\n\n"
         "只处理当前子任务。观察最新截图，调用一次 phone_action；"
@@ -751,6 +1097,8 @@ class VisionModelClient:
         request_timeout_s: float = 90.0,
         system_prompt: str = DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
         api_key_mode: str = "auto",
+        model_thinking_mode: str = MODEL_THINKING_AUTO,
+        automation_engine: str = AUTOMATION_ENGINE_VISION,
     ) -> None:
         self.model = str(model or "").strip()
         if not self.model:
@@ -758,6 +1106,9 @@ class VisionModelClient:
         self.url = model_endpoint_url(self.provider, api_base_url, self.model)
         self.api_key = str(api_key or "").strip()
         self.api_key_mode = str(api_key_mode or "auto").strip()
+        self.model_thinking_mode = normalize_model_thinking_mode(model_thinking_mode)
+        self.automation_engine = normalize_automation_engine(automation_engine)
+        self.phone_action_tool = phone_action_tool(self.automation_engine)
         self.request_timeout_s = request_timeout_s
         self.system_prompt = str(system_prompt or DEFAULT_ADB_AGENT_SYSTEM_PROMPT).strip()
 
@@ -778,6 +1129,8 @@ class OpenAICompatibleVisionClient(VisionModelClient):
         request_timeout_s: float = 90.0,
         system_prompt: str = DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
         api_key_mode: str = "auto",
+        model_thinking_mode: str = MODEL_THINKING_AUTO,
+        automation_engine: str = AUTOMATION_ENGINE_VISION,
     ) -> None:
         super().__init__(
             api_base_url,
@@ -786,6 +1139,8 @@ class OpenAICompatibleVisionClient(VisionModelClient):
             request_timeout_s,
             system_prompt,
             api_key_mode,
+            model_thinking_mode,
+            automation_engine,
         )
 
     def decide(
@@ -795,6 +1150,7 @@ class OpenAICompatibleVisionClient(VisionModelClient):
         step: int,
         max_steps: int,
         screenshot_png: bytes,
+        previous_screenshot_png: bytes = b"",
         width: int,
         height: int,
         history: Sequence[Dict[str, object]],
@@ -803,8 +1159,19 @@ class OpenAICompatibleVisionClient(VisionModelClient):
         workflow_summary: str = "",
         task_elapsed_s: float = 0.0,
         task_timeout_s: float = 0.0,
+        ui_hierarchy_text: str = "",
+        previous_ui_hierarchy_text: str = "",
+        observation_revision: str = "",
     ) -> ModelDecision:
-        encoded = base64.b64encode(screenshot_png).decode("ascii")
+        include_images = self.automation_engine != AUTOMATION_ENGINE_UIAUTOMATOR2
+        encoded = (
+            base64.b64encode(screenshot_png).decode("ascii") if include_images else ""
+        )
+        previous_encoded = (
+            base64.b64encode(previous_screenshot_png).decode("ascii")
+            if include_images and previous_screenshot_png
+            else ""
+        )
         user_text = build_agent_user_text(
             task=task,
             step=step,
@@ -817,33 +1184,117 @@ class OpenAICompatibleVisionClient(VisionModelClient):
             workflow_summary=workflow_summary,
             task_elapsed_s=task_elapsed_s,
             task_timeout_s=task_timeout_s,
+            previous_frame_available=bool(previous_encoded),
+            automation_engine=self.automation_engine,
+            ui_hierarchy_text=ui_hierarchy_text,
+            previous_ui_hierarchy_text=previous_ui_hierarchy_text,
+            observation_revision=observation_revision,
         )
+        def message_content(text: str) -> list[dict[str, object]]:
+            content: list[dict[str, object]] = [{"type": "text", "text": text}]
+            if previous_encoded:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{previous_encoded}"},
+                    }
+                )
+            if encoded:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    }
+                )
+            return content
+
         request_payload: Dict[str, object] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.system_prompt},
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{encoded}"},
-                        },
-                    ],
+                    "content": message_content(user_text),
                 },
             ],
-            "tools": [PHONE_ACTION_TOOL],
-            "tool_choice": "required",
+            "tools": [self.phone_action_tool],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "phone_action"},
+            },
+            "max_tokens": MAX_OPENAI_COMPATIBLE_OUTPUT_TOKENS,
             "stream": False,
         }
+        if self.model_thinking_mode != MODEL_THINKING_AUTO:
+            request_payload["chat_template_kwargs"] = {
+                "enable_thinking": self.model_thinking_mode == MODEL_THINKING_ENABLED
+            }
         decoded = _request_json(
             self.url,
             request_payload,
             _api_key_headers(self.provider, self.api_key, self.api_key_mode),
             self.request_timeout_s,
         )
-        return parse_openai_model_decision(decoded)
+        try:
+            return parse_openai_model_decision(decoded)
+        except RuntimeError as exc:
+            if "没有返回 phone_action" not in str(exc):
+                raise
+        repair_payload = dict(request_payload)
+        repair_payload["messages"] = [
+            {"role": "system", "content": self.system_prompt},
+            {
+                "role": "user",
+                "content": message_content(
+                    "协议修复：上一响应没有调用 phone_action。"
+                    "不要输出正文或分析；现在必须且只能调用一次 phone_action。"
+                    "若无法在不违反安全边界的情况下明确选择动作，调用 take_over。\n\n"
+                    f"{user_text}"
+                ),
+            },
+        ]
+        repair_payload["max_tokens"] = MAX_OPENAI_COMPATIBLE_REPAIR_TOKENS
+        repaired = _request_json(
+            self.url,
+            repair_payload,
+            _api_key_headers(self.provider, self.api_key, self.api_key_mode),
+            self.request_timeout_s,
+        )
+        try:
+            return parse_openai_model_decision(repaired)
+        except RuntimeError as exc:
+            if "没有返回 phone_action" not in str(exc):
+                raise
+        choices = repaired.get("choices")
+        repaired_message = (
+            choices[0].get("message")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else None
+        )
+        content = (
+            _content_text(repaired_message.get("content"))
+            if isinstance(repaired_message, dict)
+            else ""
+        )
+        usage = repaired.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        return ModelDecision(
+            action={
+                "action": "take_over",
+                "message": "模型连续两次未返回 phone_action，已按安全策略停止并请求人工接管。",
+            },
+            content=_short_text(content, 3000),
+            prompt_tokens=(
+                _integer(usage.get("prompt_tokens"), 0)
+                if usage.get("prompt_tokens") is not None
+                else None
+            ),
+            completion_tokens=(
+                _integer(usage.get("completion_tokens"), 0)
+                if usage.get("completion_tokens") is not None
+                else None
+            ),
+        )
 
 
 class AnthropicVisionClient(VisionModelClient):
@@ -856,6 +1307,7 @@ class AnthropicVisionClient(VisionModelClient):
         step: int,
         max_steps: int,
         screenshot_png: bytes,
+        previous_screenshot_png: bytes = b"",
         width: int,
         height: int,
         history: Sequence[Dict[str, object]],
@@ -864,8 +1316,19 @@ class AnthropicVisionClient(VisionModelClient):
         workflow_summary: str = "",
         task_elapsed_s: float = 0.0,
         task_timeout_s: float = 0.0,
+        ui_hierarchy_text: str = "",
+        previous_ui_hierarchy_text: str = "",
+        observation_revision: str = "",
     ) -> ModelDecision:
-        encoded = base64.b64encode(screenshot_png).decode("ascii")
+        include_images = self.automation_engine != AUTOMATION_ENGINE_UIAUTOMATOR2
+        encoded = (
+            base64.b64encode(screenshot_png).decode("ascii") if include_images else ""
+        )
+        previous_encoded = (
+            base64.b64encode(previous_screenshot_png).decode("ascii")
+            if include_images and previous_screenshot_png
+            else ""
+        )
         user_text = build_agent_user_text(
             task=task,
             step=step,
@@ -878,8 +1341,36 @@ class AnthropicVisionClient(VisionModelClient):
             workflow_summary=workflow_summary,
             task_elapsed_s=task_elapsed_s,
             task_timeout_s=task_timeout_s,
+            previous_frame_available=bool(previous_encoded),
+            automation_engine=self.automation_engine,
+            ui_hierarchy_text=ui_hierarchy_text,
+            previous_ui_hierarchy_text=previous_ui_hierarchy_text,
+            observation_revision=observation_revision,
         )
-        function = _phone_action_function()
+        function = _phone_action_function(self.automation_engine)
+        message_content: list[dict[str, object]] = [{"type": "text", "text": user_text}]
+        if previous_encoded:
+            message_content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": previous_encoded,
+                    },
+                }
+            )
+        if encoded:
+            message_content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded,
+                    },
+                }
+            )
         request_payload: Dict[str, object] = {
             "model": self.model,
             "max_tokens": 1000,
@@ -888,17 +1379,7 @@ class AnthropicVisionClient(VisionModelClient):
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": encoded,
-                            },
-                        },
-                    ],
+                    "content": message_content,
                 }
             ],
             "tools": [
@@ -944,6 +1425,7 @@ class GeminiVisionClient(VisionModelClient):
         step: int,
         max_steps: int,
         screenshot_png: bytes,
+        previous_screenshot_png: bytes = b"",
         width: int,
         height: int,
         history: Sequence[Dict[str, object]],
@@ -952,8 +1434,19 @@ class GeminiVisionClient(VisionModelClient):
         workflow_summary: str = "",
         task_elapsed_s: float = 0.0,
         task_timeout_s: float = 0.0,
+        ui_hierarchy_text: str = "",
+        previous_ui_hierarchy_text: str = "",
+        observation_revision: str = "",
     ) -> ModelDecision:
-        encoded = base64.b64encode(screenshot_png).decode("ascii")
+        include_images = self.automation_engine != AUTOMATION_ENGINE_UIAUTOMATOR2
+        encoded = (
+            base64.b64encode(screenshot_png).decode("ascii") if include_images else ""
+        )
+        previous_encoded = (
+            base64.b64encode(previous_screenshot_png).decode("ascii")
+            if include_images and previous_screenshot_png
+            else ""
+        )
         user_text = build_agent_user_text(
             task=task,
             step=step,
@@ -966,22 +1459,38 @@ class GeminiVisionClient(VisionModelClient):
             workflow_summary=workflow_summary,
             task_elapsed_s=task_elapsed_s,
             task_timeout_s=task_timeout_s,
+            previous_frame_available=bool(previous_encoded),
+            automation_engine=self.automation_engine,
+            ui_hierarchy_text=ui_hierarchy_text,
+            previous_ui_hierarchy_text=previous_ui_hierarchy_text,
+            observation_revision=observation_revision,
         )
-        function = _phone_action_function()
+        function = _phone_action_function(self.automation_engine)
+        parts: list[dict[str, object]] = [{"text": user_text}]
+        if previous_encoded:
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": previous_encoded,
+                    }
+                }
+            )
+        if encoded:
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": encoded,
+                    }
+                }
+            )
         request_payload: Dict[str, object] = {
             "systemInstruction": {"parts": [{"text": self.system_prompt}]},
             "contents": [
                 {
                     "role": "user",
-                    "parts": [
-                        {"text": user_text},
-                        {
-                            "inlineData": {
-                                "mimeType": "image/png",
-                                "data": encoded,
-                            }
-                        },
-                    ],
+                    "parts": parts,
                 }
             ],
             "tools": [
@@ -1026,6 +1535,8 @@ def create_vision_model_client(config: Dict[str, object]) -> VisionModelClient:
         _number(config.get("request_timeout_s"), 90.0),
         str(config.get("system_prompt") or DEFAULT_ADB_AGENT_SYSTEM_PROMPT),
         str(config.get("api_key_mode") or "auto"),
+        str(config.get("model_thinking_mode") or MODEL_THINKING_AUTO),
+        str(config.get("automation_engine") or DEFAULT_AUTOMATION_ENGINE),
     )
 
 
@@ -1095,6 +1606,14 @@ def _normalized_pair(
     )
 
 
+def _terminal_message(action: Dict[str, object], name: str, limit: int) -> str:
+    message = _short_text(action.get("message"), limit).strip()
+    meaningful = re.findall(r"[A-Za-z0-9\u3400-\u9fff]", message)
+    if len(meaningful) < 2:
+        raise ValueError(f"{name} requires a meaningful evidence message")
+    return message
+
+
 def execute_adb_action(
     adb: str,
     device: str,
@@ -1107,10 +1626,17 @@ def execute_adb_action(
 
     name = str(action.get("action") or "").strip().lower()
     if name == "finish":
-        message = _short_text(action.get("message") or "任务已完成", 1000)
+        message = _terminal_message(action, "finish", MAX_AGENT_FINISH_MESSAGE_CHARS)
         return ActionExecution("模型确认任务完成", message, "completed")
+    if name == "skip":
+        message = _terminal_message(action, "skip", MAX_AGENT_SKIP_MESSAGE_CHARS)
+        return ActionExecution("模型跳过当前检查项", message, "skipped")
     if name == "take_over":
-        message = _short_text(action.get("message") or "模型请求人工接管", 1000)
+        message = _terminal_message(
+            action,
+            "take_over",
+            MAX_AGENT_TAKE_OVER_MESSAGE_CHARS,
+        )
         return ActionExecution("模型请求人工接管", message, "take_over")
     if name == "wait":
         duration = _bounded_float(action.get("duration_seconds"), 0.2, 30.0, 1.0)
@@ -1213,6 +1739,7 @@ class AdbAgentController:
         output_root: Path,
         *,
         client_factory: Optional[Callable[[Dict[str, object]], object]] = None,
+        semantic_provider_factory: Optional[Callable[[str], object]] = None,
         screenshot_capture: Callable[[str, str], tuple[bytes, int, int]] = capture_adb_screenshot,
         action_executor: Callable[
             [str, str, Dict[str, object], int, int, threading.Event], ActionExecution
@@ -1221,6 +1748,9 @@ class AdbAgentController:
         self.adb = adb
         self.output_root = output_root
         self._client_factory = client_factory or self._default_client_factory
+        self._semantic_provider_factory = (
+            semantic_provider_factory or Uiautomator2Provider
+        )
         self._screenshot_capture = screenshot_capture
         self._action_executor = action_executor
         self._lock = threading.RLock()
@@ -1288,7 +1818,11 @@ class AdbAgentController:
 
     @staticmethod
     def _persist_config(directory: Path, config: Dict[str, object]) -> None:
-        public_config = {key: value for key, value in config.items() if key != "api_key"}
+        public_config = {
+            key: value
+            for key, value in config.items()
+            if key not in {"api_key", "input_secrets"}
+        }
         public_config["api_key_configured"] = bool(config.get("api_key"))
         (directory / "config.json").write_text(
             json.dumps(public_config, ensure_ascii=False, indent=2),
@@ -1309,6 +1843,7 @@ class AdbAgentController:
             payload.get("workflow_name") or tasks[0].get("name") or "ADB 测试流程",
             160,
         )
+        temporary_task = payload.get("temporary_task") is True
         system_prompt = _multiline_text(payload.get("system_prompt"), 24000)
         if not system_prompt:
             system_prompt = DEFAULT_ADB_AGENT_SYSTEM_PROMPT
@@ -1334,15 +1869,43 @@ class AdbAgentController:
         if not model or len(model) > 300:
             raise ValueError("请输入有效的模型名称")
         model_endpoint_url(model_provider, api_base_url, model)
+        model_thinking_mode = normalize_model_thinking_mode(
+            payload.get("model_thinking_mode")
+            or default_model_thinking_mode(model_provider, model)
+        )
+        if (
+            model_provider != MODEL_PROVIDER_OPENAI_COMPATIBLE
+            and model_thinking_mode != MODEL_THINKING_AUTO
+        ):
+            raise ValueError("模型思考模式仅适用于 OpenAI-compatible 协议")
+        automation_engine = normalize_automation_engine(
+            payload.get("automation_engine") or DEFAULT_AUTOMATION_ENGINE
+        )
+        if automation_engine in {
+            AUTOMATION_ENGINE_UIAUTOMATOR2,
+            AUTOMATION_ENGINE_HYBRID,
+        }:
+            available, detail = uiautomator2_dependency_status()
+            if not available and self._semantic_provider_factory is Uiautomator2Provider:
+                raise ValueError(f"uiautomator2 引擎不可用：{detail}")
         api_key_mode = str(
             payload.get("api_key_mode")
             or provider_definition["default_api_key_mode"]
             or "auto"
         ).strip()
         _api_key_headers(model_provider, "validation-key", api_key_mode)
+        input_secrets = _normalize_input_secrets(payload.get("input_secrets"))
         config: Dict[str, object] = {
             "device": device,
+            "device_brand": _short_text(payload.get("device_brand"), 80),
+            "device_model": _short_text(payload.get("device_model"), 120),
+            "device_product": _short_text(payload.get("device_product"), 120),
+            "device_codename": _short_text(payload.get("device_codename"), 120),
+            "device_connection_type": _short_text(
+                payload.get("device_connection_type"), 40
+            ),
             "workflow_name": workflow_name,
+            "temporary_task": temporary_task,
             "tasks": tasks,
             "task": tasks[0]["prompt"],
             "system_prompt": system_prompt,
@@ -1350,14 +1913,24 @@ class AdbAgentController:
             "model_provider": model_provider,
             "api_base_url": api_base_url,
             "model": model,
+            "model_thinking_mode": model_thinking_mode,
+            "automation_engine": automation_engine,
             "api_key": str(
                 payload.get("api_key")
                 or (DEFAULT_MODEL_API_KEY if provider_is_default else "")
             ).strip(),
             "api_key_mode": api_key_mode,
+            "input_secrets": input_secrets,
+            "input_secret_ids": sorted(input_secrets),
             "step_delay_s": _bounded_float(payload.get("step_delay_s"), 0.2, 30.0, 1.2),
             "request_timeout_s": _bounded_float(
                 payload.get("request_timeout_s"), 5.0, 600.0, 90.0
+            ),
+            "screenshot_retry_timeout_s": _bounded_float(
+                payload.get("screenshot_retry_timeout_s"), 0.0, 300.0, 30.0
+            ),
+            "max_ui_elements": _bounded_int(
+                payload.get("max_ui_elements"), 20, 1000, 240
             ),
             "created_at": time.time(),
         }
@@ -1379,7 +1952,13 @@ class AdbAgentController:
             self._session = {
                 "session_id": session_id,
                 "device": device,
+                "device_brand": config["device_brand"],
+                "device_model": config["device_model"],
+                "device_product": config["device_product"],
+                "device_codename": config["device_codename"],
+                "device_connection_type": config["device_connection_type"],
                 "workflow_name": workflow_name,
+                "temporary_task": temporary_task,
                 "task": tasks[0]["prompt"],
                 "tasks": [dict(task) for task in tasks],
                 "task_count": len(tasks),
@@ -1395,11 +1974,16 @@ class AdbAgentController:
                 "model_provider": model_provider,
                 "api_base_url": api_base_url,
                 "model": model,
+                "model_thinking_mode": model_thinking_mode,
+                "automation_engine": automation_engine,
                 "api_key_mode": api_key_mode,
                 "api_key_configured": bool(config.get("api_key")),
+                "input_secret_ids": list(config["input_secret_ids"]),
                 "max_steps": tasks[0]["max_steps"],
                 "step_delay_s": config["step_delay_s"],
                 "request_timeout_s": config["request_timeout_s"],
+                "screenshot_retry_timeout_s": config["screenshot_retry_timeout_s"],
+                "max_ui_elements": config["max_ui_elements"],
                 "step": 0,
                 "status": "starting",
                 "phase": "starting",
@@ -1450,10 +2034,13 @@ class AdbAgentController:
     def snapshot(self) -> Dict[str, object]:
         with self._lock:
             defaults = {
+                "automation_engine": DEFAULT_AUTOMATION_ENGINE,
+                "automation_engines": automation_engine_definitions_snapshot(),
                 "model_provider": DEFAULT_MODEL_PROVIDER,
                 "model_providers": model_provider_definitions_snapshot(),
                 "api_base_url": DEFAULT_MODEL_API_BASE_URL,
                 "model": DEFAULT_MODEL,
+                "model_thinking_mode": DEFAULT_MODEL_THINKING_MODE,
                 "api_key_mode": model_provider_definition(DEFAULT_MODEL_PROVIDER)[
                     "default_api_key_mode"
                 ],
@@ -1461,6 +2048,8 @@ class AdbAgentController:
                 "task_timeout_s": 300,
                 "step_delay_s": 1.2,
                 "request_timeout_s": 90,
+                "screenshot_retry_timeout_s": 30,
+                "max_ui_elements": 240,
                 "api_key_configured": bool(DEFAULT_MODEL_API_KEY),
                 "system_prompt": DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
                 "system_prompt_version": ADB_AGENT_SYSTEM_PROMPT_VERSION,
@@ -1516,14 +2105,31 @@ class AdbAgentController:
         try:
             client = self._client_factory(config)
             provider = model_provider_definition(str(config["model_provider"]))
+            automation_engine = normalize_automation_engine(
+                config.get("automation_engine")
+            )
+            semantic_provider: Optional[object] = None
+            if automation_engine in {
+                AUTOMATION_ENGINE_UIAUTOMATOR2,
+                AUTOMATION_ENGINE_HYBRID,
+            }:
+                semantic_provider = self._semantic_provider_factory(
+                    str(config["device"])
+                )
             self._log(
                 "info",
-                f"已连接多模态模型：{provider['label']} · {config['model']}",
+                f"已连接模型：{provider['label']} · {config['model']} · "
+                + {
+                    AUTOMATION_ENGINE_UIAUTOMATOR2: "uiautomator2 语义控件",
+                    AUTOMATION_ENGINE_HYBRID: "视觉 + uiautomator2",
+                }.get(automation_engine, "视觉截图"),
             )
             tasks = config.get("tasks")
             if not isinstance(tasks, list) or not tasks:
                 raise RuntimeError("Agent workflow has no tasks")
             task_results: List[Dict[str, object]] = []
+            device_identity_attention = _device_identity_attention(config)
+            secret_alias_attention = _secret_alias_attention(config)
             had_warnings = False
             total_steps = 0
 
@@ -1539,6 +2145,8 @@ class AdbAgentController:
                 timeout_s = _number(task.get("timeout_s"), 300.0)
                 task_started_at = time.time()
                 task_history: List[Dict[str, object]] = []
+                previous_screenshot = b""
+                previous_ui_hierarchy_text = ""
                 task_status: Optional[str] = None
                 task_message = ""
 
@@ -1593,9 +2201,74 @@ class AdbAgentController:
                         task_elapsed_s=task_elapsed,
                         message=f"子任务 {task_index}/{len(tasks)} · 正在获取第 {step} 步截图",
                     )
-                    screenshot, width, height = self._screenshot_capture(
-                        self.adb, str(config["device"])
+                    retry_timeout_s = _number(
+                        config.get("screenshot_retry_timeout_s"), 30.0
                     )
+                    retry_started = time.monotonic()
+                    retry_count = 0
+                    while True:
+                        try:
+                            screenshot, width, height = self._screenshot_capture(
+                                self.adb, str(config["device"])
+                            )
+                            if retry_count:
+                                self._log(
+                                    "info",
+                                    f"ADB 截图已恢复，重试 {retry_count} 次",
+                                )
+                                try:
+                                    self._persist_event(
+                                        directory,
+                                        {
+                                            "event_type": "screenshot_recovered",
+                                            "time": time.time(),
+                                            "task_index": task_index,
+                                            "step": step,
+                                            "retry_count": retry_count,
+                                            "unavailable_s": time.monotonic() - retry_started,
+                                        },
+                                    )
+                                except OSError:
+                                    pass
+                            break
+                        except RuntimeError as exc:
+                            retry_count += 1
+                            elapsed = time.monotonic() - retry_started
+                            if stop_event.is_set():
+                                self._finish(session_id, "stopped", "测试流程已由用户停止")
+                                return
+                            if elapsed >= retry_timeout_s:
+                                raise RuntimeError(
+                                    f"ADB screenshot unavailable for {elapsed:.1f}s: {exc}"
+                                ) from exc
+                            if retry_count == 1:
+                                self._log(
+                                    "warning",
+                                    f"ADB 截图暂时不可用，最多重试 {retry_timeout_s:g} 秒：{exc}",
+                                )
+                                try:
+                                    self._persist_event(
+                                        directory,
+                                        {
+                                            "event_type": "screenshot_retry",
+                                            "time": time.time(),
+                                            "task_index": task_index,
+                                            "step": step,
+                                            "error": _short_text(exc, 500),
+                                            "timeout_s": retry_timeout_s,
+                                        },
+                                    )
+                                except OSError:
+                                    pass
+                            self._update(
+                                session_id,
+                                phase="reconnecting",
+                                message=(
+                                    f"子任务 {task_index}/{len(tasks)} · "
+                                    f"ADB 暂时离线，正在重试截图（{elapsed:.0f}/{retry_timeout_s:g} 秒）"
+                                ),
+                            )
+                            stop_event.wait(min(2.0, max(0.1, retry_timeout_s - elapsed)))
                     screenshot_name = f"task-{task_index:02d}-step-{step:03d}.png"
                     with self._lock:
                         if (
@@ -1615,6 +2288,67 @@ class AdbAgentController:
                         (directory / screenshot_name).write_bytes(screenshot)
                     except OSError as exc:
                         self._log("warning", f"保存第 {task_index}.{step} 步截图失败：{exc}")
+                    observation: Optional[Observation] = None
+                    ui_hierarchy_text = ""
+                    ui_hierarchy_name = ""
+                    if semantic_provider is not None:
+                        self._update(
+                            session_id,
+                            phase="observing_ui",
+                            message=(
+                                f"子任务 {task_index}/{len(tasks)} · "
+                                f"正在读取第 {step} 步语义控件树"
+                            ),
+                        )
+                        observation = semantic_provider.observe(  # type: ignore[attr-defined]
+                            ObservationRequest(
+                                channels=frozenset(
+                                    {
+                                        "ui_hierarchy",
+                                        "foreground_activity",
+                                        "device_context",
+                                    }
+                                ),
+                                timeout_s=_number(config.get("request_timeout_s"), 90.0),
+                                max_ui_elements=_bounded_int(
+                                    config.get("max_ui_elements"),
+                                    20,
+                                    1000,
+                                    240,
+                                ),
+                            )
+                        )
+                        if not isinstance(observation, Observation):
+                            raise RuntimeError(
+                                "uiautomator2 provider returned an invalid observation"
+                            )
+                        ui_hierarchy_text = format_ui_hierarchy(observation)
+                        if observation.ui is not None:
+                            ui_hierarchy_name = (
+                                f"task-{task_index:02d}-step-{step:03d}.xml"
+                            )
+                            raw_artifact = observation.ui.raw_artifact
+                            if raw_artifact is not None and raw_artifact.data:
+                                try:
+                                    (directory / ui_hierarchy_name).write_bytes(
+                                        raw_artifact.data
+                                    )
+                                except OSError as exc:
+                                    self._log(
+                                        "warning",
+                                        f"保存第 {task_index}.{step} 步控件树失败：{exc}",
+                                    )
+                        self._update(
+                            session_id,
+                            observation_revision=observation.revision,
+                            ui_element_count=(
+                                len(observation.ui.elements)
+                                if observation.ui is not None
+                                else 0
+                            ),
+                            foreground_package=observation.context.foreground_package,
+                            foreground_activity=observation.context.foreground_activity,
+                        )
                     self._update(
                         session_id,
                         phase="thinking",
@@ -1624,20 +2358,69 @@ class AdbAgentController:
                     decision = client.decide(  # type: ignore[attr-defined]
                         task=str(task.get("prompt") or ""),
                         task_name=task_name,
-                        attention_prompt=str(task.get("attention_prompt") or ""),
+                        attention_prompt="\n".join(
+                            value
+                            for value in (
+                                device_identity_attention,
+                                secret_alias_attention,
+                                str(task.get("attention_prompt") or ""),
+                            )
+                            if value
+                        ),
                         workflow_summary=_workflow_summary(task_results),
                         task_elapsed_s=time.time() - task_started_at,
                         task_timeout_s=timeout_s,
                         step=step,
                         max_steps=max_steps,
                         screenshot_png=screenshot,
+                        previous_screenshot_png=previous_screenshot,
                         width=width,
                         height=height,
                         history=task_history,
+                        ui_hierarchy_text=ui_hierarchy_text,
+                        previous_ui_hierarchy_text=previous_ui_hierarchy_text,
+                        observation_revision=(
+                            observation.revision if observation is not None else ""
+                        ),
                     )
                     request_duration = time.monotonic() - request_started
                     if not isinstance(decision, ModelDecision):
                         raise RuntimeError("Agent client returned an invalid decision")
+                    action = dict(decision.action)
+                    if (
+                        str(task.get("id") or "").startswith("phone-config-")
+                        and str(action.get("action") or "").strip().lower()
+                        == "take_over"
+                    ):
+                        takeover_message = _short_text(
+                            action.get("message") or "当前检查项需要人工处理",
+                            96,
+                        )
+                        action = {
+                            "action": "skip",
+                            "message": _short_text(
+                                f"{takeover_message}；手机配置检查已记录并继续后续项目",
+                                MAX_AGENT_TAKE_OVER_MESSAGE_CHARS,
+                            ),
+                        }
+                    if (
+                        str(task.get("id") or "").startswith("phone-config-")
+                        and observation is not None
+                        and _matching_action_state_count(
+                            task_history,
+                            action,
+                            observation.revision,
+                        )
+                        >= 2
+                    ):
+                        action = {
+                            "action": "skip",
+                            "message": _short_text(
+                                "同一界面上的同一操作已执行两次且状态未变化；"
+                                "手机配置检查已停止重试并记录该项",
+                                MAX_AGENT_TAKE_OVER_MESSAGE_CHARS,
+                            ),
+                        }
                     with self._lock:
                         if (
                             self._session is None
@@ -1645,7 +2428,7 @@ class AdbAgentController:
                         ):
                             return
                         self._session["latest_reasoning"] = decision.reasoning
-                        self._session["latest_action"] = dict(decision.action)
+                        self._session["latest_action"] = dict(action)
                         self._session["latest_request_s"] = request_duration
                         self._session["prompt_tokens"] = _integer(
                             self._session.get("prompt_tokens"), 0
@@ -1656,7 +2439,7 @@ class AdbAgentController:
                     self._log(
                         "model",
                         f"子任务 {task_index} 第 {step} 步决策："
-                        f"{json.dumps(decision.action, ensure_ascii=False)}",
+                        f"{json.dumps(action, ensure_ascii=False)}",
                     )
                     if stop_event.is_set():
                         self._finish(session_id, "stopped", "测试流程已由用户停止")
@@ -1670,14 +2453,89 @@ class AdbAgentController:
                         phase="acting",
                         message=f"子任务 {task_index}/{len(tasks)} · 正在执行第 {step} 步",
                     )
-                    execution = self._action_executor(
-                        self.adb,
-                        str(config["device"]),
-                        decision.action,
-                        width,
-                        height,
-                        stop_event,
-                    )
+                    action_validation_error = ""
+                    action_execution_error = ""
+                    try:
+                        execution_action = dict(action)
+                        secret_input_id = ""
+                        if str(execution_action.get("action") or "").strip().lower() == (
+                            "input_secret"
+                        ):
+                            secret_input_id = str(
+                                execution_action.get("secret_id") or ""
+                            ).strip()
+                            input_secrets = config.get("input_secrets")
+                            if (
+                                not secret_input_id
+                                or not isinstance(input_secrets, dict)
+                                or secret_input_id not in input_secrets
+                            ):
+                                raise ValueError(
+                                    "input_secret requires a configured secret_id from the current session"
+                                )
+                            execution_action = {
+                                "action": "input_text",
+                                "text": str(input_secrets[secret_input_id]),
+                            }
+                        if (
+                            semantic_provider is not None
+                            and observation is not None
+                            and str(action.get("action") or "").strip().lower()
+                            not in {"finish", "skip", "take_over"}
+                        ):
+                            semantic_action = dict(execution_action)
+                            if str(task.get("id") or "").startswith(
+                                "phone-config-a0-store-"
+                            ):
+                                semantic_action["_forbid_recommendation_controls"] = True
+                                if str(task.get("id") or "") != (
+                                    "phone-config-a0-store-wechat"
+                                ):
+                                    semantic_action["_forbid_notification_allow"] = True
+                            if str(task.get("id") or "") == (
+                                "phone-config-a0-genshin-full-package"
+                            ):
+                                semantic_action["_forbid_launch_packages"] = (
+                                    "com.bbk.appstore",
+                                    "com.heytap.market",
+                                    "com.xiaomi.market",
+                                    "com.huawei.appmarket",
+                                    "com.hihonor.appmarket",
+                                    "com.sec.android.app.samsungapps",
+                                )
+                            semantic_summary = semantic_provider.execute_action(  # type: ignore[attr-defined]
+                                semantic_action,
+                                observation,
+                                stop_event,
+                            )
+                            execution = ActionExecution(
+                                f"uiautomator2 输入密钥 {secret_input_id}（内容已脱敏）"
+                                if secret_input_id
+                                else semantic_summary
+                            )
+                        else:
+                            execution = self._action_executor(
+                                self.adb,
+                                str(config["device"]),
+                                execution_action,
+                                width,
+                                height,
+                                stop_event,
+                            )
+                            if secret_input_id:
+                                execution = ActionExecution(
+                                    f"输入密钥 {secret_input_id}（内容已脱敏）"
+                                )
+                    except ValueError as exc:
+                        action_validation_error = _short_text(exc, 400)
+                        execution = ActionExecution(
+                            f"动作未执行：参数校验失败（{action_validation_error}）"
+                        )
+                    except RuntimeError as exc:
+                        action_execution_error = _short_text(exc, 400)
+                        execution = ActionExecution(
+                            f"动作未执行：引擎执行失败（{action_execution_error}）"
+                        )
                     total_steps += 1
                     event = {
                         "event_type": "action",
@@ -1688,24 +2546,60 @@ class AdbAgentController:
                         "step": step,
                         "workflow_step": total_steps,
                         "screenshot": screenshot_name,
+                        "ui_hierarchy": ui_hierarchy_name or None,
+                        "observation_revision": (
+                            observation.revision if observation is not None else None
+                        ),
+                        "ui_element_count": (
+                            len(observation.ui.elements)
+                            if observation is not None and observation.ui is not None
+                            else None
+                        ),
+                        "automation_engine": automation_engine,
                         "reasoning": decision.reasoning,
-                        "action": decision.action,
+                        "action": action,
                         "result": execution.summary,
                         "request_s": request_duration,
                         "prompt_tokens": decision.prompt_tokens,
                         "completion_tokens": decision.completion_tokens,
+                        "action_valid": not bool(
+                            action_validation_error or action_execution_error
+                        ),
                     }
                     with self._lock:
                         self._history.append(event)
                         if self._session is not None:
                             self._session["total_steps"] = total_steps
                     task_history.append(event)
+                    previous_screenshot = screenshot
+                    previous_ui_hierarchy_text = ui_hierarchy_text
                     try:
                         self._persist_event(directory, event)
                     except OSError as exc:
                         self._log("warning", f"保存第 {task_index}.{step} 步事件失败：{exc}")
                     self._update(session_id, latest_action_result=execution.summary)
-                    self._log("action", execution.summary)
+                    self._log(
+                        (
+                            "warning"
+                            if action_validation_error or action_execution_error
+                            else "action"
+                        ),
+                        execution.summary,
+                    )
+                    if action_validation_error or action_execution_error:
+                        if stop_event.is_set():
+                            self._finish(session_id, "stopped", "测试流程已由用户停止")
+                            return
+                        self._update(
+                            session_id,
+                            phase="settling",
+                            message=(
+                                f"子任务 {task_index}/{len(tasks)} · "
+                                "动作无效或执行失败，等待模型修正"
+                            ),
+                        )
+                        stop_event.wait(_number(config.get("step_delay_s"), 1.2))
+                        continue
                     if execution.terminal_status == "completed":
                         task_status = "completed"
                         task_message = execution.message or execution.summary
@@ -1765,6 +2659,9 @@ class AdbAgentController:
 
                 if task_status == "completed":
                     continue
+                if task_status == "skipped":
+                    had_warnings = True
+                    continue
                 if task_status == "take_over":
                     self._finish(
                         session_id,
@@ -1782,12 +2679,31 @@ class AdbAgentController:
                 )
                 return
 
-            final_status = "completed_with_warnings" if had_warnings else "completed"
-            final_message = (
-                f"测试流程完成，共 {len(tasks)} 个子任务；部分子任务按策略跳过"
-                if had_warnings
-                else f"测试流程完成，共 {len(tasks)} 个子任务全部通过"
+            skipped_count = sum(
+                str(item.get("status") or "") == "skipped" for item in task_results
             )
+            completed_count = sum(
+                str(item.get("status") or "") == "completed" for item in task_results
+            )
+            failed_results = [
+                item
+                for item in task_results
+                if str(item.get("status") or "") not in {"completed", "skipped"}
+            ]
+            final_status = "completed_with_warnings" if had_warnings else "completed"
+            if had_warnings:
+                reason_summary = "；".join(
+                    f"{item.get('name')}：{_short_text(item.get('message'), 80)}"
+                    for item in task_results
+                    if str(item.get("status") or "") != "completed"
+                )
+                final_message = (
+                    f"检查完成：完成 {completed_count} 项，跳过 {skipped_count} 项，"
+                    f"未完成 {len(failed_results)} 项。"
+                    + (f"原因：{_short_text(reason_summary, 600)}" if reason_summary else "")
+                )
+            else:
+                final_message = f"测试流程完成，共 {len(tasks)} 个子任务全部通过"
             self._finish(session_id, final_status, final_message)
         except Exception as exc:
             self._finish(

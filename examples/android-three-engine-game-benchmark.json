@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "validated_at": "2026-07-21",
+  "device": "vivo V2458A",
+  "model": {
+    "provider": "openai_compatible",
+    "endpoint": "http://192.168.31.237:8000",
+    "name": "qwen3.6-27b",
+    "thinking_mode": "disabled"
+  },
+  "protocol": {
+    "uiautomator2_version": "3.7.0",
+    "start_state": "force-stop target package, then press Home",
+    "task_split": [
+      "进入主玩法并完成一次可验证操作；该任务不得按 Home",
+      "按 Home 后重新观察；只有最新证据确认系统桌面才 finish"
+    ],
+    "reason": "finish 只结束当前子任务，避免模型在完成玩法后跳过回桌面要求。",
+    "metrics": [
+      "status",
+      "steps",
+      "elapsed_s",
+      "prompt_tokens",
+      "completion_tokens"
+    ]
+  },
+  "games": [
+    {
+      "id": "fifteen-puzzle",
+      "package": "com.italankin.fifteen",
+      "apk": {
+        "path": "profiler-runs/app-benchmark/github-candidates/fifteen-puzzle.apk",
+        "sha256": "08B51E4DEA12B7A54C723F9E52A96275F034348D5673A620429A64BFC029F732"
+      },
+      "routing": {
+        "recommended_engine": "vision",
+        "fallback_engine": "hybrid",
+        "reason": "游戏只暴露整块 game_view；纯语义树看不到数字格。"
+      },
+      "workflows": {
+        "vision": {
+          "tasks": [
+            {
+              "id": "fifteen-play-vision",
+              "name": "15 Puzzle：移动一格",
+              "prompt": "启动包 com.italankin.fifteen。若棋盘被暂停层覆盖，先解除暂停并在下一轮重新观察，不得把解除暂停算作移动。识别 4×4 棋盘中的空格，记录一个相邻数字及其位置，只点击该数字一次。下一轮直接比较前后截图；只有该数字进入原空格、原位置变空，且可见 MOVES 计数递增（若界面提供）时才 finish。本子任务不要按 Home。",
+              "attention_prompt": "不要重置、连续试点多个格子、打开外链或设置。无法可靠识别空格和相邻数字时 take_over。",
+              "max_steps": 8,
+              "timeout_s": 150,
+              "on_failure": "stop"
+            },
+            {
+              "id": "fifteen-home-vision",
+              "name": "15 Puzzle：返回桌面",
+              "prompt": "若最新截图仍是 15 Puzzle，执行一次 home；下一轮只有截图清楚显示 vivo 系统桌面、桌面组件和应用图标时才 finish。若已经在桌面，直接 finish。",
+              "attention_prompt": "不要启动或点击其他应用；Home 后必须等待新截图。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        },
+        "uiautomator2": {
+          "tasks": [
+            {
+              "id": "fifteen-play-uia",
+              "name": "15 Puzzle：移动一格",
+              "prompt": "启动包 com.italankin.fifteen 并进入 4×4 棋盘。只有当前语义树分别表示数字格和空格时，才点击一个与空格相邻的数字元素，并在下一轮语义树确认两者位置变化后 finish。本子任务不要按 Home。",
+              "attention_prompt": "若语义树只有整块 game_view 或 canvas，没有数字格子元素，立即 take_over；禁止对整块画布猜坐标。",
+              "max_steps": 5,
+              "timeout_s": 120,
+              "on_failure": "stop"
+            },
+            {
+              "id": "fifteen-home-uia",
+              "name": "15 Puzzle：返回桌面",
+              "prompt": "若前台仍是 15 Puzzle，执行一次 home；下一轮只有 foreground package 为 com.bbk.launcher2 时才 finish。",
+              "attention_prompt": "不要启动或点击其他应用；Home 后必须等待新语义树。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        },
+        "hybrid": {
+          "tasks": [
+            {
+              "id": "fifteen-play-hybrid",
+              "name": "15 Puzzle：移动一格",
+              "prompt": "启动包 com.italankin.fifteen。若棋盘被暂停层覆盖，先解除暂停并重新观察。识别空格和一个相邻数字，只移动该数字一次；下一轮同时比较截图与语义树，只有数字与空格位置确实互换时才 finish。本子任务不要按 Home。",
+              "attention_prompt": "game_view/canvas 只代表整块棋盘，不能用 tap_element 当作内部数字；棋盘内部必须依据截图使用坐标。不要重置或连续试点多个格子。",
+              "max_steps": 8,
+              "timeout_s": 150,
+              "on_failure": "stop"
+            },
+            {
+              "id": "fifteen-home-hybrid",
+              "name": "15 Puzzle：返回桌面",
+              "prompt": "若前台仍是 15 Puzzle，执行一次 home；下一轮只有截图显示系统桌面且 foreground package 为 com.bbk.launcher2 时才 finish。",
+              "attention_prompt": "截图与语义树冲突时不得 finish；不要启动或点击其他应用。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        }
+      },
+      "benchmark": [
+        {
+          "engine": "uiautomator2",
+          "status": "take_over",
+          "steps": 4,
+          "elapsed_s": 65.513,
+          "prompt_tokens": 42930,
+          "completion_tokens": 108,
+          "run_directory": "profiler-runs/agent-runs/20260721-133540-candidate-fifteen-puzzle-uia-cbf5ce",
+          "evidence": "语义树只有整块 game_view，没有任何数字格；安全接管符合预期。"
+        },
+        {
+          "engine": "vision",
+          "status": "completed",
+          "steps": 7,
+          "elapsed_s": 33.857,
+          "prompt_tokens": 66297,
+          "completion_tokens": 165,
+          "run_directory": "profiler-runs/agent-runs/20260721-133701-candidate-fifteen-puzzle-vision-0ab462",
+          "evidence": "截图确认数字与空格互换，随后显示系统桌面。"
+        },
+        {
+          "engine": "hybrid",
+          "status": "completed",
+          "steps": 7,
+          "elapsed_s": 51.815,
+          "prompt_tokens": 85798,
+          "completion_tokens": 278,
+          "run_directory": "profiler-runs/agent-runs/20260721-135536-candidate-fifteen-puzzle-hybrid-optimized-735859",
+          "evidence": "人工核验 MOVES 7→8，数字 4 移入空格；随后截图与 package 均确认桌面。"
+        }
+      ]
+    },
+    {
+      "id": "minesweeper-compose",
+      "package": "com.jayasuryat.minesweeperjc",
+      "apk": {
+        "path": "profiler-runs/app-benchmark/github-candidates/minesweeper-compose.apk",
+        "sha256": "3345B0C020A80BE1414DC69C76354FE9B11A14F48593B7E9F4D9DD38C8561A90"
+      },
+      "routing": {
+        "recommended_engine": "uiautomator2",
+        "efficiency_winner": "vision",
+        "diagnostic_engine": "hybrid",
+        "reason": "Compose 暴露单格语义元素，UIA 点击跨分辨率更稳；当前设备上视觉耗时和 Token 最低。"
+      },
+      "workflows": {
+        "vision": {
+          "tasks": [
+            {
+              "id": "minesweeper-play-vision",
+              "name": "扫雷：进入玩法并揭开一格",
+              "prompt": "启动包 com.jayasuryat.minesweeperjc。若看到 New game，点击进入新棋盘。选择一个清晰可见且仍覆盖的棋盘格，只普通点击一次；下一轮直接比较前后截图，只有棋盘由全覆盖变为出现数字、空白或地雷画面后才 finish。本子任务不要按 Home。",
+              "attention_prompt": "不要长按或插旗，不要打开外链、设置或账户功能。必须点击格子中心并用下一张截图验证。",
+              "max_steps": 8,
+              "timeout_s": 150,
+              "on_failure": "stop"
+            },
+            {
+              "id": "minesweeper-home-vision",
+              "name": "扫雷：返回桌面",
+              "prompt": "若最新截图仍是扫雷，执行一次 home；下一轮只有截图清楚显示 vivo 系统桌面、应用图标和桌面背景时才 finish。若已经在桌面，直接 finish。",
+              "attention_prompt": "不要启动或点击其他应用；Home 后先观察新截图。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        },
+        "uiautomator2": {
+          "tasks": [
+            {
+              "id": "minesweeper-play-uia",
+              "name": "扫雷：进入玩法并揭开一格",
+              "prompt": "启动包 com.jayasuryat.minesweeperjc。若看到 New game，点击进入新棋盘。只点击一个当前语义树中明确代表未揭开格子的可点击元素；下一轮必须对比前后语义树，确认局面由全覆盖变为出现数字、空白或地雷状态后 finish。本子任务不要按 Home。",
+              "attention_prompt": "不要长按或插旗，不要打开外链、设置或账户功能。若控件树没有单格元素，立即 take_over，不要猜坐标。",
+              "max_steps": 8,
+              "timeout_s": 150,
+              "on_failure": "stop"
+            },
+            {
+              "id": "minesweeper-home-uia",
+              "name": "扫雷：返回桌面",
+              "prompt": "若前台仍是扫雷，执行一次 home；下一轮只有 foreground package 为 com.bbk.launcher2 时才 finish。若已经在该桌面包，直接 finish。",
+              "attention_prompt": "不要启动或点击其他应用；Home 后先观察新语义树。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        },
+        "hybrid": {
+          "tasks": [
+            {
+              "id": "minesweeper-play-hybrid",
+              "name": "扫雷：进入玩法并揭开一格",
+              "prompt": "启动包 com.jayasuryat.minesweeperjc。若看到 New game，优先用对应语义元素进入新棋盘。选择一个语义树中明确代表未揭开格子的精确元素并普通点击一次；下一轮同时比较前后截图与语义树，只有棋盘出现数字、空白或地雷状态时才 finish。本子任务不要按 Home。",
+              "attention_prompt": "准确语义元素优先 tap_element；不要把整块 canvas 当作单个格子。不要长按、插旗或打开外链。截图与语义树冲突时 take_over。",
+              "max_steps": 8,
+              "timeout_s": 150,
+              "on_failure": "stop"
+            },
+            {
+              "id": "minesweeper-home-hybrid",
+              "name": "扫雷：返回桌面",
+              "prompt": "若前台仍是扫雷，执行一次 home；下一轮只有截图显示系统桌面且 foreground package 为 com.bbk.launcher2 时才 finish。",
+              "attention_prompt": "不要启动或点击其他应用；截图与语义树冲突时不得 finish。",
+              "max_steps": 3,
+              "timeout_s": 60,
+              "on_failure": "stop"
+            }
+          ]
+        }
+      },
+      "benchmark": [
+        {
+          "engine": "uiautomator2",
+          "status": "completed",
+          "steps": 6,
+          "elapsed_s": 45.803,
+          "prompt_tokens": 66407,
+          "completion_tokens": 195,
+          "run_directory": "profiler-runs/agent-runs/20260721-140238-candidate-minesweeper-uia-2task-7010b8",
+          "evidence": "精确点击 New game 与单格元素；语义树出现数字，最终 package 为 com.bbk.launcher2。"
+        },
+        {
+          "engine": "vision",
+          "status": "completed",
+          "steps": 6,
+          "elapsed_s": 36.740,
+          "prompt_tokens": 52950,
+          "completion_tokens": 143,
+          "run_directory": "profiler-runs/agent-runs/20260721-140352-candidate-minesweeper-vision-2task-3ab4f4",
+          "evidence": "前图全覆盖、后图出现多格数字；最终截图为 vivo 桌面。"
+        },
+        {
+          "engine": "hybrid",
+          "status": "completed",
+          "steps": 6,
+          "elapsed_s": 54.284,
+          "prompt_tokens": 100898,
+          "completion_tokens": 202,
+          "run_directory": "profiler-runs/agent-runs/20260721-140455-candidate-minesweeper-hybrid-2task-2a0728",
+          "evidence": "语义元素完成精确点击，截图确认数字展开；桌面截图与 package 双重通过。"
+        }
+      ]
+    }
+  ]
+}

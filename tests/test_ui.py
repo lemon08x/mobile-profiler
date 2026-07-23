@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 from collections import Counter
+import io
 import json
 import re
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
@@ -49,6 +51,7 @@ from mobile_profiler.ui import (
     _percentile,
     _parse_android_brightness_capability,
     android_icon_data_uri,
+    android_icon_data_uri_from_archive,
     parse_android_apk_icon_candidates,
     parse_android_launcher_activities,
     parse_android_package_list,
@@ -1545,6 +1548,98 @@ class UiServerTests(unittest.TestCase):
             )
         )
 
+    def test_android_project_archives_expose_catalog_icons(self) -> None:
+        payload = b"\x89PNG\r\n\x1a\n" + b"0" * 600
+        obfuscated_payload = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\rIHDR"
+            + (192).to_bytes(4, "big")
+            + (192).to_bytes(4, "big")
+            + b"0" * 600
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apk_path = root / "app.apk"
+            with zipfile.ZipFile(apk_path, "w") as archive:
+                archive.writestr("res/mipmap-xxxhdpi/ic_launcher.png", payload)
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as archive:
+                archive.writestr("res/mipmap-xxxhdpi/ic_launcher.png", payload)
+            apks_path = root / "app.apks"
+            with zipfile.ZipFile(apks_path, "w") as archive:
+                archive.writestr("base-master.apk", inner.getvalue())
+            obfuscated_path = root / "obfuscated.apk"
+            with zipfile.ZipFile(obfuscated_path, "w") as archive:
+                archive.writestr("res/qYz.png", obfuscated_payload)
+
+            apk_icon = android_icon_data_uri_from_archive(apk_path)
+            apks_icon = android_icon_data_uri_from_archive(apks_path)
+            obfuscated_icon = android_icon_data_uri_from_archive(obfuscated_path)
+
+        self.assertTrue(str(apk_icon).startswith("data:image/png;base64,"))
+        self.assertTrue(str(apks_icon).startswith("data:image/png;base64,"))
+        self.assertTrue(str(obfuscated_icon).startswith("data:image/png;base64,"))
+
+    def test_android_package_manager_helper_reads_installed_icons(self) -> None:
+        encoded = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 600).decode("ascii")
+        helper_result = Mock(ok=True, stdout=encoded, stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("custom-adb", Path(directory))
+            manager._android_icon_helper_ready["SERIAL"] = True
+            with patch("mobile_profiler.ui.adb_shell", return_value=helper_result) as shell:
+                first = manager._android_icon_from_device_apk(
+                    "SERIAL",
+                    "com.example.game",
+                    "/data/app/example/base.apk",
+                )
+                second = manager._android_icon_from_device_apk(
+                    "SERIAL",
+                    "com.example.game",
+                    "/data/app/example/base.apk",
+                )
+            manager.close()
+
+        self.assertTrue(str(first).startswith("data:image/png;base64,"))
+        self.assertEqual(first, second)
+        self.assertEqual(shell.call_count, 1)
+        self.assertIn("app_process", shell.call_args.args[2])
+
+    def test_campaign_software_assets_merge_project_icon_and_live_install_state(self) -> None:
+        payload = b"\x89PNG\r\n\x1a\n" + b"0" * 600
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            apk_path = root / "app.apk"
+            with zipfile.ZipFile(apk_path, "w") as archive:
+                archive.writestr("res/mipmap-xxxhdpi/ic_launcher.png", payload)
+            manager = DashboardManager("custom-adb", root / "runs")
+            manager._require_ready_android_device = Mock(return_value={"serial": "SERIAL"})
+            manager.campaign.software_catalog_snapshot = Mock(
+                return_value={
+                    "items": [
+                        {
+                            "package": "com.example.game",
+                            "source_path": str(apk_path),
+                        }
+                    ]
+                }
+            )
+            package_result = Mock(
+                ok=True,
+                stdout="package:/data/app/example/base.apk=com.example.game\n",
+                stderr="",
+            )
+            with patch("mobile_profiler.ui.adb_shell", return_value=package_result):
+                result = manager.campaign_software_assets(
+                    {"device": "SERIAL", "packages": ["com.example.game"]}
+                )
+            manager.close()
+
+        self.assertEqual(result["icon_count"], 1)
+        self.assertTrue(result["assets"][0]["installed"])
+        self.assertTrue(
+            result["assets"][0]["icon_data_uri"].startswith("data:image/png;base64,")
+        )
+
     def test_android_app_scan_uses_launcher_activities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("custom-adb", Path(directory))
@@ -1916,7 +2011,7 @@ class UiServerTests(unittest.TestCase):
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
                 with urlopen(base + "/app.css?v=platform-ui-43", timeout=5) as response:
-                    css = response.read().decode("utf-8")
+                    css = response.read().decode("utf-8").replace("\r\n", "\n")
                 with urlopen(base + "/app.js?v=platform-ui-43", timeout=5) as response:
                     javascript = response.read().decode("utf-8").replace("\r\n", "\n")
                 with urlopen(base + "/api/state", timeout=5) as response:
@@ -1954,8 +2049,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-43', html)
-            self.assertIn('/app.js?v=platform-ui-43', html)
+            self.assertIn('/app.css?v=platform-ui-63', html)
+            self.assertIn('/app.js?v=platform-ui-63', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2288,34 +2383,161 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="agent-screen-image"', html)
             self.assertIn('id="agent-task-list"', html)
             self.assertIn('id="agent-task-template-select"', html)
+            self.assertIn('id="agent-template-selection-hint"', html)
+            self.assertIn('id="agent-loop-workflow-input"', html)
+            self.assertIn('id="agent-edit-template-button"', html)
+            self.assertIn('id="agent-new-template-button"', html)
+            self.assertNotIn('id="agent-reset-template-button"', html)
+            self.assertNotIn('id="agent-add-template-button"', html)
+            self.assertNotIn("选择任务模板", html)
+            self.assertNotIn("选择任务模板", javascript)
             self.assertIn('id="agent-config-tab-model"', html)
+            self.assertIn('id="agent-config-tab-software"', html)
+            self.assertIn('data-agent-config-tab="software"', html)
+            self.assertIn('data-agent-config-view="software"', html)
             self.assertIn('data-agent-config-tab="model"', html)
             self.assertIn('data-agent-config-view="model"', html)
             self.assertIn('data-agent-config-view="prompt"', html)
-            self.assertIn('class="agent-control-dock"', html)
+            self.assertIn('data-agent-prompt-tab="task"', html)
+            self.assertIn('data-agent-prompt-tab="system"', html)
+            self.assertIn('data-agent-prompt-view="task"', html)
+            self.assertIn('data-agent-prompt-view="system"', html)
+            self.assertIn('id="agent-prompt-task-select"', html)
+            self.assertIn('id="agent-task-prompt-input"', html)
+            self.assertIn('id="agent-task-attention-input"', html)
+            self.assertIn('id="agent-save-prompt-button"', html)
+            self.assertIn('id="agent-prompt-save-state"', html)
+            self.assertIn('id="agent-temporary-task-input"', html)
+            self.assertIn('id="agent-run-temporary-task-button"', html)
+            self.assertIn('id="agent-temporary-task-menu-button"', html)
+            self.assertIn('id="agent-temporary-task-menu"', html)
+            self.assertIn('id="agent-close-temporary-task-button"', html)
+            self.assertIn('aria-haspopup="dialog"', html)
+            workflow_view = html[
+                html.index('id="agent-config-view-workflow"'):
+                html.index('id="agent-config-view-software"')
+            ]
+            software_view = html[
+                html.index('id="agent-config-view-software"'):
+                html.index('id="agent-config-view-model"')
+            ]
+            prompt_view = html[
+                html.index('id="agent-config-view-prompt"'):
+                html.index('</form>', html.index('id="agent-config-view-prompt"'))
+            ]
+            self.assertIn("任务启动", workflow_view)
+            self.assertIn('id="agent-task-template-select"', workflow_view)
+            self.assertIn('id="agent-loop-workflow-input"', workflow_view)
+            self.assertIn('id="agent-launch-current-task"', workflow_view)
+            self.assertIn('id="agent-launch-current-step"', workflow_view)
+            self.assertIn('id="agent-start-button"', workflow_view)
+            self.assertIn('id="agent-stop-button"', workflow_view)
+            self.assertIn('id="agent-phone-configuration-launcher"', workflow_view)
+            self.assertIn('id="agent-select-phone-configuration-button"', workflow_view)
+            self.assertIn("续航测试 5.0 · 手机配置检查", workflow_view)
+            self.assertNotIn('id="agent-temporary-task-input"', workflow_view)
+            self.assertNotIn('id="agent-run-temporary-task-button"', workflow_view)
+            self.assertNotIn('id="agent-task-list"', workflow_view)
+            self.assertNotIn('id="agent-workflow-name-input"', workflow_view)
+            self.assertIn("应用与游戏", software_view)
+            self.assertIn('data-agent-software-category="app"', software_view)
+            self.assertIn('data-agent-software-category="game"', software_view)
+            self.assertIn('data-agent-software-category="project"', software_view)
+            self.assertIn('data-agent-software-category="app_store"', software_view)
+            self.assertIn('data-agent-software-category="official"', software_view)
+            self.assertIn('id="agent-software-catalog-list"', software_view)
+            self.assertIn('id="agent-software-refresh-button"', software_view)
+            self.assertIn('id="agent-open-preparation-button"', software_view)
+            self.assertIn("点击上方分类查看具体软件", software_view)
+            self.assertIn('id="agent-task-list"', prompt_view)
+            self.assertIn('id="agent-workflow-name-input"', prompt_view)
+            self.assertIn("执行顺序与限制", prompt_view)
+            self.assertIn("任务配置与 Prompt", prompt_view)
+            self.assertIn("Prompt 编辑", html)
+            self.assertIn("系统级 Prompt", html)
+            self.assertIn('class="agent-control-dock agent-launch-control-dock"', html)
             self.assertIn('class="agent-form" novalidate', html)
             self.assertIn('id="agent-model-provider-input"', html)
+            self.assertIn('id="agent-automation-engine-input"', html)
+            self.assertIn('id="agent-automation-engine-hint"', html)
+            self.assertIn('<option value="hybrid">视觉 + uiautomator2</option>', html)
             self.assertIn('id="agent-api-key-mode-input"', html)
+            self.assertIn('id="agent-thinking-mode-input"', html)
             self.assertIn('id="agent-system-prompt-input"', html)
             self.assertIn('id="agent-task-results"', html)
-            self.assertIn('api("/api/ai-agent/start"', javascript)
-            self.assertIn('api("/api/ai-agent/stop"', javascript)
+            self.assertIn('id="agent-workflow-report"', html)
+            self.assertIn('id="agent-workflow-report-reason-list"', html)
+            self.assertIn('"/api/ai-agent/start"', javascript)
+            self.assertIn('"/api/ai-agent/stop"', javascript)
+            self.assertIn('"/api/campaign/start"', javascript)
+            self.assertIn('"/api/campaign/stop"', javascript)
+            self.assertIn('"/api/campaign/software/assets"', javascript)
+            self.assertIn('"/api/campaign/software/install"', javascript)
             self.assertIn("function renderAdbAgent", javascript)
+            self.assertIn("function renderAgentSoftwareCatalog", javascript)
+            self.assertIn("function renderAgentWorkflowReport", javascript)
+            self.assertIn("function agentSoftwareCardMarkup", javascript)
+            self.assertIn("function loadAgentSoftwareAssets", javascript)
+            self.assertIn("function installAgentSoftware", javascript)
+            self.assertIn("function agentSoftwareInstallTask", javascript)
             self.assertIn("function readAgentTasks", javascript)
+            self.assertIn("function setAgentTemplateMode", javascript)
+            self.assertIn("function applyAgentTemplate", javascript)
+            self.assertIn("function saveCurrentAgentTemplateDraft", javascript)
+            self.assertIn("template_revision:", javascript)
+            self.assertIn("storedDraft.template_revision", javascript)
+            self.assertIn("function saveAgentPromptConfiguration", javascript)
+            self.assertIn("function createAgentTemplate", javascript)
+            self.assertIn("function savedAgentSystemPrompt", javascript)
+            self.assertIn("async function startAgentExecution", javascript)
+            self.assertIn("function editCurrentAgentTemplate", javascript)
+            self.assertIn("function setAgentPromptTab", javascript)
+            self.assertIn("function syncAgentTaskPromptEditor", javascript)
+            self.assertIn('$("#agent-task-template-select").addEventListener("change"', javascript)
+            self.assertIn('$("#agent-edit-template-button").addEventListener("click"', javascript)
+            self.assertIn('$("#agent-new-template-button").addEventListener("click"', javascript)
+            self.assertIn('$("#agent-select-phone-configuration-button").addEventListener("click"', javascript)
+            self.assertIn('$("#agent-save-prompt-button").addEventListener("click"', javascript)
+            self.assertIn('$("#agent-run-temporary-task-button").addEventListener("click"', javascript)
+            self.assertIn('$("#agent-temporary-task-menu-button").addEventListener("click"', javascript)
+            self.assertIn("function setAgentTemporaryTaskMenu", javascript)
+            self.assertIn("if (app.agentPromptDirty)", javascript)
+            self.assertIn("agentCampaignStage", javascript)
+            self.assertIn("loop_enabled:", javascript)
+            self.assertIn('setAgentPromptTab("system")', javascript)
+            self.assertIn('software: { title: "应用与游戏"', javascript)
             self.assertIn("function setAgentConfigTab", javascript)
             self.assertIn('setAgentConfigTab("model")', javascript)
             self.assertIn("workflow_name:", javascript)
             self.assertIn("model_provider:", javascript)
+            self.assertIn("automation_engine:", javascript)
+            self.assertIn("model_thinking_mode:", javascript)
             self.assertIn("api_key_mode:", javascript)
             self.assertIn("function applyAgentProviderPresentation", javascript)
+            self.assertIn("function applyAgentAutomationEnginePresentation", javascript)
+            self.assertIn("function populateAgentAutomationEngines", javascript)
+            self.assertIn("function normalizeAgentSystemPrompt", javascript)
+            self.assertIn("function refreshAgentSystemPromptVersion", javascript)
             self.assertIn("system_prompt: systemPrompt", javascript)
             self.assertIn("tasks,", javascript)
+            self.assertIn("temporary: true", javascript)
             self.assertIn(".agent-config-tabs", css)
+            self.assertIn(".agent-corner-menu-trigger", css)
+            self.assertIn(".agent-temporary-task-menu[hidden]", css)
             self.assertIn(".agent-config-view[hidden]", css)
             self.assertIn(".agent-control-dock", css)
             self.assertIn("height: calc(100vh - 188px)", css)
             self.assertIn(".agent-config-panel {\n  position: relative;", css)
             self.assertNotIn(".agent-config-panel {\n  position: sticky;", css)
+            self.assertIn("width: min(100%, 340px);", css)
+            self.assertIn(".agent-software-summary", css)
+            self.assertIn(".agent-software-categories", css)
+            self.assertIn(".agent-software-icon", css)
+            self.assertIn(".agent-software-install-actions", css)
+            self.assertIn(".agent-software-stage-grid", css)
+            self.assertIn(".agent-phone-configuration-launcher", css)
+            self.assertIn(".agent-workflow-report", css)
+            self.assertIn(".agent-task-result.skipped", css)
             self.assertIn("模型不能下发任意 shell", html)
             self.assertIn("局域网千问是默认配置而非协议绑定", html)
             self.assertIn("测试配置", html)
@@ -2506,6 +2728,27 @@ class UiServerTests(unittest.TestCase):
                     "warnings": [],
                 }
             )
+            manager.campaign_software_assets = Mock(
+                return_value={
+                    "device": "USB123",
+                    "count": 1,
+                    "icon_count": 1,
+                    "assets": [
+                        {
+                            "package": "com.example.game",
+                            "installed": True,
+                            "icon_data_uri": "data:image/png;base64,AA==",
+                        }
+                    ],
+                }
+            )
+            manager.install_campaign_software = Mock(
+                return_value={
+                    "package": "com.example.game",
+                    "succeeded": True,
+                    "install_mode": "project",
+                }
+            )
             manager.connect_ios_bluetooth = Mock(
                 return_value={
                     "serial": "ios:IPHONE",
@@ -2577,6 +2820,30 @@ class UiServerTests(unittest.TestCase):
                 )
                 with urlopen(apps_request, timeout=5) as response:
                     apps_result = json.loads(response.read().decode("utf-8"))
+                assets_payload = {
+                    "device": "USB123",
+                    "packages": ["com.example.game"],
+                }
+                assets_request = Request(
+                    base + "/api/campaign/software/assets",
+                    data=json.dumps(assets_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(assets_request, timeout=5) as response:
+                    assets_result = json.loads(response.read().decode("utf-8"))
+                install_payload = {
+                    "device": "USB123",
+                    "package": "com.example.game",
+                }
+                install_request = Request(
+                    base + "/api/campaign/software/install",
+                    data=json.dumps(install_payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(install_request, timeout=5) as response:
+                    install_result = json.loads(response.read().decode("utf-8"))
                 bluetooth_request = Request(
                     base + "/api/ios/bluetooth",
                     data=json.dumps({"device": "ios:IPHONE"}).encode("utf-8"),
@@ -2605,6 +2872,8 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(tcpip_result["tcpip_enabled"])
             self.assertTrue(disconnect_result["disconnected"])
             self.assertEqual(apps_result["apps"][0]["package"], "com.example.game")
+            self.assertEqual(assets_result["icon_count"], 1)
+            self.assertTrue(install_result["succeeded"])
             self.assertTrue(bluetooth_result["connected"])
             self.assertEqual(bluetooth_result["endpoint"]["host"], "172.20.10.1")
             self.assertIn("comparison", comparison_html)
@@ -2618,6 +2887,8 @@ class UiServerTests(unittest.TestCase):
             manager.scan_android_apps.assert_called_once_with(
                 {"device": "USB123", "platform": "android"}
             )
+            manager.campaign_software_assets.assert_called_once_with(assets_payload)
+            manager.install_campaign_software.assert_called_once_with(install_payload)
 
     def test_start_record_launches_existing_cli_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

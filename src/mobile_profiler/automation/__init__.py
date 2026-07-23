@@ -1,8 +1,4 @@
-"""Public, integration-free API for future task-aware phone automation.
-
-Only names re-exported here are considered stable.  The current dashboard and
-ADB vision-agent do not import or instantiate this package yet.
-"""
+"""Public API for task-aware phone automation contracts and optional adapters."""
 
 from .contracts import (
     AgentDecision,
@@ -55,6 +51,14 @@ from .ports import (
     VerifierEngine,
     Watcher,
 )
+from .image_matching import (
+    NormalizedRegion,
+    OpenCvTemplateMatcher,
+    TemplateMatch,
+    TemplateMatchVerifier,
+    TemplateSpec,
+    template_matching_dependency_status,
+)
 from .registry import ComponentRegistry
 from .scenario import (
     SCENARIO_COMPLETE,
@@ -81,6 +85,22 @@ from .state import (
     UiStateTracker,
     UiTransition,
     ui_state_signature,
+)
+from .screen_graph import (
+    ScreenGraphSkill,
+    StateDetection,
+    TemplateStateDetector,
+    VisualAutomationBundle,
+    VisualScreenGraph,
+    VisualState,
+    VisualTransition,
+    load_visual_automation_bundle,
+)
+from .uiautomator2_provider import (
+    Uiautomator2Provider,
+    format_ui_hierarchy,
+    parse_uiautomator2_hierarchy,
+    uiautomator2_dependency_status,
 )
 
 
@@ -113,10 +133,12 @@ __all__ = [
     "EvidenceSink",
     "InterventionKind",
     "LoopDetection",
+    "NormalizedRegion",
     "Observation",
     "ObservationRequest",
     "OperationCall",
     "OperationKind",
+    "OpenCvTemplateMatcher",
     "PolicyDecision",
     "ScenarioDefinition",
     "ScenarioEngine",
@@ -129,6 +151,7 @@ __all__ = [
     "ScenarioValidationIssue",
     "ScenarioValidationResult",
     "ScreenFrame",
+    "ScreenGraphSkill",
     "SemanticUiProvider",
     "SettleResult",
     "Skill",
@@ -136,14 +159,24 @@ __all__ = [
     "SkillResult",
     "SkillRuntime",
     "StateSignaturePolicy",
+    "StateDetection",
     "TaskCapabilityProfile",
+    "TemplateMatch",
+    "TemplateMatchVerifier",
+    "TemplateSpec",
+    "TemplateStateDetector",
     "UiElement",
     "UiHierarchy",
     "UiSettler",
     "UiStateSignature",
     "UiStateTracker",
     "UiTransition",
+    "Uiautomator2Provider",
     "ValidationSeverity",
+    "VisualAutomationBundle",
+    "VisualScreenGraph",
+    "VisualState",
+    "VisualTransition",
     "VerificationRequest",
     "VerificationMode",
     "VerificationPlan",
@@ -154,5 +187,10 @@ __all__ = [
     "VerifierEngine",
     "Watcher",
     "WatcherIntervention",
+    "format_ui_hierarchy",
+    "load_visual_automation_bundle",
+    "parse_uiautomator2_hierarchy",
+    "template_matching_dependency_status",
+    "uiautomator2_dependency_status",
     "ui_state_signature",
 ]

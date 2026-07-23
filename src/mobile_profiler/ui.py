@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ipaddress
+import io
 import json
 import math
 import os
@@ -16,18 +17,20 @@ import sys
 import threading
 import time
 import webbrowser
+import zipfile
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from importlib.resources import files
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from . import __version__ as APP_VERSION
 from .adb_agent import AdbAgentController
+from .campaign_controller import CampaignController
 from .analysis import (
     analyze_brightness_throttling,
     analyze_memory_frequency,
@@ -467,6 +470,120 @@ def parse_android_apk_icon_candidates(text: str) -> List[Dict[str, object]]:
     return candidates
 
 
+def android_raster_dimensions(payload: bytes) -> Optional[tuple[int, int]]:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n") and len(payload) >= 24:
+        width = int.from_bytes(payload[16:20], "big")
+        height = int.from_bytes(payload[20:24], "big")
+        return (width, height) if width > 0 and height > 0 else None
+    if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP" and len(payload) >= 30:
+        kind = payload[12:16]
+        if kind == b"VP8X":
+            width = 1 + int.from_bytes(payload[24:27], "little")
+            height = 1 + int.from_bytes(payload[27:30], "little")
+            return width, height
+        if kind == b"VP8L" and len(payload) >= 25 and payload[20] == 0x2F:
+            packed = int.from_bytes(payload[21:25], "little")
+            return (packed & 0x3FFF) + 1, ((packed >> 14) & 0x3FFF) + 1
+        marker = payload.find(b"\x9d\x01\x2a", 20, min(len(payload), 64))
+        if marker >= 0 and len(payload) >= marker + 7:
+            width = int.from_bytes(payload[marker + 3 : marker + 5], "little") & 0x3FFF
+            height = int.from_bytes(payload[marker + 5 : marker + 7], "little") & 0x3FFF
+            return (width, height) if width > 0 and height > 0 else None
+    if payload.startswith(b"\xff\xd8\xff"):
+        offset = 2
+        while offset + 9 <= len(payload):
+            if payload[offset] != 0xFF:
+                offset += 1
+                continue
+            marker = payload[offset + 1]
+            offset += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if offset + 2 > len(payload):
+                break
+            segment_length = int.from_bytes(payload[offset : offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(payload):
+                break
+            if marker in {
+                0xC0,
+                0xC1,
+                0xC2,
+                0xC3,
+                0xC5,
+                0xC6,
+                0xC7,
+                0xC9,
+                0xCA,
+                0xCB,
+                0xCD,
+                0xCE,
+                0xCF,
+            } and segment_length >= 7:
+                height = int.from_bytes(payload[offset + 3 : offset + 5], "big")
+                width = int.from_bytes(payload[offset + 5 : offset + 7], "big")
+                return (width, height) if width > 0 and height > 0 else None
+            offset += segment_length
+    return None
+
+
+def android_launcher_icon_score(
+    resource_name: str,
+    file_size: int,
+    width: int,
+    height: int,
+) -> Optional[int]:
+    if not (36 <= width <= 1024 and 36 <= height <= 1024):
+        return None
+    if abs(width - height) > max(3, int(max(width, height) * 0.04)):
+        return None
+    lowered = resource_name.lower()
+    if any(
+        token in lowered
+        for token in (
+            ".9.png",
+            "notification",
+            "google_signin",
+            "button",
+            "loading",
+            "camera",
+            "album",
+            "qr_",
+        )
+    ):
+        return None
+    standard_sizes = {
+        36,
+        48,
+        64,
+        72,
+        81,
+        96,
+        108,
+        128,
+        144,
+        162,
+        180,
+        192,
+        216,
+        256,
+        288,
+        324,
+        384,
+        432,
+        512,
+        576,
+        648,
+        768,
+        864,
+        1024,
+    }
+    dimension = min(width, height)
+    score = 120 if width in standard_sizes and height in standard_sizes else 40
+    score += max(0, 100 - int(abs(math.log2(max(1, dimension) / 256)) * 28))
+    score += min(30, int(math.log2(max(1, file_size))) * 2)
+    return score
+
+
 def android_icon_data_uri(encoded: str, resource_name: str) -> Optional[str]:
     compact = re.sub(r"\s+", "", encoded or "")
     if not compact or len(compact) > 1_100_000:
@@ -485,6 +602,123 @@ def android_icon_data_uri(encoded: str, resource_name: str) -> Optional[str]:
     if mime is None or len(payload) < 512:
         return None
     return f"data:{mime};base64,{compact}"
+
+
+def _android_icon_data_uri_from_zip(archive: zipfile.ZipFile) -> Optional[str]:
+    listing = "\n".join(
+        f"{info.file_size:9d}  2026-01-01 00:00 {info.filename}"
+        for info in archive.infolist()
+        if not info.is_dir()
+    )
+    for candidate in parse_android_apk_icon_candidates(listing)[:6]:
+        resource_name = str(candidate["name"])
+        try:
+            payload = archive.read(resource_name)
+        except (KeyError, OSError, RuntimeError):
+            continue
+        encoded = base64.b64encode(payload).decode("ascii")
+        icon = android_icon_data_uri(encoded, resource_name)
+        if icon:
+            return icon
+
+    fallback_candidates: List[tuple[int, zipfile.ZipInfo]] = []
+    image_entries = sorted(
+        (
+            info
+            for info in archive.infolist()
+            if not info.is_dir()
+            and info.filename.startswith("res/")
+            and info.filename.lower().endswith((".png", ".webp", ".jpg", ".jpeg"))
+            and 512 <= info.file_size <= 750_000
+        ),
+        key=lambda info: info.file_size,
+        reverse=True,
+    )
+    for info in image_entries[:512]:
+        try:
+            with archive.open(info) as stream:
+                header = stream.read(65_536)
+        except (KeyError, OSError, RuntimeError):
+            continue
+        dimensions = android_raster_dimensions(header)
+        if dimensions is None:
+            continue
+        score = android_launcher_icon_score(
+            info.filename,
+            info.file_size,
+            dimensions[0],
+            dimensions[1],
+        )
+        if score is not None:
+            fallback_candidates.append((score, info))
+    fallback_candidates.sort(
+        key=lambda item: (item[0], item[1].file_size),
+        reverse=True,
+    )
+    for _score, info in fallback_candidates[:6]:
+        try:
+            payload = archive.read(info)
+        except (KeyError, OSError, RuntimeError):
+            continue
+        encoded = base64.b64encode(payload).decode("ascii")
+        icon = android_icon_data_uri(encoded, info.filename)
+        if icon:
+            return icon
+    return None
+
+
+def android_icon_data_uri_from_archive(source: Path) -> Optional[str]:
+    path = Path(source)
+    try:
+        if path.is_dir():
+            apk_paths = sorted(
+                path.glob("*.apk"),
+                key=lambda item: (
+                    0 if any(token in item.name.lower() for token in ("base", "master", "universal")) else 1,
+                    item.name.casefold(),
+                ),
+            )
+            for apk_path in apk_paths[:6]:
+                icon = android_icon_data_uri_from_archive(apk_path)
+                if icon:
+                    return icon
+            return None
+        if path.suffix.lower() == ".apk":
+            with zipfile.ZipFile(path) as archive:
+                return _android_icon_data_uri_from_zip(archive)
+        if path.suffix.lower() not in {".apks", ".zip"}:
+            return None
+        with zipfile.ZipFile(path) as bundle:
+            apk_entries = sorted(
+                (
+                    info
+                    for info in bundle.infolist()
+                    if not info.is_dir()
+                    and info.filename.lower().endswith(".apk")
+                    and info.file_size <= 200_000_000
+                ),
+                key=lambda info: (
+                    0
+                    if any(
+                        token in Path(info.filename).name.lower()
+                        for token in ("base", "master", "universal")
+                    )
+                    else 1,
+                    info.file_size,
+                ),
+            )
+            for entry in apk_entries[:6]:
+                try:
+                    payload = bundle.read(entry)
+                    with zipfile.ZipFile(io.BytesIO(payload)) as apk_archive:
+                        icon = _android_icon_data_uri_from_zip(apk_archive)
+                except (KeyError, OSError, RuntimeError, zipfile.BadZipFile):
+                    continue
+                if icon:
+                    return icon
+    except (OSError, RuntimeError, zipfile.BadZipFile):
+        return None
+    return None
 
 
 def parse_android_launcher_activities(
@@ -2278,6 +2512,7 @@ class DashboardManager:
         self.adb_agent = AdbAgentController(self.adb, self.output_root)
         self.probe_cache: Dict[str, Dict[str, object]] = {}
         self._android_icon_cache: Dict[str, Optional[str]] = {}
+        self._android_icon_helper_ready: Dict[str, bool] = {}
         self._starting = False
         self._device_cache: List[Dict[str, str]] = []
         self._android_device_cache: List[Dict[str, str]] = []
@@ -2295,6 +2530,12 @@ class DashboardManager:
         self._lock = threading.RLock()
         self.source_root = self._discover_source_root()
         self.default_rules_path = self._discover_default_rules_path()
+        self.campaign = CampaignController(
+            self.adb,
+            self.output_root,
+            self._discover_campaign_config_path(),
+        )
+        self._automation_surface = "agent"
 
     def _base_command(self) -> List[str]:
         return [
@@ -2346,6 +2587,31 @@ class DashboardManager:
             seen.add(candidate)
             if candidate.is_file():
                 return candidate
+        return None
+
+    def _discover_campaign_config_path(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self.source_root is not None:
+            candidates.append(self.source_root / "examples" / "android-two-stage-campaign.json")
+        candidates.extend(
+            [
+                Path.cwd() / "examples" / "android-two-stage-campaign.json",
+                Path(__file__).resolve().parents[2]
+                / "examples"
+                / "android-two-stage-campaign.json",
+            ]
+        )
+        seen = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if resolved.is_file():
+                return resolved
         return None
 
     def _resolve_run_dir(self, payload: Dict[str, object], key: str = "run_name") -> Path:
@@ -2588,7 +2854,135 @@ class DashboardManager:
             "device_error": error,
         }
 
+    def _require_ready_android_device(self, device: str) -> Dict[str, str]:
+        if not device:
+            raise ValueError("请选择已授权的 Android ADB 设备")
+        devices, error = self.devices(
+            force=True,
+            refresh_android=True,
+            refresh_ios=False,
+            refresh_harmony=False,
+        )
+        if error and not devices:
+            raise RuntimeError(error)
+        selected = next(
+            (
+                item
+                for item in devices
+                if item.get("serial") == device
+                and item.get("state") == "device"
+                and item.get("platform") == "android"
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Android ADB device {device!r} is not ready")
+        return selected
+
+    def campaign_software_assets(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        self._require_ready_android_device(device)
+        catalog = self.campaign.software_catalog_snapshot()
+        raw_items = catalog.get("items")
+        catalog_items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        by_package = {
+            str(item.get("package") or ""): item
+            for item in catalog_items
+            if str(item.get("package") or "")
+        }
+        raw_packages = payload.get("packages")
+        packages = (
+            [str(item or "").strip() for item in raw_packages]
+            if isinstance(raw_packages, list)
+            else list(by_package)
+        )
+        packages = list(dict.fromkeys(package for package in packages if package))
+        if not packages or len(packages) > 80:
+            raise ValueError("软件包列表必须包含 1 到 80 项")
+        invalid = [
+            package
+            for package in packages
+            if not ANDROID_PACKAGE_RE.fullmatch(package) or package not in by_package
+        ]
+        if invalid:
+            raise ValueError(f"软件目录中不存在目标包：{invalid[0]}")
+
+        package_result = adb_shell(
+            self.adb,
+            device,
+            ["pm", "list", "packages", "-f"],
+            timeout_s=30,
+        )
+        package_paths = parse_android_package_paths(
+            package_result.stdout if package_result.ok else ""
+        )
+        assets: List[Dict[str, object]] = []
+        for package in packages:
+            item = by_package[package]
+            icon_uri: Optional[str] = None
+            source_path = str(item.get("source_path") or "").strip()
+            if source_path:
+                source = Path(source_path)
+                try:
+                    stat = source.stat()
+                    cache_key = f"project|{source.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+                except OSError:
+                    cache_key = ""
+                if cache_key:
+                    with self._lock:
+                        cached = self._android_icon_cache.get(cache_key)
+                        cached_known = cache_key in self._android_icon_cache
+                    if cached_known:
+                        icon_uri = cached
+                    else:
+                        icon_uri = android_icon_data_uri_from_archive(source)
+                        with self._lock:
+                            self._android_icon_cache[cache_key] = icon_uri
+            apk_path = package_paths.get(package)
+            if not icon_uri and apk_path:
+                icon_uri = self._android_icon_from_device_apk(
+                    device,
+                    package,
+                    apk_path,
+                )
+            assets.append(
+                {
+                    "package": package,
+                    "installed": package in package_paths if package_result.ok else None,
+                    "icon_data_uri": icon_uri or "",
+                }
+            )
+        return {
+            "device": device,
+            "count": len(assets),
+            "icon_count": sum(bool(item["icon_data_uri"]) for item in assets),
+            "assets": assets,
+            "warning": "" if package_result.ok else (
+                package_result.stderr.strip()
+                or package_result.stdout.strip()
+                or "无法读取当前安装状态"
+            ),
+        }
+
+    def install_campaign_software(self, payload: Dict[str, object]) -> Dict[str, object]:
+        device = str(payload.get("device") or "").strip()
+        package = str(payload.get("package") or "").strip()
+        self._require_ready_android_device(device)
+        if not ANDROID_PACKAGE_RE.fullmatch(package):
+            raise ValueError("请输入有效的软件包名")
+        if self.adb_agent.snapshot().get("running"):
+            raise RuntimeError("请先停止当前 ADB Agent 任务")
+        if self.campaign.snapshot().get("running"):
+            raise RuntimeError("请先停止当前 Campaign 阶段")
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("请先停止当前性能或功耗采集")
+        return self.campaign.install_project_software(device, package)
+
     def start_adb_agent(self, payload: Dict[str, object]) -> Dict[str, object]:
+        if self.campaign.snapshot().get("running"):
+            raise RuntimeError("Stop the active Campaign stage before starting ADB Agent")
         device = str(payload.get("device") or "").strip()
         devices, error = self.devices(
             force=True,
@@ -2610,10 +3004,65 @@ class DashboardManager:
         )
         if selected is None:
             raise RuntimeError(f"Android ADB device {device!r} is not ready")
-        return self.adb_agent.start(payload)
+        agent_payload = dict(payload)
+        if selected.get("model") or selected.get("product") or selected.get("device"):
+            brand_result = adb_shell(
+                self.adb,
+                device,
+                ["getprop", "ro.product.brand"],
+                timeout_s=5.0,
+            )
+            if brand_result.ok and brand_result.stdout.strip():
+                agent_payload["device_brand"] = brand_result.stdout.strip()
+            agent_payload["device_model"] = str(selected.get("model") or "").strip()
+            agent_payload["device_product"] = str(selected.get("product") or "").strip()
+            agent_payload["device_codename"] = str(selected.get("device") or "").strip()
+            agent_payload["device_connection_type"] = str(
+                selected.get("connection_type") or ""
+            ).strip()
+        result = self.adb_agent.start(agent_payload)
+        with self._lock:
+            self._automation_surface = "agent"
+        return result
 
     def stop_adb_agent(self) -> Dict[str, object]:
         return self.adb_agent.stop()
+
+    def start_campaign(self, payload: Dict[str, object]) -> Dict[str, object]:
+        if self.adb_agent.snapshot().get("running"):
+            raise RuntimeError("Stop the active ADB Agent before starting a Campaign stage")
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("Stop the active recording before starting a Campaign stage")
+        device = str(payload.get("device") or "").strip()
+        devices, error = self.devices(
+            force=True,
+            refresh_android=True,
+            refresh_ios=False,
+            refresh_harmony=False,
+        )
+        if error and not devices:
+            raise RuntimeError(error)
+        selected = next(
+            (
+                item
+                for item in devices
+                if item.get("serial") == device
+                and item.get("state") == "device"
+                and item.get("platform") == "android"
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Android ADB device {device!r} is not ready")
+        result = self.campaign.start(payload)
+        with self._lock:
+            self._automation_surface = "campaign"
+        return result
+
+    def stop_campaign(self) -> Dict[str, object]:
+        return self.campaign.stop()
 
     def connect_harmony(self, payload: Dict[str, object]) -> Dict[str, object]:
         address = str(payload.get("address") or "").strip()
@@ -3074,6 +3523,107 @@ class DashboardManager:
             self.probe_cache[device] = entry
         return entry
 
+    def _ensure_android_icon_helper(self, device: str) -> bool:
+        with self._lock:
+            cached = self._android_icon_helper_ready.get(device)
+        if cached is not None:
+            return cached
+
+        ready = False
+        try:
+            helper_resource = files("mobile_profiler").joinpath(
+                "assets",
+                "android-icon-helper.jar",
+            )
+            if helper_resource.is_file():
+                with as_file(helper_resource) as helper_path:
+                    result = subprocess.run(
+                        [
+                            self.adb,
+                            "-s",
+                            device,
+                            "push",
+                            str(helper_path),
+                            "/data/local/tmp/mobile-profiler-icon-helper-v1.jar",
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=15,
+                        check=False,
+                    )
+                ready = result.returncode == 0
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            ready = False
+
+        with self._lock:
+            self._android_icon_helper_ready[device] = ready
+        return ready
+
+    def _android_icon_from_package_manager(
+        self,
+        device: str,
+        package: str,
+    ) -> Optional[str]:
+        if not self._ensure_android_icon_helper(device):
+            return None
+        encoded = adb_shell(
+            self.adb,
+            device,
+            "CLASSPATH=/data/local/tmp/mobile-profiler-icon-helper-v1.jar "
+            f"app_process /system/bin IconDump {shlex.quote(package)} 192 "
+            "2>/dev/null | base64",
+            timeout_s=12,
+        )
+        if not encoded.ok:
+            return None
+        return android_icon_data_uri(encoded.stdout, f"package:{package}")
+
+    def _android_icon_from_device_apk(
+        self,
+        device: str,
+        package: str,
+        apk_path: str,
+    ) -> Optional[str]:
+        cache_key = f"{device}|{package}|{apk_path}"
+        with self._lock:
+            cached = self._android_icon_cache.get(cache_key)
+            cached_known = cache_key in self._android_icon_cache
+        if cached_known:
+            return cached
+        icon_uri = self._android_icon_from_package_manager(device, package)
+        if not icon_uri:
+            listing = adb_shell(
+                self.adb,
+                device,
+                ["unzip", "-l", apk_path],
+                timeout_s=12,
+            )
+        else:
+            listing = None
+        if listing is not None and listing.ok:
+            candidates = parse_android_apk_icon_candidates(listing.stdout)
+            for candidate in candidates[:6]:
+                resource_name = str(candidate["name"])
+                encoded = adb_shell(
+                    self.adb,
+                    device,
+                    "unzip -p "
+                    f"{shlex.quote(apk_path)} {shlex.quote(resource_name)} "
+                    "2>/dev/null | base64",
+                    timeout_s=12,
+                )
+                if not encoded.ok:
+                    continue
+                icon_uri = android_icon_data_uri(encoded.stdout, resource_name)
+                if icon_uri:
+                    break
+        with self._lock:
+            self._android_icon_cache[cache_key] = icon_uri
+        return icon_uri
+
     def scan_android_apps(self, payload: Dict[str, object]) -> Dict[str, object]:
         device = str(payload.get("device") or "").strip()
         if not device:
@@ -3191,41 +3741,11 @@ class DashboardManager:
             if not apk_path:
                 continue
             icon_attempt_count += 1
-            cache_key = f"{device}|{package}|{apk_path}"
-            with self._lock:
-                cached = self._android_icon_cache.get(cache_key)
-                cached_known = cache_key in self._android_icon_cache
-            if cached_known:
-                if cached:
-                    item["icon_data_uri"] = cached
-                    icon_count += 1
-                continue
-            listing = adb_shell(
-                self.adb,
+            icon_uri = self._android_icon_from_device_apk(
                 device,
-                ["unzip", "-l", apk_path],
-                timeout_s=12,
+                package,
+                apk_path,
             )
-            icon_uri: Optional[str] = None
-            if listing.ok:
-                candidates = parse_android_apk_icon_candidates(listing.stdout)
-                if candidates:
-                    resource_name = str(candidates[0]["name"])
-                    encoded = adb_shell(
-                        self.adb,
-                        device,
-                        "unzip -p "
-                        f"{shlex.quote(apk_path)} {shlex.quote(resource_name)} "
-                        "2>/dev/null | base64",
-                        timeout_s=12,
-                    )
-                    if encoded.ok:
-                        icon_uri = android_icon_data_uri(
-                            encoded.stdout,
-                            resource_name,
-                        )
-            with self._lock:
-                self._android_icon_cache[cache_key] = icon_uri
             if icon_uri:
                 item["icon_data_uri"] = icon_uri
                 icon_count += 1
@@ -4447,6 +4967,7 @@ class DashboardManager:
         devices, error = self.devices()
         with self._lock:
             probes = dict(self.probe_cache)
+            automation_surface = self._automation_surface
         return {
             "version": APP_VERSION,
             "server_time": time.time(),
@@ -4461,6 +4982,8 @@ class DashboardManager:
             "probes": probes,
             "active": self.active_snapshot(),
             "adb_agent": self.adb_agent.snapshot(),
+            "campaign": self.campaign.snapshot(),
+            "automation_surface": automation_surface,
             "history": self.history(),
             "tooling": self.tooling_state(),
             "demo_mode": self.demo_mode,
@@ -4937,6 +5460,7 @@ class DashboardManager:
 
     def close(self) -> None:
         self.adb_agent.stop()
+        self.campaign.close()
         with self._lock:
             active = self.active
         if active is None or not active.running:
@@ -5046,6 +5570,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self._send_bytes(screenshot, "image/png")
             return
+        if path == "/api/campaign/screenshot":
+            screenshot = self.server.manager.campaign.latest_screenshot()
+            if screenshot is None:
+                self._send_json(
+                    {"error": "Campaign screenshot not available"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._send_bytes(screenshot, "image/png")
+            return
         match = re.fullmatch(r"/runs/([^/]+)/report\.html", path)
         if match:
             report = self.server.manager.report_path(match.group(1))
@@ -5086,6 +5620,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.start_adb_agent(payload)
             elif path == "/api/ai-agent/stop":
                 result = self.server.manager.stop_adb_agent()
+            elif path == "/api/campaign/start":
+                result = self.server.manager.start_campaign(payload)
+            elif path == "/api/campaign/stop":
+                result = self.server.manager.stop_campaign()
+            elif path == "/api/campaign/software/assets":
+                result = self.server.manager.campaign_software_assets(payload)
+            elif path == "/api/campaign/software/install":
+                result = self.server.manager.install_campaign_software(payload)
             elif path == "/api/connect":
                 result = self.server.manager.connect_device(payload)
             elif path == "/api/harmony/connect":

@@ -34,7 +34,14 @@
   const storedPlatform = localStorage.getItem("mobile-profiler-platform");
   const liveTimelineLayoutStorageKey = "mobile-profiler-live-timeline-layout-v1";
   const agentConfigTabStorageKey = "mobile-profiler-agent-config-tab";
-  const agentConfigTabs = ["workflow", "model", "prompt"];
+  const agentPromptTabStorageKey = "mobile-profiler-agent-prompt-tab";
+  const agentTemplateDraftStorageKey = "mobile-profiler-agent-template-drafts-v1";
+  const agentCustomTemplateStorageKey = "mobile-profiler-agent-custom-templates-v2";
+  const agentSelectedTemplateStorageKey = "mobile-profiler-agent-selected-template-v1";
+  const agentSystemPromptStorageKey = "mobile-profiler-agent-system-prompt-v1";
+  const agentTemporarySessionStorageKey = "mobile-profiler-agent-temporary-session-v1";
+  const agentConfigTabs = ["workflow", "software", "model", "prompt"];
+  const agentPromptTabs = ["task", "system"];
   const maxUiLogLines = 500;
   const uiErrorDedupWindowS = 2;
   const liveTimelineLayoutDefinitions = [
@@ -100,6 +107,26 @@
     }
   }
 
+  function loadAgentTemplateDrafts() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(agentTemplateDraftStorageKey) || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function loadAgentCustomTemplates() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(agentCustomTemplateStorageKey) || "[]");
+      return Array.isArray(parsed)
+        ? parsed.filter(item => item && typeof item === "object" && String(item.id || "").trim())
+        : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+
   const app = {
     state: null,
     metric: "power_mw",
@@ -138,14 +165,35 @@
     agentNotificationKey: "",
     agentTaskSeed: 0,
     agentTemplateSignature: "",
+    agentTemplateDrafts: loadAgentTemplateDrafts(),
+    agentCustomTemplates: loadAgentCustomTemplates(),
+    agentServerTemplates: [],
+    agentSelectedTemplateId: localStorage.getItem(agentSelectedTemplateStorageKey) || "",
+    agentTemplateInitialized: false,
+    agentTemplateLoading: false,
+    agentCampaignStage: "",
+    agentPromptTaskId: "",
     agentDefaultSystemPrompt: "",
+    agentSavedSystemPrompt: localStorage.getItem(agentSystemPromptStorageKey) || "",
+    agentPromptDirty: false,
+    agentTemporarySessionId: localStorage.getItem(agentTemporarySessionStorageKey) || "",
     agentEditorSessionId: "",
     agentProviderSignature: "",
     agentProviderProfiles: new Map(),
     agentPresentedProvider: "",
+    agentSoftwareCategory: "all",
+    agentSoftwareAssets: new Map(),
+    agentSoftwareAssetsDevice: "",
+    agentSoftwareAssetsSignature: "",
+    agentSoftwareAssetsLoading: false,
+    agentSoftwareInstallingPackage: "",
+    agentSoftwareInstallSessionId: "",
     agentConfigTab: agentConfigTabs.includes(localStorage.getItem(agentConfigTabStorageKey))
       ? localStorage.getItem(agentConfigTabStorageKey)
       : "workflow",
+    agentPromptTab: agentPromptTabs.includes(localStorage.getItem(agentPromptTabStorageKey))
+      ? localStorage.getItem(agentPromptTabStorageKey)
+      : "task",
     agentDefaultSystemPromptVersion: "",
   };
 
@@ -5298,12 +5346,29 @@
     };
   }
 
+  function setAgentTemporaryTaskMenu(open, { focusInput = false, returnFocus = false } = {}) {
+    const menu = $("#agent-temporary-task-menu");
+    const trigger = $("#agent-temporary-task-menu-button");
+    if (!menu || !trigger) return;
+    const nextOpen = Boolean(open);
+    menu.hidden = !nextOpen;
+    trigger.classList.toggle("active", nextOpen);
+    trigger.setAttribute("aria-expanded", String(nextOpen));
+    trigger.setAttribute("aria-label", nextOpen ? "关闭手机临时任务" : "打开手机临时任务");
+    if (nextOpen && focusInput) $("#agent-temporary-task-input")?.focus();
+    if (!nextOpen && returnFocus) trigger.focus();
+  }
+
   function setAgentConfigTab(tab, { persist = true } = {}) {
     const nextTab = agentConfigTabs.includes(tab) ? tab : "workflow";
     const presentation = {
-      workflow: { title: "测试任务编排", source: "WORKFLOW" },
+      workflow: { title: "任务启动", source: "TASK LAUNCH" },
+      software: { title: "应用与游戏", source: "SUPPORTED SOFTWARE" },
       model: { title: "模型调度", source: "MODEL ROUTING" },
-      prompt: { title: "Agent 规则", source: "SYSTEM PROMPT" },
+      prompt: {
+        title: "Prompt 编辑",
+        source: app.agentPromptTab === "system" ? "SYSTEM PROMPT" : "TASK PROMPT",
+      },
     }[nextTab];
     app.agentConfigTab = nextTab;
     $$('[data-agent-config-tab]').forEach(button => {
@@ -5319,10 +5384,42 @@
     });
     $("#agent-config-panel-title").textContent = presentation.title;
     $("#agent-config-panel-source").textContent = presentation.source;
+    if (nextTab === "prompt") setAgentPromptTab(app.agentPromptTab, { persist: false });
     if (persist) localStorage.setItem(agentConfigTabStorageKey, nextTab);
   }
 
+  function setAgentPromptTab(tab, { persist = true } = {}) {
+    const nextTab = agentPromptTabs.includes(tab) ? tab : "task";
+    app.agentPromptTab = nextTab;
+    $$('[data-agent-prompt-tab]').forEach(button => {
+      const active = button.dataset.agentPromptTab === nextTab;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    $$('[data-agent-prompt-view]').forEach(view => {
+      const active = view.dataset.agentPromptView === nextTab;
+      view.hidden = !active;
+      view.classList.toggle("active", active);
+    });
+    if (app.agentConfigTab === "prompt") {
+      $("#agent-config-panel-source").textContent = nextTab === "system"
+        ? "SYSTEM PROMPT"
+        : "TASK PROMPT";
+    }
+    if (nextTab === "task") renderAgentTaskPromptEditor();
+    if (persist) localStorage.setItem(agentPromptTabStorageKey, nextTab);
+  }
+
   function refreshAgentModelSummary() {
+    const engineInput = $("#agent-automation-engine-input");
+    const engineProfile = app.agentEngineProfiles?.get(engineInput.value) || {};
+    const engineLabel = String(
+      engineProfile.label
+      || engineInput.selectedOptions[0]?.textContent
+      || engineInput.value
+      || "视觉截图"
+    );
     const providerInput = $("#agent-model-provider-input");
     const profile = app.agentProviderProfiles.get(providerInput.value) || {};
     const providerLabel = String(
@@ -5331,18 +5428,54 @@
       || providerInput.value
       || "未配置协议"
     );
-    const model = $("#agent-model-input").value.trim()
-      || String(profile.default_model || "")
-      || "未配置模型";
-    $("#agent-config-tab-model-meta").textContent = providerLabel;
-    $("#agent-dock-model").textContent = model;
+    $("#agent-config-tab-model-meta").textContent = `${engineLabel} · ${providerLabel}`;
   }
 
-  function refreshAgentPromptSummary(label = "") {
+  function normalizeAgentSystemPrompt(value) {
+    return String(value || "").replace(/\r\n?/g, "\n").trim();
+  }
+
+  function currentAgentSystemPromptVersion() {
+    const prompt = normalizeAgentSystemPrompt($("#agent-system-prompt-input").value);
+    const defaultPrompt = normalizeAgentSystemPrompt(app.agentDefaultSystemPrompt);
+    return prompt && defaultPrompt && prompt === defaultPrompt
+      ? app.agentDefaultSystemPromptVersion
+      : "custom";
+  }
+
+  function refreshAgentSystemPromptVersion() {
+    const version = currentAgentSystemPromptVersion();
+    $("#agent-system-prompt-version").textContent = `${version} · 坐标协议、动作边界与安全规则`;
+    refreshAgentSystemPromptSummary(version === "custom" ? "" : version);
+  }
+
+  function refreshAgentSystemPromptSummary(label = "") {
     const prompt = $("#agent-system-prompt-input").value.trim();
-    $("#agent-config-tab-prompt-meta").textContent = prompt
+    $("#agent-prompt-tab-system-meta").textContent = prompt
       ? (label || "自定义规则")
       : "未配置";
+  }
+
+  function setAgentPromptDirty(dirty, message = "") {
+    app.agentPromptDirty = Boolean(dirty);
+    const bar = $(".agent-prompt-save-bar");
+    const state = $("#agent-prompt-save-state");
+    if (bar) bar.classList.toggle("dirty", app.agentPromptDirty);
+    if (state) {
+      state.textContent = message || (
+        app.agentPromptDirty
+          ? "有未保存修改；保存后才会用于下次启动"
+          : "当前配置已保存并会用于下次启动"
+      );
+    }
+  }
+
+  function savedAgentSystemPrompt() {
+    return normalizeAgentSystemPrompt(
+      app.agentSavedSystemPrompt
+      || localStorage.getItem(agentSystemPromptStorageKey)
+      || app.agentDefaultSystemPrompt
+    );
   }
 
   function agentTaskCardMarkup(rawTask, index) {
@@ -5353,7 +5486,7 @@
       <article class="agent-task-card" data-agent-task-id="${escapeHtml(taskId)}">
         <header>
           <span class="agent-task-index" data-agent-task-number>${index + 1}</span>
-          <div><strong>${escapeHtml(task.name || `任务 ${index + 1}`)}</strong><small>一个 finish 对应一个子任务</small></div>
+          <div><strong>${escapeHtml(task.name || `任务 ${index + 1}`)}</strong><small data-agent-task-prompt-summary>${task.prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务</small></div>
           <nav aria-label="调整任务顺序">
             <button type="button" title="上移" data-agent-task-action="up">↑</button>
             <button type="button" title="下移" data-agent-task-action="down">↓</button>
@@ -5365,13 +5498,9 @@
             <label>任务名称</label>
             <input type="text" maxlength="120" data-agent-task-field="name" value="${escapeHtml(task.name || "")}" placeholder="例如：打开系统设置">
           </div>
-          <div class="form-field agent-task-prompt-field">
-            <label>任务目标</label>
-            <textarea rows="4" maxlength="6000" data-agent-task-field="prompt" placeholder="说明当前子任务需要在手机上完成并验证的目标">${escapeHtml(task.prompt || "")}</textarea>
-          </div>
-          <div class="form-field agent-task-attention-field">
-            <label>注意事项 <span>可选</span></label>
-            <textarea rows="2" maxlength="3000" data-agent-task-field="attention_prompt" placeholder="限定入口、禁止动作、成功证据或厂商差异">${escapeHtml(task.attention_prompt || "")}</textarea>
+          <div class="agent-task-prompt-storage" aria-hidden="true">
+            <textarea tabindex="-1" data-agent-task-field="prompt">${escapeHtml(task.prompt || "")}</textarea>
+            <textarea tabindex="-1" data-agent-task-field="attention_prompt">${escapeHtml(task.attention_prompt || "")}</textarea>
           </div>
           <div class="agent-task-limits">
             <div class="form-field"><label>最大步骤</label><input type="number" min="1" max="200" step="1" data-agent-task-field="max_steps" value="${escapeHtml(task.max_steps)}"></div>
@@ -5382,21 +5511,111 @@
       </article>`;
   }
 
+  function agentTaskCardById(taskId) {
+    return $$("#agent-task-list .agent-task-card")
+      .find(card => card.dataset.agentTaskId === String(taskId || "")) || null;
+  }
+
+  function refreshAgentTaskPromptSummary() {
+    const cards = $$("#agent-task-list .agent-task-card");
+    const missing = cards.filter(card => (
+      !card.querySelector('[data-agent-task-field="prompt"]')?.value.trim()
+    )).length;
+    const summary = missing
+      ? `${cards.length} 个任务 · ${missing} 待填写`
+      : `${cards.length} 个任务`;
+    $("#agent-config-tab-prompt-meta").textContent = summary;
+    $("#agent-prompt-tab-task-meta").textContent = summary;
+  }
+
+  function renderAgentTaskPromptEditor() {
+    const cards = $$("#agent-task-list .agent-task-card");
+    const promptInput = $("#agent-task-prompt-input");
+    const attentionInput = $("#agent-task-attention-input");
+    if (!cards.length || !promptInput || !attentionInput) return;
+    const card = agentTaskCardById(app.agentPromptTaskId) || cards[0];
+    const taskId = card.dataset.agentTaskId;
+    const index = cards.indexOf(card);
+    const name = card.querySelector('[data-agent-task-field="name"]')?.value.trim()
+      || `任务 ${index + 1}`;
+    const prompt = card.querySelector('[data-agent-task-field="prompt"]')?.value || "";
+    const attention = card.querySelector('[data-agent-task-field="attention_prompt"]')?.value || "";
+    app.agentPromptTaskId = taskId;
+    if ($("#agent-prompt-task-select").value !== taskId) {
+      $("#agent-prompt-task-select").value = taskId;
+    }
+    $("#agent-task-prompt-index").textContent = `TASK ${String(index + 1).padStart(2, "0")}`;
+    $("#agent-task-prompt-name").textContent = name;
+    if (promptInput.value !== prompt) promptInput.value = prompt;
+    if (attentionInput.value !== attention) attentionInput.value = attention;
+    const configured = Boolean(prompt.trim());
+    const state = $("#agent-task-prompt-state");
+    state.textContent = configured ? "Prompt 已配置" : "Prompt 未填写";
+    state.classList.toggle("ready", configured);
+  }
+
+  function refreshAgentTaskPromptSelector({ selectedId = "" } = {}) {
+    const cards = $$("#agent-task-list .agent-task-card");
+    const select = $("#agent-prompt-task-select");
+    if (!select || !cards.length) return;
+    const preferredId = String(selectedId || select.value || app.agentPromptTaskId || "");
+    const options = cards.map((card, index) => {
+      const name = card.querySelector('[data-agent-task-field="name"]')?.value.trim()
+        || `任务 ${index + 1}`;
+      return `<option value="${escapeHtml(card.dataset.agentTaskId)}">${index + 1}. ${escapeHtml(name)}</option>`;
+    }).join("");
+    if (select.innerHTML !== options) select.innerHTML = options;
+    const selectedCard = agentTaskCardById(preferredId) || cards[0];
+    app.agentPromptTaskId = selectedCard.dataset.agentTaskId;
+    select.value = app.agentPromptTaskId;
+    renderAgentTaskPromptEditor();
+    refreshAgentTaskPromptSummary();
+  }
+
+  function syncAgentTaskPromptEditor() {
+    const card = agentTaskCardById(app.agentPromptTaskId);
+    if (!card) return;
+    card.querySelector('[data-agent-task-field="prompt"]').value = $("#agent-task-prompt-input").value;
+    card.querySelector('[data-agent-task-field="attention_prompt"]').value = $("#agent-task-attention-input").value;
+    const configured = Boolean($("#agent-task-prompt-input").value.trim());
+    card.classList.toggle("prompt-missing", !configured);
+    card.querySelector("[data-agent-task-prompt-summary]").textContent = `${configured ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务`;
+    const state = $("#agent-task-prompt-state");
+    state.textContent = configured ? "Prompt 已配置" : "Prompt 未填写";
+    state.classList.toggle("ready", configured);
+    refreshAgentTaskPromptSummary();
+    setAgentPromptDirty(true);
+  }
+
+  function selectAgentTaskPrompt(taskId, { focus = false } = {}) {
+    const card = agentTaskCardById(taskId);
+    if (!card) return;
+    app.agentPromptTaskId = card.dataset.agentTaskId;
+    $("#agent-prompt-task-select").value = app.agentPromptTaskId;
+    renderAgentTaskPromptEditor();
+    if (focus) $("#agent-task-prompt-input").focus();
+  }
+
   function refreshAgentTaskOrder() {
     const cards = $$("#agent-task-list .agent-task-card");
     cards.forEach((card, index) => {
       card.querySelector("[data-agent-task-number]").textContent = String(index + 1);
       const title = card.querySelector("header strong");
       const name = card.querySelector('[data-agent-task-field="name"]')?.value.trim();
+      const prompt = card.querySelector('[data-agent-task-field="prompt"]')?.value.trim();
       title.textContent = name || `任务 ${index + 1}`;
+      card.classList.toggle("prompt-missing", !prompt);
+      card.querySelector("[data-agent-task-prompt-summary]").textContent = `${prompt ? "Prompt 已配置" : "Prompt 未填写"} · 一个 finish 对应一个子任务`;
       card.querySelector('[data-agent-task-action="up"]').disabled = index === 0;
       card.querySelector('[data-agent-task-action="down"]').disabled = index === cards.length - 1;
-      card.querySelector('[data-agent-task-action="remove"]').disabled = cards.length <= 1;
+      card.querySelector('[data-agent-task-action="remove"]').disabled = (
+        cards.length <= 1 || Boolean(app.agentCampaignStage)
+      );
     });
     const label = $("#agent-task-count-label");
     if (label) label.textContent = `${cards.length} 个子任务 · 按顺序执行；finish 只完成当前子任务`;
     $("#agent-config-tab-task-meta").textContent = `${cards.length} 个任务`;
-    $("#agent-dock-workflow").textContent = `${cards.length} 个子任务`;
+    refreshAgentTaskPromptSelector();
   }
 
   function renderAgentTaskEditor(tasks) {
@@ -5425,6 +5644,7 @@
     } else {
       list.insertAdjacentHTML("beforeend", agentTaskCardMarkup(item, list.children.length));
     }
+    app.agentPromptTaskId = item.id;
     refreshAgentTaskOrder();
     list.lastElementChild?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
@@ -5442,14 +5662,257 @@
   }
 
   function populateAgentTaskTemplates(templates) {
-    const items = Array.isArray(templates) ? templates : [];
-    const signature = JSON.stringify(items.map(item => [item.id, item.label]));
+    app.agentServerTemplates = Array.isArray(templates) ? templates : [];
+    const items = [...app.agentServerTemplates, ...app.agentCustomTemplates];
+    const signature = JSON.stringify(items.map(item => [
+      item.id,
+      item.label,
+      item.kind,
+      item.campaign_stage,
+      item.revision,
+      Array.isArray(item.tasks) ? item.tasks.length : 0,
+    ]));
     if (signature === app.agentTemplateSignature) return;
     app.agentTemplateSignature = signature;
-    $("#agent-task-template-select").innerHTML = [
-      '<option value="">选择任务模板</option>',
-      ...items.map(item => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.label || item.name || item.id || "未命名模板")}</option>`),
-    ].join("");
+    const select = $("#agent-task-template-select");
+    const selectedId = app.agentSelectedTemplateId || select.value;
+    select.innerHTML = items
+      .map(item => `<option value="${escapeHtml(item.id || "")}">${escapeHtml(item.label || item.name || item.id || "未命名模板")}</option>`)
+      .join("");
+    const nextId = items.some(item => String(item.id) === selectedId)
+      ? selectedId
+      : String(items[0]?.id || "");
+    if (nextId) select.value = nextId;
+  }
+
+  function agentTemplateById(templateId) {
+    const templates = [...app.agentServerTemplates, ...app.agentCustomTemplates];
+    return templates.find(item => String(item.id) === String(templateId || "")) || null;
+  }
+
+  function persistAgentCustomTemplates() {
+    localStorage.setItem(
+      agentCustomTemplateStorageKey,
+      JSON.stringify(app.agentCustomTemplates || []),
+    );
+  }
+
+  function persistAgentTemplateDrafts() {
+    localStorage.setItem(
+      agentTemplateDraftStorageKey,
+      JSON.stringify(app.agentTemplateDrafts || {}),
+    );
+  }
+
+  function saveCurrentAgentTemplateDraft() {
+    const templateId = app.agentSelectedTemplateId;
+    const template = agentTemplateById(templateId);
+    if (!templateId || app.agentTemplateLoading || !template) return;
+    const workflowName = $("#agent-workflow-name-input").value.trim() || "未命名任务";
+    const tasks = readAgentTasks();
+    app.agentTemplateDrafts[templateId] = {
+      workflow_name: workflowName,
+      loop_enabled: Boolean($("#agent-loop-workflow-input").checked),
+      template_revision: String(template.revision || ""),
+      tasks,
+    };
+    persistAgentTemplateDrafts();
+    const customTemplate = app.agentCustomTemplates.find(item => String(item.id) === templateId);
+    if (customTemplate) {
+      customTemplate.label = workflowName;
+      customTemplate.name = workflowName;
+      customTemplate.workflow_name = workflowName;
+      customTemplate.tasks = tasks;
+      persistAgentCustomTemplates();
+      app.agentTemplateSignature = "";
+      populateAgentTaskTemplates(app.agentServerTemplates);
+      $("#agent-task-template-select").value = templateId;
+    }
+  }
+
+  function saveAgentLoopPreference() {
+    const templateId = app.agentSelectedTemplateId;
+    if (!templateId || !agentTemplateById(templateId)) return;
+    const existing = app.agentTemplateDrafts[templateId];
+    app.agentTemplateDrafts[templateId] = {
+      ...(existing && typeof existing === "object" ? existing : {}),
+      loop_enabled: Boolean($("#agent-loop-workflow-input").checked),
+    };
+    persistAgentTemplateDrafts();
+  }
+
+  function saveAgentPromptConfiguration() {
+    const invalidTaskControl = $$(
+      '#agent-task-list input[type="number"], #agent-task-list select'
+    ).find(control => !control.checkValidity());
+    if (invalidTaskControl) {
+      setAgentPromptTab("task");
+      notify("任务参数无效", "请检查子任务的步骤上限、超时时间和失败策略。", "error");
+      invalidTaskControl.focus();
+      return false;
+    }
+    const systemPrompt = normalizeAgentSystemPrompt($("#agent-system-prompt-input").value);
+    if (!systemPrompt) {
+      setAgentPromptTab("system");
+      notify("System Prompt 不能为空", "请恢复默认 prompt 或填写自定义 ADB Agent 规则。", "error");
+      $("#agent-system-prompt-input").focus();
+      return false;
+    }
+    saveCurrentAgentTemplateDraft();
+    app.agentSavedSystemPrompt = systemPrompt;
+    localStorage.setItem(agentSystemPromptStorageKey, systemPrompt);
+    const missing = readAgentTasks().filter(task => !task.prompt).length;
+    setAgentPromptDirty(false, missing
+      ? `配置已保存；仍有 ${missing} 个任务 Prompt 待填写`
+      : "配置已保存并会用于下次启动");
+    notify(
+      "Prompt 配置已保存",
+      missing ? `已保存为草稿，仍有 ${missing} 个任务目标未填写。` : "任务配置与 System Prompt 已生效。",
+      missing ? "warning" : "success",
+      4500,
+    );
+    return true;
+  }
+
+  function createAgentTemplate() {
+    if (app.agentPromptDirty) {
+      notify("请先保存当前修改", "保存当前 Prompt 配置后再新建任务。", "warning", 5000);
+      setAgentConfigTab("prompt");
+      return;
+    }
+    const now = Date.now();
+    const ordinal = app.agentCustomTemplates.length + 1;
+    const label = `新建任务 ${ordinal}`;
+    const template = {
+      id: `local-task-${now}`,
+      kind: "custom",
+      label,
+      name: label,
+      workflow_name: label,
+      loop_enabled: false,
+      tasks: [defaultAgentTask({ id: `task-${now}`, name: "任务 1" })],
+    };
+    app.agentCustomTemplates.push(template);
+    app.agentTemplateSignature = "";
+    populateAgentTaskTemplates(app.agentServerTemplates);
+    applyAgentTemplate(template, { useDraft: false });
+    setAgentPromptDirty(true, "新任务尚未保存；填写完成后点击保存");
+    setAgentConfigTab("prompt");
+    setAgentPromptTab("task");
+    $("#agent-workflow-name-input").focus();
+  }
+
+  function applyAgentTemplate(template, { useDraft = true, notifyUser = false } = {}) {
+    if (!template) return;
+    const templateId = String(template.id || "");
+    const storedDraft = app.agentTemplateDrafts[templateId]
+      && typeof app.agentTemplateDrafts[templateId] === "object"
+      ? app.agentTemplateDrafts[templateId]
+      : null;
+    const templateRevision = String(template.revision || "");
+    const draft = useDraft
+      && storedDraft
+      && (!templateRevision || String(storedDraft.template_revision || "") === templateRevision)
+      ? storedDraft
+      : null;
+    const templateTasks = Array.isArray(template.tasks) && template.tasks.length
+      ? template.tasks
+      : [{ ...template, name: template.label || template.name || "模板任务" }];
+    const tasks = Array.isArray(draft?.tasks) && draft.tasks.length
+      ? draft.tasks
+      : templateTasks;
+    app.agentTemplateLoading = true;
+    renderAgentTaskEditor(tasks);
+    $("#agent-workflow-name-input").value = String(
+      draft?.workflow_name
+      || template.workflow_name
+      || template.label
+      || "ADB 测试流程"
+    );
+    setAgentTemplateMode(template);
+    if (app.agentCampaignStage === "test") {
+      $("#agent-loop-workflow-input").checked = draft?.loop_enabled === undefined
+        ? template.loop_enabled !== false
+        : Boolean(draft.loop_enabled);
+    }
+    $("#agent-task-template-select").value = templateId;
+    app.agentTemplateLoading = false;
+    refreshAgentTaskOrder();
+    setAgentPromptDirty(false);
+    if (notifyUser) {
+      notify(
+        "已切换当前任务",
+        `${template.label || template.name || templateId} · 修改后请点击保存`,
+        "success",
+        4000,
+      );
+    }
+  }
+
+  function editCurrentAgentTemplate() {
+    const template = agentTemplateById(app.agentSelectedTemplateId);
+    if (!template) return;
+    setAgentConfigTab("prompt");
+    setAgentPromptTab("task");
+    refreshAgentTaskPromptSelector();
+    $("#agent-task-prompt-input").focus();
+  }
+
+  function agentCampaignStartLabel() {
+    if (app.agentCampaignStage === "prepare") return "启动预备阶段";
+    if (app.agentCampaignStage === "test") return "启动实际测试阶段";
+    if (agentTemplateById(app.agentSelectedTemplateId)?.kind === "phone_configuration") {
+      return "启动手机配置检查";
+    }
+    return "启动测试流程";
+  }
+
+  function setAgentTemplateMode(template = null) {
+    const campaignStage = template?.kind === "campaign"
+      ? String(template.campaign_stage || "")
+      : "";
+    app.agentCampaignStage = ["prepare", "test"].includes(campaignStage) ? campaignStage : "";
+    app.agentSelectedTemplateId = String(template?.id || "");
+    if (app.agentSelectedTemplateId) {
+      localStorage.setItem(agentSelectedTemplateStorageKey, app.agentSelectedTemplateId);
+    } else {
+      localStorage.removeItem(agentSelectedTemplateStorageKey);
+    }
+    const loopControl = $("#agent-loop-control");
+    const loopInput = $("#agent-loop-workflow-input");
+    const loopHint = $("#agent-loop-workflow-hint");
+    if (loopControl && loopInput && loopHint) {
+      loopControl.hidden = false;
+      loopInput.checked = app.agentCampaignStage === "test"
+        ? template?.loop_enabled !== false
+        : false;
+      loopInput.disabled = app.agentCampaignStage !== "test";
+      loopHint.textContent = app.agentCampaignStage === "prepare"
+        ? "预备阶段固定执行一次；系统设置、本地安装和权限步骤由宿主按配置完成。"
+        : app.agentCampaignStage === "test"
+          ? "开启后重复当前任务并继续下一轮，直到设备关机或手动停止；关闭后整套任务只执行一遍。"
+          : "当前任务固定执行一次。";
+    }
+    const hint = $("#agent-template-selection-hint");
+    if (hint) {
+      hint.textContent = template
+        ? `${template.description || "当前模板已载入。"} 顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。`
+        : "选择任务后即可启动；顺序、步骤、超时和任务指令统一在 Prompt 编辑中修改。";
+      hint.classList.toggle("campaign", Boolean(app.agentCampaignStage));
+    }
+    $("#agent-task-list")?.classList.toggle("campaign-preview", Boolean(app.agentCampaignStage));
+    const startButton = $("#agent-start-button");
+    if (startButton && !startButton.disabled) startButton.textContent = agentCampaignStartLabel();
+    const configurationButton = $("#agent-select-phone-configuration-button");
+    if (configurationButton) {
+      const selected = template?.kind === "phone_configuration";
+      configurationButton.classList.toggle("active", selected);
+      configurationButton.textContent = selected ? "已选择配置检查" : "选择配置检查";
+      configurationButton.disabled = selected || agentSoftwareAutomationRunning();
+    }
+    const editButton = $("#agent-edit-template-button");
+    if (editButton) editButton.disabled = !app.agentSelectedTemplateId;
+    refreshAgentTaskOrder();
   }
 
   function populateAgentModelProviders(providers) {
@@ -5465,6 +5928,41 @@
     }
   }
 
+  function populateAgentAutomationEngines(engines) {
+    const items = Array.isArray(engines) ? engines : [];
+    const signature = JSON.stringify(items);
+    if (signature === app.agentEngineSignature) return;
+    app.agentEngineSignature = signature;
+    app.agentEngineProfiles = new Map(items.map(item => [String(item.id), item]));
+    if (items.length) {
+      $("#agent-automation-engine-input").innerHTML = items
+        .map(item => `<option value="${escapeHtml(item.id)}"${item.available === false ? " disabled" : ""}>${escapeHtml(item.label || item.id)}${item.available === false ? "（不可用）" : ""}</option>`)
+        .join("");
+    }
+  }
+
+  function applyAgentAutomationEnginePresentation() {
+    const input = $("#agent-automation-engine-input");
+    const profile = app.agentEngineProfiles?.get(input.value) || {};
+    const semanticOnly = input.value === "uiautomator2";
+    const hybrid = input.value === "hybrid";
+    $("#agent-automation-engine-hint").textContent = String(
+      profile.available === false
+        ? (profile.detail || "uiautomator2 依赖不可用")
+        : (profile.description || profile.detail || (
+          semanticOnly
+            ? "模型读取语义控件树并按 revision 绑定的元素编号操作；截图仅用于运行证据。"
+            : hybrid
+              ? "模型同时读取前后截图与控件树；语义元素缺失时可使用视觉坐标。"
+              : "模型比较前后 ADB 截图并使用归一化坐标操作。"
+        ))
+    );
+    $("#agent-model-input").placeholder = semanticOnly
+      ? "支持文本与工具调用的模型名称"
+      : "支持图像与工具调用的模型名称";
+    refreshAgentModelSummary();
+  }
+
   function applyAgentProviderPresentation({ replaceDefaults = false } = {}) {
     const provider = $("#agent-model-provider-input").value;
     const profile = app.agentProviderProfiles.get(provider) || {};
@@ -5472,6 +5970,7 @@
     const apiInput = $("#agent-api-base-input");
     const modelInput = $("#agent-model-input");
     const keyModeInput = $("#agent-api-key-mode-input");
+    const thinkingModeInput = $("#agent-thinking-mode-input");
     if (replaceDefaults) {
       const endpointIsPreviousDefault = !apiInput.value.trim()
         || apiInput.value.trim() === String(previous.default_api_base_url || "");
@@ -5482,9 +5981,16 @@
       }
       if (modelIsPreviousDefault) modelInput.value = String(profile.default_model || "");
       keyModeInput.value = String(profile.default_api_key_mode || "bearer");
+      thinkingModeInput.value = String(profile.default_thinking_mode || "auto");
     }
+    thinkingModeInput.disabled = provider !== "openai_compatible";
     apiInput.placeholder = String(profile.api_placeholder || "填写模型 API 地址或完整端点");
-    modelInput.placeholder = String(profile.model_placeholder || "支持图像与工具调用的模型名称");
+    modelInput.placeholder = String(
+      profile.model_placeholder
+      || ($("#agent-automation-engine-input").value === "uiautomator2"
+        ? "支持文本与工具调用的模型名称"
+        : "支持图像与工具调用的模型名称")
+    );
     $("#agent-model-provider-hint").textContent = String(
       profile.description || "选择模型供应商使用的多模态工具调用协议。"
     );
@@ -5492,7 +5998,46 @@
       ? "本地模型可留空"
       : "仅保留在当前进程内存";
     app.agentPresentedProvider = provider;
-    refreshAgentModelSummary();
+    applyAgentAutomationEnginePresentation();
+  }
+
+  function renderAgentWorkflowReport(agent) {
+    const report = $("#agent-workflow-report");
+    if (!report) return;
+    const tasks = Array.isArray(agent.tasks) ? agent.tasks : [];
+    const results = Array.isArray(agent.task_results) ? agent.task_results : [];
+    if (agent.running || !results.length) {
+      report.hidden = true;
+      return;
+    }
+    const completed = results.filter(item => item.status === "completed").length;
+    const skipped = results.filter(item => item.status === "skipped").length;
+    const failedResults = results.filter(item => !["completed", "skipped"].includes(String(item.status || "")));
+    const pending = Math.max(0, tasks.length - results.length);
+    const configurationWorkflow = String(agent.workflow_name || "").includes("手机配置检查")
+      || tasks.some(task => /^(?:A[0-3]|B)\./.test(String(task.name || "")));
+    const statusLabels = {
+      skipped: "已跳过",
+      timeout: "已超时",
+      max_steps: "步骤耗尽",
+      take_over: "人工接管",
+      stopped: "已停止",
+      error: "运行失败",
+    };
+    report.hidden = false;
+    report.className = `agent-workflow-report ${failedResults.length ? "failed" : skipped ? "warning" : "completed"}`;
+    $("#agent-workflow-report-title").textContent = configurationWorkflow ? "手机配置检查统一汇总" : "任务统一汇总";
+    $("#agent-workflow-report-state").textContent = failedResults.length
+      ? "NEEDS ATTENTION"
+      : skipped ? "COMPLETED WITH SKIPS" : "COMPLETED";
+    $("#agent-workflow-report-completed").textContent = String(completed);
+    $("#agent-workflow-report-skipped").textContent = String(skipped);
+    $("#agent-workflow-report-failed").textContent = String(failedResults.length);
+    $("#agent-workflow-report-pending").textContent = String(pending);
+    const issues = results.filter(item => item.status !== "completed");
+    $("#agent-workflow-report-reason-list").innerHTML = issues.length
+      ? issues.map(item => `<li class="${escapeHtml(String(item.status || "unknown"))}"><strong>${escapeHtml(item.name || `检查项 ${item.index || ""}`)}</strong><em>${escapeHtml(statusLabels[item.status] || String(item.status || "未完成"))}</em><span>${escapeHtml(item.message || "未提供原因")}</span></li>`).join("")
+      : "<li class=\"completed\"><strong>全部检查项</strong><em>已完成</em><span>没有跳过或未完成项目。</span></li>";
   }
 
   function renderAgentTaskResults(agent) {
@@ -5502,8 +6047,9 @@
     const container = $("#agent-task-results");
     const summary = $("#agent-task-progress-summary");
     if (!tasks.length) {
-      container.innerHTML = '<div class="agent-log-empty">编排任务后启动流程</div>';
+      container.innerHTML = '<div class="agent-log-empty">配置任务后启动流程</div>';
       summary.textContent = "尚未启动流程";
+      renderAgentWorkflowReport(agent);
       return;
     }
     const currentIndex = Number(agent.task_index || 0);
@@ -5511,6 +6057,7 @@
       pending: "等待执行",
       running: "执行中",
       completed: "已完成",
+      skipped: "已跳过",
       timeout: "已超时",
       max_steps: "步骤耗尽",
       take_over: "人工接管",
@@ -5533,25 +6080,415 @@
       return `<article class="agent-task-result ${escapeHtml(taskStatus)}"><i>${index}</i><div><strong>${escapeHtml(task.name || `任务 ${index}`)}</strong><p>${escapeHtml(message || "")}</p><small>${escapeHtml(details)}</small></div><em>${escapeHtml(statusLabels[taskStatus] || taskStatus)}</em></article>`;
     }).join("");
     const completed = results.filter(item => item.status === "completed").length;
+    const skipped = results.filter(item => item.status === "skipped").length;
+    const failed = results.filter(item => !["completed", "skipped"].includes(String(item.status || ""))).length;
     summary.textContent = agent.running
       ? `执行第 ${currentIndex || 1} / ${tasks.length} 项 · 已完成 ${completed} 项`
-      : `已结束 ${results.length} / ${tasks.length} 项 · 通过 ${completed} 项`;
+      : `已结束 ${results.length} / ${tasks.length} 项 · 完成 ${completed} · 跳过 ${skipped} · 未完成 ${failed}`;
+    renderAgentWorkflowReport(agent);
+  }
+
+  function agentSoftwareStatusPresentation(status) {
+    return {
+      verified: ["已通过", "verified"],
+      installed: ["已安装", "verified"],
+      running: ["验证中", "running"],
+      pending_validation: ["待正式检验", "pending"],
+      needs_attention: ["需人工", "attention"],
+      missing: ["未安装", "missing"],
+      failed: ["未通过", "failed"],
+      stopped: ["已停止", "stopped"],
+      not_checked: ["未检验", "not-checked"],
+    }[String(status || "not_checked")] || [String(status || "--"), "not-checked"];
+  }
+
+  const agentSoftwareCategoryProfiles = {
+    all: {
+      kicker: "ALL SOFTWARE",
+      title: "全部应用与游戏",
+      description: "查看所有已适配软件，以及与各自来源匹配的安装操作。",
+      matches: () => true,
+    },
+    app: {
+      kicker: "APPLICATIONS",
+      title: "通用应用",
+      description: "浏览器、办公、资讯、地图与工具类应用。",
+      matches: item => item.software_type !== "game",
+    },
+    game: {
+      kicker: "GAMES",
+      title: "游戏",
+      description: "已经配置安全主玩法验证流程的游戏。",
+      matches: item => item.software_type === "game",
+    },
+    project: {
+      kicker: "PROJECT PACKAGES",
+      title: "项目安装包",
+      description: "从项目归档的 APK / APKS 安装固定测试版本。",
+      matches: item => item.install_mode === "project",
+    },
+    app_store: {
+      kicker: "APP STORE",
+      title: "应用商店安装",
+      description: "由 Agent 打开设备应用商店，搜索并安装官方应用。",
+      matches: item => ["app_store", "app_store_or_official"].includes(item.install_channel),
+    },
+    official: {
+      kicker: "OFFICIAL WEBSITE",
+      title: "官网安装",
+      description: "由 Agent 仅访问配置中的官方网站并完成下载安装。",
+      matches: item => ["official_website", "app_store_or_official"].includes(item.install_channel) && Boolean(item.official_url),
+    },
+    pending: {
+      kicker: "PENDING VALIDATION",
+      title: "待正式检验",
+      description: "已完成手机烟测，等待预备阶段再次验证安装、初始化和正常流程。",
+      matches: item => item.catalog_status === "pending_validation",
+    },
+  };
+
+  function agentSoftwareAutomationRunning() {
+    const adbAgent = app.state?.adb_agent || {};
+    const campaign = app.state?.campaign || {};
+    return Boolean(
+      adbAgent.running
+      || campaign.running
+      || ["starting", "stopping"].includes(String(adbAgent.status || ""))
+      || ["starting", "stopping"].includes(String(campaign.status || ""))
+    );
+  }
+
+  function agentSoftwareAsset(item) {
+    if (app.agentSoftwareAssetsDevice !== selectedDevice()) return null;
+    return app.agentSoftwareAssets.get(String(item.package || "")) || null;
+  }
+
+  function agentSoftwareInstallationStatus(item) {
+    const asset = agentSoftwareAsset(item);
+    if (asset && typeof asset.installed === "boolean") {
+      return asset.installed ? "installed" : "missing";
+    }
+    return String(item.installation_status || "not_checked");
+  }
+
+  function agentSoftwareIconMarkup(item) {
+    const asset = agentSoftwareAsset(item);
+    const icon = String(asset?.icon_data_uri || item.icon_data_uri || "");
+    const name = String(item.name || item.package || "?");
+    if (icon.startsWith("data:image/")) {
+      return `<span class="agent-software-icon"><img src="${escapeHtml(icon)}" alt="${escapeHtml(`${name} 图标`)}" loading="lazy"></span>`;
+    }
+    return `<span class="agent-software-icon fallback" aria-label="${escapeHtml(`${name} 图标占位`)}">${escapeHtml(name.trim().slice(0, 1).toUpperCase() || "?")}</span>`;
+  }
+
+  function agentSoftwareInstallActionsMarkup(item) {
+    const packageName = String(item.package || "");
+    const installationStatus = agentSoftwareInstallationStatus(item);
+    const installed = installationStatus === "installed";
+    const automationRunning = agentSoftwareAutomationRunning();
+    const packageBusy = app.agentSoftwareInstallingPackage === packageName;
+    const actions = Array.isArray(item.install_actions) && item.install_actions.length
+      ? item.install_actions.map(String)
+      : item.install_mode === "project"
+        ? ["project"]
+        : [String(item.install_channel || "app_store")];
+    const buttons = actions.map(action => {
+      const missingProject = action === "project" && item.source_available === false;
+      const disabled = automationRunning || packageBusy || missingProject || (action === "project" && installed);
+      let label = "安装";
+      if (packageBusy) label = "正在启动安装…";
+      else if (action === "project") {
+        label = missingProject ? "项目安装包缺失" : installed ? "项目包已安装" : "从项目安装包安装";
+      } else if (action === "official_website") {
+        label = installed ? "Agent 从官网检查 / 更新" : "Agent 从官网安装";
+      } else {
+        label = installed ? "Agent 从应用商店检查 / 更新" : "Agent 从应用商店安装";
+      }
+      return `<button class="button ghost compact" type="button" data-agent-software-install="${escapeHtml(action)}" data-agent-software-package="${escapeHtml(packageName)}"${disabled ? " disabled" : ""}>${escapeHtml(label)}</button>`;
+    }).join("");
+    return `<div class="agent-software-install-actions"><span>安装操作</span>${buttons || "<em>当前没有可用安装方式</em>"}</div>`;
+  }
+
+  function agentSoftwareCardMarkup(item) {
+    const validation = agentSoftwareStatusPresentation(item.validation_status);
+    const installation = agentSoftwareStatusPresentation(agentSoftwareInstallationStatus(item));
+    const setup = agentSoftwareStatusPresentation(item.setup_status);
+    const normalFlow = agentSoftwareStatusPresentation(item.normal_flow_status);
+    const engineLabels = (Array.isArray(item.supported_engines) ? item.supported_engines : [])
+      .map(engine => app.agentEngineProfiles?.get(String(engine))?.label || String(engine))
+      .join(" / ") || "未声明";
+    const typeLabel = item.software_type === "game" ? "游戏" : "应用";
+    const modeLabel = item.install_mode === "project"
+      ? "项目安装包"
+      : item.install_channel === "app_store"
+        ? "应用商店"
+        : item.install_channel === "official_website"
+          ? "官方网站"
+          : "应用商店 / 官网";
+    const source = item.install_source || item.source_path || modeLabel;
+    const sourceState = item.install_mode === "project" && item.source_available === false
+      ? " · 项目文件缺失"
+      : "";
+    const catalogPending = item.catalog_status === "pending_validation";
+    const headline = catalogPending
+      ? agentSoftwareStatusPresentation("pending_validation")
+      : validation;
+    const official = item.official_url
+      ? `<div><dt>官方网站</dt><dd>${escapeHtml(item.official_url)}</dd></div>`
+      : "";
+    return `<article class="agent-software-card ${escapeHtml(headline[1])}" data-agent-software-package-card="${escapeHtml(item.package || "")}">
+      <header><div class="agent-software-identity">${agentSoftwareIconMarkup(item)}<div><small>${escapeHtml(typeLabel)} · ${escapeHtml(modeLabel)}</small><strong>${escapeHtml(item.name || item.package || "未命名软件")}</strong></div></div><em class="${escapeHtml(headline[1])}">${escapeHtml(headline[0])}</em></header>
+      <p>${escapeHtml(item.description || "已配置安装、初始化和正常测试流程。")}</p>
+      <div class="agent-software-stage-grid">
+        <span class="${escapeHtml(installation[1])}"><small>安装</small><strong>${escapeHtml(installation[0])}</strong></span>
+        <span class="${escapeHtml(setup[1])}"><small>初始化</small><strong>${escapeHtml(setup[0])}</strong></span>
+        <span class="${escapeHtml(normalFlow[1])}"><small>正常流程</small><strong>${escapeHtml(normalFlow[0])}</strong></span>
+      </div>
+      <dl><div><dt>安装来源</dt><dd>${escapeHtml(`${source}${sourceState}`)}</dd></div>${official}<div><dt>支持引擎</dt><dd>${escapeHtml(engineLabels)}</dd></div></dl>
+      ${agentSoftwareInstallActionsMarkup(item)}
+      <footer><code>${escapeHtml(item.package || "--")}</code><span>${item.required ? "必检" : "可选"}</span></footer>
+      <small class="agent-software-message">${escapeHtml(item.validation_message || "尚未运行预备验证")}</small>
+    </article>`;
+  }
+
+  function readyAgentSoftwareDevice() {
+    const device = selectedDevice();
+    const selected = (app.state?.devices || []).find(item => item.serial === device);
+    return selected && devicePlatform(selected) === "android" && selected.state === "device"
+      ? device
+      : "";
+  }
+
+  async function loadAgentSoftwareAssets(catalog, { force = false, notifyFailure = false } = {}) {
+    const items = Array.isArray(catalog?.items) ? catalog.items : [];
+    const device = readyAgentSoftwareDevice();
+    if (!device || !items.length || app.agentSoftwareAssetsLoading) return null;
+    const packages = items.map(item => String(item.package || "")).filter(Boolean).sort();
+    const signature = `${device}|${packages.join("|")}`;
+    if (!force && app.agentSoftwareAssetsSignature === signature) return null;
+    if (app.agentSoftwareAssetsDevice !== device) {
+      app.agentSoftwareAssets = new Map();
+      app.agentSoftwareAssetsDevice = device;
+    }
+    app.agentSoftwareAssetsLoading = true;
+    app.agentSoftwareAssetsSignature = signature;
+    const refreshButton = $("#agent-software-refresh-button");
+    if (refreshButton) {
+      refreshButton.disabled = true;
+      refreshButton.textContent = "正在读取图标与安装状态…";
+    }
+    try {
+      const result = await api("/api/campaign/software/assets", {
+        method: "POST",
+        body: JSON.stringify({ device, packages }),
+      });
+      (Array.isArray(result.assets) ? result.assets : []).forEach(asset => {
+        const packageName = String(asset.package || "");
+        if (packageName) app.agentSoftwareAssets.set(packageName, asset);
+      });
+      return result;
+    } catch (error) {
+      if (notifyFailure) notify("无法刷新软件图标", error.message, "error", 8000);
+      return null;
+    } finally {
+      app.agentSoftwareAssetsLoading = false;
+      renderAgentSoftwareCatalog(catalog);
+    }
+  }
+
+  function agentSoftwareInstallTask(item, action) {
+    const name = String(item.name || item.package || "目标应用");
+    const packageName = String(item.package || "");
+    const catalog = app.state?.campaign?.software_catalog || {};
+    const storePackage = String(catalog.store_package || "");
+    const prompt = action === "official_website"
+      ? `启动浏览器并只打开配置中的官方页面 ${item.official_url}。确认页面属于 ${name} 官方站点后，下载官方 Android 安装包并通过系统安装器安装；安装后确认包 ${packageName} 已可打开再 finish。`
+      : `启动当前设备自带应用商店${storePackage ? `（包 ${storePackage}）` : ""}，搜索“${name}”并核对官方应用名称和开发者。完成安装或官方更新后，确认包 ${packageName} 已可打开再 finish。`;
+    return defaultAgentTask({
+      id: `software-install-${Date.now()}`,
+      name: `${name} 安装`,
+      prompt,
+      attention_prompt: `只安装目标包 ${packageName}。不得登录、输入手机号或验证码、实名、支付、安装推荐应用或从第三方下载站获取 APK；遇到 Google Play、Play Games 或 GMS 页面直接 take_over。`,
+      max_steps: 60,
+      timeout_s: 1800,
+      on_failure: "stop",
+    });
+  }
+
+  async function installAgentSoftware(item, action) {
+    const device = readyAndroidAgentDevice();
+    if (!device) return;
+    const packageName = String(item.package || "");
+    app.agentSoftwareInstallingPackage = packageName;
+    renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
+    if (action === "project") {
+      try {
+        const result = await api("/api/campaign/software/install", {
+          method: "POST",
+          body: JSON.stringify({ device, package: packageName }),
+        });
+        if (result.succeeded !== true) {
+          throw new Error(result.error || result.output || "ADB 安装未成功");
+        }
+        const currentAsset = app.agentSoftwareAssets.get(packageName) || { package: packageName };
+        app.agentSoftwareAssets.set(packageName, { ...currentAsset, installed: true });
+        notify(
+          result.already_installed ? "项目软件已经安装" : "项目安装包安装完成",
+          `${item.name || packageName} · ${packageName}`,
+          "success",
+          6000,
+        );
+        app.agentSoftwareAssetsSignature = "";
+      } catch (error) {
+        notify("项目安装包安装失败", error.message, "error", 9000);
+      } finally {
+        app.agentSoftwareInstallingPackage = "";
+        renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
+        void loadAgentSoftwareAssets(app.state?.campaign?.software_catalog || {}, { force: true });
+      }
+      return;
+    }
+
+    const result = await startAgentExecution({
+      device,
+      tasks: [agentSoftwareInstallTask(item, action)],
+      workflowName: `安装 ${item.name || packageName}`,
+      temporary: true,
+    });
+    if (result) {
+      app.agentSoftwareInstallSessionId = String(result.session_id || "");
+    } else {
+      app.agentSoftwareInstallingPackage = "";
+      renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
+    }
+  }
+
+  function renderAgentSoftwareCatalog(catalog) {
+    const items = Array.isArray(catalog?.items) ? catalog.items : [];
+    const category = agentSoftwareCategoryProfiles[app.agentSoftwareCategory]
+      ? app.agentSoftwareCategory
+      : "all";
+    app.agentSoftwareCategory = category;
+    const profile = agentSoftwareCategoryProfiles[category];
+    const search = String($("#agent-software-search-input")?.value || "").trim().toLowerCase();
+    const categoryItems = items.filter(profile.matches);
+    const visible = categoryItems.filter(item => !search || [
+      item.name,
+      item.package,
+      item.install_source,
+      item.install_channel,
+      item.official_url,
+      item.description,
+      ...(Array.isArray(item.supported_engines) ? item.supported_engines : []),
+    ].some(value => String(value || "").toLowerCase().includes(search)));
+    const list = $("#agent-software-catalog-list");
+    if (list) {
+      list.innerHTML = visible.length
+        ? visible.map(agentSoftwareCardMarkup).join("")
+        : `<div class="agent-software-list-empty">${escapeHtml(search ? "当前分类没有匹配的软件" : "当前分类没有软件")}</div>`;
+    }
+    $$("[data-agent-software-category]").forEach(button => {
+      const key = String(button.dataset.agentSoftwareCategory || "all");
+      const active = key === category;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    $$("[data-agent-software-count]").forEach(element => {
+      const key = String(element.dataset.agentSoftwareCount || "all");
+      const definition = agentSoftwareCategoryProfiles[key] || agentSoftwareCategoryProfiles.all;
+      element.textContent = String(items.filter(definition.matches).length);
+    });
+    $("#agent-software-browser-kicker").textContent = profile.kicker;
+    $("#agent-software-browser-title").textContent = profile.title;
+    $("#agent-software-browser-description").textContent = profile.description;
+    $("#agent-software-browser-count").textContent = search
+      ? `${visible.length} / ${categoryItems.length} 项`
+      : `${visible.length} 项`;
+    $("#agent-software-total").textContent = String(catalog?.total ?? items.length);
+    $("#agent-software-project-count").textContent = String(catalog?.project_count ?? 0);
+    $("#agent-software-external-count").textContent = String(catalog?.external_count ?? 0);
+    $("#agent-software-verified-count").textContent = String(catalog?.verified_count ?? 0);
+    $("#agent-software-failed-count").textContent = `${catalog?.failed_count ?? 0} 项待处理`;
+    $("#agent-software-pending-count").textContent = String(catalog?.pending_count ?? 0);
+    $("#agent-config-tab-software-meta").textContent = catalog?.available === false
+      ? "目录不可用"
+      : `${catalog?.total ?? items.length} 项软件`;
+    const refreshButton = $("#agent-software-refresh-button");
+    if (refreshButton) {
+      refreshButton.disabled = (
+        app.agentSoftwareAssetsLoading
+        || !readyAgentSoftwareDevice()
+        || agentSoftwareAutomationRunning()
+      );
+      refreshButton.textContent = app.agentSoftwareAssetsLoading
+        ? "正在读取图标与安装状态…"
+        : "刷新图标与安装状态";
+    }
+
+    const run = catalog?.validation_run || {};
+    const runStatus = String(run.status || "not_checked");
+    const runPresentation = {
+      running: "预备验证运行中",
+      completed: "最近预备验证已完成",
+      completed_with_warnings: "最近预备验证有待处理项",
+      failed: "最近预备验证未通过",
+      operator_stopped: "最近预备验证已停止",
+      device_unavailable: "最近验证时设备不可用",
+      device_locked: "最近验证时设备被锁定",
+      not_checked: "尚未运行预备验证",
+    }[runStatus] || `最近预备验证：${runStatus}`;
+    $("#agent-software-validation-title").textContent = runPresentation;
+    const timestamp = Number(run.finished_at || run.started_at || 0);
+    const timeText = timestamp
+      ? new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false })
+      : "暂无运行时间";
+    $("#agent-software-validation-detail").textContent = runStatus === "running"
+      ? `${timeText} 开始 · 当前按安装、初始化、Qwen 正常 workflow 三层验证`
+      : `${timeText} · 只有 Qwen 正常测试流程完成才标记为已通过`;
+    $("#agent-software-validation").className = `agent-software-validation ${escapeHtml(runStatus)}`;
+    void loadAgentSoftwareAssets(catalog);
   }
 
   function renderAdbAgent(state) {
-    const agent = state?.adb_agent || {};
-    const defaults = agent.defaults || {};
+    const adbAgent = state?.adb_agent || {};
+    const campaign = state?.campaign || {};
+    const automationSurface = state?.automation_surface === "campaign" ? "campaign" : "agent";
+    const agent = automationSurface === "campaign" ? campaign : adbAgent;
+    const defaults = adbAgent.defaults || {};
     const sessionSource = agent.session_id ? agent : defaults;
     app.agentDefaultSystemPrompt = String(defaults.system_prompt || app.agentDefaultSystemPrompt || "");
     app.agentDefaultSystemPromptVersion = String(
       defaults.system_prompt_version || app.agentDefaultSystemPromptVersion || "内置规则"
     );
     populateAgentTaskTemplates(defaults.task_templates);
+    populateAgentAutomationEngines(defaults.automation_engines);
     populateAgentModelProviders(defaults.model_providers);
+    const installAgentStatus = String(adbAgent.status || "idle");
+    if (
+      app.agentSoftwareInstallSessionId
+      && String(adbAgent.session_id || "") === app.agentSoftwareInstallSessionId
+      && ["completed", "completed_with_warnings", "stopped", "take_over", "task_failed", "max_steps", "error"].includes(installAgentStatus)
+    ) {
+      app.agentSoftwareInstallSessionId = "";
+      app.agentSoftwareInstallingPackage = "";
+      app.agentSoftwareAssetsSignature = "";
+    }
+    renderAgentSoftwareCatalog(campaign.software_catalog || {});
+    const editorSessionId = agent.session_id
+      ? `${automationSurface}:${String(agent.session_id)}`
+      : "";
     const agentSessionChanged = Boolean(
-      agent.session_id && String(agent.session_id) !== app.agentEditorSessionId
+      editorSessionId && editorSessionId !== app.agentEditorSessionId
     );
-    if (!app.agentDefaultsApplied || agentSessionChanged) {
+    const temporarySession = Boolean(
+      automationSurface === "agent"
+      && editorSessionId
+      && (agent.temporary_task === true || editorSessionId === app.agentTemporarySessionId)
+    );
+    if (agentSessionChanged && temporarySession) {
+      app.agentEditorSessionId = editorSessionId;
+    }
+    if (!app.agentDefaultsApplied || (agentSessionChanged && !temporarySession)) {
       const useStoredDefaults = !agent.session_id;
       const storedValue = (key, fallback) => (
         useStoredDefaults
@@ -5565,6 +6502,14 @@
       $("#agent-model-provider-input").value = app.agentProviderProfiles.has(requestedProvider)
         ? requestedProvider
         : String(defaults.model_provider || "openai_compatible");
+      const requestedEngine = storedValue(
+        "mobile-profiler-agent-automation-engine",
+        sessionSource.automation_engine || defaults.automation_engine || "vision",
+      );
+      const requestedEngineProfile = app.agentEngineProfiles?.get(requestedEngine);
+      $("#agent-automation-engine-input").value = requestedEngineProfile?.available !== false
+        ? requestedEngine
+        : String(defaults.automation_engine || "vision");
       $("#agent-api-base-input").value = storedValue(
         "mobile-profiler-agent-api-base",
         sessionSource.api_base_url,
@@ -5585,20 +6530,52 @@
         "mobile-profiler-agent-api-key-mode",
         sessionSource.api_key_mode || defaults.api_key_mode || "bearer",
       );
+      $("#agent-thinking-mode-input").value = storedValue(
+        "mobile-profiler-agent-thinking-mode",
+        sessionSource.model_thinking_mode || defaults.model_thinking_mode || "auto",
+      );
       applyAgentProviderPresentation();
       $("#agent-workflow-name-input").value = String(sessionSource.workflow_name || "ADB 测试流程");
-      $("#agent-system-prompt-input").value = String(sessionSource.system_prompt || defaults.system_prompt || "");
-      const systemPromptVersion = String(
-        sessionSource.system_prompt_version || defaults.system_prompt_version || "custom"
+      const storedSystemPrompt = useStoredDefaults
+        ? localStorage.getItem(agentSystemPromptStorageKey)
+        : null;
+      const editorSystemPrompt = String(
+        storedSystemPrompt !== null
+          ? storedSystemPrompt
+          : (sessionSource.system_prompt || defaults.system_prompt || "")
       );
-      $("#agent-system-prompt-version").textContent = `${systemPromptVersion} · 坐标协议、动作边界与安全规则`;
-      refreshAgentPromptSummary(systemPromptVersion);
+      $("#agent-system-prompt-input").value = editorSystemPrompt;
+      app.agentSavedSystemPrompt = normalizeAgentSystemPrompt(editorSystemPrompt);
+      refreshAgentSystemPromptVersion();
       const sessionTasks = Array.isArray(agent.tasks) && agent.tasks.length
         ? agent.tasks
         : (agent.task ? [defaultAgentTask({ name: "任务 1", prompt: agent.task, max_steps: agent.max_steps })] : []);
       renderAgentTaskEditor(sessionTasks);
+      if (agentSessionChanged && automationSurface === "campaign") {
+        const campaignTemplate = (defaults.task_templates || []).find(item => (
+          item.kind === "campaign" && String(item.campaign_stage) === String(agent.campaign_stage)
+        ));
+        setAgentTemplateMode(campaignTemplate || {
+          kind: "campaign",
+          campaign_stage: agent.campaign_stage,
+          id: `campaign-${agent.campaign_stage || "stage"}`,
+        });
+        $("#agent-loop-workflow-input").checked = Boolean(agent.loop_enabled);
+        refreshAgentTaskOrder();
+        $("#agent-task-template-select").value = String(campaignTemplate?.id || "");
+      } else if (agentSessionChanged) {
+        setAgentTemplateMode(agentTemplateById(app.agentSelectedTemplateId));
+      } else if (!agent.session_id && !app.agentTemplateInitialized) {
+        const templates = [...app.agentServerTemplates, ...app.agentCustomTemplates];
+        const initialTemplate = agentTemplateById(app.agentSelectedTemplateId)
+          || templates.find(item => item.kind === "campaign")
+          || templates[0];
+        if (initialTemplate) applyAgentTemplate(initialTemplate);
+        app.agentTemplateInitialized = true;
+      }
       app.agentDefaultsApplied = true;
-      app.agentEditorSessionId = String(agent.session_id || "");
+      app.agentEditorSessionId = editorSessionId;
+      setAgentPromptDirty(false);
     }
 
     const status = String(agent.status || "idle");
@@ -5643,13 +6620,24 @@
     $("#agent-current-task-value").textContent = agent.current_task?.name || "尚未开始";
     $("#agent-step-value").textContent = `${agent.step || 0} / ${agent.max_steps || defaults.max_steps || 0}`;
     $("#agent-phase-value").textContent = String(agent.phase || "idle").toUpperCase();
+    $("#agent-launch-current-task").textContent = agent.current_task?.name || "尚未开始";
+    $("#agent-launch-task-position").textContent = `${agent.task_index || 0} / ${agent.task_count || 0}`;
+    $("#agent-launch-current-step").textContent = `${agent.step || 0} / ${agent.max_steps || defaults.max_steps || 0}`;
+    $("#agent-launch-step-state").textContent = String(agent.phase || "idle").toUpperCase();
+    $("#agent-launch-state").textContent = statusPresentation[0];
+    $("#agent-launch-state").className = status;
+    $("#agent-launch-progress-detail").textContent = status === "idle"
+      ? "选择 Android 设备和任务后即可开始。"
+      : statusPresentation[1];
     const activeProvider = String(agent.model_provider || defaults.model_provider || "openai_compatible");
     const activeProviderLabel = app.agentProviderProfiles.get(activeProvider)?.label || activeProvider;
+    const activeEngine = String(agent.automation_engine || defaults.automation_engine || "vision");
+    const activeEngineLabel = app.agentEngineProfiles?.get(activeEngine)?.label || activeEngine;
     $("#agent-model-value").textContent = agent.model || defaults.model || "--";
-    $("#agent-model-value").title = activeProviderLabel;
+    $("#agent-model-value").title = `${activeEngineLabel} · ${activeProviderLabel}`;
     $("#agent-latency-value").textContent = finite(agent.latest_request_s)
       ? `最近 ${Number(agent.latest_request_s).toFixed(1)} 秒`
-      : `${activeProviderLabel} · 等待请求`;
+      : `${activeEngineLabel} · ${activeProviderLabel}`;
     $("#agent-token-value").textContent = `${agent.prompt_tokens || 0} / ${agent.completion_tokens || 0}`;
     $("#agent-elapsed-value").textContent = formatDuration(agent.elapsed_s || 0);
     $("#agent-device-value").textContent = agent.device || selectedDevice() || "未选择设备";
@@ -5695,7 +6683,9 @@
       && selected.state === "device"
     );
     const running = Boolean(agent.running || ["starting", "stopping"].includes(status));
+    const campaignPreview = Boolean(app.agentCampaignStage);
     $("#agent-start-button").disabled = running || !androidReady;
+    if (!running) $("#agent-start-button").textContent = agentCampaignStartLabel();
     $("#agent-start-button").title = androidReady
       ? ""
       : "请先在右上角选择已授权的 Android ADB 设备";
@@ -5704,12 +6694,23 @@
       if (control.tagName === "DETAILS") {
         control.classList.toggle("disabled", running);
       } else {
-        control.disabled = running;
+        const fixedSinglePassLoop = (
+          control.id === "agent-loop-workflow-input"
+          && app.agentCampaignStage !== "test"
+        );
+        control.disabled = running || fixedSinglePassLoop;
       }
     });
-    $$("#agent-add-task-button, #agent-add-template-button, #agent-reset-system-prompt-button").forEach(control => {
-      control.disabled = running;
-    });
+    $("#agent-add-task-button").disabled = running || campaignPreview;
+    $("#agent-edit-template-button").disabled = running || !app.agentSelectedTemplateId;
+    $("#agent-new-template-button").disabled = running;
+    $("#agent-select-phone-configuration-button").disabled = running
+      || agentTemplateById(app.agentSelectedTemplateId)?.kind === "phone_configuration";
+    $("#agent-save-prompt-button").disabled = running;
+    $("#agent-run-temporary-task-button").disabled = running || !androidReady;
+    $("#agent-temporary-task-input").disabled = running;
+    $("#agent-reset-system-prompt-button").disabled = running;
+    $("#agent-open-preparation-button").disabled = running;
     if (running) {
       $$('[data-agent-task-action]').forEach(control => { control.disabled = true; });
     } else {
@@ -5813,6 +6814,154 @@
     };
   }
 
+  function readyAndroidAgentDevice() {
+    const device = selectedDevice();
+    const selected = (app.state?.devices || []).find(item => item.serial === device);
+    if (!device || !selected || devicePlatform(selected) !== "android" || selected.state !== "device") {
+      notify("请选择 Android ADB 设备", "AI 自动化基础闭环当前只支持已授权的 Android 设备。", "error");
+      return "";
+    }
+    return device;
+  }
+
+  function readAgentExecutionModelConfig() {
+    const apiInput = $("#agent-api-base-input");
+    const modelInput = $("#agent-model-input");
+    const invalidModelControl = [
+      apiInput,
+      $("#agent-step-delay-input"),
+      $("#agent-timeout-input"),
+    ].find(control => !control.checkValidity());
+    if (!apiInput.value.trim() || invalidModelControl) {
+      setAgentConfigTab("model");
+      notify(
+        "模型 API 配置无效",
+        apiInput.value.trim() ? "请检查 API 地址、动作等待和请求超时。" : "请填写多模态模型 API 地址。",
+        "error",
+      );
+      (invalidModelControl || apiInput).focus();
+      return null;
+    }
+    if (!modelInput.value.trim()) {
+      setAgentConfigTab("model");
+      notify("模型不能为空", "请填写支持截图理解与工具调用的多模态模型。", "error");
+      modelInput.focus();
+      return null;
+    }
+    const systemPrompt = savedAgentSystemPrompt();
+    if (!systemPrompt) {
+      setAgentConfigTab("prompt");
+      setAgentPromptTab("system");
+      notify("System Prompt 不能为空", "请恢复默认 prompt 并点击保存。", "error");
+      $("#agent-system-prompt-input").focus();
+      return null;
+    }
+    return {
+      system_prompt: systemPrompt,
+      automation_engine: $("#agent-automation-engine-input").value,
+      model_provider: $("#agent-model-provider-input").value,
+      api_base_url: apiInput.value.trim(),
+      model: modelInput.value.trim(),
+      model_thinking_mode: $("#agent-thinking-mode-input").value,
+      api_key: $("#agent-api-key-input").value,
+      api_key_mode: $("#agent-api-key-mode-input").value,
+      step_delay_s: Number($("#agent-step-delay-input").value),
+      request_timeout_s: Number($("#agent-timeout-input").value),
+    };
+  }
+
+  function rememberAgentExecutionModelConfig(payload) {
+    localStorage.setItem("mobile-profiler-agent-automation-engine", payload.automation_engine);
+    localStorage.setItem("mobile-profiler-agent-model-provider", payload.model_provider);
+    localStorage.setItem("mobile-profiler-agent-api-base", payload.api_base_url);
+    localStorage.setItem("mobile-profiler-agent-model", payload.model);
+    localStorage.setItem("mobile-profiler-agent-thinking-mode", payload.model_thinking_mode);
+    localStorage.setItem("mobile-profiler-agent-api-key-mode", payload.api_key_mode);
+    localStorage.setItem("mobile-profiler-agent-step-delay", String(payload.step_delay_s));
+    localStorage.setItem("mobile-profiler-agent-timeout", String(payload.request_timeout_s));
+  }
+
+  async function startAgentExecution({
+    device,
+    tasks,
+    workflowName,
+    campaignStage = "",
+    loopEnabled = false,
+    temporary = false,
+  }) {
+    const modelConfig = readAgentExecutionModelConfig();
+    if (!modelConfig) return null;
+    const payload = {
+      device,
+      workflow_name: workflowName,
+      tasks,
+      ...modelConfig,
+      loop_enabled: Boolean(loopEnabled),
+    };
+    if (campaignStage) payload.stage = campaignStage;
+    if (temporary) payload.temporary_task = true;
+    const startButton = $("#agent-start-button");
+    const temporaryButton = $("#agent-run-temporary-task-button");
+    startButton.disabled = true;
+    temporaryButton.disabled = true;
+    if (temporary) temporaryButton.textContent = "正在启动...";
+    else startButton.textContent = "正在启动...";
+    try {
+      const endpoint = campaignStage ? "/api/campaign/start" : "/api/ai-agent/start";
+      const result = await api(endpoint, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      rememberAgentExecutionModelConfig(payload);
+      $("#agent-api-key-input").value = "";
+      app.agentNotificationKey = "";
+      app.agentTemporarySessionId = temporary ? String(result.session_id || "") : "";
+      if (app.agentTemporarySessionId) {
+        localStorage.setItem(agentTemporarySessionStorageKey, app.agentTemporarySessionId);
+      } else {
+        localStorage.removeItem(agentTemporarySessionStorageKey);
+      }
+      app.state = campaignStage
+        ? { ...(app.state || {}), campaign: result, automation_surface: "campaign" }
+        : { ...(app.state || {}), adb_agent: result, automation_surface: "agent" };
+      renderAdbAgent(app.state);
+      const providerLabel = app.agentProviderProfiles.get(payload.model_provider)?.label
+        || payload.model_provider;
+      const engineLabel = app.agentEngineProfiles?.get(payload.automation_engine)?.label
+        || payload.automation_engine;
+      const phoneConfiguration = !temporary
+        && !campaignStage
+        && agentTemplateById(app.agentSelectedTemplateId)?.kind === "phone_configuration";
+      notify(
+        temporary
+          ? "临时任务已启动"
+          : campaignStage
+            ? (campaignStage === "prepare" ? "预备阶段已启动" : "实际测试阶段已启动")
+            : phoneConfiguration ? "手机配置检查已启动" : "ADB 测试流程已启动",
+        campaignStage === "test"
+          ? `${payload.loop_enabled ? "循环至设备关机" : "整套任务执行一遍"} · ${engineLabel} · ${providerLabel} · ${payload.model}`
+          : `${temporary ? "固定执行一次" : `${tasks.length} 个子任务`} · ${engineLabel} · ${providerLabel} · ${payload.model}`,
+        "success",
+        6000,
+      );
+      return result;
+    } catch (error) {
+      notify(
+        temporary
+          ? "无法启动临时任务"
+          : campaignStage ? "无法启动 Campaign 阶段" : "无法启动 ADB Agent",
+        error.message,
+        "error",
+        9000,
+      );
+      return null;
+    } finally {
+      startButton.textContent = agentCampaignStartLabel();
+      temporaryButton.textContent = "运行临时任务";
+      if (app.state) renderAdbAgent(app.state);
+    }
+  }
+
   function bindEvents() {
     $$(".nav-item").forEach(button => button.addEventListener("click", () => switchView(button.dataset.view)));
     $$(".platform-switch [data-platform]").forEach(button => button.addEventListener("click", () => {
@@ -5834,6 +6983,9 @@
       app.brightnessInfo = null;
       app.brightnessError = "";
       app.brightnessLoading = false;
+      app.agentSoftwareAssets = new Map();
+      app.agentSoftwareAssetsDevice = "";
+      app.agentSoftwareAssetsSignature = "";
       if (app.scannedAppsDevice && app.scannedAppsDevice !== event.target.value) {
         resetAppScanner({ clearPackage: true });
       }
@@ -5858,10 +7010,30 @@
       void applyBrightnessValue();
     });
 
+    $("#agent-automation-engine-input").addEventListener("change", () => {
+      applyAgentAutomationEnginePresentation();
+    });
     $("#agent-model-provider-input").addEventListener("change", () => {
       applyAgentProviderPresentation({ replaceDefaults: true });
     });
     $("#agent-model-input").addEventListener("input", refreshAgentModelSummary);
+    $("#agent-temporary-task-menu-button").addEventListener("click", () => {
+      const menu = $("#agent-temporary-task-menu");
+      setAgentTemporaryTaskMenu(menu.hidden, { focusInput: menu.hidden });
+    });
+    $("#agent-close-temporary-task-button").addEventListener("click", () => {
+      setAgentTemporaryTaskMenu(false, { returnFocus: true });
+    });
+    document.addEventListener("click", event => {
+      const menu = $("#agent-temporary-task-menu");
+      if (menu.hidden || event.target.closest(".agent-panel-heading-tools")) return;
+      setAgentTemporaryTaskMenu(false);
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key !== "Escape" || $("#agent-temporary-task-menu").hidden) return;
+      event.preventDefault();
+      setAgentTemporaryTaskMenu(false, { returnFocus: true });
+    });
     $$("[data-agent-config-tab]").forEach(button => {
       button.addEventListener("click", () => setAgentConfigTab(button.dataset.agentConfigTab));
       button.addEventListener("keydown", event => {
@@ -5877,21 +7049,109 @@
         $(`[data-agent-config-tab="${agentConfigTabs[nextIndex]}"]`).focus();
       });
     });
-
-    $("#agent-add-task-button").addEventListener("click", () => appendAgentTask());
-    $("#agent-add-template-button").addEventListener("click", () => {
-      const templateId = $("#agent-task-template-select").value;
-      const templates = app.state?.adb_agent?.defaults?.task_templates || [];
-      const template = templates.find(item => String(item.id) === templateId);
-      if (!template) {
-        notify("请选择任务模板", "从下拉框选择一个模板后再添加。", "warning", 4000);
+    $("#agent-software-search-input").addEventListener("input", () => {
+      renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
+    });
+    $$("[data-agent-software-category]").forEach(button => {
+      button.addEventListener("click", () => {
+        app.agentSoftwareCategory = String(button.dataset.agentSoftwareCategory || "all");
+        renderAgentSoftwareCatalog(app.state?.campaign?.software_catalog || {});
+      });
+    });
+    $("#agent-software-refresh-button").addEventListener("click", () => {
+      app.agentSoftwareAssetsSignature = "";
+      void loadAgentSoftwareAssets(
+        app.state?.campaign?.software_catalog || {},
+        { force: true, notifyFailure: true },
+      );
+    });
+    $("#agent-software-catalog-list").addEventListener("click", event => {
+      const button = event.target.closest("[data-agent-software-install]");
+      if (!button || button.disabled) return;
+      const packageName = String(button.dataset.agentSoftwarePackage || "");
+      const item = (app.state?.campaign?.software_catalog?.items || [])
+        .find(candidate => String(candidate.package || "") === packageName);
+      if (!item) {
+        notify("软件目录已变化", "请刷新页面后重新选择安装操作。", "error");
         return;
       }
-      appendAgentTask({ ...template, name: template.label || template.name || "模板任务" });
+      void installAgentSoftware(item, String(button.dataset.agentSoftwareInstall || ""));
     });
+    $("#agent-open-preparation-button").addEventListener("click", () => {
+      const template = [...app.agentServerTemplates, ...app.agentCustomTemplates]
+        .find(item => item.kind === "campaign" && item.campaign_stage === "prepare");
+      if (!template) {
+        notify("预备模板不可用", "当前服务没有提供预备阶段任务。", "error");
+        return;
+      }
+      if (app.agentPromptDirty && !confirm("当前 Prompt 有未保存修改，确认切换到预备验证任务？")) return;
+      applyAgentTemplate(template);
+      $("#agent-task-template-select").value = String(template.id || "");
+      setAgentConfigTab("workflow");
+      notify("已选择预备验证", "启动后将逐项执行安装、初始化和 Qwen 正常流程验证。", "success", 6000);
+    });
+    $("#agent-select-phone-configuration-button").addEventListener("click", () => {
+      const template = agentTemplateById("phone-configuration-endurance-5");
+      if (!template) {
+        notify("配置检查不可用", "当前服务没有提供续航测试 5.0 手机配置检查任务。", "error");
+        return;
+      }
+      if (app.agentPromptDirty && !confirm("当前 Prompt 有未保存修改，确认切换到手机配置检查？")) return;
+      applyAgentTemplate(template);
+      $("#agent-task-template-select").value = String(template.id || "");
+      setAgentConfigTab("workflow");
+      notify(
+        "已选择手机配置检查",
+        `${Array.isArray(template.tasks) ? template.tasks.length : 0} 个检查项；无法完成的项目会跳过并统一汇总原因。`,
+        "success",
+        6000,
+      );
+    });
+    $$("[data-agent-prompt-tab]").forEach(button => {
+      button.addEventListener("click", () => setAgentPromptTab(button.dataset.agentPromptTab));
+      button.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const currentIndex = agentPromptTabs.indexOf(button.dataset.agentPromptTab);
+        const nextIndex = event.key === "Home"
+          ? 0
+          : (event.key === "End"
+            ? agentPromptTabs.length - 1
+            : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + agentPromptTabs.length) % agentPromptTabs.length);
+        setAgentPromptTab(agentPromptTabs[nextIndex]);
+        $(`[data-agent-prompt-tab="${agentPromptTabs[nextIndex]}"]`).focus();
+      });
+    });
+
+    $("#agent-add-task-button").addEventListener("click", () => {
+      appendAgentTask();
+      setAgentPromptDirty(true);
+    });
+    $("#agent-loop-workflow-input").addEventListener("change", () => {
+      refreshAgentTaskOrder();
+      saveAgentLoopPreference();
+    });
+    $("#agent-workflow-name-input").addEventListener("input", () => setAgentPromptDirty(true));
+    $("#agent-task-template-select").addEventListener("change", () => {
+      const templateId = $("#agent-task-template-select").value;
+      if (app.agentPromptDirty) {
+        $("#agent-task-template-select").value = app.agentSelectedTemplateId;
+        notify("请先保存当前修改", "保存 Prompt 配置后再切换任务。", "warning", 5000);
+        setAgentConfigTab("prompt");
+        return;
+      }
+      const template = agentTemplateById(templateId);
+      if (!template) return;
+      applyAgentTemplate(template, { notifyUser: true });
+      renderAdbAgent(app.state);
+    });
+    $("#agent-new-template-button").addEventListener("click", createAgentTemplate);
+    $("#agent-edit-template-button").addEventListener("click", editCurrentAgentTemplate);
     $("#agent-task-list").addEventListener("input", event => {
       if (event.target.matches('[data-agent-task-field="name"]')) refreshAgentTaskOrder();
+      setAgentPromptDirty(true);
     });
+    $("#agent-task-list").addEventListener("change", () => setAgentPromptDirty(true));
     $("#agent-task-list").addEventListener("click", event => {
       const button = event.target.closest("[data-agent-task-action]");
       if (!button || button.disabled) return;
@@ -5905,127 +7165,105 @@
         card.remove();
       }
       refreshAgentTaskOrder();
+      setAgentPromptDirty(true);
     });
+    $("#agent-prompt-task-select").addEventListener("change", event => {
+      selectAgentTaskPrompt(event.target.value);
+    });
+    $("#agent-task-prompt-input").addEventListener("input", syncAgentTaskPromptEditor);
+    $("#agent-task-attention-input").addEventListener("input", syncAgentTaskPromptEditor);
+    $("#agent-save-prompt-button").addEventListener("click", saveAgentPromptConfiguration);
     $("#agent-reset-system-prompt-button").addEventListener("click", () => {
       $("#agent-system-prompt-input").value = app.agentDefaultSystemPrompt;
-      $("#agent-system-prompt-version").textContent = `${app.agentDefaultSystemPromptVersion} · 坐标协议、动作边界与安全规则`;
-      refreshAgentPromptSummary(app.agentDefaultSystemPromptVersion);
-      notify("已恢复默认 System Prompt", "本次启动时将使用内置 ADB 操作与安全规则。", "success", 4000);
+      refreshAgentSystemPromptVersion();
+      setAgentPromptDirty(true, "已恢复默认内容；点击保存后生效");
+      notify("已恢复默认 System Prompt", "点击保存后，模板任务和临时任务将使用内置规则。", "success", 4000);
     });
     $("#agent-system-prompt-input").addEventListener("input", () => {
-      $("#agent-system-prompt-version").textContent = "custom · 坐标协议、动作边界与安全规则";
-      refreshAgentPromptSummary();
+      refreshAgentSystemPromptVersion();
+      setAgentPromptDirty(true);
     });
 
     $("#adb-agent-form").addEventListener("submit", async event => {
       event.preventDefault();
-      const device = selectedDevice();
-      const selected = (app.state?.devices || []).find(item => item.serial === device);
-      if (!device || !selected || devicePlatform(selected) !== "android" || selected.state !== "device") {
-        notify("请选择 Android ADB 设备", "AI 自动化基础闭环当前只支持已授权的 Android 设备。", "error");
+      if (app.agentPromptDirty) {
+        setAgentConfigTab("prompt");
+        notify("Prompt 配置尚未保存", "点击保存后，修改才会用于任务启动。", "warning", 6000);
         return;
       }
+      const device = readyAndroidAgentDevice();
+      if (!device) return;
       const tasks = readAgentTasks();
       const invalidTaskControl = $$(
         '#agent-task-list input[type="number"], #agent-task-list select'
       ).find(control => !control.checkValidity());
       if (invalidTaskControl) {
-        setAgentConfigTab("workflow");
+        setAgentConfigTab("prompt");
+        setAgentPromptTab("task");
         notify("任务参数无效", "请检查子任务的步骤上限、超时时间和失败策略。", "error");
         invalidTaskControl.focus();
         return;
       }
       const missingTaskIndex = tasks.findIndex(task => !task.prompt);
       if (missingTaskIndex >= 0) {
-        setAgentConfigTab("workflow");
-        notify("任务目标不能为空", `请填写第 ${missingTaskIndex + 1} 个子任务的目标。`, "error");
-        $$("#agent-task-list .agent-task-card")[missingTaskIndex]
-          ?.querySelector('[data-agent-task-field="prompt"]')
-          ?.focus();
-        return;
-      }
-      const apiInput = $("#agent-api-base-input");
-      const modelInput = $("#agent-model-input");
-      const invalidModelControl = [
-        apiInput,
-        $("#agent-step-delay-input"),
-        $("#agent-timeout-input"),
-      ].find(control => !control.checkValidity());
-      if (!apiInput.value.trim() || invalidModelControl) {
-        setAgentConfigTab("model");
-        notify(
-          "模型 API 配置无效",
-          apiInput.value.trim() ? "请检查 API 地址、动作等待和请求超时。" : "请填写多模态模型 API 地址。",
-          "error",
-        );
-        (invalidModelControl || apiInput).focus();
-        return;
-      }
-      if (!modelInput.value.trim()) {
-        setAgentConfigTab("model");
-        notify("模型不能为空", "请填写支持截图理解与工具调用的多模态模型。", "error");
-        modelInput.focus();
-        return;
-      }
-      const systemPrompt = $("#agent-system-prompt-input").value.trim();
-      if (!systemPrompt) {
         setAgentConfigTab("prompt");
-        notify("System Prompt 不能为空", "请恢复默认 prompt 或填写自定义 ADB Agent 规则。", "error");
-        $("#agent-system-prompt-input").focus();
+        setAgentPromptTab("task");
+        selectAgentTaskPrompt(tasks[missingTaskIndex].id);
+        notify("任务目标不能为空", `请填写第 ${missingTaskIndex + 1} 个子任务的目标。`, "error");
+        $("#agent-task-prompt-input").focus();
         return;
       }
-      const payload = {
+      await startAgentExecution({
         device,
-        workflow_name: $("#agent-workflow-name-input").value.trim() || "ADB 测试流程",
         tasks,
-        system_prompt: systemPrompt,
-        model_provider: $("#agent-model-provider-input").value,
-        api_base_url: $("#agent-api-base-input").value.trim(),
-        model: $("#agent-model-input").value.trim(),
-        api_key: $("#agent-api-key-input").value,
-        api_key_mode: $("#agent-api-key-mode-input").value,
-        step_delay_s: Number($("#agent-step-delay-input").value),
-        request_timeout_s: Number($("#agent-timeout-input").value),
-      };
-      $("#agent-start-button").disabled = true;
-      $("#agent-start-button").textContent = "正在启动...";
-      try {
-        const result = await api("/api/ai-agent/start", {
-          method: "POST",
-          body: JSON.stringify(payload),
-        });
-        localStorage.setItem("mobile-profiler-agent-model-provider", payload.model_provider);
-        localStorage.setItem("mobile-profiler-agent-api-base", payload.api_base_url);
-        localStorage.setItem("mobile-profiler-agent-model", payload.model);
-        localStorage.setItem("mobile-profiler-agent-api-key-mode", payload.api_key_mode);
-        localStorage.setItem("mobile-profiler-agent-step-delay", String(payload.step_delay_s));
-        localStorage.setItem("mobile-profiler-agent-timeout", String(payload.request_timeout_s));
-        $("#agent-api-key-input").value = "";
-        app.agentNotificationKey = "";
-        app.state = { ...(app.state || {}), adb_agent: result };
-        renderAdbAgent(app.state);
-        const providerLabel = app.agentProviderProfiles.get(payload.model_provider)?.label
-          || payload.model_provider;
-        notify("ADB 测试流程已启动", `${tasks.length} 个子任务 · ${providerLabel} · ${payload.model}`, "success", 5000);
-      } catch (error) {
-        notify("无法启动 ADB Agent", error.message, "error", 9000);
-      } finally {
-        $("#agent-start-button").textContent = "启动测试流程";
-        if (app.state) renderAdbAgent(app.state);
+        workflowName: $("#agent-workflow-name-input").value.trim() || "ADB 测试流程",
+        campaignStage: app.agentCampaignStage,
+        loopEnabled: Boolean($("#agent-loop-workflow-input").checked),
+      });
+    });
+
+    $("#agent-run-temporary-task-button").addEventListener("click", async () => {
+      const device = readyAndroidAgentDevice();
+      if (!device) return;
+      const prompt = $("#agent-temporary-task-input").value.trim();
+      if (!prompt) {
+        notify("临时任务不能为空", "请直接描述这一次要在手机上完成并验证的操作。", "error");
+        $("#agent-temporary-task-input").focus();
+        return;
       }
+      const defaults = app.state?.adb_agent?.defaults || {};
+      const firstLine = prompt.split(/\r?\n/, 1)[0].trim();
+      const task = defaultAgentTask({
+        id: `temporary-${Date.now()}`,
+        name: firstLine.slice(0, 60) || "手动临时任务",
+        prompt,
+        max_steps: Number(defaults.max_steps || 30),
+        timeout_s: Number(defaults.task_timeout_s || 300),
+        on_failure: "stop",
+      });
+      const result = await startAgentExecution({
+        device,
+        tasks: [task],
+        workflowName: "手动临时任务",
+        temporary: true,
+      });
+      if (result) setAgentTemporaryTaskMenu(false);
     });
 
     $("#agent-stop-button").addEventListener("click", async () => {
       $("#agent-stop-button").disabled = true;
       try {
-        const result = await api("/api/ai-agent/stop", {
+        const campaignActive = app.state?.automation_surface === "campaign";
+        const result = await api(campaignActive ? "/api/campaign/stop" : "/api/ai-agent/stop", {
           method: "POST",
           body: "{}",
         });
-        app.state = { ...(app.state || {}), adb_agent: result };
+        app.state = campaignActive
+          ? { ...(app.state || {}), campaign: result }
+          : { ...(app.state || {}), adb_agent: result };
         renderAdbAgent(app.state);
       } catch (error) {
-        notify("停止 ADB Agent 失败", error.message, "error", 8000);
+        notify("停止自动化流程失败", error.message, "error", 8000);
       }
     });
 

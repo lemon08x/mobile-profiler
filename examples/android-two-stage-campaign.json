@@ -1,0 +1,1295 @@
+{
+  "version": 1,
+  "campaign_id": "android-general-two-hour-soak",
+  "device": "",
+  "model": {
+    "automation_engine": "vision",
+    "provider": "openai_compatible",
+    "api_base_url": "http://192.168.31.237:8000",
+    "model": "qwen3.6-27b",
+    "thinking_mode": "disabled",
+    "api_key_mode": "none",
+    "api_key_env": "MOBILE_PROFILER_MODEL_API_KEY",
+    "api_base_url_env": "MOBILE_PROFILER_MODEL_ENDPOINT",
+    "model_env": "MOBILE_PROFILER_MODEL_NAME",
+    "step_delay_s": 0.8,
+    "request_timeout_s": 60
+  },
+  "preparation": {
+    "store_package": "com.bbk.appstore",
+    "agent_poll_interval_s": 1,
+    "prompt_prefix": "这是正式测试前的设备预备阶段。用户已授权为本测试设备安装指定软件、处理指定应用的首次启动弹窗，并授予配置中逐项列出的运行时权限。每次操作后必须依据下一张截图确认状态变化，最终停在稳定主界面。",
+    "attention_prompt": "只处理当前目标应用、应用商店和系统安装器。不得登录账号、输入手机号或验证码、实名认证、支付、下单、发送消息、清除数据或授予配置未列出的权限。",
+    "settings": [
+      {
+        "namespace": "global",
+        "key": "window_animation_scale",
+        "value": "0",
+        "required": true
+      },
+      {
+        "namespace": "global",
+        "key": "transition_animation_scale",
+        "value": "0",
+        "required": true
+      },
+      {
+        "namespace": "global",
+        "key": "animator_duration_scale",
+        "value": "0",
+        "required": true
+      },
+      {
+        "namespace": "global",
+        "key": "stay_on_while_plugged_in",
+        "value": "15",
+        "required": true
+      },
+      {
+        "namespace": "global",
+        "key": "low_power",
+        "value": "0",
+        "required": false
+      },
+      {
+        "namespace": "system",
+        "key": "screen_brightness_mode",
+        "value": "0",
+        "required": true
+      },
+      {
+        "namespace": "system",
+        "key": "screen_brightness",
+        "value": "128",
+        "required": true
+      },
+      {
+        "namespace": "system",
+        "key": "screen_off_timeout",
+        "value": "600000",
+        "required": true
+      },
+      {
+        "namespace": "system",
+        "key": "accelerometer_rotation",
+        "value": "0",
+        "required": true
+      },
+      {
+        "namespace": "system",
+        "key": "user_rotation",
+        "value": "0",
+        "required": true
+      }
+    ],
+    "install_sets": [
+      {
+        "name": "SGTPuzzles portable install set",
+        "package": "name.boyle.chris.sgtpuzzles",
+        "source": "../profiler-runs/app-benchmark/exported-games/sgtpuzzles.apks",
+        "required": true,
+        "replace": true
+      },
+      {
+        "name": "Shattered Pixel Dungeon portable install set",
+        "package": "com.shatteredpixel.shatteredpixeldungeon",
+        "source": "../profiler-runs/app-benchmark/exported-games/shattered-pixel-dungeon.apks",
+        "required": true,
+        "replace": true
+      },
+      {
+        "name": "15 Puzzle project APK",
+        "package": "com.italankin.fifteen",
+        "source": "../profiler-runs/app-benchmark/github-candidates/fifteen-puzzle.apk",
+        "required": true,
+        "replace": true
+      },
+      {
+        "name": "Minesweeper Compose project APK",
+        "package": "com.jayasuryat.minesweeperjc",
+        "source": "../profiler-runs/app-benchmark/github-candidates/minesweeper-compose.apk",
+        "required": true,
+        "replace": true
+      },
+      {
+        "name": "Tetris project APK",
+        "package": "ds.tetris.android",
+        "source": "../profiler-runs/app-benchmark/github-candidates/tetris-compose.apk",
+        "required": false,
+        "replace": true
+      },
+      {
+        "name": "Super Snake project APK",
+        "package": "com.mdibaiee.supersnake",
+        "source": "../profiler-runs/app-benchmark/github-candidates/super-snake.apk",
+        "required": false,
+        "replace": true
+      },
+      {
+        "name": "AstroSmash project APK",
+        "package": "ru.exlmoto.astrosmash",
+        "source": "../profiler-runs/app-benchmark/github-candidates/astrosmash.apk",
+        "required": false,
+        "replace": true
+      }
+    ],
+    "apps": [
+      {
+        "name": "SGTPuzzles",
+        "package": "name.boyle.chris.sgtpuzzles",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apks",
+        "install_source": "项目内导出的 SGTPuzzles APKS",
+        "supported_engines": ["vision", "hybrid"],
+        "description": "离线谜题合集；使用 Light Up 可逆落子做跨机型验证。",
+        "required": true,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "puzzle-home-ready",
+            "name": "SGTPuzzles stable entry",
+            "prompt": "确认应用已进入谜题列表或现有谜题棋盘。关闭帮助或首次启动说明；不要开始求解。看到可重复进入的稳定应用界面后 finish。",
+            "max_steps": 8,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "Shattered Pixel Dungeon",
+        "package": "com.shatteredpixel.shatteredpixeldungeon",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apks",
+        "install_source": "项目内导出的 Shattered Pixel Dungeon APKS",
+        "supported_engines": ["vision", "hybrid"],
+        "description": "离线地牢游戏；通过安全相邻移动验证视觉操作。",
+        "required": true,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "dungeon-entry-ready",
+            "name": "Shattered Pixel Dungeon stable entry",
+            "prompt": "关闭首次启动提示并确认已经到达标题页、进入地牢介绍页或已有存档入口。预备阶段不要删除存档，也不要求开始战斗。看到稳定入口后 finish。",
+            "max_steps": 10,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "15 Puzzle",
+        "package": "com.italankin.fifteen",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apk",
+        "install_source": "项目内 GitHub Release APK",
+        "supported_engines": ["vision", "hybrid"],
+        "description": "Canvas 数字华容道；纯视觉最快，混合模式可作为备选。",
+        "required": true,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "fifteen-entry-ready",
+            "name": "15 Puzzle stable board",
+            "prompt": "处理旧版应用提示或暂停遮罩，确认已经看到完整 4×4 数字棋盘和一个空格。预备阶段不要移动数字、重置或新开局；稳定棋盘清晰可见后 finish。",
+            "attention_prompt": "Canvas 棋盘内部没有可靠语义格子；本任务只验证稳定入口，不进行落子。",
+            "max_steps": 10,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "Minesweeper Compose",
+        "package": "com.jayasuryat.minesweeperjc",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apk",
+        "install_source": "项目内 GitHub Release APK",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "Compose 扫雷；单格语义元素完整，三种引擎均已验证。",
+        "required": true,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "minesweeper-entry-ready",
+            "name": "Minesweeper stable entry",
+            "prompt": "确认已经进入扫雷主界面，能够看到 New game 或完整未揭开的棋盘。关闭无害说明；预备阶段不要点击任何格子或插旗。稳定入口可重复进入后 finish。",
+            "max_steps": 10,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "Tetris",
+        "package": "ds.tetris.android",
+        "catalog_status": "pending_validation",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apk",
+        "install_source": "项目内 GitHub Release APK",
+        "supported_engines": ["hybrid"],
+        "description": "Compose 俄罗斯方块；混合引擎可精确点击方向键并观察方块横向移动，等待正式复验。",
+        "required": false,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "tetris-entry-ready",
+            "name": "Tetris stable board",
+            "prompt": "确认已经进入正在运行的俄罗斯方块棋盘，能够看到活动方块、下一个方块、Level/Score 和底部左右方向键。关闭无害首次启动提示；预备阶段不要点击方向键、重开、暂停或声音。稳定棋盘清晰可见后 finish。",
+            "attention_prompt": "推荐使用视觉 + uiautomator2 混合引擎；本任务只验证稳定入口，不操作方块。",
+            "max_steps": 8,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "Super Snake",
+        "package": "com.mdibaiee.supersnake",
+        "catalog_status": "pending_validation",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apk",
+        "install_source": "项目内 GitHub Release APK",
+        "supported_engines": ["vision"],
+        "description": "离线横屏方向游戏；真机烟测已确认玩家线段转向，等待预备阶段正式复验。",
+        "required": false,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "super-snake-entry-ready",
+            "name": "Super Snake stable playfield",
+            "prompt": "关闭系统针对旧版 Android 应用的兼容性警告，确认进入横屏主玩法并看到 Points、Lives、玩家线段以及圆形或星形目标。预备阶段不要点击或滑动游戏区；稳定画面清晰可见后 finish。",
+            "attention_prompt": "只关闭兼容性提示，不要打开 About；不要把背景动画当作初始化完成前的操作目标。",
+            "max_steps": 8,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "AstroSmash",
+        "package": "ru.exlmoto.astrosmash",
+        "catalog_status": "pending_validation",
+        "software_type": "game",
+        "install_mode": "project",
+        "install_channel": "project_apk",
+        "install_source": "项目内 GitHub Release APK",
+        "supported_engines": ["vision"],
+        "description": "离线复古射击游戏；拆分进入玩法和长按移动后已真机通过，等待正式复验。",
+        "required": false,
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "astrosmash-entry-ready",
+            "name": "AstroSmash stable entry",
+            "prompt": "若出现系统切换显示设置提示，选择取消以保留当前显示模式。在 AstroSmash 设置首页不要修改复选框或分辨率，只确认 RUN ASTROSMASH! 按钮清晰可见后 finish。预备阶段不要进入游戏。",
+            "attention_prompt": "不要修改显示模式、游戏设置或高分表；只验证可重复进入的稳定设置首页。",
+            "max_steps": 8,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "OpenCalculator",
+        "package": "com.darkempire78.opencalculator",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "应用商店、F-Droid 或 OpenCalc 官方 GitHub Release",
+        "official_url": "https://github.com/Darkempire78/OpenCalc",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "开源离线计算器；真机已完成 12+7=19 与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "优先在当前设备应用商店搜索“OpenCalculator”或“OpenCalc”并安装；商店没有时，只从 https://github.com/Darkempire78/OpenCalc 官方 Release 下载 Android APK。安装后确认包 com.darkempire78.opencalculator 可以打开再 finish。",
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "opencalculator-entry-ready",
+            "name": "OpenCalculator stable entry",
+            "prompt": "处理无害的首次主题或说明弹窗，确认已进入无遮挡的计算器主界面，数字键、运算符和结果区清晰可见。预备阶段不要输入算式；稳定后 finish。",
+            "max_steps": 10,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "Fossify Calculator",
+        "package": "org.fossify.math",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "应用商店、F-Droid 或 Fossify 官方 GitHub Release",
+        "official_url": "https://github.com/FossifyOrg/Calculator",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "开源离线计算器；真机已完成 8×6=48 与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "优先在当前设备应用商店搜索“Fossify Calculator”并安装；商店没有时，只从 https://github.com/FossifyOrg/Calculator 官方 Release 下载 Android APK。安装后确认包 org.fossify.math 可以打开再 finish。",
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "fossify-calculator-entry-ready",
+            "name": "Fossify Calculator stable entry",
+            "prompt": "处理无害的首次主题说明，确认已进入无遮挡的计算器主界面，数字键、运算符和结果区清晰可见。预备阶段不要输入算式；稳定后 finish。",
+            "max_steps": 10,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "质感文件",
+        "package": "me.zhanghai.android.files",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "应用商店、F-Droid 或 Material Files 官方 GitHub Release",
+        "official_url": "https://github.com/zhanghai/MaterialFiles",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "开源文件管理器；真机已完成只读目录进入、返回与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "优先在当前设备应用商店搜索“质感文件”或“Material Files”并安装；商店没有时，只从 https://github.com/zhanghai/MaterialFiles 官方 Release 下载 Android APK。安装后确认包 me.zhanghai.android.files 可以打开再 finish。",
+        "allow_terms_acceptance": false,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "material-files-entry-ready",
+            "name": "Material Files stable entry",
+            "prompt": "启动质感文件并完成文件浏览所需的初始化。如果跳到系统“管理所有文件”页面，必须点击右侧开关本体将“允许管理所有文件”设为开启，再按返回回到质感文件；不要反复点击文字行中心。确认内部存储目录列表可见后 finish，不要打开、修改、移动或删除文件。",
+            "attention_prompt": "只允许为 me.zhanghai.android.files 开启管理本机文件权限；禁止云登录、删除、改名、移动、上传或打开文件内容。",
+            "max_steps": 18,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "Microsoft Edge",
+        "package": "com.microsoft.emmx",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "手机应用商店或 Microsoft Edge 官网",
+        "official_url": "https://www.microsoft.com/edge/download",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用浏览器；真机已完成 example.org 页面加载与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“Microsoft Edge”并安装；商店没有时，只从 https://www.microsoft.com/edge/download 官方页面下载。安装后确认包 com.microsoft.emmx 可以打开再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "edge-public-browser-ready",
+            "name": "Microsoft Edge stable entry",
+            "prompt": "处理首次启动条款，选择不登录、不导入、不设为默认浏览器、不发送可选诊断，通知权限选择禁止。最终停在可用的新标签页或公开网页；地址栏可交互后 finish。",
+            "attention_prompt": "禁止账号登录、同步、设为默认浏览器、导入数据、下载文件或提交表单。",
+            "max_steps": 24,
+            "timeout_s": 300,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "WPS Office",
+        "package": "cn.wps.moffice_eng",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "手机应用商店或 WPS Office 官网",
+        "official_url": "https://www.wps.com/office/android/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用办公套件；真机已完成临时文字文档编辑、不保存退出与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“WPS Office”并安装；商店没有时，只从 https://www.wps.com/office/android/ 官方页面下载。安装后确认包 cn.wps.moffice_eng 可以打开再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "wps-local-home-ready",
+            "name": "WPS Office stable entry",
+            "prompt": "接受必要使用条款，拒绝通知、个性化广告和可选诊断，关闭引导并跳过登录。为本地文档所需时可允许普通文件访问；最终停在能看到“空白文档”入口的 WPS 首页后 finish。",
+            "attention_prompt": "禁止登录、云同步、上传、会员购买和修改现有文件；预备阶段不要创建文档。",
+            "max_steps": 24,
+            "timeout_s": 300,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "百度",
+        "package": "com.baidu.searchbox",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://mo.baidu.com/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开推荐流；真机已完成两次滚动、内容变化与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“百度”，确认官方百度应用后安装。安装完成并能打开包 com.baidu.searchbox 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "baidu-public-home-ready",
+            "name": "百度公开首页准备",
+            "prompt": "处理首次协议、通知、定位和功能介绍；通知与定位选择禁止，不登录。最终停在免登录可浏览的公开推荐首页后 finish。",
+            "attention_prompt": "禁止登录、搜索、打开详情、消息、购买或授予敏感权限。",
+            "max_steps": 18,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "知乎",
+        "package": "com.zhihu.android",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://www.zhihu.com/app/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开推荐流；真机已完成两次滚动、内容变化与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“知乎”，确认知乎官方应用后安装。安装完成并能打开包 com.zhihu.android 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "zhihu-public-home-ready",
+            "name": "知乎公开首页准备",
+            "prompt": "处理首次协议、通知、兴趣引导和功能介绍；通知选择禁止，兴趣选择和登录均跳过。最终停在免登录公开推荐首页后 finish。",
+            "attention_prompt": "禁止登录、提问、回答、点赞、评论、关注、收藏、消息或授予敏感权限。",
+            "max_steps": 20,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "腾讯新闻",
+        "package": "com.tencent.news",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://news.qq.com/mobile/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开新闻流；真机已完成两次滚动、标题变化与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“腾讯新闻”，确认腾讯官方新闻应用后安装。安装完成并能打开包 com.tencent.news 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "tencent-news-public-home-ready",
+            "name": "腾讯新闻公开首页准备",
+            "prompt": "处理首次协议、通知、定位和功能介绍；通知与定位选择禁止，不登录。最终停在免登录公开新闻首页后 finish。",
+            "attention_prompt": "禁止登录、打开新闻详情、评论、收藏、分享、消息或授予敏感权限。",
+            "max_steps": 18,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "搜狐新闻",
+        "package": "com.sohu.newsclient",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://news.sohu.com/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开新闻流；真机已完成两次滚动、标题变化与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“搜狐新闻”，确认搜狐官方新闻应用后安装。安装完成并能打开包 com.sohu.newsclient 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "sohu-news-public-home-ready",
+            "name": "搜狐新闻公开首页准备",
+            "prompt": "处理首次协议、通知、定位、推送设置和功能介绍；通知与定位选择禁止，关闭推送引导，不登录。最终停在免登录公开新闻首页后 finish。",
+            "attention_prompt": "禁止登录、打开新闻详情、评论、收藏、分享、消息或授予敏感权限。",
+            "max_steps": 20,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "夸克",
+        "package": "com.quark.browser",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "手机应用商店或夸克官网",
+        "official_url": "https://www.quark.cn/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用浏览器；真机已完成百度公开首页加载与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“夸克”并安装；商店没有时，只从 https://www.quark.cn/ 官方页面下载。安装后确认包 com.quark.browser 可以打开再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "quark-public-browser-ready",
+            "name": "夸克公开浏览准备",
+            "prompt": "处理首次启动条款，选择不登录、不设为默认、不导入，通知与定位选择禁止。最终停在地址栏可交互的新标签页或公开网页后 finish。",
+            "attention_prompt": "禁止账号登录、同步、设为默认、导入、下载、提交表单或点击广告。",
+            "max_steps": 22,
+            "timeout_s": 300,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "UC浏览器",
+        "package": "com.UCMobile",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "手机应用商店或 UC 浏览器官网",
+        "official_url": "https://www.uc.cn/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用浏览器；真机已完成百度公开首页加载与回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“UC浏览器”并安装；商店没有时，只从 https://www.uc.cn/ 官方页面下载。安装后确认包 com.UCMobile 可以打开再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "uc-public-browser-ready",
+            "name": "UC浏览器公开浏览准备",
+            "prompt": "处理首次启动条款，选择不登录、不设为默认、不导入，通知与定位选择禁止。最终停在地址栏可交互的新标签页或公开网页后 finish。",
+            "attention_prompt": "禁止账号登录、同步、设为默认、导入、下载、提交表单或点击广告。",
+            "max_steps": 22,
+            "timeout_s": 300,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "百度地图",
+        "package": "com.baidu.BaiduMap",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://map.baidu.com/zt/client/index/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用地图；真机已拒绝敏感权限，完成公开地图平移、道路与地名换位及回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“百度地图”，确认百度官方地图应用后安装。安装完成并能打开包 com.baidu.BaiduMap 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "baidu-map-public-entry-ready",
+            "name": "百度地图公开地图准备",
+            "prompt": "处理首次协议、通知、定位、更新和无害引导；通知与定位选择禁止，不登录。最终停在显示道路、地名且地图可拖动的公开地图主界面后 finish。",
+            "attention_prompt": "跳过 Google Play、Play Games、GMS 或任何谷歌组件页面；禁止搜索地点、发起导航、打车、登录或授予敏感权限。",
+            "max_steps": 24,
+            "timeout_s": 360,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "腾讯地图",
+        "package": "com.tencent.map",
+        "catalog_status": "pending_validation",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://map.qq.com/mobile/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "通用地图；真机已拒绝敏感权限，完成公开地图平移、道路与地名换位及回桌面验证，等待预备阶段正式复验。",
+        "required": false,
+        "install_prompt": "在当前设备应用商店搜索“腾讯地图”，确认腾讯官方地图应用后安装。安装完成并能打开包 com.tencent.map 后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [],
+        "setup_tasks": [
+          {
+            "id": "tencent-map-public-entry-ready",
+            "name": "腾讯地图公开地图准备",
+            "prompt": "处理首次协议、通知、定位、更新和无害引导；通知与定位选择禁止，不登录。最终停在显示道路、地名且地图可拖动的公开地图主界面后 finish。",
+            "attention_prompt": "跳过 Google Play、Play Games、GMS 或任何谷歌组件页面；禁止搜索地点、发起导航、打车、登录或授予敏感权限。",
+            "max_steps": 24,
+            "timeout_s": 360,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "name": "哔哩哔哩",
+        "package": "tv.danmaku.bili",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://app.bilibili.com/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开推荐流，只执行滚动和页面变化验证。",
+        "required": false,
+        "install_prompt": "在当前设备的应用商店中搜索“哔哩哔哩”，确认开发者和应用名称后安装。系统安装器完成后，验证桌面或商店页面显示已安装，再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [
+          {
+            "name": "android.permission.POST_NOTIFICATIONS",
+            "required": false
+          }
+        ],
+        "setup_tasks": [
+          {
+            "id": "bilibili-public-home",
+            "name": "哔哩哔哩公开首页准备",
+            "prompt": "处理首次启动协议、通知、更新、青少年模式提示和功能介绍。不要登录；最终停在免登录可浏览的公开推荐首页并 finish。",
+            "max_steps": 16,
+            "timeout_s": 180,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "小红书",
+        "package": "com.xingin.xhs",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://www.xiaohongshu.com/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开发现流，只执行滚动和卡片变化验证。",
+        "required": false,
+        "install_prompt": "在当前设备的应用商店中搜索“小红书”，确认应用名称后安装。安装完成并能从商店打开后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [
+          {
+            "name": "android.permission.POST_NOTIFICATIONS",
+            "required": false
+          }
+        ],
+        "setup_tasks": [
+          {
+            "id": "xhs-public-feed",
+            "name": "小红书公开发现页准备",
+            "prompt": "处理首次启动协议、通知、更新和功能介绍。不要登录或选择兴趣画像；最终停在免登录公开发现页或公开卡片流并 finish。",
+            "max_steps": 18,
+            "timeout_s": 180,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "京东",
+        "package": "com.jingdong.app.mall",
+        "software_type": "app",
+        "install_mode": "external",
+        "install_channel": "app_store",
+        "install_source": "手机应用商店（保持商店最新版）",
+        "official_url": "https://www.jd.com/",
+        "supported_engines": ["vision", "uiautomator2", "hybrid"],
+        "description": "免登录公开首页，只执行滚动，不进入商品、购物车或支付。",
+        "required": false,
+        "install_prompt": "在当前设备的应用商店中搜索“京东”，确认官方购物应用后安装。安装完成并能从商店打开后 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [
+          {
+            "name": "android.permission.POST_NOTIFICATIONS",
+            "required": false
+          }
+        ],
+        "setup_tasks": [
+          {
+            "id": "jd-public-home",
+            "name": "京东公开首页准备",
+            "prompt": "处理首次启动协议、通知、更新、定位和营销弹窗。定位不是本场景必需权限，不要允许；不要登录。最终停在免登录公开首页并 finish。",
+            "max_steps": 18,
+            "timeout_s": 180,
+            "on_failure": "stop"
+          }
+        ]
+      },
+      {
+        "name": "崩坏：星穹铁道",
+        "package": "com.miHoYo.hkrpg",
+        "software_type": "game",
+        "install_mode": "external",
+        "install_channel": "app_store_or_official",
+        "install_source": "手机应用商店或米哈游官网（保持最新版）",
+        "official_url": "https://sr.mihoyo.com/",
+        "supported_engines": ["vision", "hybrid"],
+        "description": "大型在线 3D 游戏；安装、资源更新和公告使用视觉，账号登录需要人工接管。",
+        "required": false,
+        "install_prompt": "优先在当前设备应用商店搜索“崩坏：星穹铁道”，确认米哈游官方应用后安装；若商店没有该应用，打开浏览器搜索并进入 sr.mihoyo.com 官方下载页，只下载官方 Android 安装包并完成系统安装。安装后验证包 com.miHoYo.hkrpg 已可打开，再 finish。",
+        "allow_terms_acceptance": true,
+        "permissions": [
+          {
+            "name": "android.permission.POST_NOTIFICATIONS",
+            "required": false
+          }
+        ],
+        "setup_tasks": [
+          {
+            "id": "star-rail-entry-ready",
+            "name": "崩坏：星穹铁道稳定入口准备",
+            "prompt": "处理版本更新提示、资源校验、公告和非敏感权限弹窗。若设备已有登录态，进入游戏并停在稳定主界面后 finish；若没有登录态，确认官方登录界面正常显示后 take_over，并说明安装和启动已完成、需要用户登录。不要输入账号、手机号、验证码或密码。",
+            "attention_prompt": "允许等待官方资源更新，但禁止登录、实名、充值、购买、删除资源或切换账号。",
+            "max_steps": 40,
+            "timeout_s": 1200,
+            "on_failure": "continue"
+          }
+        ]
+      }
+    ]
+  },
+  "test": {
+    "cycle_duration_s": 7200,
+    "offline_grace_s": 120,
+    "device_poll_interval_s": 2,
+    "recording_start_delay_s": 10,
+    "record_finalize_timeout_s": 300,
+    "shutdown_finalize_timeout_s": 45,
+    "agent_poll_interval_s": 1,
+    "prompt_prefix": "这是两小时续航轮次中的实际测试。应用已由宿主启动；完成当前任务卡的可逆主功能操作，并用操作前后截图确认页面、卡片、棋子或角色确实变化。",
+    "attention_prompt": "不要登录、注册、实名、购买、支付、下单、点赞、评论、关注、发送消息、修改账号或授予任务未声明的敏感权限。出现验证码、支付、实名或离开目标应用时立即 take_over。",
+    "recording": {
+      "enabled": true,
+      "test_mode": "power",
+      "capture_preset": "low-overhead",
+      "interval_s": 5,
+      "session_mode": true,
+      "require_unplugged": false,
+      "checkpoint_interval_s": 30,
+      "reconnect_timeout_s": 120,
+      "no_system_monitor": false,
+      "enable_features": [
+        "thermal",
+        "runtime_settings"
+      ],
+      "disable_features": []
+    },
+    "workflows": [
+      {
+        "id": "sgtpuzzles-light-up-toggle",
+        "name": "SGTPuzzles Light Up reversible move",
+        "package": "name.boyle.chris.sgtpuzzles",
+        "required": true,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "light-up-toggle",
+            "name": "Light Up 可逆落子",
+            "prompt": "进入或保持在 Light Up 棋盘，只选择一个当前灰色且没有灯或黑色标记的空格。该游戏同一格按“灰色空格 → 白色灯泡 → 小黑色标记 → 灰色空格”循环：第一次点击后必须在下一张图看到白色灯泡；第二次点击同一坐标后必须看到小黑色标记；第三次点击同一坐标后必须看到最初的灰色空格。历史中同一坐标正好出现三次 tap 且最新图已恢复灰色空格时立即 finish，不要再点击任何格，也不要声称解完整谜题。",
+            "attention_prompt": "三次点击必须是同一个归一化坐标；这是允许连续三次相同 tap 的明确例外。只操作这一个棋盘空格；红色冲突灯代表无效解，不能称为成功。",
+            "max_steps": 7,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "shattered-pixel-dungeon-move",
+        "name": "Shattered Pixel Dungeon adjacent move",
+        "package": "com.shatteredpixel.shatteredpixeldungeon",
+        "required": true,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 20,
+        "tasks": [
+          {
+            "id": "dungeon-adjacent-move",
+            "name": "地牢相邻移动",
+            "prompt": "进入已有地牢或沿默认新手路径到达可操作地图，先关闭设置、网络和普通教程遮罩。如果出现要求点击右上角闪光日志的教学提示，这是允许处理的安全步骤：按提示点击闪光日志，阅读后用返回键回到地图。明确定位英雄精灵中心，再选择与英雄相差正好一个地图格、没有敌人的可通行地板或木板格，点击该格中心。比较动作前后两张图：只有英雄精灵中心确实移动约一个格、旧位置已空出时才 finish；若只有按钮图标或提示文字变化，继续修正或 take_over。",
+            "attention_prompt": "除明确的右上角闪光日志教学外，不要点击其他日志/菜单或底部提示文字；不要删除存档、打开商店、攻击角色或使用物品。必须用前后两张截图确认英雄坐标变化；语义树无法表达地图精灵移动时改用视觉引擎。",
+            "max_steps": 24,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "fifteen-puzzle-move",
+        "name": "15 Puzzle adjacent tile move",
+        "package": "com.italankin.fifteen",
+        "required": true,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "fifteen-move",
+            "name": "15 Puzzle 相邻数字移动",
+            "prompt": "确认处于 4×4 数字棋盘。若有暂停层，先解除暂停并在下一轮重新观察，不能把解除暂停算作移动。识别空格和一个相邻数字，只点击该数字一次；下一轮比较前后截图，只有数字进入原空格、原位置变空，且 MOVES 计数递增（若可见）时才 finish。",
+            "attention_prompt": "Canvas 棋盘内部必须使用视觉坐标；不要把整块 game_view/canvas 当作数字格，不要重置或连续试点多个数字。",
+            "max_steps": 8,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "minesweeper-compose-reveal",
+        "name": "Minesweeper Compose reveal one cell",
+        "package": "com.jayasuryat.minesweeperjc",
+        "required": true,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "minesweeper-reveal",
+            "name": "扫雷揭开一格",
+            "prompt": "若看到 New game，进入新棋盘。选择一个明确未揭开的格子并普通点击一次；下一轮比较前后证据，只有棋盘由全覆盖变为出现数字、空白或地雷状态时才 finish。",
+            "attention_prompt": "语义元素存在时优先 tap_element；不要长按、插旗、打开外链或设置。",
+            "max_steps": 8,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "tetris-controlled-move",
+        "name": "Tetris controlled horizontal move",
+        "package": "ds.tetris.android",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "tetris-controlled-move",
+            "name": "Tetris 方块横向移动",
+            "prompt": "确认棋盘正在运行，优先用语义元素点击左侧“<”方向键一次。下一轮只比较同一形状活动方块的水平中心，忽略自然向下移动；只要方块向左移动约一个格且棋局仍运行就 finish。若第一次没有水平变化，最多再点击一次左键，仍无变化则 take_over。",
+            "attention_prompt": "推荐混合引擎并优先 tap_element；不要点击右键、上下键、重开、暂停或声音。自然下落、方块换新和分数不算左移证据。",
+            "max_steps": 5,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "super-snake-turn",
+        "name": "Super Snake direction change",
+        "package": "com.mdibaiee.supersnake",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "super-snake-turn",
+            "name": "Super Snake 转向验证",
+            "prompt": "确认横屏游戏正在运行并观察玩家短线当前是水平还是垂直。最多执行六次彼此间隔一轮截图的安全点击，优先在玩家前进方向一侧的空白游戏区点击。只有新截图明确显示玩家短线从水平变垂直或从垂直变水平，并且 Points/Lives 仍可见时才 finish。",
+            "attention_prompt": "同方向自然移动不算成功；必须看到玩家短线轴向改变。不要连续三次点击完全相同坐标，不要打开 About。",
+            "max_steps": 10,
+            "timeout_s": 180,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "astrosmash-cannon-move",
+        "name": "AstroSmash enter and move cannon",
+        "package": "ru.exlmoto.astrosmash",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "astrosmash-enter-play",
+            "name": "AstroSmash 进入主玩法",
+            "prompt": "若在 AstroSmash 设置首页，只点击一次 RUN ASTROSMASH!。下一轮只有截图显示黑色游戏区、绿色地面、白色炮台和底部左右大箭头时才 finish；进入游戏后不要操作箭头。",
+            "attention_prompt": "不要修改任何设置、分辨率、复选框或高分表；本子任务只进入主玩法。",
+            "max_steps": 4,
+            "timeout_s": 90,
+            "on_failure": "continue"
+          },
+          {
+            "id": "astrosmash-cannon-left",
+            "name": "AstroSmash 炮台左移",
+            "prompt": "先观察绿色地面线上方白色炮台的水平位置，只在底部左箭头中心执行一次 long_press，duration_ms=1000。紧邻下一轮只有白色炮台明确从屏幕中心向左移动且游戏仍运行时才 finish；若炮台不动则 take_over。",
+            "attention_prompt": "必须使用 long_press，不能普通 tap 或重复操作。敌人、自动弹丸、分数和背景变化都不能替代白色炮台位置证据。",
+            "max_steps": 3,
+            "timeout_s": 90,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "opencalculator-arithmetic",
+        "name": "OpenCalculator arithmetic",
+        "package": "com.darkempire78.opencalculator",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 10,
+        "tasks": [
+          {
+            "id": "opencalculator-arithmetic",
+            "name": "OpenCalculator 算术验证",
+            "prompt": "确认处于 OpenCalculator 主界面，先用 AC 清除旧输入，再依次输入 12+7=。下一轮只有表达式明确显示 12+7、结果明确显示 19 时才 finish。",
+            "attention_prompt": "不要打开历史记录、设置或外部页面；必须从最新截图或语义树读取到结果 19。",
+            "max_steps": 10,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "fossify-calculator-arithmetic",
+        "name": "Fossify Calculator arithmetic",
+        "package": "org.fossify.math",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 10,
+        "tasks": [
+          {
+            "id": "fossify-calculator-arithmetic",
+            "name": "Fossify Calculator 算术验证",
+            "prompt": "确认处于 Fossify Calculator 主界面，先清除旧输入，再依次输入 8×6=。下一轮只有表达式明确显示 8×6、结果明确显示 48 时才 finish。",
+            "attention_prompt": "不要打开历史记录、设置或外部页面；必须从最新截图或语义树读取到结果 48。",
+            "max_steps": 10,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "material-files-directory-roundtrip",
+        "name": "Material Files directory round trip",
+        "package": "me.zhanghai.android.files",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 2,
+        "idle_after_s": 10,
+        "tasks": [
+          {
+            "id": "material-files-directory-roundtrip",
+            "name": "质感文件目录往返",
+            "prompt": "确认处于质感文件的普通目录列表，记住当前面包屑和一个可见子目录名。打开该子目录，下一轮确认面包屑或列表发生变化；再按返回回到原目录，只有原面包屑和原子目录项重新出现时才 finish。",
+            "attention_prompt": "只做只读目录导航；禁止打开文件内容、删除、改名、移动、上传、创建目录或云登录。",
+            "max_steps": 10,
+            "timeout_s": 180,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "edge-example-navigation",
+        "name": "Microsoft Edge example navigation",
+        "package": "com.microsoft.emmx",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "edge-example-navigation",
+            "name": "Microsoft Edge 公开网页导航",
+            "prompt": "确认处于 Edge。读取当前地址栏：如果当前是 example.com，则输入并打开 https://example.org；否则输入并打开 https://example.com。文本输入后先确认地址栏内容已变化，再按 Enter。只有最新页面显示 Example Domain 正文且地址栏与本轮目标域名一致时才 finish。",
+            "attention_prompt": "只访问 example.com 或 example.org；禁止登录、同步、设为默认浏览器、下载文件或提交表单。",
+            "max_steps": 12,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "wps-local-document-discard",
+        "name": "WPS local document edit and discard",
+        "package": "cn.wps.moffice_eng",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "wps-local-document-discard",
+            "name": "WPS 临时文档编辑并放弃",
+            "prompt": "从 WPS 首页新建空白文字文档，在正文输入 MP smoke 0722；下一轮必须确认文字清晰可见。随后按返回并选择“不保存/放弃更改”，只有确认回到 WPS 首页且临时文档未保存时才 finish。",
+            "attention_prompt": "禁止登录、云同步、上传、分享、购买会员、打开付费模板或修改现有文件；临时文档最终必须不保存。",
+            "max_steps": 24,
+            "timeout_s": 420,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "baidu-public-feed",
+        "name": "百度公开推荐流",
+        "package": "com.baidu.searchbox",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "baidu-public-feed",
+            "name": "百度公开推荐流滚动",
+            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次都必须从新标题、卡片或封面确认内容变化。最后仍停在公开推荐流时 finish。",
+            "attention_prompt": "禁止登录、搜索、打开详情、点赞、评论、关注、收藏、分享、消息或购买。",
+            "max_steps": 8,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "zhihu-public-feed",
+        "name": "知乎公开推荐流",
+        "package": "com.zhihu.android",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "zhihu-public-feed",
+            "name": "知乎公开推荐流滚动",
+            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次都必须从新问题标题或回答卡片确认内容变化。最后仍停在公开推荐流时 finish。",
+            "attention_prompt": "禁止登录、提问、回答、打开详情、点赞、评论、关注、收藏或消息。",
+            "max_steps": 10,
+            "timeout_s": 180,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "tencent-news-public-feed",
+        "name": "腾讯新闻公开新闻流",
+        "package": "com.tencent.news",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "tencent-news-public-feed",
+            "name": "腾讯新闻公开新闻流滚动",
+            "prompt": "确认处于免登录公开新闻首页，连续完成两次向上滚动；每次都必须从不同新闻标题或封面确认内容变化。最后仍停在公开新闻流时 finish。",
+            "attention_prompt": "禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "max_steps": 8,
+            "timeout_s": 150,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "sohu-news-public-feed",
+        "name": "搜狐新闻公开新闻流",
+        "package": "com.sohu.newsclient",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "sohu-news-public-feed",
+            "name": "搜狐新闻公开新闻流滚动",
+            "prompt": "确认处于免登录公开新闻首页，连续完成两次向上滚动；每次都必须从不同新闻标题或封面确认内容变化。最后仍停在公开新闻流时 finish。",
+            "attention_prompt": "禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "max_steps": 9,
+            "timeout_s": 180,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "quark-baidu-navigation",
+        "name": "夸克百度公开页面导航",
+        "package": "com.quark.browser",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "quark-baidu-navigation",
+            "name": "夸克公开网页导航",
+            "prompt": "点击地址栏并输入 https://www.baidu.com；先确认地址栏内容变化，再按 Enter。只有页面显示百度标志、搜索框或百度一下按钮，且仍在夸克内时才 finish；不要执行搜索。",
+            "attention_prompt": "只访问 www.baidu.com；禁止登录、同步、设为默认、导入、下载、提交搜索或点击广告。",
+            "max_steps": 14,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "uc-baidu-navigation",
+        "name": "UC浏览器百度公开页面导航",
+        "package": "com.UCMobile",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 12,
+        "tasks": [
+          {
+            "id": "uc-baidu-navigation",
+            "name": "UC浏览器公开网页导航",
+            "prompt": "点击地址栏并输入 https://www.baidu.com；先确认地址栏内容变化，再按 Enter。只有页面显示百度标志、搜索框或百度一下按钮，且仍在 UC 浏览器内时才 finish；不要执行搜索。",
+            "attention_prompt": "只访问 www.baidu.com；禁止登录、同步、设为默认、导入、下载、提交搜索或点击广告。",
+            "max_steps": 14,
+            "timeout_s": 240,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "baidu-map-pan",
+        "name": "百度地图公开地图平移",
+        "package": "com.baidu.BaiduMap",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 4,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "baidu-map-pan",
+            "name": "百度地图平移验证",
+            "prompt": "确认处于显示道路和地名的公开地图主界面，记住中心附近至少两个道路或地名标签，只在地图空白区域执行一次中等距离水平拖动。下一轮只有道路或地名整体明显换位、地图仍可操作时才 finish。",
+            "attention_prompt": "跳过任何 Google Play、Play Games、GMS 页面；不要点击地点卡片、搜索框、路线、打车、签到、广告或个人中心，只执行一次地图平移。",
+            "max_steps": 6,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "tencent-map-pan",
+        "name": "腾讯地图公开地图平移",
+        "package": "com.tencent.map",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 4,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "tencent-map-pan",
+            "name": "腾讯地图平移验证",
+            "prompt": "确认处于显示道路和地名的公开地图主界面，记住中心附近至少两个道路或地名标签，只在地图空白区域执行一次中等距离水平拖动。下一轮只有道路或地名整体明显换位、地图仍可操作时才 finish。",
+            "attention_prompt": "跳过任何 Google Play、Play Games、GMS 页面；不要点击地点卡片、搜索框、路线、打车、签到、广告或个人中心，只执行一次地图平移。",
+            "max_steps": 6,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "bilibili-public-feed",
+        "name": "哔哩哔哩公开推荐流",
+        "package": "tv.danmaku.bili",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "bilibili-scroll",
+            "name": "公开推荐流滚动",
+            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次滚动后都要从新卡片标题或封面确认内容变化。最后停在公开推荐流并 finish。",
+            "attention_prompt": "不要打开视频、点赞、投币、收藏、关注、评论、登录或进入消息/个人中心。",
+            "max_steps": 7,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "xiaohongshu-public-feed",
+        "name": "小红书公开发现流",
+        "package": "com.xingin.xhs",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 15,
+        "tasks": [
+          {
+            "id": "xhs-scroll",
+            "name": "公开发现流滚动",
+            "prompt": "确认处于免登录公开发现页或卡片流，连续完成两次向上滚动；每次滚动后都要确认出现不同卡片。最后停在公开卡片流并 finish。",
+            "attention_prompt": "不要打开笔记、点赞、收藏、关注、评论、搜索、登录或进入消息/个人中心。",
+            "max_steps": 7,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "jd-public-home",
+        "name": "京东公开首页",
+        "package": "com.jingdong.app.mall",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 3,
+        "idle_after_s": 20,
+        "tasks": [
+          {
+            "id": "jd-scroll",
+            "name": "公开首页滚动",
+            "prompt": "确认处于免登录公开首页，连续完成两次向上滚动；每次滚动后都要确认商品或频道卡片发生变化。最后停在公开首页并 finish。",
+            "attention_prompt": "不要打开商品、搜索、登录、领券、加入购物车、下单、支付、进入消息或个人中心。",
+            "max_steps": 7,
+            "timeout_s": 120,
+            "on_failure": "continue"
+          }
+        ]
+      },
+      {
+        "id": "star-rail-safe-camera",
+        "name": "崩坏：星穹铁道安全视角验证",
+        "package": "com.miHoYo.hkrpg",
+        "required": false,
+        "home_after": true,
+        "launch_wait_s": 8,
+        "idle_after_s": 30,
+        "tasks": [
+          {
+            "id": "star-rail-camera-drag",
+            "name": "星穹铁道安全视角拖动",
+            "prompt": "处理公告、资源校验和普通更新提示后，确认已经进入可控制角色的游戏主场景。只在屏幕右侧无按钮区域完成一次短距离水平拖动以旋转视角；下一轮比较背景、地面或角色朝向，只有视角确实变化且仍处于安全主场景时才 finish。",
+            "attention_prompt": "如果停在登录、验证码、实名、下载付费资源、充值或账号页面，立即 take_over。不要移动角色、进入战斗、打开抽卡/商店、领取奖励、发送消息或修改账号。",
+            "max_steps": 24,
+            "timeout_s": 600,
+            "on_failure": "continue"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,311 @@
+{
+  "version": 1,
+  "generated_at": "2026-07-21",
+  "selection_policy": {
+    "source": "GitHub Release APK",
+    "requirements": [
+      "无需账号即可进入主要玩法",
+      "优先离线、无支付、无外部副作用",
+      "至少能由 uiautomator2 语义控件或视觉截图引擎之一完成一次可验证操作",
+      "验证流程必须进入主玩法、操作一段时间并回到桌面"
+    ],
+    "engine_order": [
+      "uiautomator2",
+      "hybrid",
+      "vision"
+    ],
+    "archive_rule": "只有真机三引擎试验中至少一套流程通过后，才归档 APK 并加入正式 Campaign。"
+  },
+  "games": [
+    {
+      "id": "fifteen-puzzle",
+      "name": "15 Puzzle",
+      "repository": "italankin/15Puzzle",
+      "license": "MIT",
+      "release": "1.16.0",
+      "asset": "15-puzzle-1.16.0.apk",
+      "size_mb": 0.09,
+      "apk_url": "https://github.com/italankin/15Puzzle/releases/download/1.16.0/15-puzzle-1.16.0.apk",
+      "package": "com.italankin.fifteen",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/fifteen-puzzle.apk",
+      "sha256": "08B51E4DEA12B7A54C723F9E52A96275F034348D5673A620429A64BFC029F732",
+      "test_goal": "进入棋盘，点击一个与空格相邻的数字块，确认空格与数字位置交换，再回桌面。",
+      "recommended_engine": "vision",
+      "validation_ref": "android-three-engine-game-benchmark.json#fifteen-puzzle",
+      "status": "validated_vision_hybrid"
+    },
+    {
+      "id": "minesweeper-compose",
+      "name": "Minesweeper Jetpack Compose",
+      "repository": "jayasuryat/minesweeper-j-compose",
+      "license": "Apache-2.0",
+      "release": "v1.0.1",
+      "asset": "Minesweeper-jc-v1.0.1.apk",
+      "size_mb": 3.04,
+      "apk_url": "https://github.com/jayasuryat/minesweeper-j-compose/releases/download/v1.0.1/Minesweeper-jc-v1.0.1.apk",
+      "package": "com.jayasuryat.minesweeperjc",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/minesweeper-compose.apk",
+      "sha256": "3345B0C020A80BE1414DC69C76354FE9B11A14F48593B7E9F4D9DD38C8561A90",
+      "test_goal": "开始新局并点击一个未揭开的格子，确认格子状态变化，再回桌面。",
+      "recommended_engine": "uiautomator2",
+      "efficiency_winner": "vision",
+      "validation_ref": "android-three-engine-game-benchmark.json#minesweeper-compose",
+      "status": "validated_all_engines"
+    },
+    {
+      "id": "2048",
+      "name": "2048",
+      "repository": "tpcstld/2048",
+      "license": "MIT",
+      "release": "1.3.3",
+      "asset": "133-release.apk",
+      "size_mb": 2.13,
+      "apk_url": "https://github.com/tpcstld/2048/releases/download/1.3.3/133-release.apk",
+      "package": "com.tpcstld.twozerogame",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/2048.apk",
+      "test_goal": "进入棋盘并完成一次有效四向滑动，确认方块位置或数值变化，再回桌面。",
+      "recommended_engine": "vision",
+      "smoke_validation": {
+        "status": "completed",
+        "run_directory": "profiler-runs/agent-runs/20260721-151014-discovery-2048-smoke-cdfc45",
+        "evidence": "数字块在单次左滑后发生明确位置变化，随后截图确认返回 vivo 桌面。"
+      },
+      "status": "smoke_passed_pending_validation"
+    },
+    {
+      "id": "tetris-compose",
+      "name": "Tetris",
+      "repository": "mykola-dev/Tetris",
+      "license": "Apache-2.0",
+      "release": "v1.0.18",
+      "asset": "tetris-release.apk",
+      "size_mb": 2.23,
+      "apk_url": "https://github.com/mykola-dev/Tetris/releases/download/v1.0.18/tetris-release.apk",
+      "package": "ds.tetris.android",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/tetris-compose.apk",
+      "test_goal": "开始一局，执行一次左右移动或旋转，确认下落方块状态变化，再回桌面。",
+      "recommended_engine": "hybrid",
+      "smoke_validation": {
+        "status": "completed",
+        "run_directory": "profiler-runs/agent-runs/20260721-151339-discovery-tetris-hybrid-strict-450c47",
+        "evidence": "混合引擎精确点击左右语义按钮，方块横向位置及底部堆叠发生可见变化，随后回桌面。"
+      },
+      "status": "smoke_passed_pending_validation"
+    },
+    {
+      "id": "compose-bird",
+      "name": "Compose Bird",
+      "repository": "ellisonchan/ComposeBird",
+      "license": "MIT",
+      "release": "compose_bird/1.0.1",
+      "asset": "ComposeBird-1.0.1.apk",
+      "size_mb": 15.99,
+      "apk_url": "https://github.com/ellisonchan/ComposeBird/releases/download/compose_bird/1.0.1/ComposeBird-1.0.1.apk",
+      "test_goal": "开始游戏并点击一次使小鸟上升，确认画面进入运行状态，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "astrosmash",
+      "name": "AstroSmash",
+      "repository": "EXL/AstroSmash",
+      "license": "MIT",
+      "release": "v1.2",
+      "asset": "AstroSmash_v1.2_05-MAY-2017.apk",
+      "size_mb": 0.11,
+      "apk_url": "https://github.com/EXL/AstroSmash/releases/download/v1.2/AstroSmash_v1.2_05-MAY-2017.apk",
+      "package": "ru.exlmoto.astrosmash",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/astrosmash.apk",
+      "test_goal": "进入主玩法，执行一次移动或射击并确认画面变化，再回桌面。",
+      "recommended_engine": "vision",
+      "smoke_validation": {
+        "status": "completed",
+        "run_directory": "profiler-runs/agent-runs/20260721-152240-discovery-astrosmash-split-739631",
+        "evidence": "拆分进入玩法与长按移动后，白色炮台从屏幕中心明确移动到左侧，随后回桌面。"
+      },
+      "status": "smoke_passed_pending_validation"
+    },
+    {
+      "id": "asteroid",
+      "name": "Asteroid",
+      "repository": "fennifith/Asteroid",
+      "license": "Apache-2.0",
+      "release": "1.3",
+      "asset": "app-release.apk",
+      "size_mb": 2.85,
+      "apk_url": "https://github.com/fennifith/Asteroid/releases/download/1.3/app-release.apk",
+      "package": "james.asteroid",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/asteroid.apk",
+      "test_goal": "开始躲避玩法并完成一次方向操作，确认飞船或障碍位置变化，再回桌面。",
+      "smoke_validation": {
+        "status": "blocked",
+        "run_directory": "profiler-runs/agent-runs/20260721-151527-discovery-asteroid-smoke-362849",
+        "evidence": "启动流程跳转到 Google Play 服务设置页，未进入主玩法；模型 finish 为人工核验后的假阳性。"
+      },
+      "status": "blocked_google_play_services"
+    },
+    {
+      "id": "super-snake",
+      "name": "Super Snake",
+      "repository": "mdibaiee/super-snake",
+      "license": "MIT",
+      "release": "1.0.0",
+      "asset": "super-snake.apk",
+      "size_mb": 4.10,
+      "apk_url": "https://github.com/mdibaiee/super-snake/releases/download/1.0.0/super-snake.apk",
+      "package": "com.mdibaiee.supersnake",
+      "archived_apk": "profiler-runs/app-benchmark/github-candidates/super-snake.apk",
+      "test_goal": "开始一局并执行一次转向，确认蛇头方向或位置变化，再回桌面。",
+      "recommended_engine": "vision",
+      "smoke_validation": {
+        "status": "completed",
+        "run_directory": "profiler-runs/agent-runs/20260721-151700-discovery-super-snake-smoke-49b0e3",
+        "evidence": "玩家短线从垂直轴向转为水平轴向并改变位置，Points/Lives 保持可见，随后回桌面。"
+      },
+      "status": "smoke_passed_pending_validation"
+    },
+    {
+      "id": "jump-dont-die",
+      "name": "Jump Don't Die",
+      "repository": "danirod/jumpdontdie",
+      "license": "GPL-3.0",
+      "release": "v1.0.1",
+      "asset": "jdd-v1.0.1.apk",
+      "size_mb": 7.97,
+      "apk_url": "https://github.com/danirod/jumpdontdie/releases/download/v1.0.1/jdd-v1.0.1.apk",
+      "test_goal": "开始跑酷并点击一次跳跃，确认角色离地或场景推进，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "tower-jumper",
+      "name": "Tower Jumper",
+      "repository": "Dariasteam/TowerJumper",
+      "license": "GPL-3.0",
+      "release": "v1.0.8",
+      "asset": "TowerJumper.apk",
+      "size_mb": 9.34,
+      "apk_url": "https://github.com/Dariasteam/TowerJumper/releases/download/v1.0.8/TowerJumper.apk",
+      "test_goal": "进入关卡并执行一次跳跃或方向操作，确认角色位置变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "rectball",
+      "name": "Rectball",
+      "repository": "danirod/rectball",
+      "license": "GPL-3.0",
+      "release": "v0.5.436",
+      "asset": "rectball-0.5.436-android.apk",
+      "size_mb": 6.62,
+      "apk_url": "https://github.com/danirod/rectball/releases/download/v0.5.436/rectball-0.5.436-android.apk",
+      "test_goal": "进入谜题并完成一次合法放置或移动，确认棋盘状态变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "tangler",
+      "name": "Tangler",
+      "repository": "andrzej-nov/Tangler",
+      "license": "CC-BY-4.0",
+      "release": "v1.16",
+      "asset": "Tangler.apk",
+      "size_mb": 4.93,
+      "apk_url": "https://github.com/andrzej-nov/Tangler/releases/download/v1.16/Tangler.apk",
+      "test_goal": "进入谜题并拖动一个可操作节点，确认连线布局变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "chain-relations",
+      "name": "Chain Relations",
+      "repository": "andrzej-nov/ChainRelations",
+      "license": "CC-BY-4.0",
+      "release": "v1.9",
+      "asset": "ChainRelations.apk",
+      "size_mb": 4.95,
+      "apk_url": "https://github.com/andrzej-nov/ChainRelations/releases/download/v1.9/ChainRelations.apk",
+      "test_goal": "进入谜题并完成一次合法节点或链条操作，确认布局变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "gauguin",
+      "name": "Gauguin",
+      "repository": "meikpiep/gauguin",
+      "license": "GPL-3.0",
+      "release": "v0.51.0",
+      "asset": "gauguin-app-release.apk",
+      "size_mb": 12.10,
+      "apk_url": "https://github.com/meikpiep/gauguin/releases/download/v0.51.0/gauguin-app-release.apk",
+      "test_goal": "进入一个谜题并选择单元格、填入或切换一个候选数字，确认格子状态变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "puzzle-suite",
+      "name": "Puzzle",
+      "repository": "sidhant947/Puzzle",
+      "license": "GPL-3.0",
+      "release": "V1.1.6",
+      "asset": "app-arm64-v8a-release.apk",
+      "size_mb": 11.81,
+      "apk_url": "https://github.com/sidhant947/Puzzle/releases/download/V1.1.6/app-arm64-v8a-release.apk",
+      "test_goal": "从谜题列表进入任一默认小游戏并完成一次可逆操作，确认画面变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "braincup",
+      "name": "Braincup",
+      "repository": "SimonSchubert/Braincup",
+      "license": "Apache-2.0",
+      "release": "v2.30.0",
+      "asset": "Braincup-2.30.0-android.apk",
+      "size_mb": 8.60,
+      "apk_url": "https://github.com/SimonSchubert/Braincup/releases/download/v2.30.0/Braincup-2.30.0-android.apk",
+      "test_goal": "进入一个无需账号的训练小游戏，完成一道题或一次选择并确认结果变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "tiny-crate",
+      "name": "Tiny Crate",
+      "repository": "HarmonyHoney/tiny_crate",
+      "license": "Unlicense",
+      "release": "2026.03.12",
+      "asset": "Tiny-Crate.apk",
+      "size_mb": 30.47,
+      "apk_url": "https://github.com/HarmonyHoney/tiny_crate/releases/download/2026.03.12/Tiny-Crate.apk",
+      "test_goal": "开始关卡并执行一次移动、跳跃或抛箱操作，确认角色或箱子位置变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "rota",
+      "name": "ROTA",
+      "repository": "HarmonyHoney/ROTA",
+      "license": "MIT",
+      "release": "2026.03.12",
+      "asset": "ROTA.apk",
+      "size_mb": 63.45,
+      "apk_url": "https://github.com/HarmonyHoney/ROTA/releases/download/2026.03.12/ROTA.apk",
+      "test_goal": "开始关卡并执行一次移动或重力旋转，确认角色或场景方向变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "feudal-tactics",
+      "name": "Feudal Tactics",
+      "repository": "Sesu8642/FeudalTactics",
+      "license": "GPL-3.0",
+      "release": "v1.5.2",
+      "asset": "FeudalTactics-android.apk",
+      "size_mb": 9.40,
+      "apk_url": "https://github.com/Sesu8642/FeudalTactics/releases/download/v1.5.2/FeudalTactics-android.apk",
+      "test_goal": "进入教程或默认局面并完成一次合法的地块/单位选择，确认棋盘选择或回合状态变化，再回桌面。",
+      "status": "candidate"
+    },
+    {
+      "id": "shattered-pixel-dungeon",
+      "name": "Shattered Pixel Dungeon",
+      "repository": "00-Evan/shattered-pixel-dungeon",
+      "license": "GPL-3.0",
+      "release": "v3.3.8",
+      "asset": "ShatteredPD-v3.3.8-Android.apk",
+      "size_mb": 28.54,
+      "apk_url": "https://github.com/00-Evan/shattered-pixel-dungeon/releases/download/v3.3.8/ShatteredPD-v3.3.8-Android.apk",
+      "test_goal": "进入已有地图，按允许流程处理闪光日志教学，移动英雄一个安全相邻格并确认位置变化，再回桌面。",
+      "status": "vision_passed_baseline"
+    }
+  ]
+}

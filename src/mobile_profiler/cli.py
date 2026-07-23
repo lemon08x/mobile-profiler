@@ -2847,6 +2847,86 @@ def run_ui(args: argparse.Namespace) -> int:
         return 2
 
 
+def _campaign_config_for_args(args: argparse.Namespace):
+    from .campaign_config import load_campaign_config
+
+    config = load_campaign_config(args.config)
+    device = str(getattr(args, "device", "") or "").strip()
+    return config.with_device(device) if device else config
+
+
+def run_campaign_validate(args: argparse.Namespace) -> int:
+    try:
+        config = _campaign_config_for_args(args)
+        summary = {
+            "valid": True,
+            "version": config.version,
+            "campaign_id": config.campaign_id,
+            "device": config.device,
+            "config": str(config.source_path),
+            "preparation": {
+                "settings": len(config.preparation.settings),
+                "install_sets": len(config.preparation.install_sets),
+                "apps": len(config.preparation.apps),
+            },
+            "test": {
+                "cycle_duration_s": config.test.cycle_duration_s,
+                "workflow_count": len(config.test.workflows),
+                "recording_enabled": config.test.recording.enabled,
+                "stop_condition": (
+                    f"device unavailable for {config.test.offline_grace_s:.0f}s"
+                ),
+            },
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+def run_campaign_prepare(args: argparse.Namespace) -> int:
+    from .campaign import AndroidCampaignRunner
+
+    try:
+        config = _campaign_config_for_args(args)
+        runner = AndroidCampaignRunner(args.adb, config, args.output_root)
+        result = runner.prepare(dry_run=bool(args.dry_run))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("status") in {
+            "completed",
+            "completed_with_warnings",
+            "dry_run",
+        } else 2
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+def run_campaign_test(args: argparse.Namespace) -> int:
+    from .campaign import AndroidCampaignRunner
+
+    try:
+        config = _campaign_config_for_args(args)
+        runner = AndroidCampaignRunner(args.adb, config, args.output_root)
+        result = runner.run_test(
+            dry_run=bool(args.dry_run),
+            max_rounds=args.max_rounds,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        status = str(result.get("status") or "")
+        if status == "operator_stopped":
+            return 130
+        return 0 if status in {
+            "device_shutdown_or_unavailable",
+            "dry_run",
+            "max_rounds",
+        } else 2
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -3115,6 +3195,69 @@ def build_parser() -> argparse.ArgumentParser:
     demo = subparsers.add_parser("demo", help="generate a report from built-in demonstration data")
     demo.add_argument("--output", type=Path, help="output directory")
     demo.set_defaults(handler=run_demo)
+
+    campaign = subparsers.add_parser(
+        "campaign",
+        help="run independently configurable Android preparation and endurance-test stages",
+    )
+    campaign_commands = campaign.add_subparsers(
+        dest="campaign_command",
+        required=True,
+    )
+    campaign_validate = campaign_commands.add_parser(
+        "validate",
+        help="validate a two-stage campaign JSON without touching a device",
+    )
+    campaign_validate.add_argument("config", type=Path)
+    campaign_validate.add_argument(
+        "--device",
+        default="",
+        help="optional device override used only in the validation summary",
+    )
+    campaign_validate.set_defaults(handler=run_campaign_validate)
+
+    campaign_prepare = campaign_commands.add_parser(
+        "prepare",
+        help="apply settings, install APK sets, grant declared permissions, and clear first-launch UI",
+    )
+    campaign_prepare.add_argument("config", type=Path)
+    campaign_prepare.add_argument("--device", default="", help="override config.device")
+    campaign_prepare.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("profiler-runs") / "campaigns",
+    )
+    campaign_prepare.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the normalized preparation plan without changing the device",
+    )
+    campaign_prepare.set_defaults(handler=run_campaign_prepare)
+
+    campaign_test = campaign_commands.add_parser(
+        "test",
+        aliases=("run",),
+        help="run fixed two-hour rounds until the Android device remains unavailable",
+    )
+    campaign_test.add_argument("config", type=Path)
+    campaign_test.add_argument("--device", default="", help="override config.device")
+    campaign_test.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("profiler-runs") / "campaigns",
+    )
+    campaign_test.add_argument(
+        "--max-rounds",
+        type=positive_int,
+        default=None,
+        help="optional bounded run count for smoke tests; omitted means continue until shutdown",
+    )
+    campaign_test.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the record command and workflow sequence without starting the test",
+    )
+    campaign_test.set_defaults(handler=run_campaign_test)
 
     ui = subparsers.add_parser("ui", help="launch the local runtime dashboard")
     ui.add_argument("--host", default="127.0.0.1", help="dashboard bind address")

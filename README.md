@@ -153,12 +153,48 @@ task has its own objective, attention prompt, step/time limit, and
 stop-or-continue failure policy. Reusable templates cover returning home,
 opening Settings, brightness initialization, and read-only smoke browsing.
 
+The model panel exposes three operation engines for the same task workflow:
+
+- `vision` sends the previous/current screenshots and uses normalized coordinates.
+- `uiautomator2` sends a compact, revision-bound semantic control tree without
+  images; exact elements are operated through `tap_element`.
+- `hybrid` sends both screenshots and the matching control tree. It prefers exact
+  semantic elements, while Canvas/OpenGL game content can fall back to visual
+  coordinates.
+
+The semantic and hybrid engines use an optional dependency and remain absent from
+the standard-library core installation:
+
+```powershell
+python -m pip install -e ".[uiautomator2]"
+```
+
+All three modes still persist step screenshots as run evidence. See
+[`docs/android-automation-engine-benchmark.md`](docs/android-automation-engine-benchmark.md)
+for the current Qwen comparison and the two-task validation protocol.
+
 The adapter layer currently supports:
 
 - OpenAI-compatible Chat Completions, including OpenAI, a complete Azure
   deployment URL, local vLLM/Ollama, and compatible model gateways.
 - Anthropic Messages API with native image blocks and `tool_use`.
 - Google Gemini `generateContent` with native inline images and function calls.
+
+OpenAI-compatible requests have a bounded 1,000-token output budget. The model
+panel also exposes an internal-thinking mode: `auto` leaves the server default
+unchanged, while `disabled`/`enabled` forwards vLLM-style
+`chat_template_kwargs.enable_thinking`. The bundled LAN Qwen default uses
+`disabled` so screenshot decisions return one tool call promptly instead of
+spending the request timeout on hidden reasoning; other providers remain on
+`auto`.
+
+If an OpenAI-compatible response omits the required `phone_action`, the adapter
+performs one bounded protocol-repair request against the same screenshot and
+task. If that repair also omits the tool call, the workflow now stops safely as
+`take_over` instead of crashing with a generic model-protocol error. A
+syntactically valid tool call whose action-specific fields are missing (for
+example, a swipe without `start`) is recorded as an unexecuted step and fed
+back to the next model turn for correction; it is never forwarded to ADB.
 
 The temporary defaults are still the LAN Qwen deployment at
 `http://192.168.31.237:8000` and `qwen3.6-27b`; both fields remain editable and
@@ -170,14 +206,13 @@ remain backward-compatible aliases.
 Each step performs this closed loop:
 
 ```text
-adb exec-out screencap -p
-        -> editable ADB system prompt
-        -> current task + attention rules + workflow summary
-        -> screenshot + recent action results
-        -> selected OpenAI-compatible / Anthropic / Gemini adapter
-        -> one native tool/function call translated to phone_action
-        -> validated adb input / keyevent / monkey action
-        -> next screenshot
+ADB screenshot --------------------\
+                                      -> selected engine evidence
+uiautomator2 hierarchy (optional) --/   -> editable system/task prompts
+                                          -> model adapter
+                                          -> one phone_action
+                                          -> validated ADB/UIA action
+                                          -> next observation
 ```
 
 Tasks run sequentially. `finish` completes only the current task and advances
@@ -185,16 +220,23 @@ the orchestrator; `take_over` stops the whole workflow. A timeout or exhausted
 step budget either stops with `task_failed` or is recorded and skipped,
 according to the task's failure policy. The editable system prompt defines the
 ADB screenshot/coordinate protocol, one-action-per-frame behavior, popup and
-input handling, loop prevention, and takeover boundaries. Its built-in version
-is exposed by `/api/state` so the UI can restore the default safely.
+input handling, loop prevention, and takeover boundaries. The prompt requires a
+full-screen scan before scrolling, visual-anchor verification after
+every input event, explicit evidence for intermediate states, and post-action
+proof before position/value-change tasks may finish. The current v10 prompt adds
+engine-specific evidence rules, revision-bound semantic element IDs, Canvas
+fallback constraints, and task-local `finish`. Its built-in version is exposed by
+`/api/state` so the UI can restore the default safely.
 
 The model cannot provide arbitrary shell commands. The server only accepts
-tap, double-tap, long-press, swipe, key events, printable-ASCII text input,
-package launch, wait, finish, and takeover. Account authorization, CAPTCHA,
-payment, destructive actions, and other ambiguous irreversible steps are
-explicit takeover boundaries. Every run writes `config.json`, step screenshots,
-and `events.jsonl` below `profiler-runs/agent-runs/`; API keys are neither
-returned by `/api/state` nor persisted in those artifacts.
+revision-bound element taps, coordinate taps, double-tap, long-press, swipe, key
+events, bounded text input, package launch, wait, finish, and takeover. Vision
+text input remains printable ASCII; uiautomator2 and hybrid can use ordinary UTF-8.
+Account authorization, CAPTCHA, payment, destructive actions, and other ambiguous
+irreversible steps are explicit takeover boundaries. Every run writes
+`config.json`, step screenshots, optional UI XML, and `events.jsonl` below
+`profiler-runs/agent-runs/`; API keys are neither returned by `/api/state` nor
+persisted in those artifacts.
 
 This first PR keeps the agent block separate from power recording. A power run
 and an agent may already coexist at the ADB level, but automatic shared
@@ -203,14 +245,54 @@ are intentionally reserved for the next integration stage. The task-card and
 prompt contracts are designed to host additional phone-initialization recipes
 without changing the allowlisted ADB executor.
 
-The next automation layer is being defined independently under
-`mobile_profiler.automation`. It currently exposes only standard-library data
-contracts and ports for semantic UI providers, typed device gateways, policy /
-approval, deterministic verifiers, watchers, skills, scenario graphs, evidence,
-and UI-state loop detection. It is not imported by the dashboard or the current
-agent. See [`docs/automation-kernel.md`](docs/automation-kernel.md) for the
-open-source mechanism mapping, functional requirements, safety boundary, and
-explicit non-goals.
+The automation layer under `mobile_profiler.automation` keeps its contracts and
+ports standard-library-only. The dashboard agent now consumes the optional
+`Uiautomator2Provider` for semantic observation/action, while policy/approval,
+deterministic verifiers, watchers, skills, and the scenario graph remain separate
+future integration points. See [`docs/automation-kernel.md`](docs/automation-kernel.md)
+for the mechanism mapping and safety boundary.
+
+### Two-stage Android endurance campaign
+
+The product-level `campaign` runner composes the existing recorder and ADB vision
+agent without changing the provider-neutral automation kernel. One JSON defines two
+independently executable stages:
+
+```powershell
+mobile-profiler campaign validate examples\android-two-stage-campaign.json
+mobile-profiler campaign prepare examples\android-two-stage-campaign.json --device IP:PORT
+mobile-profiler campaign test examples\android-two-stage-campaign.json --device IP:PORT
+```
+
+`prepare` applies allowlisted system settings, installs complete APK/split sets,
+grants only explicitly declared permissions, runs per-app first-launch prompts,
+and then executes the matching real test workflow with Qwen. A candidate is not
+treated as supported until that normal workflow passes; the runner also verifies
+that the resumed package is still the target app, converting an off-app false
+`finish` into `wrong_foreground`.
+`test` records a two-hour session-mode round while cycling configured app/game
+workflows, then starts the next round until the Android serial remains unavailable
+for the configured grace period. This is the observable ADB shutdown boundary; a
+Wi-Fi outage can look identical, so a stable test WLAN is required. See the
+[two-stage campaign guide](docs/two-stage-android-campaign.md) for the config schema,
+permission/terms boundaries, dry runs, recovery, and output layout.
+
+The same two stages are available in **AI automation → Task launch**. That page is
+limited to template selection, repeat mode, live task/step progress, and start/stop.
+Workflow name, task order, prompt, attention, step/timeout limits, and failure policy
+live under **Prompt editing → Task configuration & prompt**. The endurance repeat
+toggle keeps cycling until shutdown/manual stop, or runs the configured scene list
+once when disabled. Browser-local template edits are auto-saved, and the edited task
+order is forwarded to the Campaign runner. Start/stop is routed to the background
+Campaign controller.
+
+The adjacent **Apps & games** tab separates project APK/APKS installs from
+store/official-site installs and from `pending_validation` candidates. The current
+pending project candidates are 2048, Tetris, Super Snake, and AstroSmash; each has
+completed a real-device “main operation + evidence + Home” smoke run. A later
+preparation pass dynamically promotes a pending item to supported in the catalog
+snapshot. Asteroid is intentionally excluded because its launch path stopped in
+Google Play Services instead of reaching gameplay.
 
 The UI has an explicit **Android / iOS / HarmonyOS** platform selector above the
 test profile. It filters the device picker and changes connection controls,

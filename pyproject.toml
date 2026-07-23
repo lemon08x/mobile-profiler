@@ -10,6 +10,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+uiautomator2 = ["uiautomator2>=3.4,<4"]
+image = [
+    "numpy>=1.26,<3",
+    "opencv-python-headless>=4.10,<5",
+]
+
 [project.scripts]
 mobile-profiler = "mobile_profiler.cli:main"
 
@@ -20,4 +27,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-mobile_profiler = ["web/*.html", "web/*.css", "web/*.js"]
+mobile_profiler = ["web/*.html", "web/*.css", "web/*.js", "assets/*.jar"]

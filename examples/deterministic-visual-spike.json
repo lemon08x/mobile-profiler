@@ -1,0 +1,64 @@
+{
+  "graph_id": "canvas-game-smoke",
+  "max_transitions": 8,
+  "templates": [
+    {
+      "id": "home-marker",
+      "path": "visual-assets/home-marker.png",
+      "threshold": 0.92,
+      "region": [0.0, 0.0, 1.0, 1.0],
+      "scales": [0.9, 1.0, 1.1]
+    },
+    {
+      "id": "menu-marker",
+      "path": "visual-assets/menu-marker.png",
+      "threshold": 0.92,
+      "region": [0.0, 0.0, 1.0, 1.0],
+      "scales": [0.9, 1.0, 1.1]
+    },
+    {
+      "id": "game-marker",
+      "path": "visual-assets/game-marker.png",
+      "threshold": 0.92,
+      "region": [0.0, 0.0, 1.0, 1.0],
+      "scales": [0.9, 1.0, 1.1]
+    }
+  ],
+  "states": [
+    {"id": "home", "template": "home-marker"},
+    {"id": "menu", "template": "menu-marker"},
+    {"id": "game", "template": "game-marker"}
+  ],
+  "transitions": [
+    {
+      "from": "home",
+      "to": "menu",
+      "action": {
+        "name": "tap",
+        "arguments": {"element": [920, 920]},
+        "risk": "low"
+      },
+      "settle_s": 0.5
+    },
+    {
+      "from": "menu",
+      "to": "game",
+      "action": {
+        "name": "tap",
+        "arguments": {"element": [500, 760]},
+        "risk": "low"
+      },
+      "settle_s": 1.0
+    },
+    {
+      "from": "game",
+      "to": "home",
+      "action": {
+        "name": "home",
+        "arguments": {},
+        "risk": "low"
+      },
+      "settle_s": 0.5
+    }
+  ]
+}
