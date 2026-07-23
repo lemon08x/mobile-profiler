@@ -54,6 +54,10 @@ is easier to audit after a one-hour robotic workflow:
   selected multimodal endpoint, translates its native tool/function response
   into one `phone_action`, executes a validated ADB action, and advances tasks
   under per-task step, timeout, and failure policies.
+- An optional **Open Source Automation** dashboard view for deterministic visual
+  verification. It reports the image-runtime/disk cost, renders a typed screen
+  graph, runs an OpenCV synthetic benchmark, and exposes frame/template/overlay
+  evidence without loading a model or accepting executable workflow strings.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -251,6 +255,46 @@ ports standard-library-only. The dashboard agent now consumes the optional
 deterministic verifiers, watchers, skills, and the scenario graph remain separate
 future integration points. See [`docs/automation-kernel.md`](docs/automation-kernel.md)
 for the mechanism mapping and safety boundary.
+
+### Open source automation hub
+
+The **Open Source Automation** view (`#opensource`) is a data-driven catalog for
+selecting multiple open-source projects and the automation features provided by
+each project. The simulated-universe feature uses the existing external Star Rail
+adapter. MaaEnd is also available through an official, user-installed Windows
+release and an MXU instance that has already been configured for the selected ADB
+device. MaaAssistantArknights remains the next planned integration.
+
+For MaaEnd, extract the official release, create a uniquely named ADB instance in
+MaaEnd, enable only tasks whose Project Interface declares ADB support, then enter
+the release directory and instance name in the runtime panel. The adapter validates
+the AGPL release, MaaFramework/agent files, controller, resource, device binding,
+and enabled tasks. Profiles with enabled external pre-actions are rejected. A
+successful preflight permits only this fixed one-shot launch:
+
+```text
+MaaEnd.exe --autostart --instance "<instance name>" --quit-after-run
+```
+
+The values can alternatively default from `MOBILE_PROFILER_MAAEND_ROOT` and
+`MOBILE_PROFILER_MAAEND_INSTANCE`. MaaEnd and its agents remain separate upstream
+processes; Mobile Profiler does not load their native DLLs or redistribute their
+Pipeline/image resources.
+
+The earlier deterministic visual spike is retained under the collapsed adapter
+diagnostics section. Install the optional image runtime only when using that
+diagnostic:
+
+```powershell
+python -m pip install -e ".[image]"
+mobile-profiler ui
+```
+
+The optional OpenCV/NumPy runtime adds a measured ~159.6 MiB; selecting and saving
+a project plan itself adds no heavyweight runtime. The diagnostic still exposes
+the typed graph, exact match coordinates, latency, PNG evidence, and adapter
+capability alignment. See
+[`docs/deterministic-visual-spike.md`](docs/deterministic-visual-spike.md).
 
 ### Two-stage Android endurance campaign
 
