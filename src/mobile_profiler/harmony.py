@@ -15,7 +15,7 @@ import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, TextIO, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
 from .collector import run_command
 from .models import (
@@ -98,6 +98,12 @@ HARMONY_POWER_MODES = {
     602: "performance",
     603: "extreme_power_save",
 }
+HARMONY_SETTINGS_BUNDLE = "com.huawei.hmos.settings"
+HARMONY_SETTINGS_ABILITY = "com.huawei.hmos.settings.MainAbility"
+HARMONY_BRIGHTNESS_LAYOUT_PATH = "/data/local/tmp/mobile_profiler_brightness_layout.json"
+HARMONY_DISPLAY_MANAGER_COMMAND = "ohos-displayManager"
+HARMONY_BRIGHTNESS_CALIBRATION_ALGORITHM = "settings-slider-adaptive-v1"
+HARMONY_BRIGHTNESS_TRACK_INSET_RATIO = 16.0 / 35.0
 
 
 @dataclass
@@ -896,6 +902,1050 @@ def parse_harmony_power_state(text: str) -> Dict[str, object]:
     return {"state": state, "reason": reason, "screen_state": screen_state}
 
 
+def parse_harmony_display_brightness(
+    display_power_text: str,
+    render_screen_text: str = "",
+    power_state_text: str = "",
+) -> Dict[str, object]:
+    display_match = re.search(
+        r"Display Id=(\d+)\s+State=(\d+)\s+Discount=([-+\d.]+)\s+Brightness=([-+\d.]+)",
+        display_power_text,
+    )
+    device_match = re.search(r"DeviceBrightness=([-+\d.]+)", display_power_text)
+    limits_match = re.search(
+        r"Brightness Limits:\s*Max=([-+\d.]+)\s+Min=([-+\d.]+)\s+Default=([-+\d.]+)",
+        display_power_text,
+    )
+    auto_match = re.search(r"Auto Adjust Brightness:\s*(ON|OFF)", display_power_text, re.I)
+    ambient_match = re.search(r"Support Ambient Light:\s*(TRUE|FALSE)", display_power_text, re.I)
+    render = parse_harmony_render_screen(render_screen_text)
+    power = parse_harmony_power_state(power_state_text)
+    requested = float(display_match.group(4)) if display_match else None
+    effective = float(device_match.group(1)) if device_match else requested
+    maximum = float(limits_match.group(1)) if limits_match else 255.0
+    minimum = float(limits_match.group(2)) if limits_match else 1.0
+    default = float(limits_match.group(3)) if limits_match else None
+    discount = float(display_match.group(3)) if display_match else None
+    automatic = auto_match.group(1).upper() == "ON" if auto_match else None
+    display_state = int(display_match.group(2)) if display_match else None
+    render_state = str(render.get("display_power_state") or "").upper()
+    screen_state = str(power.get("screen_state") or "").lower() or None
+    if screen_state is None and render_state:
+        screen_state = "off" if "OFF" in render_state else "on" if "ON" in render_state else None
+    normalized_requested = (
+        requested / maximum
+        if requested is not None and maximum > 0
+        else None
+    )
+    normalized_effective = (
+        effective / maximum
+        if effective is not None and maximum > 0
+        else None
+    )
+    restriction_active = bool(
+        requested is not None
+        and effective is not None
+        and (
+            effective < requested - 0.5
+            or (discount is not None and discount < 0.999)
+        )
+    )
+    result: Dict[str, object] = {
+        "available": display_match is not None or device_match is not None,
+        "platform": "harmony",
+        "source": "HarmonyOS DisplayPowerManagerService + RenderService",
+        "display_id": int(display_match.group(1)) if display_match else None,
+        "display_state": display_state,
+        "screen_state": screen_state,
+        "power_state": power.get("state"),
+        "power_reason": power.get("reason"),
+        "setting_raw": requested,
+        "setting_float": normalized_requested,
+        "current_screen_brightness": normalized_requested,
+        "last_user_set_brightness": normalized_requested,
+        "screen_brightness": normalized_effective,
+        "adjusted_brightness": normalized_effective,
+        "effective_raw": effective,
+        "brightness_discount": discount,
+        "thermal_cap": normalized_effective if restriction_active else 1.0,
+        "thermal_applied": restriction_active,
+        "thermal_status": None,
+        "brightness_minimum_raw": minimum,
+        "brightness_maximum_raw": maximum,
+        "brightness_default_raw": default,
+        "automatic": automatic,
+        "mode": 1 if automatic is True else 0 if automatic is False else None,
+        "ambient_light_supported": (
+            ambient_match.group(1).upper() == "TRUE" if ambient_match else None
+        ),
+        "render_backlight_raw": render.get("brightness_raw"),
+        "render_display_state": render.get("display_power_state"),
+        "restriction_active": restriction_active,
+    }
+    return result
+
+
+def harmony_brightness_limit_active(display: object) -> bool:
+    if not isinstance(display, dict):
+        return False
+    if display.get("restriction_active") is True or display.get("thermal_applied") is True:
+        return True
+    discount = display.get("brightness_discount")
+    requested = display.get("setting_raw")
+    effective = display.get("effective_raw")
+    return bool(
+        (isinstance(discount, (int, float)) and float(discount) < 0.999)
+        or (
+            isinstance(requested, (int, float))
+            and isinstance(effective, (int, float))
+            and float(effective) < float(requested) - 0.5
+        )
+    )
+
+
+def collect_harmony_display_brightness(
+    hdc: str,
+    device: str,
+    *,
+    timeout_s: float = 20.0,
+) -> Tuple[Dict[str, object], Optional[str], float]:
+    started = time.monotonic()
+    result = hdc_shell(
+        hdc,
+        device,
+        "echo __DISPLAY_POWER__; hidumper -s DisplayPowerManagerService; "
+        "echo __RENDER_SCREEN__; hidumper -s RenderService -a 'screen'; "
+        "echo __POWER_STATE__; hidumper -s PowerManagerService -a '-s'; "
+        f"echo __DISPLAY_CLI__; command -v {HARMONY_DISPLAY_MANAGER_COMMAND} 2>/dev/null; "
+        "echo __UITEST__; command -v uitest 2>/dev/null",
+        timeout_s=timeout_s,
+    )
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    if not result.ok:
+        return {}, result.stderr.strip() or result.stdout.strip() or "HarmonyOS brightness probe failed", elapsed_ms
+    sections = _split_sections(
+        result.stdout,
+        (
+            "__DISPLAY_POWER__",
+            "__RENDER_SCREEN__",
+            "__POWER_STATE__",
+            "__DISPLAY_CLI__",
+            "__UITEST__",
+        ),
+    )
+    parsed = parse_harmony_display_brightness(
+        sections["__DISPLAY_POWER__"],
+        sections["__RENDER_SCREEN__"],
+        sections["__POWER_STATE__"],
+    )
+    parsed["probe_elapsed_ms"] = elapsed_ms
+    direct_command = sections["__DISPLAY_CLI__"].strip().splitlines()
+    direct_command = direct_command[-1].strip() if direct_command else ""
+    parsed["direct_setter_available"] = bool(direct_command)
+    parsed["direct_setter_command"] = direct_command or None
+    parsed["ui_fallback_available"] = bool(sections["__UITEST__"].strip())
+    parsed["writable"] = bool(
+        parsed["direct_setter_available"] or parsed["ui_fallback_available"]
+    )
+    return parsed, None, elapsed_ms
+
+
+def harmony_brightness_capability(
+    hdc: str,
+    device: str,
+    calibration: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    state, error, _ = collect_harmony_display_brightness(hdc, device)
+    if error or not state.get("available"):
+        raise RuntimeError(error or "HarmonyOS DisplayPowerManagerService did not expose brightness")
+    minimum = int(round(float(state.get("brightness_minimum_raw") or 1.0)))
+    maximum = int(round(float(state.get("brightness_maximum_raw") or 255.0)))
+    current = int(round(float(state.get("setting_raw") or minimum)))
+    effective = int(round(float(state.get("effective_raw") or current)))
+    direct = state.get("direct_setter_available") is True
+    fallback = state.get("ui_fallback_available") is True
+    if direct:
+        setter = "HarmonyOS ohos-displayManager direct API + DisplayPowerManagerService verification"
+        setter_mode = "direct"
+    elif fallback:
+        setter = "HarmonyOS Settings compatibility fallback + DisplayPowerManagerService verification"
+        setter_mode = "settings_fallback"
+    else:
+        setter = "unavailable"
+        setter_mode = "none"
+    capability: Dict[str, object] = {
+        **state,
+        "device": harmony_device_id(harmony_target(device)),
+        "platform": "harmony",
+        "current": current,
+        "effective_current": effective,
+        "minimum": minimum,
+        "maximum": maximum,
+        "step": 1,
+        "normalized_minimum": minimum / max(1, maximum),
+        "normalized_maximum": 1.0,
+        "normalized_step": 1.0 / max(1, maximum),
+        "automatic": state.get("automatic") is True,
+        "writable": direct or fallback,
+        "range_source": "HarmonyOS DisplayPowerManagerService Brightness Limits",
+        "setter": setter,
+        "setter_mode": setter_mode,
+        "setter_restriction": (
+            None
+            if direct
+            else "DisplayPowerManagerService SetBrightness/AutoAdjustBrightness require system application identity"
+        ),
+    }
+    normalized_calibration = _normalize_harmony_brightness_calibration(calibration)
+    if normalized_calibration is not None and not direct:
+        selectable_values = list(normalized_calibration["selectable_values"])
+        capability.update(
+            {
+                "calibrated": True,
+                "calibration_required": False,
+                "selectable_values": selectable_values,
+                "unavailable_values": list(
+                    normalized_calibration.get("unavailable_values") or []
+                ),
+                "minimum": selectable_values[0],
+                "maximum": selectable_values[-1],
+                "range_source": "HarmonyOS Settings slider + DisplayPowerManagerService calibration",
+                "calibration_algorithm": normalized_calibration.get("algorithm"),
+                "calibrated_at": normalized_calibration.get("calibrated_at"),
+                "slider_bounds": normalized_calibration.get("slider_bounds"),
+            }
+        )
+    else:
+        capability.update(
+            {
+                "calibrated": direct,
+                "calibration_required": bool(fallback and not direct),
+                "selectable_values": (
+                    list(range(minimum, maximum + 1)) if direct else []
+                ),
+                "unavailable_values": [],
+            }
+        )
+    return capability
+
+
+def parse_harmony_ui_layout(text: str) -> List[Dict[str, object]]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        return []
+    try:
+        root = json.loads(text[start : end + 1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    rows: List[Dict[str, object]] = []
+
+    def walk(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        attributes = node.get("attributes")
+        if isinstance(attributes, dict):
+            rows.append(dict(attributes))
+        children = node.get("children")
+        if isinstance(children, list):
+            for child in children:
+                walk(child)
+
+    walk(root)
+    return rows
+
+
+def _harmony_layout_nodes(hdc: str, device: str) -> List[Dict[str, object]]:
+    result = hdc_shell(
+        hdc,
+        device,
+        f"uitest dumpLayout -p {HARMONY_BRIGHTNESS_LAYOUT_PATH} >/dev/null 2>&1; "
+        f"cat {HARMONY_BRIGHTNESS_LAYOUT_PATH} 2>/dev/null; "
+        f"rm -f {HARMONY_BRIGHTNESS_LAYOUT_PATH}",
+        timeout_s=20,
+    )
+    if not result.ok:
+        raise RuntimeError(result.stderr.strip() or "Unable to read HarmonyOS UI layout")
+    nodes = parse_harmony_ui_layout(result.stdout)
+    if not nodes:
+        raise RuntimeError("HarmonyOS UI layout did not contain accessible nodes")
+    return nodes
+
+
+def _harmony_node(nodes: Sequence[Dict[str, object]], node_id: str) -> Optional[Dict[str, object]]:
+    return next(
+        (
+            item
+            for item in nodes
+            if str(item.get("id") or item.get("key") or "") == node_id
+            and str(item.get("visible") or "true").lower() != "false"
+        ),
+        None,
+    )
+
+
+def _harmony_bounds(value: object) -> Optional[Tuple[int, int, int, int]]:
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", str(value or "").strip())
+    if not match:
+        return None
+    left, top, right, bottom = (int(item) for item in match.groups())
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _harmony_brightness_track(
+    slider: Dict[str, object],
+) -> Tuple[int, int, int, str]:
+    bounds_text = str(slider.get("bounds") or "").strip()
+    bounds = _harmony_bounds(bounds_text)
+    if bounds is None:
+        raise RuntimeError("HarmonyOS brightness slider bounds are unavailable")
+    left, top, right, bottom = bounds
+    height = bottom - top
+    inset = int(round(height * HARMONY_BRIGHTNESS_TRACK_INSET_RATIO))
+    track_left = left + inset
+    track_right = right - inset
+    if track_right <= track_left:
+        raise RuntimeError("HarmonyOS brightness slider track is too small to calibrate")
+    return track_left, (top + bottom) // 2, track_right, bounds_text
+
+
+def _normalize_harmony_brightness_calibration(
+    calibration: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    if not isinstance(calibration, dict):
+        return None
+    raw_values = calibration.get("selectable_values")
+    raw_positions = calibration.get("position_by_value")
+    slider_bounds = str(calibration.get("slider_bounds") or "").strip()
+    if (
+        not isinstance(raw_values, list)
+        or not isinstance(raw_positions, dict)
+        or _harmony_bounds(slider_bounds) is None
+    ):
+        return None
+    values: List[int] = []
+    positions: Dict[str, int] = {}
+    for raw_value in raw_values:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        raw_position = raw_positions.get(str(value), raw_positions.get(value))
+        try:
+            position = int(raw_position)
+        except (TypeError, ValueError):
+            return None
+        values.append(value)
+        positions[str(value)] = position
+    values = sorted(set(values))
+    if not values:
+        return None
+    track = calibration.get("track_bounds")
+    if not isinstance(track, list) or len(track) != 3:
+        return None
+    try:
+        track_left, track_y, track_right = (int(item) for item in track)
+    except (TypeError, ValueError):
+        return None
+    if track_right <= track_left:
+        return None
+    if any(position < track_left or position > track_right for position in positions.values()):
+        return None
+    return {
+        **calibration,
+        "selectable_values": values,
+        "position_by_value": positions,
+        "slider_bounds": slider_bounds,
+        "track_bounds": [track_left, track_y, track_right],
+    }
+
+
+def discover_harmony_brightness_values(
+    read_value: Callable[[int], int],
+    left: int,
+    right: int,
+) -> Dict[str, object]:
+    """Discover every value of a deterministic monotonic integer slider mapping."""
+    if right <= left:
+        raise ValueError("brightness slider right edge must be greater than the left edge")
+    cache: Dict[int, int] = {}
+    constant_intervals: List[Tuple[int, int, int]] = []
+
+    def read(position: int) -> int:
+        if position not in cache:
+            cache[position] = int(read_value(position))
+        return cache[position]
+
+    left_value = read(left)
+    right_value = read(right)
+    stack = [(left, right, left_value, right_value)]
+    while stack:
+        interval_left, interval_right, value_left, value_right = stack.pop()
+        if value_left > value_right:
+            raise RuntimeError(
+                "HarmonyOS brightness slider mapping is not monotonic: "
+                f"x={interval_left} reported {value_left}, "
+                f"x={interval_right} reported {value_right}"
+            )
+        if interval_right - interval_left <= 1:
+            continue
+        if value_left == value_right:
+            constant_intervals.append((value_left, interval_left, interval_right))
+            continue
+        if value_right - value_left <= 1:
+            continue
+        midpoint = (interval_left + interval_right) // 2
+        midpoint_value = read(midpoint)
+        if midpoint_value < value_left or midpoint_value > value_right:
+            raise RuntimeError(
+                "HarmonyOS brightness slider midpoint is not monotonic: "
+                f"{value_left}, {midpoint_value}, {value_right}"
+            )
+        stack.append((midpoint, interval_right, midpoint_value, value_right))
+        stack.append((interval_left, midpoint, value_left, midpoint_value))
+
+    selectable_values = sorted(set(cache.values()))
+    candidates: Dict[int, List[int]] = {value: [] for value in selectable_values}
+    for position, value in cache.items():
+        candidates[value].append(position)
+    for value, interval_left, interval_right in constant_intervals:
+        if value in candidates:
+            candidates[value].append((interval_left + interval_right) // 2)
+    position_by_value = {
+        str(value): sorted(positions)[len(positions) // 2]
+        for value, positions in candidates.items()
+    }
+    unavailable_values = [
+        value
+        for value in range(selectable_values[0], selectable_values[-1] + 1)
+        if value not in candidates
+    ]
+    return {
+        "selectable_values": selectable_values,
+        "position_by_value": position_by_value,
+        "unavailable_values": unavailable_values,
+        "query_count": len(cache),
+    }
+
+
+def _harmony_click_position(hdc: str, device: str, x: int, y: int) -> None:
+    result = hdc_shell(
+        hdc,
+        device,
+        ["uitest", "uiInput", "click", str(x), str(y)],
+        timeout_s=12,
+    )
+    if not result.ok:
+        raise RuntimeError(
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "HarmonyOS brightness slider click failed"
+        )
+
+
+def _harmony_click_node(hdc: str, device: str, node: Dict[str, object]) -> None:
+    bounds = _harmony_bounds(node.get("bounds"))
+    if bounds is None:
+        raise RuntimeError(f"HarmonyOS control {node.get('id') or node.get('key') or 'unknown'} has no usable bounds")
+    left, top, right, bottom = bounds
+    _harmony_click_position(hdc, device, (left + right) // 2, (top + bottom) // 2)
+
+
+def _harmony_previous_foreground(nodes: Sequence[Dict[str, object]]) -> Tuple[Optional[str], Optional[str]]:
+    for item in nodes:
+        bundle = str(item.get("bundleName") or "").strip()
+        ability = str(item.get("abilityName") or "").strip()
+        if bundle and ability:
+            return bundle, ability
+    return None, None
+
+
+def _harmony_previous_application(
+    hdc: str,
+    device: str,
+    nodes: Sequence[Dict[str, object]],
+) -> Tuple[Optional[str], Optional[str]]:
+    bundle, ability = _harmony_previous_foreground(nodes)
+    system_bundles = {
+        HARMONY_SETTINGS_BUNDLE,
+        "com.ohos.sceneboard",
+        "com.huawei.hmos.launcher",
+    }
+    if bundle and ability and bundle not in system_bundles:
+        return bundle, ability
+    result = hdc_shell(
+        hdc,
+        device,
+        "hidumper -s AbilityManagerService -a '-a'",
+        timeout_s=15,
+    )
+    if result.ok:
+        for match in re.finditer(
+            r"mission name #\[#([^:\]\s]+)(?::[^:\]\s]+)*:([^:\]\s]+)\]",
+            result.stdout,
+        ):
+            candidate_bundle, candidate_ability = match.groups()
+            if candidate_bundle not in system_bundles:
+                return candidate_bundle, candidate_ability
+    return bundle, ability
+
+
+def _harmony_display_cli_error(result: CommandResult) -> str:
+    output = (result.stderr.strip() or result.stdout.strip()).strip()
+    for line in reversed(output.splitlines()):
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            detail = str(payload.get("errMsg") or payload.get("message") or "").strip()
+            code = str(payload.get("errCode") or "").strip()
+            if detail and code:
+                return f"{code}: {detail}"
+            if detail:
+                return detail
+    return output or f"{HARMONY_DISPLAY_MANAGER_COMMAND} failed with exit code {result.returncode}"
+
+
+def _open_harmony_brightness_slider(
+    hdc: str,
+    device: str,
+    before: Dict[str, object],
+) -> Dict[str, object]:
+    screen_was_off = before.get("screen_state") == "off"
+    if screen_was_off:
+        wake = hdc_shell(hdc, device, ["power-shell", "wakeup"], timeout_s=12)
+        if not wake.ok:
+            raise RuntimeError(wake.stderr.strip() or "Unable to wake HarmonyOS display")
+        time.sleep(0.5)
+    previous_nodes = _harmony_layout_nodes(hdc, device)
+    previous_bundle, previous_ability = _harmony_previous_application(
+        hdc,
+        device,
+        previous_nodes,
+    )
+    hdc_shell(hdc, device, ["aa", "force-stop", HARMONY_SETTINGS_BUNDLE], timeout_s=12)
+    opened = hdc_shell(
+        hdc,
+        device,
+        ["aa", "start", "-b", HARMONY_SETTINGS_BUNDLE, "-a", HARMONY_SETTINGS_ABILITY],
+        timeout_s=15,
+    )
+    if not opened.ok:
+        raise RuntimeError(
+            opened.stderr.strip()
+            or opened.stdout.strip()
+            or "Unable to open HarmonyOS Settings"
+        )
+    time.sleep(0.8)
+    nodes = _harmony_layout_nodes(hdc, device)
+    slider = _harmony_node(nodes, "brightness_slider")
+    if slider is None:
+        display_row = _harmony_node(nodes, "display_settings")
+        for _ in range(4):
+            if display_row is not None:
+                break
+            root_bounds = next(
+                (_harmony_bounds(item.get("bounds")) for item in nodes if item.get("type") == "root"),
+                None,
+            )
+            if root_bounds is None:
+                break
+            left, top, right, bottom = root_bounds
+            swipe = hdc_shell(
+                hdc,
+                device,
+                [
+                    "uitest",
+                    "uiInput",
+                    "swipe",
+                    str((left + right) // 2),
+                    str(int(bottom * 0.82)),
+                    str((left + right) // 2),
+                    str(int(bottom * 0.30)),
+                    "800",
+                ],
+                timeout_s=12,
+            )
+            if not swipe.ok:
+                break
+            time.sleep(0.25)
+            nodes = _harmony_layout_nodes(hdc, device)
+            display_row = _harmony_node(nodes, "display_settings")
+        if display_row is None:
+            raise RuntimeError("HarmonyOS Settings did not expose the display_settings entry")
+        _harmony_click_node(hdc, device, display_row)
+        time.sleep(0.7)
+        nodes = _harmony_layout_nodes(hdc, device)
+        slider = _harmony_node(nodes, "brightness_slider")
+    if slider is None:
+        raise RuntimeError("HarmonyOS Settings did not expose brightness_slider")
+    automatic_toggle = _harmony_node(nodes, "automatic_adjust_toggle")
+    manual_mode_changed = False
+    if (
+        automatic_toggle is not None
+        and str(automatic_toggle.get("checked") or "false").lower() == "true"
+    ):
+        _harmony_click_node(hdc, device, automatic_toggle)
+        manual_mode_changed = True
+        time.sleep(0.35)
+    return {
+        "slider": slider,
+        "previous_bundle": previous_bundle,
+        "previous_ability": previous_ability,
+        "screen_was_off": screen_was_off,
+        "manual_mode_changed": manual_mode_changed,
+    }
+
+
+def _restore_harmony_brightness_ui_context(
+    hdc: str,
+    device: str,
+    context: Dict[str, object],
+    *,
+    restore_automatic: bool = False,
+) -> List[str]:
+    warnings: List[str] = []
+    if restore_automatic and context.get("manual_mode_changed") is True:
+        try:
+            nodes = _harmony_layout_nodes(hdc, device)
+            toggle = _harmony_node(nodes, "automatic_adjust_toggle")
+            if toggle is None:
+                warnings.append("Unable to restore HarmonyOS automatic brightness: toggle not found")
+            elif str(toggle.get("checked") or "false").lower() != "true":
+                _harmony_click_node(hdc, device, toggle)
+                time.sleep(0.35)
+        except Exception as exc:
+            warnings.append(f"Unable to restore HarmonyOS automatic brightness: {exc}")
+    previous_bundle = str(context.get("previous_bundle") or "").strip()
+    previous_ability = str(context.get("previous_ability") or "").strip()
+    if previous_bundle and previous_ability and previous_bundle != HARMONY_SETTINGS_BUNDLE:
+        restored = hdc_shell(
+            hdc,
+            device,
+            ["aa", "start", "-b", previous_bundle, "-a", previous_ability],
+            timeout_s=15,
+        )
+        if not restored.ok:
+            warnings.append(
+                restored.stderr.strip()
+                or restored.stdout.strip()
+                or f"Unable to restore foreground application {previous_bundle}"
+            )
+    if context.get("screen_was_off") is True:
+        suspended = hdc_shell(hdc, device, ["power-shell", "suspend"], timeout_s=12)
+        if not suspended.ok:
+            warnings.append(
+                suspended.stderr.strip()
+                or suspended.stdout.strip()
+                or "Unable to restore the HarmonyOS screen-off state"
+            )
+    return warnings
+
+
+def calibrate_harmony_brightness(hdc: str, device: str) -> Dict[str, object]:
+    before = harmony_brightness_capability(hdc, device)
+    if before.get("ui_fallback_available") is not True:
+        raise RuntimeError("HarmonyOS brightness slider calibration requires uitest")
+    context: Dict[str, object] = {}
+    calibration: Dict[str, object] = {}
+    warnings: List[str] = []
+    try:
+        context = _open_harmony_brightness_slider(hdc, device, before)
+        slider = context["slider"]
+        if not isinstance(slider, dict):
+            raise RuntimeError("HarmonyOS brightness slider metadata is unavailable")
+        track_left, track_y, track_right, slider_bounds = _harmony_brightness_track(slider)
+        midpoint = (track_left + track_right) // 2
+
+        def read_position(position: int) -> int:
+            anchor = track_right if position <= midpoint else track_left
+            result = hdc_shell(
+                hdc,
+                device,
+                (
+                    f"uitest uiInput click {anchor} {track_y} >/dev/null 2>&1; "
+                    "sleep 0.15; "
+                    f"uitest uiInput click {position} {track_y} >/dev/null 2>&1; "
+                    "sleep 0.30; "
+                    "hidumper -s DisplayPowerManagerService"
+                ),
+                timeout_s=20,
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "HarmonyOS brightness calibration query failed"
+                )
+            match = re.search(
+                r"Display Id=0[^\n]*?Brightness=(\d+)",
+                result.stdout,
+            )
+            if not match:
+                raise RuntimeError(
+                    "DisplayPowerManagerService did not report brightness during calibration"
+                )
+            return int(match.group(1))
+
+        discovered = discover_harmony_brightness_values(
+            read_position,
+            track_left,
+            track_right,
+        )
+        selectable_values = list(discovered["selectable_values"])
+        position_by_value = dict(discovered["position_by_value"])
+        original = int(before["current"])
+        restored_value = min(
+            selectable_values,
+            key=lambda value: (abs(int(value) - original), int(value)),
+        )
+        restored_position = int(position_by_value[str(restored_value)])
+        restored_actual = read_position(restored_position)
+        if restored_actual != restored_value:
+            warnings.append(
+                f"Brightness calibration restored {restored_actual} instead of {restored_value}"
+            )
+        if restored_value != original:
+            warnings.append(
+                f"Original brightness {original} is not reachable from the system slider; restored {restored_value}"
+            )
+        calibration = {
+            **discovered,
+            "algorithm": HARMONY_BRIGHTNESS_CALIBRATION_ALGORITHM,
+            "device": harmony_device_id(harmony_target(device)),
+            "slider_bounds": slider_bounds,
+            "track_bounds": [track_left, track_y, track_right],
+            "calibrated_at": time.time(),
+            "original_value": original,
+            "restored_value": restored_actual,
+            "manual_mode_changed": context.get("manual_mode_changed") is True,
+            "warnings": warnings,
+        }
+        return calibration
+    finally:
+        if context:
+            warnings.extend(
+                _restore_harmony_brightness_ui_context(
+                    hdc,
+                    device,
+                    context,
+                    restore_automatic=before.get("automatic") is True,
+                )
+            )
+            if calibration:
+                calibration["warnings"] = warnings
+
+
+def _harmony_brightness_result(
+    capability: Dict[str, object],
+    *,
+    requested: int,
+    before: Dict[str, object],
+    setter_used: str,
+    warnings: Optional[Sequence[str]] = None,
+    manual_mode_changed: bool = False,
+) -> Dict[str, object]:
+    step = int(capability.get("step") or 1)
+    current = int(capability["current"])
+    capability.update(
+        {
+            "requested": requested,
+            "applied": abs(current - requested) <= step,
+            "previous_mode": before.get("mode"),
+            "manual_mode_changed": manual_mode_changed,
+            "warnings": list(warnings or []),
+            "setter_used": setter_used,
+        }
+    )
+    return capability
+
+
+def _set_harmony_brightness_via_settings(
+    hdc: str,
+    device: str,
+    value: int,
+    *,
+    before: Dict[str, object],
+    initial_warnings: Optional[Sequence[str]] = None,
+    calibration: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    minimum = int(before["minimum"])
+    maximum = int(before["maximum"])
+    if value < minimum or value > maximum:
+        raise ValueError(f"brightness value must be between {minimum} and {maximum}")
+    if not before.get("ui_fallback_available"):
+        raise RuntimeError("HarmonyOS Settings compatibility fallback is unavailable because uitest is missing")
+    previous_bundle: Optional[str] = None
+    previous_ability: Optional[str] = None
+    manual_mode_changed = False
+    restored = False
+    warnings = list(initial_warnings or [])
+    best_value = int(before["current"])
+    best_x: Optional[int] = None
+    last_x: Optional[int] = None
+    try:
+        if before.get("screen_state") == "off":
+            wake = hdc_shell(hdc, device, ["power-shell", "wakeup"], timeout_s=12)
+            if not wake.ok:
+                raise RuntimeError(wake.stderr.strip() or "Unable to wake HarmonyOS display")
+            time.sleep(0.5)
+        previous_nodes = _harmony_layout_nodes(hdc, device)
+        previous_bundle, previous_ability = _harmony_previous_application(
+            hdc,
+            device,
+            previous_nodes,
+        )
+        hdc_shell(hdc, device, ["aa", "force-stop", HARMONY_SETTINGS_BUNDLE], timeout_s=12)
+        opened = hdc_shell(
+            hdc,
+            device,
+            ["aa", "start", "-b", HARMONY_SETTINGS_BUNDLE, "-a", HARMONY_SETTINGS_ABILITY],
+            timeout_s=15,
+        )
+        if not opened.ok:
+            raise RuntimeError(opened.stderr.strip() or opened.stdout.strip() or "Unable to open HarmonyOS Settings")
+        time.sleep(0.8)
+        nodes = _harmony_layout_nodes(hdc, device)
+        slider = _harmony_node(nodes, "brightness_slider")
+        if slider is None:
+            display_row = _harmony_node(nodes, "display_settings")
+            for _ in range(4):
+                if display_row is not None:
+                    break
+                root_bounds = next(
+                    (_harmony_bounds(item.get("bounds")) for item in nodes if item.get("type") == "root"),
+                    None,
+                )
+                if root_bounds is None:
+                    break
+                left, top, right, bottom = root_bounds
+                swipe = hdc_shell(
+                    hdc,
+                    device,
+                    [
+                        "uitest",
+                        "uiInput",
+                        "swipe",
+                        str((left + right) // 2),
+                        str(int(bottom * 0.82)),
+                        str((left + right) // 2),
+                        str(int(bottom * 0.30)),
+                        "800",
+                    ],
+                    timeout_s=12,
+                )
+                if not swipe.ok:
+                    break
+                time.sleep(0.25)
+                nodes = _harmony_layout_nodes(hdc, device)
+                display_row = _harmony_node(nodes, "display_settings")
+            if display_row is None:
+                raise RuntimeError("HarmonyOS Settings did not expose the display_settings entry")
+            _harmony_click_node(hdc, device, display_row)
+            time.sleep(0.7)
+            nodes = _harmony_layout_nodes(hdc, device)
+            slider = _harmony_node(nodes, "brightness_slider")
+        if slider is None:
+            raise RuntimeError("HarmonyOS Settings did not expose brightness_slider")
+        automatic_toggle = _harmony_node(nodes, "automatic_adjust_toggle")
+        if automatic_toggle is not None and str(automatic_toggle.get("checked") or "false").lower() == "true":
+            _harmony_click_node(hdc, device, automatic_toggle)
+            manual_mode_changed = True
+            time.sleep(0.35)
+
+        normalized_calibration = _normalize_harmony_brightness_calibration(calibration)
+        if normalized_calibration is not None:
+            if str(slider.get("bounds") or "").strip() != normalized_calibration["slider_bounds"]:
+                raise RuntimeError(
+                    "HarmonyOS brightness slider layout changed; scan the selectable values again"
+                )
+            selectable_values = list(normalized_calibration["selectable_values"])
+            if value not in selectable_values:
+                raise ValueError(
+                    f"brightness value {value} is not reachable from this HarmonyOS slider"
+                )
+            track_left, track_y, track_right = normalized_calibration["track_bounds"]
+            target_x = int(normalized_calibration["position_by_value"][str(value)])
+            anchor_x = track_right if target_x <= (track_left + track_right) // 2 else track_left
+            _harmony_click_position(hdc, device, anchor_x, track_y)
+            time.sleep(0.15)
+            _harmony_click_position(hdc, device, target_x, track_y)
+            time.sleep(0.30)
+            best_x = target_x
+            last_x = target_x
+        elif int(before["current"]) != value:
+            bounds = _harmony_bounds(slider.get("bounds"))
+            if bounds is None:
+                raise RuntimeError("HarmonyOS brightness slider bounds are unavailable")
+            left, top, right, bottom = bounds
+            width = max(1, right - left)
+            y = (top + bottom) // 2
+            slider_value = _number(slider.get("text") or slider.get("originalText"))
+            if slider_value is None:
+                slider_value = float(before["current"])
+            current_x = int(round(left + (slider_value - minimum) / max(1, maximum - minimum) * width))
+            current_x = max(left, min(right, current_x))
+            low_x, high_x = (current_x, right) if value > int(before["current"]) else (left, current_x)
+            exponent = 1.0
+            current_ratio = max(1e-6, min(1.0, float(before["current"]) / maximum))
+            slider_ratio = max(1e-6, min(1.0, float(slider_value) / maximum))
+            if current_ratio not in {0.0, 1.0} and slider_ratio not in {0.0, 1.0}:
+                with suppress(ValueError, ZeroDivisionError):
+                    exponent = max(0.45, min(3.0, math.log(current_ratio) / math.log(slider_ratio)))
+            target_slider = maximum * (max(minimum, value) / maximum) ** (1.0 / exponent)
+            candidate = int(round(left + (target_slider - minimum) / max(1, maximum - minimum) * width))
+            candidate = max(low_x, min(high_x, candidate))
+            best_error = abs(best_value - value)
+            best_x = current_x
+            for attempt in range(11):
+                if attempt > 0:
+                    candidate = (low_x + high_x) // 2
+                click = hdc_shell(
+                    hdc,
+                    device,
+                    ["uitest", "uiInput", "click", str(candidate), str(y)],
+                    timeout_s=12,
+                )
+                if not click.ok:
+                    raise RuntimeError(click.stderr.strip() or click.stdout.strip() or "Unable to move HarmonyOS brightness slider")
+                last_x = candidate
+                time.sleep(0.25)
+                current_state = harmony_brightness_capability(hdc, device)
+                measured = int(current_state["current"])
+                error = abs(measured - value)
+                if error < best_error:
+                    best_error = error
+                    best_value = measured
+                    best_x = candidate
+                if error <= int(current_state.get("step") or 1):
+                    best_value = measured
+                    best_x = candidate
+                    break
+                if measured < value:
+                    low_x = min(high_x, candidate + 1)
+                else:
+                    high_x = max(low_x, candidate - 1)
+                if low_x > high_x:
+                    break
+            if best_x is not None and last_x != best_x:
+                hdc_shell(
+                    hdc,
+                    device,
+                    ["uitest", "uiInput", "click", str(best_x), str(y)],
+                    timeout_s=12,
+                )
+                time.sleep(0.25)
+        refreshed = harmony_brightness_capability(hdc, device, normalized_calibration)
+        calibrated_exact = normalized_calibration is not None
+        if (
+            int(refreshed["current"]) != value
+            if calibrated_exact
+            else abs(int(refreshed["current"]) - value) > int(refreshed.get("step") or 1)
+        ):
+            warnings.append(
+                f"HarmonyOS slider stopped at {refreshed['current']} while {value} was requested"
+            )
+        refreshed = _harmony_brightness_result(
+            refreshed,
+            requested=value,
+            before=before,
+            setter_used="settings_fallback",
+            warnings=warnings,
+            manual_mode_changed=manual_mode_changed,
+        )
+        if calibrated_exact:
+            refreshed["applied"] = int(refreshed["current"]) == value
+        refreshed["previous_foreground_package"] = previous_bundle
+        refreshed["previous_foreground_activity"] = previous_ability
+        return refreshed
+    finally:
+        if previous_bundle and previous_ability and previous_bundle != HARMONY_SETTINGS_BUNDLE:
+            restore = hdc_shell(
+                hdc,
+                device,
+                ["aa", "start", "-b", previous_bundle, "-a", previous_ability],
+                timeout_s=15,
+            )
+            restored = restore.ok
+        elif previous_bundle == HARMONY_SETTINGS_BUNDLE:
+            restored = True
+        if not restored and previous_bundle:
+            with suppress(Exception):
+                hdc_shell(hdc, device, ["uitest", "uiInput", "keyEvent", "Back"], timeout_s=8)
+        if before.get("screen_state") == "off":
+            with suppress(Exception):
+                hdc_shell(hdc, device, ["power-shell", "suspend"], timeout_s=12)
+
+
+def set_harmony_brightness(
+    hdc: str,
+    device: str,
+    value: int,
+    calibration: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    before = harmony_brightness_capability(hdc, device, calibration)
+    minimum = int(before["minimum"])
+    maximum = int(before["maximum"])
+    if value < minimum or value > maximum:
+        raise ValueError(f"brightness value must be between {minimum} and {maximum}")
+    current = int(before["current"])
+    if current == value and before.get("automatic") is not True:
+        return _harmony_brightness_result(
+            before,
+            requested=value,
+            before=before,
+            setter_used="none",
+        )
+
+    direct_error: Optional[str] = None
+    if before.get("direct_setter_available") is True and before.get("automatic") is not True:
+        command = str(before.get("direct_setter_command") or HARMONY_DISPLAY_MANAGER_COMMAND)
+        result = hdc_shell(
+            hdc,
+            device,
+            [command, "set-brightness", "--value", str(value)],
+            timeout_s=15,
+        )
+        if result.ok:
+            time.sleep(0.15)
+            refreshed = harmony_brightness_capability(hdc, device)
+            if abs(int(refreshed["current"]) - value) <= int(refreshed.get("step") or 1):
+                return _harmony_brightness_result(
+                    refreshed,
+                    requested=value,
+                    before=before,
+                    setter_used="direct",
+                )
+            direct_error = (
+                f"{HARMONY_DISPLAY_MANAGER_COMMAND} returned success but "
+                f"DisplayPowerManagerService reported {refreshed['current']} instead of {value}"
+            )
+        else:
+            direct_error = _harmony_display_cli_error(result)
+
+    if before.get("ui_fallback_available") is not True:
+        if before.get("automatic") is True and before.get("direct_setter_available") is True:
+            raise RuntimeError(
+                "HarmonyOS direct brightness setter cannot disable automatic brightness, and the Settings fallback is unavailable"
+            )
+        raise RuntimeError(
+            direct_error
+            or "HarmonyOS numeric brightness is unavailable: the system direct setter is absent and uitest fallback is unavailable"
+        )
+
+    return _set_harmony_brightness_via_settings(
+        hdc,
+        device,
+        value,
+        before=before,
+        initial_warnings=[f"Direct brightness setter failed: {direct_error}"] if direct_error else None,
+        calibration=calibration,
+    )
+
+
 def parse_harmony_foreground(text: str) -> Dict[str, Optional[str]]:
     candidates: List[Dict[str, Optional[str]]] = []
     ability_blocks = re.split(r"(?=\n\s*AbilityRecord ID #)", "\n" + text)
@@ -1497,17 +2547,58 @@ def collect_harmony_system_snapshot(
 def collect_harmony_thermal_snapshot(
     hdc: str,
     device: str,
+    include_display_brightness: bool = True,
 ) -> Tuple[Optional[ThermalSnapshot], Optional[str]]:
     started = time.monotonic()
-    script = "echo __TIME__; date +%s.%N; echo __THERMAL__; hidumper -s ThermalService -a '-t'"
+    commands = [
+        "echo __TIME__; date +%s.%N",
+        "echo __THERMAL__; hidumper -s ThermalService -a '-t'",
+    ]
+    if include_display_brightness:
+        commands.extend(
+            [
+                "echo __DISPLAY_POWER__; hidumper -s DisplayPowerManagerService",
+                "echo __RENDER_SCREEN__; hidumper -s RenderService -a 'screen'",
+                "echo __POWER_STATE__; hidumper -s PowerManagerService -a '-s'",
+            ]
+        )
+    else:
+        commands.extend(
+            [
+                "echo __DISPLAY_POWER__",
+                "echo __RENDER_SCREEN__",
+                "echo __POWER_STATE__",
+            ]
+        )
+    script = "; ".join(commands)
     result = hdc_shell(hdc, device, script, timeout_s=20)
     if not result.ok:
         return None, result.stderr.strip() or "HarmonyOS thermal snapshot failed"
-    sections = _split_sections(result.stdout, ("__TIME__", "__THERMAL__"))
+    sections = _split_sections(
+        result.stdout,
+        (
+            "__TIME__",
+            "__THERMAL__",
+            "__DISPLAY_POWER__",
+            "__RENDER_SCREEN__",
+            "__POWER_STATE__",
+        ),
+    )
     timestamp = _extract_timestamp(sections["__TIME__"])
     if timestamp is None:
         return None, "HarmonyOS thermal snapshot did not include a device timestamp"
     temperatures = parse_harmony_thermal(sections["__THERMAL__"])
+    display_brightness = (
+        parse_harmony_display_brightness(
+            sections["__DISPLAY_POWER__"],
+            sections["__RENDER_SCREEN__"],
+            sections["__POWER_STATE__"],
+        )
+        if include_display_brightness
+        else {}
+    )
+    if display_brightness:
+        display_brightness["probe_elapsed_ms"] = (time.monotonic() - started) * 1000.0
     return (
         ThermalSnapshot(
             uptime_s=timestamp,
@@ -1518,6 +2609,7 @@ def collect_harmony_thermal_snapshot(
             cooling_devices=[],
             thresholds=[],
             headroom_thresholds=[],
+            display_brightness=display_brightness,
             collection_ms=(time.monotonic() - started) * 1000.0,
         ),
         None,
@@ -1610,6 +2702,19 @@ def probe_harmony_device(
     cpufreq_result = hdc_shell(hdc, target, "hidumper --cpufreq", timeout_s=20)
     thermal_result = hdc_shell(hdc, target, "hidumper -s ThermalService -a '-t'", timeout_s=15)
     power_result = hdc_shell(hdc, target, "hidumper -s PowerManagerService -a '-s'", timeout_s=15)
+    display_power_result = hdc_shell(
+        hdc,
+        target,
+        "hidumper -s DisplayPowerManagerService",
+        timeout_s=15,
+    )
+    brightness_setter_result = hdc_shell(
+        hdc,
+        target,
+        f"echo __DISPLAY_CLI__; command -v {HARMONY_DISPLAY_MANAGER_COMMAND} 2>/dev/null; "
+        "echo __UITEST__; command -v uitest 2>/dev/null",
+        timeout_s=10,
+    )
     ability_result = hdc_shell(hdc, target, "aa dump -a", timeout_s=20)
     stat_result = hdc_shell(hdc, target, "grep '^cpu' /proc/stat", timeout_s=10)
     smartperf_result = hdc_shell(
@@ -1652,6 +2757,25 @@ def probe_harmony_device(
         ),
     )
     display = parse_harmony_render_screen(performance_sections["__SCREEN__"])
+    brightness = parse_harmony_display_brightness(
+        display_power_result.stdout if display_power_result.ok else "",
+        performance_sections["__SCREEN__"],
+        power_result.stdout if power_result.ok else "",
+    )
+    brightness_setter_sections = _split_sections(
+        brightness_setter_result.stdout if brightness_setter_result.ok else "",
+        ("__DISPLAY_CLI__", "__UITEST__"),
+    )
+    direct_commands = brightness_setter_sections["__DISPLAY_CLI__"].strip().splitlines()
+    direct_command = direct_commands[-1].strip() if direct_commands else ""
+    brightness["direct_setter_available"] = bool(direct_command)
+    brightness["direct_setter_command"] = direct_command or None
+    brightness["ui_fallback_available"] = bool(
+        brightness_setter_sections["__UITEST__"].strip()
+    )
+    brightness["writable"] = bool(
+        brightness["direct_setter_available"] or brightness["ui_fallback_available"]
+    )
     refresh_rate = display.get("refresh_rate_hz")
     display_active = _harmony_screen_active(
         power.get("screen_state") or display.get("screen_state") or display.get("display_power_state")
@@ -1710,6 +2834,7 @@ def probe_harmony_device(
         "cpu_policies": [asdict(item) for item in policies],
         "cpu_frequencies_mhz": frequencies,
         "display": display,
+        "brightness": brightness,
         "performance": performance,
         "touch": {
             "devices": touch_devices,
@@ -1757,6 +2882,9 @@ def probe_harmony_device(
             "ability_manager": bool(ability_result.stdout.strip()),
             "process_top": system_snapshot is not None and bool(system_snapshot.processes),
             "display_modes": bool(display.get("supported_refresh_rates_hz")),
+            "brightness_read": bool(brightness.get("available")),
+            "brightness_control": bool(brightness.get("available") and brightness.get("writable")),
+            "brightness_limit_state": bool(brightness.get("available")),
             "render_service_fps": bool(frame_pacing.get("frame_sample_count")),
             "window_manager": bool(window.get("foreground_window_id")),
             "touch_devices": bool(touch_devices),
@@ -2165,7 +3293,11 @@ def build_harmony_smartperf_context(
     )
 
 
-def _smartperf_thermal_snapshot(record: Dict[str, str], sample: Sample) -> ThermalSnapshot:
+def _smartperf_thermal_snapshot(
+    record: Dict[str, str],
+    sample: Sample,
+    display_brightness: Optional[Dict[str, object]] = None,
+) -> ThermalSnapshot:
     sensors: List[Dict[str, object]] = []
     for key, value in record.items():
         lowered = key.lower()
@@ -2196,6 +3328,7 @@ def _smartperf_thermal_snapshot(record: Dict[str, str], sample: Sample) -> Therm
         cooling_devices=[],
         thresholds=[],
         headroom_thresholds=[],
+        display_brightness=dict(display_brightness or {}),
         collection_ms=None,
     )
 
@@ -2279,6 +3412,7 @@ def collect_harmony_smartperf_session(
     checkpoint_interval_s: float,
     reconnect_timeout_s: float,
     process_interval_s: float,
+    thermal_interval_s: float,
     scheduler_interval_s: float,
     context_interval_s: float,
     external_power: Optional[bool] = None,
@@ -2305,6 +3439,8 @@ def collect_harmony_smartperf_session(
     latest_foreground_activity: Optional[str] = None
     last_render_service_timestamp_ns: Optional[int] = None
     last_sample_received_at = started
+    next_brightness_probe = started
+    brightness_tracking_active = False
     warned: set[str] = set()
 
     def warn_once(key: str, message: str) -> None:
@@ -2390,6 +3526,7 @@ def collect_harmony_smartperf_session(
                 battery_probe_interval_s,
                 time.monotonic(),
             )
+        nonlocal next_brightness_probe, brightness_tracking_active
         sample = build_harmony_smartperf_sample(
             record,
             result.sample_count,
@@ -2485,7 +3622,23 @@ def collect_harmony_smartperf_session(
             result.context_count += 1
 
         if features.get("thermal"):
-            journal.append_thermal_snapshot(_smartperf_thermal_snapshot(record, sample))
+            display_brightness: Dict[str, object] = {}
+            if brightness_tracking_active or now >= next_brightness_probe:
+                display_brightness, brightness_error, _ = collect_harmony_display_brightness(
+                    hdc,
+                    target,
+                )
+                if brightness_error:
+                    warn_once("brightness", brightness_error)
+                was_tracking = brightness_tracking_active
+                brightness_tracking_active = harmony_brightness_limit_active(display_brightness)
+                if brightness_tracking_active or was_tracking:
+                    next_brightness_probe = now + max(2.0, thermal_interval_s)
+                elif display_brightness:
+                    next_brightness_probe = now + max(30.0, thermal_interval_s * 3.0)
+            journal.append_thermal_snapshot(
+                _smartperf_thermal_snapshot(record, sample, display_brightness)
+            )
             result.thermal_snapshot_count += 1
 
         if features.get("target_process"):
@@ -2826,6 +3979,8 @@ def collect_harmony_session(
     next_thermal = started if thermal_monitor_enabled else float("inf")
     next_scheduler = started if scheduler_monitor_enabled else float("inf")
     next_cpu_frequency = started if cpu_frequency_enabled else float("inf")
+    next_brightness_probe = started if thermal_monitor_enabled else float("inf")
+    brightness_tracking_active = False
     max_cpu_gap_s = max(interval_s * 3.0, interval_s + 2.0)
 
     def warn_once(key: str, message: str) -> None:
@@ -2989,10 +4144,26 @@ def collect_harmony_session(
                     next_process = _advance_due(next_process, process_interval_s, now)
 
                 if thermal_monitor_enabled and now >= next_thermal:
-                    snapshot, error = collect_harmony_thermal_snapshot(hdc, target)
+                    include_brightness = brightness_tracking_active or now >= next_brightness_probe
+                    snapshot, error = collect_harmony_thermal_snapshot(
+                        hdc,
+                        target,
+                        include_display_brightness=include_brightness,
+                    )
                     if snapshot is not None:
                         journal.append_thermal_snapshot(snapshot)
                         result.thermal_snapshot_count += 1
+                        was_tracking = brightness_tracking_active
+                        brightness_tracking_active = harmony_brightness_limit_active(
+                            snapshot.display_brightness
+                        )
+                        if brightness_tracking_active or was_tracking:
+                            next_brightness_probe = now + max(2.0, thermal_interval_s)
+                        elif snapshot.display_brightness:
+                            next_brightness_probe = now + max(
+                                30.0,
+                                thermal_interval_s * 3.0,
+                            )
                     elif error:
                         warn_once("thermal", error)
                     next_thermal = _advance_due(next_thermal, thermal_interval_s, now)

@@ -576,17 +576,22 @@
                   <small class="field-hint" id="package-input-hint">功耗测试可留空；填写后会保留目标应用的资源与归因上下文。</small>
                 </div>
                 </div>
-                  <section class="brightness-setting" id="brightness-setting" data-platforms="android" aria-labelledby="brightness-setting-title">
+                  <section class="brightness-setting" id="brightness-setting" data-platforms="android ios harmony" aria-labelledby="brightness-setting-title">
                     <div class="brightness-setting-heading">
-                      <span><strong id="brightness-setting-title">设备亮度</strong><small>按 Android 数值档位固定测试亮度</small></span>
+                      <span><strong id="brightness-setting-title">设备亮度</strong><small id="brightness-setting-subtitle">按 Android 数值档位固定测试亮度</small></span>
                       <em id="brightness-current-badge">等待读取</em>
                     </div>
                     <div class="brightness-setting-controls">
-                      <div class="input-with-unit"><input id="brightness-input" type="number" min="0" max="255" step="1" inputmode="numeric" placeholder="--" aria-label="设备亮度数值"><span>级</span></div>
+                      <div class="input-with-unit">
+                        <input id="brightness-input" type="number" min="0" max="255" step="1" inputmode="numeric" placeholder="--" aria-label="设备亮度数值">
+                        <select id="brightness-select" class="hidden" aria-label="HarmonyOS 可应用亮度值"><option value="">请先扫描</option></select>
+                        <span>级</span>
+                      </div>
                       <button id="brightness-refresh" type="button">读取范围</button>
+                      <button id="brightness-calibrate" type="button" class="calibrate hidden">扫描可选值</button>
                       <button id="brightness-apply" type="button" class="apply">应用亮度</button>
                     </div>
-                    <small class="field-hint" id="brightness-hint" aria-live="polite">选择在线 Android 设备后读取最小值、最大值和最小调整间隔；应用时会切换为手动亮度。</small>
+                    <small class="field-hint" id="brightness-hint" aria-live="polite">选择在线设备后读取亮度；iPhone 提供用户亮度、原始背光和实际毫尼特只读数据。</small>
                   </section>
                   <label class="switch-row emphasis essential-option hidden" id="harmony-high-performance-row">
                     <span><strong>设备高性能模式</strong><small>测试期间切换到 power-shell 602；正常结束与可捕获异常时尽力恢复，强杀后请核验当前模式</small></span>
@@ -595,7 +600,7 @@
                 </section>
 
                 <details class="advanced-settings">
-                  <summary><span class="advanced-summary-copy"><strong>更多采集设置</strong><small>命名、采样策略、监控开关与抓取项目</small></span><em id="advanced-setting-count">默认已配置</em></summary>
+                  <summary><span class="advanced-summary-copy"><strong>更多采集设置</strong><small id="advanced-summary-description">目标应用、命名、采样策略、监控开关与抓取项目</small></span><em id="advanced-setting-count">默认已配置</em></summary>
                   <div class="advanced-body">
                     <div class="form-field">
                       <label for="title-input">会话标题 <span>可选</span></label>
@@ -801,7 +806,7 @@
                 </div>
               </section>
 
-              <section class="panel brightness-dim-panel hidden" id="brightness-dim-panel" data-platforms="android">
+              <section class="panel brightness-dim-panel hidden" id="brightness-dim-panel" data-platforms="android ios harmony">
                 <div class="panel-heading"><div><small>DISPLAY THERMAL LIMIT</small><h2>屏幕热降亮监控</h2></div><span class="data-source" id="brightness-dim-source">DisplayManager / Thermal HAL</span></div>
                 <div class="brightness-dim-summary">
                   <span class="brightness-dim-indicator" aria-hidden="true"></span>

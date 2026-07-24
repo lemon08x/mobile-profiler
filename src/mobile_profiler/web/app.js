@@ -151,6 +151,7 @@
     brightnessInfo: null,
     brightnessError: "",
     brightnessLoading: false,
+    brightnessCalibrating: false,
     brightnessRequestId: 0,
     captureFeaturesOverridden: false,
     liveTimelineLayouts: loadLiveTimelineLayouts(),
@@ -909,6 +910,11 @@
     $("#performance-mode-subtitle").textContent = platform === "ios"
       ? "CPU / GPU / 进程"
       : platform === "harmony" ? "SmartPerf / 1% Low / 602" : "FPS / 1% Low / 渲染链路";
+    $("#brightness-setting-subtitle").textContent = ios
+      ? "读取 AppleARMBacklight 用户亮度、原始背光与实际毫尼特（只读）"
+      : harmony
+        ? "扫描系统滑杆的真实离散档位，只允许应用 DPM 可稳定回读的亮度值"
+        : "按 Android 数值档位固定测试亮度";
     $("#metric-fps-label").textContent = ios ? "CPU 总负载" : "实时帧率";
     $("#metric-fps-tag").textContent = ios ? "CPU" : "FPS";
     $("#metric-one-low-label").textContent = ios ? "GPU 利用率" : "1% Low";
@@ -988,6 +994,7 @@
       app.brightnessInfo = null;
       app.brightnessError = "";
       app.brightnessLoading = false;
+      app.brightnessCalibrating = false;
     }
     if (!fromRun) localStorage.setItem("mobile-profiler-platform", nextPlatform);
     $$(".platform-switch [data-platform]").forEach(button => {
@@ -1145,9 +1152,10 @@
     return (app.state?.devices || []).find(device => device.serial === selectedDevice()) || null;
   }
 
-  function androidBrightnessDevice(device = selectedDeviceInfo()) {
-    return selectedPlatform() === "android"
-      && devicePlatform(device) === "android"
+  function brightnessCapableDevice(device = selectedDeviceInfo()) {
+    const platform = selectedPlatform();
+    return ["android", "ios", "harmony"].includes(platform)
+      && devicePlatform(device) === platform
       && device?.state === "device"
       ? device
       : null;
@@ -1155,22 +1163,48 @@
 
   function renderBrightnessControl(device = selectedDeviceInfo()) {
     const input = $("#brightness-input");
+    const select = $("#brightness-select");
     const refreshButton = $("#brightness-refresh");
+    const calibrateButton = $("#brightness-calibrate");
     const applyButton = $("#brightness-apply");
     const badge = $("#brightness-current-badge");
     const hint = $("#brightness-hint");
-    if (!input || !refreshButton || !applyButton || !badge || !hint) return;
-    const readyDevice = androidBrightnessDevice(device);
+    const subtitle = $("#brightness-setting-subtitle");
+    if (!input || !select || !refreshButton || !calibrateButton || !applyButton || !badge || !hint) return;
+    const readyDevice = brightnessCapableDevice(device);
+    const platform = selectedPlatform();
+    const harmony = platform === "harmony";
+    const ios = platform === "ios";
+    refreshButton.textContent = ios ? "读取亮度" : "读取范围";
+    applyButton.textContent = ios ? "请在手机端调整" : "应用亮度";
+    if (subtitle) {
+      subtitle.textContent = ios
+        ? "读取 iPhone 用户亮度、原始背光和实际毫尼特"
+        : harmony
+          ? "按 HarmonyOS 已验证档位固定测试亮度"
+          : "按 Android 数值档位固定测试亮度";
+    }
     const recording = Boolean(app.state?.active?.running);
     const disabled = !readyDevice || recording || app.brightnessLoading;
-    input.disabled = disabled;
+    input.classList.toggle("hidden", harmony);
+    select.classList.toggle("hidden", !harmony);
+    calibrateButton.classList.toggle("hidden", !harmony);
+    input.disabled = disabled || ios;
+    select.disabled = disabled;
     refreshButton.disabled = disabled;
-    applyButton.disabled = disabled;
+    calibrateButton.disabled = disabled;
+    applyButton.disabled = disabled || ios;
     if (!readyDevice) {
       badge.textContent = "等待设备";
       badge.classList.remove("ready");
       input.value = "";
-      hint.textContent = "选择在线 Android 设备后读取最小值、最大值和最小调整间隔；应用时会切换为手动亮度。";
+      select.innerHTML = '<option value="">等待设备</option>';
+      delete select.dataset.values;
+      hint.textContent = platform === "ios"
+        ? "选择在线 iPhone 后读取用户亮度、原始背光和实际毫尼特；当前通道不提供外部写入。"
+        : platform === "harmony"
+          ? "选择在线 HarmonyOS 设备后读取亮度能力；使用系统滑杆回退时可扫描并选择稳定可回读的离散档位。"
+          : "选择在线 Android 设备后读取亮度范围与写入能力。";
       return;
     }
     if (recording) {
@@ -1180,9 +1214,11 @@
       return;
     }
     if (app.brightnessLoading) {
-      badge.textContent = "读取中";
+      badge.textContent = app.brightnessCalibrating ? "扫描中" : "读取中";
       badge.classList.remove("ready");
-      hint.textContent = "正在读取 Android 亮度当前值和设备范围…";
+      hint.textContent = app.brightnessCalibrating
+        ? "正在逐级扫描 HarmonyOS 系统滑杆并用 DisplayPowerManagerService 稳定回读，通常需要 3–6 分钟；完成后会恢复前台应用和原屏幕状态。"
+        : `正在读取 ${platform === "harmony" ? "HarmonyOS" : platform === "ios" ? "iPhone" : "Android"} 亮度当前值和设备范围…`;
       return;
     }
     const info = app.brightnessDevice === readyDevice.serial ? app.brightnessInfo : null;
@@ -1197,17 +1233,89 @@
     input.min = String(info.minimum);
     input.max = String(info.maximum);
     input.step = String(info.step || 1);
-    if (document.activeElement !== input || !input.value) input.value = String(info.current);
-    badge.textContent = `当前 ${info.current}`;
+    const selectableValues = Array.isArray(info.selectable_values)
+      ? info.selectable_values.map(Number).filter(Number.isInteger)
+      : [];
+    if (harmony) {
+      const signature = `${info.current}|${selectableValues.join(",")}`;
+      if (select.dataset.values !== signature) {
+        select.innerHTML = "";
+        const current = Number(info.current);
+        if (Number.isInteger(current) && !selectableValues.includes(current)) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = `当前 ${current}（滑杆不可达）`;
+          option.disabled = true;
+          option.selected = true;
+          select.appendChild(option);
+        }
+        if (!selectableValues.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "请先扫描可选值";
+          option.selected = true;
+          select.appendChild(option);
+        } else {
+          selectableValues.forEach(value => {
+            const option = document.createElement("option");
+            option.value = String(value);
+            option.textContent = String(value);
+            select.appendChild(option);
+          });
+          if (selectableValues.includes(current)) select.value = String(current);
+        }
+        select.dataset.values = signature;
+      }
+      const needsCalibration = info.setter_mode === "settings_fallback" && !selectableValues.length;
+      calibrateButton.classList.toggle("hidden", info.setter_mode !== "settings_fallback");
+      calibrateButton.textContent = selectableValues.length ? "重新扫描" : "扫描可选值";
+      calibrateButton.disabled = disabled || info.setter_mode !== "settings_fallback";
+      applyButton.disabled = disabled || info.writable === false || needsCalibration || !select.value;
+    } else {
+      applyButton.disabled = disabled || info.writable === false || ios;
+      if (document.activeElement !== input || !input.value) input.value = String(info.current);
+    }
+    badge.textContent = ios && finite(info.current_precise)
+      ? `${Number(info.current_precise).toFixed(1)}%${finite(info.luminance_nits) ? ` · ${Number(info.luminance_nits).toFixed(1)} nits` : ""}`
+      : finite(info.effective_current) && Number(info.effective_current) !== Number(info.current)
+      ? `设定 ${info.current} · 有效 ${info.effective_current}`
+      : `当前 ${info.current}`;
     badge.classList.add("ready");
     const normalizedStep = finite(info.normalized_step)
       ? Number(info.normalized_step).toFixed(5).replace(/0+$/, "").replace(/\.$/, "")
       : "--";
-    hint.textContent = `最小值 ${info.minimum} · 最大值 ${info.maximum} · 最小调整间隔 ${info.step || 1} 级（归一化约 ${normalizedStep}） · ${info.automatic ? "当前为自动亮度，应用时会切换手动" : "当前为手动亮度"}`;
+    const limitDetail = platform === "harmony" && finite(info.brightness_discount)
+      ? ` · 显示折扣 ${Number(info.brightness_discount).toFixed(3)}×`
+      : "";
+    const setterDetail = ios
+      ? " · iOS 通道：AppleARMBacklight 只读"
+      : platform !== "harmony"
+        ? ""
+      : info.setter_mode === "direct"
+        ? " · 设置通道：系统直写"
+        : info.setter_mode === "settings_fallback"
+          ? " · 设置通道：设置页兼容（DPM 写接口要求系统应用身份）"
+          : " · 当前仅可读取，未发现可用设置通道";
+    if (ios) {
+      const rawDetail = finite(info.raw_backlight_raw) && finite(info.raw_backlight_maximum)
+        ? ` · rawBrightness ${Number(info.raw_backlight_raw).toFixed(0)}/${Number(info.raw_backlight_maximum).toFixed(0)}`
+        : "";
+      const maxNits = finite(info.maximum_luminance_nits)
+        ? ` · 面板公开上限 ${Number(info.maximum_luminance_nits).toFixed(1)} nits`
+        : "";
+      hint.textContent = `用户亮度 ${finite(info.current_precise) ? Number(info.current_precise).toFixed(1) : "--"}%${rawDetail}${maxNits}。iOS 未向该 sidecar 提供可信的通用亮度 setter，请在手机端调整后点击“读取亮度”复核；采集期间会持续记录实际毫尼特并标记疑似降亮点。`;
+    } else if (harmony && info.setter_mode === "settings_fallback") {
+      const unavailableCount = Array.isArray(info.unavailable_values) ? info.unavailable_values.length : 0;
+      hint.textContent = selectableValues.length
+        ? `已校准 ${selectableValues.length} 个稳定档位 · 可选范围 ${selectableValues[0]}–${selectableValues.at(-1)} · 理论范围内另有 ${unavailableCount} 个值不可达（只在下拉框列出可应用值） · ${info.automatic ? "当前为自动亮度，应用时会切换手动" : "当前为手动亮度"}${limitDetail}${setterDetail}`
+        : `DisplayPowerManagerService 的理论范围 ${info.minimum}–${info.maximum} 不等于滑杆可达档位。点击“扫描可选值”进行一次约 3–6 分钟的真机校准；校准会临时打开显示设置，并恢复前台应用与原屏幕状态。${setterDetail}`;
+    } else {
+      hint.textContent = `最小值 ${info.minimum} · 最大值 ${info.maximum} · 最小调整间隔 ${info.step || 1} 级（归一化约 ${normalizedStep}） · ${info.automatic ? "当前为自动亮度，应用时会切换手动" : "当前为手动亮度"}${limitDetail}${setterDetail}`;
+    }
   }
 
   async function refreshBrightnessCapability({ force = false, notifyFailure = false } = {}) {
-    const device = androidBrightnessDevice();
+    const device = brightnessCapableDevice();
     if (!device) {
       renderBrightnessControl();
       return null;
@@ -1221,11 +1329,12 @@
     app.brightnessInfo = null;
     app.brightnessError = "";
     app.brightnessLoading = true;
+    app.brightnessCalibrating = false;
     renderBrightnessControl(device);
     try {
       const info = await api("/api/brightness", {
         method: "POST",
-        body: JSON.stringify({ device: device.serial, platform: "android", action: "read" }),
+        body: JSON.stringify({ device: device.serial, platform: selectedPlatform(), action: "read" }),
       });
       if (requestId !== app.brightnessRequestId || selectedDevice() !== device.serial) return null;
       app.brightnessInfo = info;
@@ -1243,15 +1352,83 @@
     }
   }
 
+  async function calibrateHarmonyBrightness() {
+    const device = brightnessCapableDevice();
+    if (!device || selectedPlatform() !== "harmony") {
+      notify("无法扫描亮度档位", "请先选择在线 HarmonyOS 设备。", "error");
+      return;
+    }
+    const requestId = ++app.brightnessRequestId;
+    app.brightnessLoading = true;
+    app.brightnessCalibrating = true;
+    app.brightnessError = "";
+    renderBrightnessControl(device);
+    try {
+      const result = await api("/api/brightness", {
+        method: "POST",
+        body: JSON.stringify({
+          device: device.serial,
+          platform: "harmony",
+          action: "calibrate",
+        }),
+      });
+      if (requestId !== app.brightnessRequestId) return;
+      app.brightnessInfo = result;
+      const values = Array.isArray(result.selectable_values) ? result.selectable_values : [];
+      const restoreDetail = finite(result.original_value) && finite(result.restored_value)
+        && Number(result.original_value) !== Number(result.restored_value)
+        ? `；原值 ${result.original_value} 不可达，已恢复到最近的 ${result.restored_value}`
+        : "";
+      notify(
+        "亮度档位扫描完成",
+        `识别到 ${values.length} 个稳定档位，范围 ${values[0] ?? "--"}–${values.at(-1) ?? "--"}${restoreDetail}`,
+        "success",
+        9000,
+      );
+      const warnings = Array.isArray(result.calibration_warnings)
+        ? result.calibration_warnings
+        : [];
+      if (warnings.length) notify("亮度校准提示", warnings.join("；"), "error", 10000);
+    } catch (error) {
+      if (requestId !== app.brightnessRequestId) return;
+      app.brightnessError = error.message || "无法扫描 HarmonyOS 亮度档位";
+      notify("亮度档位扫描失败", app.brightnessError, "error", 10000);
+    } finally {
+      if (requestId === app.brightnessRequestId) {
+        app.brightnessLoading = false;
+        app.brightnessCalibrating = false;
+        renderBrightnessControl();
+      }
+    }
+  }
+
   async function applyBrightnessValue() {
-    const device = androidBrightnessDevice();
-    const input = $("#brightness-input");
+    const device = brightnessCapableDevice();
+    if (selectedPlatform() === "ios") {
+      notify(
+        "iPhone 亮度为只读监控",
+        "请在 iPhone 上调整亮度，然后点击“读取亮度”复核。iOS 未向当前 sidecar 提供可信的通用外部亮度 setter。",
+        "error",
+        8000,
+      );
+      return;
+    }
+    const input = selectedPlatform() === "harmony"
+      ? $("#brightness-select")
+      : $("#brightness-input");
     const info = app.brightnessInfo;
     if (!device || !input || !info) {
-      notify("无法设置亮度", "请先选择在线 Android 设备并读取亮度范围。", "error");
+      notify("无法设置亮度", "请先选择在线 Android 或 HarmonyOS 设备并读取亮度范围。", "error");
       return;
     }
     const value = Number(input.value);
+    const selectableValues = Array.isArray(info.selectable_values)
+      ? info.selectable_values.map(Number).filter(Number.isInteger)
+      : [];
+    if (selectedPlatform() === "harmony" && !selectableValues.includes(value)) {
+      notify("亮度档位不可用", "请选择扫描后下拉框中列出的 HarmonyOS 亮度值。", "error");
+      return;
+    }
     if (!Number.isInteger(value) || value < Number(info.minimum) || value > Number(info.maximum)) {
       notify(
         "亮度数值无效",
@@ -1262,6 +1439,7 @@
     }
     const requestId = ++app.brightnessRequestId;
     app.brightnessLoading = true;
+    app.brightnessCalibrating = false;
     app.brightnessError = "";
     renderBrightnessControl(device);
     try {
@@ -1269,14 +1447,23 @@
         method: "POST",
         body: JSON.stringify({
           device: device.serial,
-          platform: "android",
+          platform: selectedPlatform(),
           action: "set",
           value,
         }),
       });
       if (requestId !== app.brightnessRequestId) return;
       app.brightnessInfo = result;
-      const detail = `当前 ${result.current} · 最小 ${result.minimum} · 最大 ${result.maximum} · 间隔 ${result.step}`;
+      const setterLabel = selectedPlatform() !== "harmony"
+        ? ""
+        : result.setter_used === "direct"
+          ? " · 系统直写"
+          : result.setter_used === "settings_fallback"
+            ? " · 设置页兼容通道"
+            : result.setter_used === "none"
+              ? " · 已是目标值，未打开设置页"
+              : "";
+      const detail = `当前 ${result.current}${finite(result.effective_current) && Number(result.effective_current) !== Number(result.current) ? ` · 有效 ${result.effective_current}` : ""} · 最小 ${result.minimum} · 最大 ${result.maximum} · 间隔 ${result.step}${setterLabel}`;
       notify(
         result.applied ? "亮度已应用" : "亮度值已写入",
         `${detail}${result.manual_mode_changed ? " · 已切换为手动亮度" : ""}`,
@@ -1951,7 +2138,8 @@
     const panel = $("#brightness-dim-panel");
     if (!panel) return;
     const analysis = active?.brightness_throttling || {};
-    const available = activePlatform(active) === "android" && Boolean(analysis.available);
+    const platform = activePlatform(active);
+    const available = ["android", "ios", "harmony"].includes(platform) && Boolean(analysis.available);
     panel.classList.toggle("hidden", !available);
     if (!available) return;
     const points = Array.isArray(analysis.points) ? analysis.points : [];
@@ -1976,7 +2164,11 @@
     const source = $("#brightness-dim-source");
     const pointList = $("#brightness-dim-points");
     const parts = [];
-    if (finite(current.setting_raw)) parts.push(`系统设定 ${Number(current.setting_raw).toFixed(0)}`);
+    if (finite(current.setting_raw)) {
+      parts.push(platform === "ios"
+        ? `用户亮度 ${Number(current.setting_raw).toFixed(1)}%`
+        : `系统设定 ${Number(current.setting_raw).toFixed(0)}`);
+    }
     if (finite(current.effective_raw_estimate)) {
       parts.push(`有效档位约 ${Number(current.effective_raw_estimate).toFixed(0)}`);
     } else if (finite(current.effective_brightness)) {
@@ -1990,10 +2182,31 @@
       parts.push(`系统标称上限 ${Number(current.vendor_thermal_limit_nits).toFixed(0)} nit（非亮度计实测）`);
     }
     if (finite(current.vendor_thermal_temperature_c)) parts.push(`厂商温控温度 ${Number(current.vendor_thermal_temperature_c).toFixed(1)} °C`);
+    if (platform === "harmony" && finite(current.brightness_discount)) {
+      parts.push(`显示折扣 ${Number(current.brightness_discount).toFixed(3)}×`);
+    }
     if (finite(current.lcd_backlight_cooling) && Number(current.lcd_backlight_cooling) > 0) {
       parts.push(`LCD 冷却档 ${Number(current.lcd_backlight_cooling).toFixed(0)}`);
     }
+    if (platform === "harmony" && finite(current.render_backlight_raw)) {
+      parts.push(`RS 背光 ${Number(current.render_backlight_raw).toFixed(0)}`);
+    }
+    if (platform === "ios" && finite(current.luminance_nits)) {
+      parts.push(`实际 ${Number(current.luminance_nits).toFixed(1)} nits`);
+    }
+    if (platform === "ios" && finite(current.luminance_drop_pct)) {
+      parts.push(`较同档基线下降 ${Number(current.luminance_drop_pct).toFixed(1)}%`);
+    }
+    if (platform === "ios" && finite(current.raw_backlight_raw)) {
+      parts.push(`rawBrightness ${Number(current.raw_backlight_raw).toFixed(0)}`);
+    }
+    if (platform === "ios" && current.thermal_notification_active && current.thermal_notification) {
+      parts.push(`热压力通知 ${current.thermal_notification}`);
+    }
     if (finite(current.skin_temperature_c)) parts.push(`SKIN ${Number(current.skin_temperature_c).toFixed(1)} °C`);
+    if (platform === "ios" && finite(current.battery_temperature_c)) {
+      parts.push(`电池 ${Number(current.battery_temperature_c).toFixed(1)} °C`);
+    }
     if (currentActive) {
       title.textContent = status === "confirmed" ? "确认发生屏幕热降亮" : "疑似发生屏幕热降亮";
       detail.textContent = `${parts.join(" · ") || "显示侧热限制已触发"}；${current.reason || "请查看时间点证据"}`;
@@ -2037,14 +2250,22 @@
       badge.textContent = "INACTIVE";
     } else if (points.length) {
       title.textContent = `当前已恢复，历史标记 ${points.length} 个降亮点`;
-      detail.textContent = parts.length ? parts.join(" · ") : "当前 DisplayManager 和 lcd-backlight 未继续限制亮度。";
+      detail.textContent = parts.length
+        ? parts.join(" · ")
+        : platform === "ios"
+          ? "当前 AppleARMBacklight 未继续显示同档位实际毫尼特下降。"
+          : "当前 DisplayManager 和 lcd-backlight 未继续限制亮度。";
       badge.textContent = "HISTORY";
     } else {
       title.textContent = "未检测到屏幕热降亮";
       detail.textContent = parts.length ? parts.join(" · ") : "系统亮度与显示侧热限制状态正常。";
       badge.textContent = "CLEAR";
     }
-    source.textContent = `${points.length} 个确认/疑似点 · DisplayManager / Thermal HAL${vendorStateKnown || vendorLastKnown ? " / Oplus runtime" : ""}`;
+    source.textContent = platform === "harmony"
+      ? `${points.length} points · DisplayPowerManager / ThermalService`
+      : platform === "ios"
+        ? `${points.length} points · AppleARMBacklight / iOS thermal pressure`
+        : `${points.length} 个确认/疑似点 · DisplayManager / Thermal HAL${vendorStateKnown || vendorLastKnown ? " / Oplus runtime" : ""}`;
     pointList.innerHTML = points.length
       ? points.slice(-40).map(point => {
         const pointVendorKnown = point.vendor_thermal_active === true || point.vendor_thermal_active === false;
@@ -2488,7 +2709,7 @@
     updateCaptureFeatureControls();
     renderBrightnessControl(chosen);
     if (
-      androidBrightnessDevice(chosen)
+      brightnessCapableDevice(chosen)
       && !state.active?.running
       && app.brightnessDevice !== chosen.serial
     ) {
@@ -2804,9 +3025,11 @@
       ? brightnessState.vendor_thermal_active === true ? "confirmed" : "none"
       : String(brightnessState.status || "none");
     $("#resource-thermal").textContent = brightnessStatus === "confirmed"
-      ? `热降亮 · ${finite(brightnessState.vendor_thermal_limit_nits)
-        ? `系统标称上限 ${Number(brightnessState.vendor_thermal_limit_nits).toFixed(0)} nit（非实测）`
-        : finite(brightnessState.thermal_cap) ? `上限 ${Number(brightnessState.thermal_cap * 100).toFixed(1)}%` : "已限制"}`
+      ? platform === "harmony" && finite(brightnessState.brightness_discount)
+        ? `热降亮 · 折扣 ${Number(brightnessState.brightness_discount).toFixed(3)}×`
+        : finite(brightnessState.vendor_thermal_limit_nits)
+          ? `热降亮 · 系统标称上限 ${Number(brightnessState.vendor_thermal_limit_nits).toFixed(0)} nit（非实测）`
+          : `热降亮 · 上限 ${finite(brightnessState.thermal_cap) ? Number(brightnessState.thermal_cap * 100).toFixed(1) + "%" : "已限制"}`
       : brightnessStatus === "suspected"
         ? "疑似热降亮"
         : finite(thermal.status)
@@ -3304,7 +3527,10 @@
         $("#context-activity").textContent = performance.foreground_state_reason
           || "DVT 未提供采集开始时的前台应用快照";
       }
-      $("#context-display-settings").textContent = "当前 sidecar 不采集亮度 / 刷新率设置";
+      const iosBrightness = active?.system_monitor?.thermal?.display_brightness || {};
+      $("#context-display-settings").textContent = finite(iosBrightness.user_brightness_pct)
+        ? `${Number(iosBrightness.user_brightness_pct).toFixed(1)}% user · ${finite(iosBrightness.luminance_nits) ? Number(iosBrightness.luminance_nits).toFixed(1) + " nits" : "nits --"} · raw ${finite(iosBrightness.raw_backlight_raw) ? Number(iosBrightness.raw_backlight_raw).toFixed(0) : "--"}`
+        : "等待 AppleARMBacklight 亮度样本";
       $("#context-pressure-driver").textContent = finite(latest.gpu_load_pct)
         ? `GPU ${Number(latest.gpu_load_pct).toFixed(1)}%`
         : finite(latest.cpu_pct) ? `CPU ${Number(latest.cpu_pct).toFixed(1)}%` : "等待 DVT 样本";
@@ -3368,6 +3594,10 @@
     const primaryPower = primaryPowerSnapshot(active);
     const powerFlow = powerFlowPresentation(active);
     const context = active?.context || {};
+    const brightnessState = active?.brightness_throttling?.current_state || {};
+    const brightnessStatus = String(brightnessState.status || "none");
+    const brightnessIssue = brightnessStatus === "confirmed" || brightnessStatus === "suspected";
+    const brightness = monitor?.thermal?.display_brightness || {};
     const systemCount = Number(monitor.system_snapshot_count || 0);
     const processSnapshotsEnabled = captureFeatureEnabled(active, "process_snapshots");
     $("#performance-snapshot-status").textContent = systemCount
@@ -3404,8 +3634,10 @@
       return `<div class="performance-residency-row"><div><strong>${escapeHtml(item.label)}</strong><small>${value === null ? "--" : `${value.toFixed(item.label === "Observer" ? 2 : 1)} ${item.unit}`}</small></div><div class="performance-residency-track"><span style="width:${share.toFixed(1)}%"></span></div><b>${value === null ? "--" : value.toFixed(1)}</b></div>`;
     }).join("");
 
-    $("#performance-window-value").textContent = context.foreground_package || "--";
-    $("#performance-display-value").textContent = "iOS 显示参数未由当前 sidecar 采集";
+    $("#performance-window-value").textContent = context.foreground_package || active?.metadata?.target_package || "--";
+    $("#performance-display-value").textContent = finite(brightness.user_brightness_pct)
+      ? `${Number(brightness.user_brightness_pct).toFixed(1)}% user / ${finite(brightness.luminance_nits) ? Number(brightness.luminance_nits).toFixed(1) + " nits" : "nits --"} / raw ${finite(brightness.raw_backlight_raw) ? Number(brightness.raw_backlight_raw).toFixed(0) : "--"}`
+      : "等待 AppleARMBacklight 亮度样本";
     $("#performance-gpu-value").textContent = finite(latest.gpu_load_pct)
       ? `${Number(latest.gpu_load_pct).toFixed(1)}% utilization`
       : "--";
@@ -3419,10 +3651,16 @@
     const thermalStatus = finite(thermal.status) ? Number(thermal.status) : 0;
     const overhead = finite(latest.collector_cpu_pct) ? Number(latest.collector_cpu_pct) : 0;
     const banner = $("#system-priority-banner");
-    const hasIssue = priority.length > 0 || thermalStatus > 0 || overhead >= 10;
+    const hasIssue = brightnessIssue || priority.length > 0 || thermalStatus > 0 || overhead >= 10;
     banner.classList.toggle("active", hasIssue);
     banner.classList.toggle("idle", !hasIssue);
-    if (priority.length) {
+    if (brightnessIssue) {
+      $("#system-priority-title").textContent = brightnessStatus === "confirmed"
+        ? "检测到 iPhone 屏幕热降亮"
+        : "检测到 iPhone 疑似屏幕降亮";
+      $("#system-priority-detail").textContent = brightnessState.reason || "AppleARMBacklight 实际毫尼特低于同一用户亮度基线。";
+      $("#system-priority-badge").textContent = brightnessStatus === "confirmed" ? "DIM" : "SUSPECT";
+    } else if (priority.length) {
       const leading = [...priority].sort((a, b) => Number(b.cpu_pct || 0) - Number(a.cpu_pct || 0))[0];
       $("#system-priority-title").textContent = "检测到 iOS 后台资源竞争";
       $("#system-priority-detail").textContent = `${leading.name || leading.watch_name || "后台进程"} 当前 CPU ${formatNumber(leading.cpu_pct, 1)}%。`;
@@ -5136,6 +5374,7 @@
       ["Foreground Ability", data.foreground_package || "AbilityManager", Boolean(data.capabilities?.ability_manager)],
       ["Display power state", harmonyScreenState || "unknown", harmonyDisplayActive],
       ["Display refresh modes", `${data.display?.refresh_rate_hz || "--"} Hz · ${(data.display?.supported_refresh_rates_hz || []).join("/") || "modes n/a"}（亮屏时才作为当前扫描节奏）`, Boolean(data.capabilities?.display_modes)],
+      ["Brightness read / control", `${data.brightness?.setting_raw ?? "--"} → device ${data.brightness?.effective_raw ?? "--"} · discount ${finite(data.brightness?.brightness_discount) ? Number(data.brightness.brightness_discount).toFixed(3) : "--"}×`, Boolean(data.capabilities?.brightness_control)],
       ["Compositor frame pacing", harmonyDisplayActive ? `${formatNumber(data.performance?.compositor_fps, 1)} FPS sampled` : "屏幕未亮；不采用历史 RenderService 计数作为当前 FPS", harmonyCompositorAvailable],
       ["Foreground window", data.performance?.foreground_window_name || "WindowManagerService", Boolean(data.capabilities?.window_manager)],
       ["Touch devices", `${data.performance?.touch_device_count || 0} devices · axes/events`, Boolean(data.capabilities?.touch_devices)],
@@ -7611,6 +7850,7 @@
       app.agentSoftwareAssets = new Map();
       app.agentSoftwareAssetsDevice = "";
       app.agentSoftwareAssetsSignature = "";
+      app.brightnessCalibrating = false;
       if (app.scannedAppsDevice && app.scannedAppsDevice !== event.target.value) {
         resetAppScanner({ clearPackage: true });
       }
@@ -7626,8 +7866,14 @@
     $("#brightness-refresh").addEventListener("click", () => {
       void refreshBrightnessCapability({ force: true, notifyFailure: true });
     });
+    $("#brightness-calibrate").addEventListener("click", () => {
+      void calibrateHarmonyBrightness();
+    });
     $("#brightness-apply").addEventListener("click", () => {
       void applyBrightnessValue();
+    });
+    $("#brightness-select").addEventListener("change", () => {
+      renderBrightnessControl();
     });
     $("#brightness-input").addEventListener("keydown", event => {
       if (event.key !== "Enter") return;

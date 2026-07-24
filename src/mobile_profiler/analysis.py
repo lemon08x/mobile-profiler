@@ -2213,15 +2213,299 @@ def analyze_thermal_history(
     }
 
 
-def analyze_brightness_throttling(
+def _analyze_ios_brightness_throttling(
     samples: Sequence[Sample],
     contexts: Sequence[ContextSample],
     snapshots: Sequence[ThermalSnapshot],
 ) -> Dict[str, object]:
     ordered = sorted(snapshots, key=lambda item: item.uptime_s)
+    ordered_contexts = sorted(contexts, key=lambda item: item.uptime_s)
+    context_uptimes = [item.uptime_s for item in ordered_contexts]
+    sample_uptimes = [item.uptime_s for item in samples]
+    session_start = (
+        samples[0].uptime_s
+        if samples
+        else ordered_contexts[0].uptime_s
+        if ordered_contexts
+        else ordered[0].uptime_s
+        if ordered
+        else 0.0
+    )
+
+    def number(value: object) -> Optional[float]:
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        return float(value)
+
+    def context_for(uptime_s: float) -> Optional[ContextSample]:
+        if not ordered_contexts:
+            return None
+        index = bisect.bisect_right(context_uptimes, uptime_s) - 1
+        return ordered_contexts[max(0, index)]
+
+    def battery_temperature(snapshot: ThermalSnapshot) -> Optional[float]:
+        values = [
+            float(item["value_c"])
+            for item in snapshot.temperatures
+            if isinstance(item, dict)
+            and re.search(r"battery", str(item.get("name") or ""), re.I)
+            and isinstance(item.get("value_c"), (int, float))
+        ]
+        return max(values) if values else None
+
+    observations: List[Dict[str, object]] = []
+    segment_setting: Optional[float] = None
+    segment_baseline_nits: Optional[float] = None
+    segment_baseline_raw: Optional[float] = None
+    baseline_battery_temperature: Optional[float] = None
+    display_exposed = False
+    for snapshot in ordered:
+        display = snapshot.display_brightness if isinstance(snapshot.display_brightness, dict) else {}
+        if not display.get("available"):
+            continue
+        display_exposed = True
+        context = context_for(snapshot.uptime_s)
+        setting_pct = number(display.get("user_brightness_pct"))
+        if setting_pct is None:
+            setting_pct = number(display.get("setting_raw"))
+        if setting_pct is None and context is not None:
+            setting_pct = number(context.brightness_raw)
+        setting_fraction = number(display.get("setting_float"))
+        if setting_fraction is None and setting_pct is not None:
+            setting_fraction = max(0.0, min(1.0, setting_pct / 100.0))
+        luminance_nits = number(display.get("luminance_nits"))
+        raw_backlight = number(display.get("raw_backlight_raw"))
+        maximum_luminance_nits = number(display.get("maximum_luminance_nits"))
+        screen_text = str(
+            display.get("screen_state")
+            or (context.screen_state if context is not None else "")
+            or ""
+        ).strip().upper()
+        screen_off = screen_text in {"OFF", "ASLEEP"} or (
+            luminance_nits is not None
+            and luminance_nits <= 0.5
+            and (raw_backlight or 0.0) <= 0.0
+        )
+
+        new_segment = (
+            segment_setting is None
+            or setting_pct is None
+            or abs(setting_pct - segment_setting) > 1.0
+        )
+        if new_segment:
+            segment_setting = setting_pct
+            segment_baseline_nits = luminance_nits
+            segment_baseline_raw = raw_backlight
+            setting_unchanged: Optional[bool] = True if setting_pct is not None else None
+        else:
+            setting_unchanged = (
+                abs(setting_pct - segment_setting) <= 0.75
+                if setting_pct is not None and segment_setting is not None
+                else None
+            )
+        baseline_nits = segment_baseline_nits
+        baseline_raw = segment_baseline_raw
+        luminance_drop_pct = (
+            max(0.0, (baseline_nits - luminance_nits) / baseline_nits * 100.0)
+            if baseline_nits is not None
+            and baseline_nits > 0.5
+            and luminance_nits is not None
+            else None
+        )
+        raw_drop_pct = (
+            max(0.0, (baseline_raw - raw_backlight) / baseline_raw * 100.0)
+            if baseline_raw is not None
+            and baseline_raw > 0.0
+            and raw_backlight is not None
+            else None
+        )
+        if not screen_off:
+            if luminance_nits is not None:
+                segment_baseline_nits = max(segment_baseline_nits or luminance_nits, luminance_nits)
+            if raw_backlight is not None:
+                segment_baseline_raw = max(segment_baseline_raw or raw_backlight, raw_backlight)
+
+        temperature = battery_temperature(snapshot)
+        if temperature is not None and baseline_battery_temperature is None:
+            baseline_battery_temperature = temperature
+        temperature_delta = (
+            temperature - baseline_battery_temperature
+            if temperature is not None and baseline_battery_temperature is not None
+            else None
+        )
+        thermal_notification = str(display.get("thermal_notification") or "").strip() or None
+        thermal_notification_active = display.get("thermal_notification_active") is True
+        thermal_evidence = bool(
+            thermal_notification_active
+            or (temperature is not None and temperature >= 40.0)
+            or (temperature_delta is not None and temperature_delta >= 4.0)
+        )
+        display_drop = bool(
+            setting_unchanged is not False
+            and (luminance_drop_pct or 0.0) >= 8.0
+            and (raw_drop_pct is None or raw_drop_pct >= 5.0)
+        )
+        confirmed = bool(
+            not screen_off
+            and display_drop
+            and thermal_evidence
+            and (luminance_drop_pct or 0.0) >= 10.0
+        )
+        suspected = bool(not screen_off and display_drop and not confirmed)
+        status = "confirmed" if confirmed else "suspected" if suspected else "none"
+        reasons: List[str] = []
+        if isinstance(luminance_drop_pct, (int, float)) and luminance_drop_pct >= 1.0:
+            reasons.append(
+                f"实际亮度 {baseline_nits:.1f} → {luminance_nits:.1f} nits，下降 {luminance_drop_pct:.1f}%"
+            )
+        if isinstance(raw_drop_pct, (int, float)) and raw_drop_pct >= 1.0:
+            reasons.append(f"rawBrightness 下降 {raw_drop_pct:.1f}%")
+        if setting_unchanged:
+            reasons.append("iOS 用户亮度设定保持稳定")
+        if thermal_notification_active and thermal_notification:
+            reasons.append(f"收到 iOS 热压力通知 {thermal_notification}")
+        if temperature is not None and thermal_evidence:
+            reasons.append(f"电池温度 {temperature:.1f} °C")
+        if suspected and not thermal_evidence:
+            reasons.append("缺少明确热压力证据，可能包含自动亮度或 OLED 内容限制")
+        sample = _nearest_sample(samples, sample_uptimes, snapshot.uptime_s)
+        observations.append(
+            {
+                "elapsed_s": max(0.0, snapshot.uptime_s - session_start),
+                "uptime_s": snapshot.uptime_s,
+                "platform": "ios",
+                "status": status,
+                "confidence": "high" if confirmed else "medium" if suspected else "none",
+                "screen_state": screen_text or None,
+                "setting_raw": setting_pct,
+                "setting_unchanged": setting_unchanged,
+                "requested_brightness": setting_fraction,
+                "effective_brightness": None,
+                "effective_brightness_source": "AppleARMBacklight BrightnessMilliNits",
+                "effective_raw_estimate": raw_backlight,
+                "luminance_nits": luminance_nits,
+                "baseline_luminance_nits": baseline_nits,
+                "maximum_luminance_nits": maximum_luminance_nits,
+                "luminance_drop_pct": luminance_drop_pct,
+                "raw_backlight_raw": raw_backlight,
+                "baseline_raw_backlight": baseline_raw,
+                "raw_backlight_drop_pct": raw_drop_pct,
+                "thermal_notification": thermal_notification,
+                "thermal_notification_active": thermal_notification_active,
+                "battery_temperature_c": temperature,
+                "battery_temperature_delta_c": temperature_delta,
+                "skin_temperature_c": None,
+                "foreground_package": context.foreground_package if context is not None else None,
+                "power_mw": sample.power_mw if sample is not None else None,
+                "reason": "；".join(reasons) if reasons else "未观察到 iPhone 显示降亮证据",
+                "probe_elapsed_ms": display.get("probe_elapsed_ms"),
+            }
+        )
+
+    points = [item for item in observations if item.get("status") in {"suspected", "confirmed"}]
+    events: List[Dict[str, object]] = []
+    current_event: List[Dict[str, object]] = []
+
+    def finish_event() -> None:
+        nonlocal current_event
+        if not current_event:
+            return
+        confirmed_event = any(item.get("status") == "confirmed" for item in current_event)
+        luminance_values = [
+            float(item["luminance_nits"])
+            for item in current_event
+            if isinstance(item.get("luminance_nits"), (int, float))
+        ]
+        drop_values = [
+            float(item["luminance_drop_pct"])
+            for item in current_event
+            if isinstance(item.get("luminance_drop_pct"), (int, float))
+        ]
+        temperatures = [
+            float(item["battery_temperature_c"])
+            for item in current_event
+            if isinstance(item.get("battery_temperature_c"), (int, float))
+        ]
+        events.append(
+            {
+                "index": len(events) + 1,
+                "status": "confirmed" if confirmed_event else "suspected",
+                "confidence": "high" if confirmed_event else "medium",
+                "start_elapsed_s": current_event[0]["elapsed_s"],
+                "end_elapsed_s": current_event[-1]["elapsed_s"],
+                "duration_s": max(
+                    0.0,
+                    float(current_event[-1]["elapsed_s"])
+                    - float(current_event[0]["elapsed_s"]),
+                ),
+                "point_count": len(current_event),
+                "setting_raw": current_event[0].get("setting_raw"),
+                "setting_unchanged": all(item.get("setting_unchanged") is not False for item in current_event),
+                "minimum_luminance_nits": min(luminance_values) if luminance_values else None,
+                "maximum_luminance_drop_pct": max(drop_values) if drop_values else None,
+                "maximum_battery_temperature_c": max(temperatures) if temperatures else None,
+                "foreground_packages": list(
+                    dict.fromkeys(
+                        str(item.get("foreground_package"))
+                        for item in current_event
+                        if item.get("foreground_package")
+                    )
+                ),
+                "reason": current_event[0].get("reason"),
+            }
+        )
+        current_event = []
+
+    for observation in observations:
+        if observation.get("status") in {"suspected", "confirmed"}:
+            current_event.append(observation)
+        else:
+            finish_event()
+    finish_event()
+    current_state = observations[-1] if observations else None
+    return {
+        "available": display_exposed,
+        "platform": "ios",
+        "source": "iOS AppleARMBacklight user brightness/rawBrightness/BrightnessMilliNits + thermal notifications",
+        "timeline": observations,
+        "points": points,
+        "events": events,
+        "point_count": len(points),
+        "confirmed_point_count": sum(1 for item in points if item.get("status") == "confirmed"),
+        "suspected_point_count": sum(1 for item in points if item.get("status") == "suspected"),
+        "event_count": len(events),
+        "current_active": bool(
+            current_state and current_state.get("status") in {"suspected", "confirmed"}
+        ),
+        "current_state": current_state,
+        "latest_flagged_point": points[-1] if points else None,
+        "setting_baseline_raw": observations[0].get("setting_raw") if observations else None,
+        "evidence_summary": (
+            "AppleARMBacklight 分开记录用户亮度、rawBrightness 与校准毫尼特值；用户设定稳定时，"
+            "实际毫尼特和原始背光同步下降会被标记，并与 iOS 热压力通知及电池温度联合判断。"
+        ),
+        "limitations": (
+            "iOS sidecar 可以读取 AppleARMBacklight 的显示驱动数据，但不公开自动亮度开关或通用外部 setter。"
+            "没有热压力通知或温升证据时只标记为疑似，因为 OLED 内容限制、环境光策略和系统显示算法也可能改变毫尼特值。"
+        ),
+    }
+
+
+def analyze_brightness_throttling(
+    samples: Sequence[Sample],
+    contexts: Sequence[ContextSample],
+    snapshots: Sequence[ThermalSnapshot],
+    platform: str = "android",
+) -> Dict[str, object]:
+    platform = str(platform or "android").strip().lower()
+    if platform == "ios":
+        return _analyze_ios_brightness_throttling(samples, contexts, snapshots)
+    is_harmony = platform == "harmony"
+    ordered = sorted(snapshots, key=lambda item: item.uptime_s)
     if not ordered:
         return {
             "available": False,
+            "platform": platform,
             "timeline": [],
             "points": [],
             "events": [],
@@ -2295,6 +2579,7 @@ def analyze_brightness_throttling(
         return max(values) if values else None
 
     baseline_setting: Optional[float] = None
+    baseline_surface_temperature: Optional[float] = None
     observations: List[Dict[str, object]] = []
     cooling_exposed = False
     display_exposed = False
@@ -2448,6 +2733,11 @@ def analyze_brightness_throttling(
         def display_normalized(value: object) -> Optional[float]:
             return normalized(value, brightness_minimum, brightness_maximum)
 
+        setting_unchanged = (
+            abs(float(setting_raw) - baseline_setting) < 0.5
+            if isinstance(setting_raw, (int, float)) and baseline_setting is not None
+            else None
+        )
         setting_float = normalized(display.get("setting_float"))
         if setting_float is None:
             setting_float = display_normalized(setting_raw)
@@ -2470,11 +2760,15 @@ def analyze_brightness_throttling(
                 for value, source in (
                     (
                         display_normalized(display.get("screen_brightness")),
-                        "Display Power Controller",
+                        "DisplayPowerManagerService DeviceBrightness"
+                        if is_harmony
+                        else "Display Power Controller",
                     ),
                     (
                         display_normalized(display.get("adjusted_brightness")),
-                        "BrightnessInfo adjustedBrightness",
+                        "DisplayPowerManagerService adjusted brightness"
+                        if is_harmony
+                        else "BrightnessInfo adjustedBrightness",
                     ),
                     (
                         display_normalized(display.get("hbm_brightness")),
@@ -2492,6 +2786,17 @@ def analyze_brightness_throttling(
         thermal_cap = normalized(display.get("thermal_cap"))
         thermal_applied = display.get("thermal_applied") is True
         thermal_status = int(display.get("thermal_status") or 0)
+        brightness_discount = (
+            float(display["brightness_discount"])
+            if isinstance(display.get("brightness_discount"), (int, float))
+            else None
+        )
+        automatic = display.get("automatic") if isinstance(display.get("automatic"), bool) else None
+        render_backlight = (
+            float(display["render_backlight_raw"])
+            if isinstance(display.get("render_backlight_raw"), (int, float))
+            else None
+        )
         maximum_reason = (
             int(display["brightness_max_reason"])
             if isinstance(display.get("brightness_max_reason"), (int, float))
@@ -2502,7 +2807,8 @@ def analyze_brightness_throttling(
             default=0.0,
         )
         if (
-            thermal_cap is not None
+            not is_harmony
+            and thermal_cap is not None
             and requested is not None
             and thermal_applied
             and thermal_cap < requested
@@ -2520,6 +2826,8 @@ def analyze_brightness_throttling(
             screen_text
             and (screen_text in {"OFF", "ASLEEP"} or screen_text.startswith("DOZE"))
         )
+        power_state = str(display.get("power_state") or "").strip().upper()
+        screen_explicitly_dim = is_harmony and power_state == "DIM"
         cap_restricts = bool(
             thermal_cap is not None
             and requested is not None
@@ -2538,81 +2846,141 @@ def analyze_brightness_throttling(
         thermal_reason = maximum_reason == 1 or str(
             display.get("hbm_throttling_reason") or ""
         ).lower() == "thermal"
-        framework_confirmed = bool(
-            not screen_explicitly_off
-            and (
-                (
-                    thermal_reason
-                    and (cap_restricts or (effective_drop or 0.0) >= 0.005)
+        surface_temperature = sensor_value(
+            snapshot,
+            r"^(?:skin|shell_(?:front|back|frame)|system_h)$",
+        )
+        if surface_temperature is not None and baseline_surface_temperature is None:
+            baseline_surface_temperature = surface_temperature
+        surface_temperature_delta = (
+            surface_temperature - baseline_surface_temperature
+            if surface_temperature is not None and baseline_surface_temperature is not None
+            else None
+        )
+        display_restricts = bool(
+            cap_restricts
+            or (effective_drop or 0.0) >= 0.005
+            or (brightness_discount is not None and brightness_discount < 0.999)
+        )
+        surface_thermal_evidence = bool(
+            (surface_temperature is not None and surface_temperature >= 42.0)
+            or (
+                surface_temperature_delta is not None
+                and surface_temperature_delta >= 4.0
+            )
+        )
+        if is_harmony:
+            confirmed = bool(
+                not screen_explicitly_off
+                and not screen_explicitly_dim
+                and display_restricts
+                and automatic is False
+                and setting_unchanged is not False
+                and surface_thermal_evidence
+            )
+            suspected = bool(
+                not screen_explicitly_off
+                and not screen_explicitly_dim
+                and not confirmed
+                and display_restricts
+                and (automatic is False or surface_thermal_evidence)
+            )
+        else:
+            framework_confirmed = bool(
+                not screen_explicitly_off
+                and (
+                    (thermal_reason and (cap_restricts or (effective_drop or 0.0) >= 0.005))
+                    or (thermal_applied and cap_restricts)
                 )
-                or (thermal_applied and cap_restricts)
             )
-        )
-        cooling_confirmed = bool(
-            not screen_explicitly_off
-            and cooling_value > 0
-            and (effective_drop or 0.0) >= 0.005
-        )
-        # The OEM's candidate table, current level and limit value are descriptive
-        # runtime fields.  Only an explicit active=true flag proves that the OEM
-        # brightness clamp is engaged.
-        vendor_confirmed = vendor_active is True and vendor_state_exposed
-        confirmed = framework_confirmed or cooling_confirmed or vendor_confirmed
-        suspected = bool(
-            not screen_explicitly_off
-            and not confirmed
-            and (
-                cooling_value > 0
-                or (thermal_applied and cap_restricts)
-                or (thermal_status > 0 and cap_restricts)
-                or (thermal_reason and cap_restricts)
+            cooling_confirmed = bool(
+                not screen_explicitly_off
+                and cooling_value > 0
+                and (effective_drop or 0.0) >= 0.005
             )
-        )
+            # Candidate caps and descriptive levels do not prove activation.
+            vendor_confirmed = vendor_active is True and vendor_state_exposed
+            confirmed = framework_confirmed or cooling_confirmed or vendor_confirmed
+            suspected = bool(
+                not screen_explicitly_off
+                and not confirmed
+                and (
+                    cooling_value > 0
+                    or (thermal_applied and cap_restricts)
+                    or (thermal_status > 0 and cap_restricts)
+                    or (thermal_reason and cap_restricts)
+                )
+            )
+        if is_harmony:
+            framework_confirmed = False
+            cooling_confirmed = False
+            vendor_confirmed = False
         status = "confirmed" if confirmed else "suspected" if suspected else "none"
         reasons: List[str] = []
         confirmation_sources: List[str] = []
-        if vendor_confirmed:
-            confirmation_sources.append("vendor_runtime_active")
-            reasons.append("厂商运行时明确报告温控亮度限制已生效")
-            if vendor_level is not None:
-                reasons.append(f"当前档位 {vendor_level}")
-            if vendor_limit_nits is not None:
-                reasons.append(
-                    f"系统标称上限 {vendor_limit_nits:g} nit（非亮度计实测）"
+        if is_harmony:
+            if brightness_discount is not None and brightness_discount < 0.999:
+                reasons.append(f"DisplayPowerManager 显示折扣 {brightness_discount:.3f}×")
+            requested_raw = display.get("setting_raw")
+            effective_raw = display.get("effective_raw")
+            if isinstance(requested_raw, (int, float)) and isinstance(effective_raw, (int, float)):
+                if float(effective_raw) < float(requested_raw) - 0.5:
+                    reasons.append(
+                        f"逻辑亮度 {float(requested_raw):.0f} → 设备亮度 {float(effective_raw):.0f}"
+                    )
+            if setting_unchanged and display_restricts:
+                reasons.append("逻辑亮度设定保持不变")
+            if surface_temperature is not None and surface_thermal_evidence:
+                reasons.append(f"外壳/系统热传感器 {surface_temperature:.1f} °C")
+            if render_backlight is not None and display_restricts:
+                reasons.append(f"RenderService backlight {render_backlight:g}")
+        else:
+            if vendor_confirmed:
+                confirmation_sources.append("vendor_runtime_active")
+                reasons.append("厂商运行时明确报告温控亮度限制已生效")
+                if vendor_level is not None:
+                    reasons.append(f"当前档位 {vendor_level}")
+                if vendor_limit_nits is not None:
+                    reasons.append(
+                        f"系统标称上限 {vendor_limit_nits:g} nit（非亮度计实测）"
+                    )
+            elif vendor_active is False:
+                reasons.append("厂商运行时明确报告温控亮度限制未生效")
+            elif vendor_state_carried_forward and vendor_last_known_active is not None:
+                age_text = (
+                    f"{vendor_observed_age_s:.1f} 秒前"
+                    if isinstance(vendor_observed_age_s, (int, float))
+                    else "此前"
                 )
-        elif vendor_active is False:
-            reasons.append("厂商运行时明确报告温控亮度限制未生效")
-        elif vendor_state_carried_forward and vendor_last_known_active is not None:
-            age_text = (
-                f"{vendor_observed_age_s:.1f} 秒前"
-                if isinstance(vendor_observed_age_s, (int, float))
-                else "此前"
-            )
-            reasons.append(
-                "厂商运行时最近一次报告温控亮度限制"
-                f"{'已生效' if vendor_last_known_active else '未生效'}（{age_text}）"
-            )
-            if vendor_state_stale:
-                reasons.append("该厂商状态已超过低频刷新有效期，不能代表当前状态")
-        if framework_confirmed:
-            confirmation_sources.append("android_framework_thermal_clamp")
-        if cooling_confirmed:
-            confirmation_sources.append("thermal_hal_lcd_backlight")
-        if thermal_applied:
-            reasons.append("DisplayManager 已应用热亮度限制")
-        if thermal_reason:
-            reasons.append("显示亮度最大值原因标记为 thermal")
-        if thermal_cap is not None and thermal_cap < 0.999:
-            reasons.append(f"亮度上限 {thermal_cap * 100.0:.1f}%")
-        if cooling_value > 0:
-            reasons.append(f"lcd-backlight 冷却档位 {cooling_value:g}")
-        if thermal_status > 0:
-            reasons.append(f"亮度热限制状态 {thermal_status}")
+                reasons.append(
+                    "厂商运行时最近一次报告温控亮度限制"
+                    f"{'已生效' if vendor_last_known_active else '未生效'}（{age_text}）"
+                )
+                if vendor_state_stale:
+                    reasons.append("该厂商状态已超过低频刷新有效期，不能代表当前状态")
+            if framework_confirmed:
+                confirmation_sources.append("android_framework_thermal_clamp")
+            if cooling_confirmed:
+                confirmation_sources.append("thermal_hal_lcd_backlight")
+            if thermal_applied:
+                reasons.append("DisplayManager 已应用热亮度限制")
+            if thermal_reason:
+                reasons.append("显示亮度最大值原因标记为 thermal")
+            if thermal_cap is not None and thermal_cap < 0.999:
+                reasons.append(f"亮度上限 {thermal_cap * 100.0:.1f}%")
+            if cooling_value > 0:
+                reasons.append(f"lcd-backlight 冷却档位 {cooling_value:g}")
+            if thermal_status > 0:
+                reasons.append(f"亮度热限制状态 {thermal_status}")
         if isinstance(effective_drop_pct, (int, float)) and effective_drop_pct >= 0.5:
             reasons.append(f"有效亮度较请求值低 {effective_drop_pct:.1f}%")
 
-        effective_raw_estimate = None
-        if (
+        effective_raw_estimate = (
+            float(display["effective_raw"])
+            if isinstance(display.get("effective_raw"), (int, float))
+            else None
+        )
+        if effective_raw_estimate is None and (
             isinstance(setting_raw, (int, float))
             and setting_float is not None
             and setting_float > 0
@@ -2624,15 +2992,12 @@ def analyze_brightness_throttling(
             {
                 "elapsed_s": max(0.0, snapshot.uptime_s - session_start),
                 "uptime_s": snapshot.uptime_s,
+                "platform": platform,
                 "status": status,
                 "confidence": "high" if confirmed else "medium" if suspected else "none",
                 "screen_state": screen_text or None,
                 "setting_raw": float(setting_raw) if isinstance(setting_raw, (int, float)) else None,
-                "setting_unchanged": (
-                    abs(float(setting_raw) - baseline_setting) < 0.5
-                    if isinstance(setting_raw, (int, float)) and baseline_setting is not None
-                    else None
-                ),
+                "setting_unchanged": setting_unchanged,
                 "requested_brightness": requested,
                 "effective_brightness": effective,
                 "effective_brightness_source": effective_source,
@@ -2641,6 +3006,8 @@ def analyze_brightness_throttling(
                 "thermal_cap": thermal_cap,
                 "thermal_applied": thermal_applied,
                 "thermal_status": thermal_status,
+                "brightness_discount": brightness_discount,
+                "automatic_brightness": automatic,
                 "brightness_max_reason": maximum_reason,
                 "lcd_backlight_cooling": cooling_value,
                 "confirmation_sources": confirmation_sources,
@@ -2660,7 +3027,14 @@ def analyze_brightness_throttling(
                 ),
                 "vendor_thermal_temperature_c": vendor_temperature_c,
                 "vendor_thermal_candidate_caps_nits": vendor_candidate_caps,
-                "skin_temperature_c": sensor_value(snapshot, r"^skin$"),
+                "render_backlight_raw": render_backlight,
+                "skin_temperature_c": (
+                    sensor_value(snapshot, r"^skin$")
+                    if not is_harmony
+                    else surface_temperature
+                ),
+                "surface_temperature_c": surface_temperature,
+                "surface_temperature_delta_c": surface_temperature_delta,
                 "battery_temperature_c": sensor_value(snapshot, r"battery"),
                 "foreground_package": context.foreground_package if context is not None else None,
                 "power_mw": (
@@ -2730,6 +3104,16 @@ def analyze_brightness_throttling(
                 if source
             )
         )
+        discounts = [
+            float(item["brightness_discount"])
+            for item in current_event
+            if isinstance(item.get("brightness_discount"), (int, float))
+        ]
+        render_backlights = [
+            float(item["render_backlight_raw"])
+            for item in current_event
+            if isinstance(item.get("render_backlight_raw"), (int, float))
+        ]
         events.append(
             {
                 "index": len(events) + 1,
@@ -2748,6 +3132,8 @@ def analyze_brightness_throttling(
                 "minimum_effective_brightness": min(effective_values) if effective_values else None,
                 "minimum_effective_raw_estimate": min(raw_estimates) if raw_estimates else None,
                 "minimum_thermal_cap": min(caps) if caps else None,
+                "minimum_brightness_discount": min(discounts) if discounts else None,
+                "minimum_render_backlight_raw": min(render_backlights) if render_backlights else None,
                 "maximum_lcd_backlight_cooling": max(
                     float(item.get("lcd_backlight_cooling") or 0.0)
                     for item in current_event
@@ -2787,7 +3173,12 @@ def analyze_brightness_throttling(
         source_parts.append(f"{provider_text} runtime state")
     return {
         "available": available,
-        "source": " + ".join(source_parts),
+        "platform": platform,
+        "source": (
+            "HarmonyOS DisplayPowerManagerService Brightness/DeviceBrightness/Discount + ThermalService"
+            if is_harmony
+            else " + ".join(source_parts)
+        ),
         "vendor_thermal_available": vendor_thermal_exposed,
         "vendor_thermal_providers": vendor_thermal_providers,
         "vendor_thermal_confirmed_point_count": sum(
@@ -2809,8 +3200,18 @@ def analyze_brightness_throttling(
         "current_state": current_state,
         "latest_flagged_point": latest_flagged,
         "setting_baseline_raw": baseline_setting,
+        "evidence_summary": (
+            "DisplayPowerManagerService logical/device brightness and Discount are combined with RenderService "
+            "backlight, manual-mode stability and ThermalService surface temperature."
+            if is_harmony
+            else "DisplayManager thermal cap, effective brightness and Thermal HAL lcd-backlight are combined."
+        ),
         "limitations": (
-            "ADB can identify framework or Thermal HAL brightness limiting and estimate the effective normalized "
+            "HarmonyOS DisplayPowerManager Discount is not exclusively a thermal signal. A point is confirmed only "
+            "when the logical setting stays stable in manual mode and surface-temperature evidence is also present. "
+            "HDC cannot guarantee absolute panel luminance in nits."
+            if is_harmony
+            else "ADB can identify framework or Thermal HAL brightness limiting and estimate the effective normalized "
             "brightness. For an OEM channel, only vendor_thermal_active=true is treated as explicit activation; "
             "an inactive flag, a reported limit (including 9999 nit), or a candidate-cap table does not prove "
             "that dimming occurred. The OEM level and ‘system nominal cap’ are firmware-reported values, not "
@@ -6509,13 +6910,19 @@ def build_performance_findings(analysis: Dict[str, object]) -> List[Dict[str, st
         findings.append(
             {
                 "level": "high" if int(brightness.get("confirmed_point_count") or 0) else "medium",
-                "title": "检测到疑似屏幕热降亮",
+                "title": (
+                    "检测到屏幕热降亮"
+                    if int(brightness.get("confirmed_point_count") or 0)
+                    else "检测到疑似屏幕热降亮"
+                ),
                 "detail": (
                     f"共标记 {int(brightness.get('point_count') or 0)} 个采样点、"
                     f"{int(brightness.get('event_count') or 0)} 段事件；"
                     f"首次发生在 {float(leading.get('start_elapsed_s') or 0.0):.1f} s。"
                     + (
-                        "系统亮度设定在事件内保持不变，显示侧有效亮度发生下降。"
+                        "iOS 用户亮度保持不变，AppleARMBacklight 实际毫尼特和原始背光发生下降。"
+                        if platform == "ios" and leading.get("setting_unchanged")
+                        else "系统亮度设定在事件内保持不变，显示侧有效亮度发生下降。"
                         if leading.get("setting_unchanged")
                         else "请结合事件表中的设置值和有效亮度判断。"
                     )
@@ -6810,13 +7217,19 @@ def build_findings(analysis: Dict[str, object]) -> List[Dict[str, str]]:
         findings.append(
             {
                 "level": "high" if int(brightness.get("confirmed_point_count") or 0) else "medium",
-                "title": "检测到疑似屏幕热降亮",
+                "title": (
+                    "检测到屏幕热降亮"
+                    if int(brightness.get("confirmed_point_count") or 0)
+                    else "检测到疑似屏幕热降亮"
+                ),
                 "detail": (
                     f"共标记 {int(brightness.get('point_count') or 0)} 个采样点、"
                     f"{int(brightness.get('event_count') or 0)} 段事件；"
                     f"首次发生在 {float(leading.get('start_elapsed_s') or 0.0):.1f} s。"
                     + (
-                        "系统亮度设定保持不变，因此屏幕变暗不能用设置值下降解释。"
+                        "iOS 用户亮度保持不变，因此实际毫尼特下降不能用设置值变化解释。"
+                        if platform == "ios" and leading.get("setting_unchanged")
+                        else "系统亮度设定保持不变，因此屏幕变暗不能用设置值下降解释。"
                         if leading.get("setting_unchanged")
                         else "设置值同期也有变化，报告会分别展示设置与显示侧限制。"
                     )
@@ -6938,6 +7351,11 @@ def _analysis_data_sources(
                 "iOS DiagnosticsService battery temperature",
                 "measured counters",
             )
+            add(
+                "Brightness thermal limiting",
+                "iOS AppleARMBacklight user brightness/rawBrightness/BrightnessMilliNits",
+                "measured counters",
+            )
         add(
             "Test phases and actions",
             "Imported timestamped logs aligned to device uptime",
@@ -7016,6 +7434,11 @@ def _analysis_data_sources(
                 "HarmonyOS SmartPerf SP_daemon temperature fields"
                 if smartperf
                 else "HarmonyOS ThermalService via hidumper",
+                "measured counters",
+            )
+            add(
+                "Brightness thermal limiting",
+                "HarmonyOS DisplayPowerManagerService Brightness/DeviceBrightness/Discount + ThermalService",
                 "measured counters",
             )
         if feature_enabled("scheduler", False):
@@ -8163,14 +8586,19 @@ def analyze_run(
     else:
         thermal = {**thermal_post_run, **thermal_history, "post_run": thermal_post_run}
     brightness_throttling = (
-        analyze_brightness_throttling(samples, contexts, thermal_snapshots)
-        if platform == "android" and feature("thermal")
+        analyze_brightness_throttling(
+            samples,
+            contexts,
+            thermal_snapshots,
+            platform=platform,
+        )
+        if platform in {"android", "ios", "harmony"} and feature("thermal")
         else {
             "available": False,
-            "analysis_disabled": platform != "android" or not feature("thermal"),
+            "analysis_disabled": platform not in {"android", "ios", "harmony"} or not feature("thermal"),
             "reason": (
-                "当前平台未提供 Android DisplayManager 热亮度限制语义。"
-                if platform != "android"
+                "当前平台未提供可判定的显示亮度限制语义。"
+                if platform not in {"android", "ios", "harmony"}
                 else "温度与热限制采集已关闭。"
             ),
             "timeline": [],

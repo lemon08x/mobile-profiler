@@ -1261,6 +1261,25 @@ def probe_ios_device(
     return result
 
 
+def ios_brightness_capability(
+    requested: Optional[str],
+    ios_python: str = DEFAULT_IOS_PYTHON,
+) -> Dict[str, object]:
+    device = select_ios_device(requested, ios_python)
+    udid = str(device["udid"])
+    host, port = _device_endpoint(device)
+    arguments: List[object] = ["brightness", "--udid", udid]
+    if host:
+        arguments.extend(["--host", host])
+    if port:
+        arguments.extend(["--port", port])
+    result = _run_bridge_json(ios_python, arguments, timeout_s=45.0)
+    result["device"] = device.get("serial") or ios_device_id(udid)
+    result["platform"] = "ios"
+    result["writable"] = False
+    return result
+
+
 def _stop_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -1292,6 +1311,7 @@ def collect_ios_session(
     reconnect_timeout_s: float,
     system_monitor_enabled: bool,
     process_interval_s: float,
+    display_brightness_enabled: bool = True,
 ) -> IOSCollectionResult:
     udid = str(device["udid"])
     host, port = _device_endpoint(device)
@@ -1355,6 +1375,8 @@ def collect_ios_session(
         )
         if not system_monitor_enabled:
             command.append("--no-system-monitor")
+        if not display_brightness_enabled:
+            command.append("--no-display-brightness")
         creationflags = 0
         if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]

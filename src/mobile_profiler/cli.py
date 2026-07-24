@@ -1132,6 +1132,7 @@ def run_ios_record(args: argparse.Namespace) -> int:
                 reconnect_timeout_s=args.reconnect_timeout,
                 system_monitor_enabled=bool(features.get("process_snapshots")),
                 process_interval_s=args.process_interval,
+                display_brightness_enabled=bool(features.get("thermal")),
             )
             metadata["collection_stop_reason"] = collection.stop_reason
             metadata["collection_host_elapsed_s"] = collection.host_elapsed_s
@@ -1530,6 +1531,7 @@ def run_harmony_record(args: argparse.Namespace) -> int:
                         checkpoint_interval_s=args.checkpoint_interval,
                         reconnect_timeout_s=args.reconnect_timeout,
                         process_interval_s=args.process_interval,
+                        thermal_interval_s=args.thermal_interval,
                         scheduler_interval_s=args.scheduler_interval,
                         context_interval_s=args.performance_interval,
                         external_power=(

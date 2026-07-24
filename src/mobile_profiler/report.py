@@ -181,6 +181,9 @@ SOURCE_LABELS = {
     "HarmonyOS RenderService fresh active-screen compositor timestamps": "HarmonyOS RenderService · 亮屏新鲜合成时间戳",
     "SmartPerf fields when verified; otherwise HDC /proc/stat, cpufreq and ThermalService": "验证可用时使用 SmartPerf；否则使用 HDC /proc/stat、cpufreq 与 ThermalService",
     "HarmonyOS BatteryService current and voltage telemetry": "HarmonyOS BatteryService 电流与电压遥测",
+    "HarmonyOS DisplayPowerManagerService + RenderService + ThermalService": "HarmonyOS DisplayPowerManagerService + RenderService + ThermalService",
+    "HarmonyOS DisplayPowerManagerService Brightness/DeviceBrightness/Discount + ThermalService": "HarmonyOS 逻辑/设备亮度、显示折扣 + ThermalService",
+    "iOS AppleARMBacklight user brightness/rawBrightness/BrightnessMilliNits": "iOS AppleARMBacklight 用户亮度 / 原始背光 / 实际毫尼特",
 }
 COMPONENT_LABELS = {
     "screen": "屏幕",
@@ -2211,6 +2214,9 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
     brightness = brightness if isinstance(brightness, dict) else {}
     if not brightness.get("available"):
         return ""
+    platform = str(brightness.get("platform") or analysis.get("platform") or "android").lower()
+    is_harmony = platform == "harmony"
+    is_ios = platform == "ios"
     points = brightness.get("points", [])
     points = points if isinstance(points, list) else []
     current_state = brightness.get("current_state", {})
@@ -2253,11 +2259,18 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
             else vendor_note
             or "系统亮度、DisplayManager 热亮度上限和 lcd-backlight 冷却档位未形成降亮证据。"
         )
+        empty_note = (
+            "逻辑亮度、设备亮度、显示折扣与 ThermalService 温度未形成联合降亮证据。"
+            if is_harmony
+            else "iOS 用户亮度、rawBrightness、实际毫尼特与热压力证据未形成联合降亮证据。"
+            if is_ios
+            else vendor_note
+        )
         return (
             '<section class="analysis-section brightness-dim-section">'
             '<div class="priority-callout"><span class="status-dot good"></span><div>'
             '<strong>未观察到已生效的屏幕热降亮</strong>'
-            f'<span>{_escape(vendor_note)}</span>'
+            f'<span>{_escape(empty_note)}</span>'
             '</div></div></section>'
         )
     rows = []
@@ -2278,21 +2291,49 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
         effective = item.get("effective_brightness")
         cap = item.get("thermal_cap")
         effective_raw = item.get("effective_raw_estimate")
-        display_text = (
-            f'请求 {_number(float(requested) * 100.0, 1)}% → '
-            f'有效 {_number(float(effective) * 100.0, 1)}%'
-            if isinstance(requested, (int, float)) and isinstance(effective, (int, float))
-            else "有效亮度不可直接读取"
-        )
-        if isinstance(effective_raw, (int, float)):
-            display_text += f'<span class="cell-sub">折算档位约 {_number(effective_raw, 0)}</span>'
-        vendor_level = item.get("vendor_thermal_level")
-        if item.get("vendor_thermal_active") is True and isinstance(vendor_level, (int, float)):
-            display_text += f'<span class="cell-sub">厂商运行时档位 {_number(vendor_level, 0)}</span>'
+        if is_ios:
+            luminance = item.get("luminance_nits")
+            baseline_luminance = item.get("baseline_luminance_nits")
+            luminance_drop = item.get("luminance_drop_pct")
+            display_text = (
+                f'{_number(luminance, 1)} nits'
+                if isinstance(luminance, (int, float))
+                else "实际毫尼特不可读取"
+            )
+            if isinstance(baseline_luminance, (int, float)):
+                display_text += f'<span class="cell-sub">基线 {_number(baseline_luminance, 1)} nits'
+                if isinstance(luminance_drop, (int, float)):
+                    display_text += f' · 下降 {_number(luminance_drop, 1)}%'
+                display_text += "</span>"
+        else:
+            display_text = (
+                f'请求 {_number(float(requested) * 100.0, 1)}% → '
+                f'有效 {_number(float(effective) * 100.0, 1)}%'
+                if isinstance(requested, (int, float)) and isinstance(effective, (int, float))
+                else "有效亮度不可直接读取"
+            )
+            if isinstance(effective_raw, (int, float)):
+                display_text += f'<span class="cell-sub">折算档位约 {_number(effective_raw, 0)}</span>'
+            vendor_level = item.get("vendor_thermal_level")
+            if (
+                not is_harmony
+                and item.get("vendor_thermal_active") is True
+                and isinstance(vendor_level, (int, float))
+            ):
+                display_text += (
+                    f'<span class="cell-sub">厂商运行时档位 {_number(vendor_level, 0)}</span>'
+                )
+        discount = item.get("brightness_discount")
         vendor_limit_nits = item.get("vendor_thermal_limit_nits")
         cap_text = (
-            f'系统标称上限 {_number(vendor_limit_nits, 0)} nit'
-            '<span class="cell-sub">非亮度计实测</span>'
+            f'{_number(discount, 3)}×'
+            if is_harmony and isinstance(discount, (int, float))
+            else _escape(item.get("thermal_notification") or "无明确通知")
+            if is_ios
+            else (
+                f'系统标称上限 {_number(vendor_limit_nits, 0)} nit'
+                '<span class="cell-sub">非亮度计实测</span>'
+            )
             if item.get("vendor_thermal_active") is True
             and isinstance(vendor_limit_nits, (int, float))
             else f'{_number(float(cap) * 100.0, 1)}%'
@@ -2300,21 +2341,45 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
             else "—"
         )
         temperature = (
-            item.get("vendor_thermal_temperature_c")
-            if isinstance(item.get("vendor_thermal_temperature_c"), (int, float))
+            item.get("battery_temperature_c")
+            if is_ios
+            else item.get("vendor_thermal_temperature_c")
+            if not is_harmony
+            and isinstance(item.get("vendor_thermal_temperature_c"), (int, float))
             else item.get("skin_temperature_c")
+        )
+        backlight_text = (
+            _number(item.get("render_backlight_raw"), 0)
+            if is_harmony
+            else _number(item.get("raw_backlight_raw"), 0)
+            if is_ios
+            else _number(item.get("lcd_backlight_cooling"), 0)
+        )
+        temperature_source = (
+            "厂商运行时"
+            if not is_harmony
+            and not is_ios
+            and isinstance(item.get("vendor_thermal_temperature_c"), (int, float))
+            else "SKIN"
+            if not is_harmony and not is_ios
+            else None
+        )
+        temperature_source_html = (
+            f'<span class="cell-sub">{temperature_source}</span>'
+            if temperature_source
+            else ""
         )
         rows.append(
             f'<tr class="brightness-point-row" data-brightness-time="{_number(item.get("elapsed_s"), 3, "0")}">'
             f'<td>{_number(item.get("elapsed_s"), 1)} s</td>'
             f'<td><span class="source-tag {tag}">{label}</span></td>'
-            f'<td>{_number(item.get("setting_raw"), 0)}'
+            f'<td>{_number(item.get("setting_raw"), 1 if is_ios else 0)}'
             f'<span class="cell-sub">{"设定未变" if item.get("setting_unchanged") else "设定可能变化"}</span></td>'
             f'<td>{display_text}</td>'
             f'<td>{cap_text}</td>'
-            f'<td>{_number(item.get("lcd_backlight_cooling"), 0)}</td>'
+            f'<td>{backlight_text}</td>'
             f'<td>{_number(temperature, 1)} °C'
-            f'<span class="cell-sub">{"厂商运行时" if isinstance(item.get("vendor_thermal_temperature_c"), (int, float)) else "SKIN"}</span></td>'
+            f'{temperature_source_html}</td>'
             f'<td>{_escape(item.get("foreground_package") or "—")}</td>'
             f'<td>{_escape(item.get("reason") or "—")}</td>'
             '</tr>'
@@ -2329,15 +2394,14 @@ def _brightness_throttling_section(analysis: Dict[str, object]) -> str:
         f'{int(brightness.get("point_count") or 0)} 点 / {int(brightness.get("event_count") or 0)} 段</span></div>'
         '<div class="priority-callout active"><span class="status-dot warning"></span><div>'
         f'<strong>{_escape(title)}</strong>'
-        '<span>只有厂商运行时 active=true，或独立的 DisplayManager / Thermal HAL 明确限制证据，才标记为确认；候选表存在本身不构成确认。</span>'
+        f'<span>{_escape(brightness.get("evidence_summary") or ("DisplayPowerManagerService 逻辑/设备亮度、显示折扣、RenderService 背光和 ThermalService 温度已联合判定。" if is_harmony else "AppleARMBacklight 用户亮度、rawBrightness、实际毫尼特与 iOS 热压力证据已联合判定。" if is_ios else "只有厂商运行时 active=true，或独立的 DisplayManager / Thermal HAL 明确限制证据，才标记为确认；候选表存在本身不构成确认。"))}</span>'
         '</div></div>'
         '<div class="data-table-wrap"><table><thead><tr>'
-        '<th>时间</th><th>判定</th><th>系统设定</th><th>显示侧亮度</th><th>热上限</th>'
-        '<th>LCD 冷却档</th><th>SKIN</th><th>前台应用</th><th>证据</th>'
+        f'<th>时间</th><th>判定</th><th>{"逻辑亮度" if is_harmony else "用户亮度 (%)" if is_ios else "系统设定"}</th><th>{"实际亮度" if is_ios else "显示侧亮度"}</th><th>{"显示折扣" if is_harmony else "热压力证据" if is_ios else "热上限"}</th>'
+        f'<th>{"RS 背光" if is_harmony else "rawBrightness" if is_ios else "LCD 冷却档"}</th><th>{"外壳/系统温度" if is_harmony else "电池温度" if is_ios else "SKIN"}</th><th>前台应用</th><th>证据</th>'
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
         '<div class="availability-note"><strong>测量边界</strong><span>'
-        '这里能确认 Android Framework / Thermal HAL 或厂商运行时侧的限亮状态。厂商档位与 nit 是系统标称值，'
-        '不等于亮度计实测，也不能仅凭候选表推导温度→档位关系；精确面板亮度仍需外部亮度计。</span></div>'
+        f'{_escape(brightness.get("limitations") or "无法保证绝对物理亮度；精确 nits 仍需外部亮度计。")}</span></div>'
         '</section>'
     )
 
@@ -2723,6 +2787,10 @@ def _analysis_conclusion_sections(
             '</div></div></section>'
         )
 
+    brightness = _brightness_throttling_section(analysis)
+    if brightness:
+        sections.append(brightness)
+
     if test_mode == "performance":
         if has_frame_evidence:
             sections.append(
@@ -2749,9 +2817,6 @@ def _analysis_conclusion_sections(
                 if section:
                     sections.append(section)
     else:
-        brightness = _brightness_throttling_section(analysis)
-        if brightness:
-            sections.append(brightness)
         pressure = analysis.get("power_pressure", {})
         pressure = pressure if isinstance(pressure, dict) else {}
         memory = analysis.get("memory", {})

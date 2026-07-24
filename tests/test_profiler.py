@@ -80,21 +80,30 @@ from mobile_profiler.ios import (
     _windows_endpoint_route,
     collect_ios_session,
     connect_ios_bluetooth,
+    ios_brightness_capability,
     list_ios_devices,
     pair_ios_device,
     probe_ios_device,
     select_ios_device,
 )
 from mobile_profiler import ios_bridge
+from mobile_profiler.ios_bridge import (
+    _display_brightness_payload,
+    _require_tunnel_runtime,
+)
 from mobile_profiler.harmony import (
     HARMONY_NATIVE_CPU_FREQUENCY_INTERVAL_S,
     _sampler_script,
     build_harmony_smartperf_context,
     build_harmony_smartperf_sample,
     build_harmony_sample,
+    calibrate_harmony_brightness,
+    discover_harmony_brightness_values,
+    harmony_brightness_capability,
     harmony_cpu_policies,
     harmony_native_cpu_frequency_schedule_s,
     harmony_policy_frequencies_mhz,
+    parse_harmony_display_brightness,
     parse_harmony_battery,
     parse_harmony_cpufreq,
     parse_harmony_compositor_fps,
@@ -107,10 +116,12 @@ from mobile_profiler.harmony import (
     parse_harmony_render_screen,
     parse_harmony_thermal,
     parse_harmony_window_manager,
+    parse_harmony_ui_layout,
     parse_harmony_smartperf_output,
     parse_hdc_targets,
     read_harmony_power_mode,
     set_harmony_power_mode,
+    set_harmony_brightness,
 )
 from mobile_profiler.log_import import (
     host_epoch_to_device_uptime,
@@ -148,6 +159,7 @@ from mobile_profiler.parsers import (
 )
 from mobile_profiler.report import (
     _capture_configuration_rows,
+    _brightness_throttling_section,
     _frame_flow_history_section,
     _performance_context_rows,
     _report_mode_profile,
@@ -170,6 +182,7 @@ from mobile_profiler.storage import (
     write_report_excluded_ranges,
     write_samples_csv,
 )
+from mobile_profiler.ui import DashboardManager
 
 
 class ParserTests(unittest.TestCase):
@@ -2275,6 +2288,69 @@ class SystemAnalysisTests(unittest.TestCase):
             result["events"][0]["minimum_vendor_thermal_limit_nits"],
             250.0,
         )
+    def test_ios_brightness_analysis_uses_same_setting_nits_and_thermal_evidence(self) -> None:
+        samples = self._samples()
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example.iosgame",
+                screen_state="Awake",
+                brightness_raw=60.0,
+                source="ios_dvt_notifications",
+            )
+        ]
+
+        def snapshot(
+            uptime_s: float,
+            nits: float,
+            raw_backlight: float,
+            temperature: float,
+            thermal_active: bool = False,
+        ) -> ThermalSnapshot:
+            return ThermalSnapshot(
+                uptime_s=uptime_s,
+                host_epoch_s=1000.0 + uptime_s,
+                temperatures=[{"name": "Battery", "value_c": temperature}],
+                display_brightness={
+                    "available": True,
+                    "screen_state": "ON",
+                    "setting_raw": 60.0,
+                    "setting_float": 0.6,
+                    "user_brightness_pct": 60.0,
+                    "luminance_nits": nits,
+                    "maximum_luminance_nits": 2175.0,
+                    "raw_backlight_raw": raw_backlight,
+                    "thermal_notification": (
+                        "com.apple.system.thermalpressurelevel"
+                        if thermal_active
+                        else None
+                    ),
+                    "thermal_notification_active": thermal_active,
+                },
+            )
+
+        result = analyze_brightness_throttling(
+            samples,
+            contexts,
+            [
+                snapshot(100.0, 300.0, 900.0, 35.0),
+                snapshot(110.0, 270.0, 800.0, 36.0),
+                snapshot(120.0, 250.0, 730.0, 40.0, True),
+                snapshot(130.0, 300.0, 900.0, 37.0),
+            ],
+            platform="ios",
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["point_count"], 2)
+        self.assertEqual(result["suspected_point_count"], 1)
+        self.assertEqual(result["confirmed_point_count"], 1)
+        self.assertEqual(result["event_count"], 1)
+        self.assertAlmostEqual(result["points"][0]["luminance_drop_pct"], 10.0)
+        self.assertEqual(result["points"][1]["status"], "confirmed")
+        self.assertIn("thermalpressurelevel", result["points"][1]["reason"])
+        self.assertFalse(result["current_active"])
+        self.assertEqual(result["current_state"]["status"], "none")
 
     def test_bcl_vbat_status_does_not_trigger_thermal_shutdown(self) -> None:
         result = analyze_thermal_history(
@@ -2991,6 +3067,469 @@ class HarmonyAdapterTests(unittest.TestCase):
         )
         self.assertEqual(foreground["package"], "yylx.danmaku.bili")
         self.assertEqual(foreground["activity"], "EntryAbility")
+
+    def test_harmony_display_brightness_and_layout_parsers(self) -> None:
+        brightness = parse_harmony_display_brightness(
+            "DISPLAY POWER MANAGER DUMP:\n"
+            "Display Id=0 State=2 Discount=0.820000 Brightness=180\n"
+            "DeviceBrightness=148\n"
+            "Support Ambient Light: TRUE\n"
+            "Auto Adjust Brightness: OFF\n"
+            "Brightness Limits: Max=255 Min=1 Default=45\n",
+            "screen[0]: id=0, powerStatus=POWER_STATUS_ON, backlight=21700, "
+            "render resolution=1320x2856\n",
+            "State: AWAKE\nReason: USER\n",
+        )
+        self.assertEqual(brightness["setting_raw"], 180.0)
+        self.assertEqual(brightness["effective_raw"], 148.0)
+        self.assertEqual(brightness["brightness_discount"], 0.82)
+        self.assertTrue(brightness["restriction_active"])
+        self.assertFalse(brightness["automatic"])
+        self.assertEqual(brightness["brightness_minimum_raw"], 1.0)
+        self.assertEqual(brightness["brightness_maximum_raw"], 255.0)
+        self.assertEqual(brightness["render_backlight_raw"], 21700.0)
+
+        nodes = parse_harmony_ui_layout(
+            'prefix {"attributes":{"type":"root"},"children":['
+            '{"attributes":{"id":"brightness_slider","bounds":"[10,20][110,60]"},"children":[]}'
+            ']} suffix'
+        )
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[1]["id"], "brightness_slider")
+
+    def test_harmony_brightness_discovery_finds_only_stable_monotonic_values(self) -> None:
+        mapping = [1, 1, 1, 3, 3, 3, 4, 4, 4, 7, 7]
+        result = discover_harmony_brightness_values(
+            lambda position: mapping[position],
+            0,
+            len(mapping) - 1,
+        )
+        self.assertEqual(result["selectable_values"], [1, 3, 4, 7])
+        self.assertEqual(result["unavailable_values"], [2, 5, 6])
+        for value, position in result["position_by_value"].items():
+            self.assertEqual(mapping[int(position)], int(value))
+        self.assertLessEqual(result["query_count"], len(mapping))
+
+    def test_harmony_brightness_capability_distinguishes_direct_and_ui_fallback(self) -> None:
+        state = {
+            "available": True,
+            "setting_raw": 106.0,
+            "effective_raw": 90.0,
+            "brightness_minimum_raw": 1.0,
+            "brightness_maximum_raw": 255.0,
+            "automatic": False,
+            "direct_setter_available": False,
+            "ui_fallback_available": True,
+        }
+        with patch(
+            "mobile_profiler.harmony.collect_harmony_display_brightness",
+            return_value=(state, None, 1.0),
+        ):
+            capability = harmony_brightness_capability("hdc", "harmony:device")
+        self.assertEqual(capability["current"], 106)
+        self.assertEqual(capability["effective_current"], 90)
+        self.assertTrue(capability["writable"])
+        self.assertEqual(capability["setter_mode"], "settings_fallback")
+        self.assertTrue(capability["calibration_required"])
+        self.assertEqual(capability["selectable_values"], [])
+        self.assertIn("system application identity", capability["setter_restriction"])
+
+        calibration = {
+            "algorithm": "settings-slider-adaptive-v1",
+            "slider_bounds": "[185,2065][1135,2205]",
+            "track_bounds": [249, 2135, 1071],
+            "selectable_values": [1, 74, 105, 107, 237],
+            "position_by_value": {
+                "1": 274,
+                "74": 660,
+                "105": 743,
+                "107": 745,
+                "237": 1045,
+            },
+            "unavailable_values": [106],
+        }
+        with patch(
+            "mobile_profiler.harmony.collect_harmony_display_brightness",
+            return_value=(state, None, 1.0),
+        ):
+            calibrated = harmony_brightness_capability(
+                "hdc",
+                "harmony:device",
+                calibration,
+            )
+        self.assertTrue(calibrated["calibrated"])
+        self.assertFalse(calibrated["calibration_required"])
+        self.assertEqual(calibrated["minimum"], 1)
+        self.assertEqual(calibrated["maximum"], 237)
+        self.assertEqual(calibrated["selectable_values"], [1, 74, 105, 107, 237])
+        self.assertEqual(calibrated["unavailable_values"], [106])
+
+        state["direct_setter_available"] = True
+        state["direct_setter_command"] = "/system/bin/ohos-displayManager"
+        with patch(
+            "mobile_profiler.harmony.collect_harmony_display_brightness",
+            return_value=(state, None, 1.0),
+        ):
+            direct = harmony_brightness_capability("hdc", "harmony:device")
+        self.assertEqual(direct["setter_mode"], "direct")
+        self.assertIsNone(direct["setter_restriction"])
+
+    def test_harmony_brightness_noop_does_not_open_settings(self) -> None:
+        capability = {
+            "current": 106,
+            "minimum": 1,
+            "maximum": 255,
+            "step": 1,
+            "mode": 0,
+            "automatic": False,
+            "direct_setter_available": False,
+            "ui_fallback_available": True,
+        }
+        with patch(
+            "mobile_profiler.harmony.harmony_brightness_capability",
+            return_value=capability,
+        ), patch("mobile_profiler.harmony.hdc_shell") as shell:
+            result = set_harmony_brightness("hdc", "harmony:device", 106)
+        shell.assert_not_called()
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["setter_used"], "none")
+
+    def test_harmony_brightness_one_step_change_is_not_treated_as_noop(self) -> None:
+        capability = {
+            "current": 106,
+            "minimum": 1,
+            "maximum": 255,
+            "step": 1,
+            "mode": 0,
+            "automatic": False,
+            "direct_setter_available": False,
+            "ui_fallback_available": True,
+        }
+        expected = {**capability, "current": 105, "applied": True, "setter_used": "settings_fallback"}
+        with patch(
+            "mobile_profiler.harmony.harmony_brightness_capability",
+            return_value=capability,
+        ), patch(
+            "mobile_profiler.harmony._set_harmony_brightness_via_settings",
+            return_value=expected,
+        ) as fallback:
+            result = set_harmony_brightness("hdc", "harmony:device", 105)
+        fallback.assert_called_once()
+        self.assertEqual(result["current"], 105)
+
+    def test_harmony_brightness_uses_calibrated_slider_position_and_exact_verification(self) -> None:
+        calibration = {
+            "algorithm": "settings-slider-adaptive-v1",
+            "slider_bounds": "[185,2065][1135,2205]",
+            "track_bounds": [249, 2135, 1071],
+            "selectable_values": [1, 74, 105, 107, 237],
+            "position_by_value": {
+                "1": 274,
+                "74": 660,
+                "105": 743,
+                "107": 745,
+                "237": 1045,
+            },
+            "unavailable_values": [106],
+        }
+        before = {
+            "current": 74,
+            "minimum": 1,
+            "maximum": 237,
+            "step": 1,
+            "mode": 0,
+            "automatic": False,
+            "screen_state": "on",
+            "direct_setter_available": False,
+            "ui_fallback_available": True,
+        }
+        after = {
+            **before,
+            "current": 105,
+            "selectable_values": calibration["selectable_values"],
+        }
+        previous_nodes = [
+            {
+                "bundleName": "com.example.game",
+                "abilityName": "GameAbility",
+                "visible": "true",
+            }
+        ]
+        settings_nodes = [
+            {
+                "id": "brightness_slider",
+                "bounds": calibration["slider_bounds"],
+                "visible": "true",
+            },
+            {
+                "id": "automatic_adjust_toggle",
+                "checked": "false",
+                "visible": "true",
+            },
+        ]
+        success = CommandResult([], 0, "", "", 0.01)
+        with patch(
+            "mobile_profiler.harmony.harmony_brightness_capability",
+            side_effect=[before, after],
+        ), patch(
+            "mobile_profiler.harmony._harmony_layout_nodes",
+            side_effect=[previous_nodes, settings_nodes],
+        ), patch(
+            "mobile_profiler.harmony.hdc_shell",
+            return_value=success,
+        ) as shell, patch("mobile_profiler.harmony.time.sleep"):
+            result = set_harmony_brightness(
+                "hdc",
+                "harmony:device",
+                105,
+                calibration,
+            )
+        click_commands = [
+            call.args[2]
+            for call in shell.call_args_list
+            if isinstance(call.args[2], list) and call.args[2][:3] == ["uitest", "uiInput", "click"]
+        ]
+        self.assertEqual(
+            click_commands,
+            [
+                ["uitest", "uiInput", "click", "249", "2135"],
+                ["uitest", "uiInput", "click", "743", "2135"],
+            ],
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["current"], 105)
+
+    def test_harmony_brightness_prefers_direct_cli_and_verifies_dpm(self) -> None:
+        before = {
+            "current": 83,
+            "minimum": 1,
+            "maximum": 255,
+            "step": 1,
+            "mode": 0,
+            "automatic": False,
+            "direct_setter_available": True,
+            "direct_setter_command": "/system/bin/ohos-displayManager",
+            "ui_fallback_available": True,
+        }
+        after = {**before, "current": 120}
+        with patch(
+            "mobile_profiler.harmony.harmony_brightness_capability",
+            side_effect=[before, after],
+        ), patch(
+            "mobile_profiler.harmony.hdc_shell",
+            return_value=CommandResult([], 0, '{"status":"success"}', "", 0.01),
+        ) as shell, patch("mobile_profiler.harmony.time.sleep"):
+            result = set_harmony_brightness("hdc", "harmony:device", 120)
+        shell.assert_called_once_with(
+            "hdc",
+            "harmony:device",
+            ["/system/bin/ohos-displayManager", "set-brightness", "--value", "120"],
+            timeout_s=15,
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["setter_used"], "direct")
+
+    def test_harmony_brightness_falls_back_after_direct_permission_error(self) -> None:
+        before = {
+            "current": 83,
+            "minimum": 1,
+            "maximum": 255,
+            "step": 1,
+            "mode": 0,
+            "automatic": False,
+            "direct_setter_available": True,
+            "direct_setter_command": "/system/bin/ohos-displayManager",
+            "ui_fallback_available": True,
+        }
+        failure = CommandResult(
+            [],
+            1,
+            '{"errCode":"ERR_SYSTEM_API_DENIED","errMsg":"system application identity is required"}',
+            "",
+            0.01,
+        )
+        fallback_result = {**before, "current": 120, "applied": True, "setter_used": "settings_fallback"}
+        with patch(
+            "mobile_profiler.harmony.harmony_brightness_capability",
+            return_value=before,
+        ), patch(
+            "mobile_profiler.harmony.hdc_shell",
+            return_value=failure,
+        ), patch(
+            "mobile_profiler.harmony._set_harmony_brightness_via_settings",
+            return_value=fallback_result,
+        ) as fallback:
+            result = set_harmony_brightness("hdc", "harmony:device", 120)
+        self.assertEqual(result["setter_used"], "settings_fallback")
+        self.assertIn("ERR_SYSTEM_API_DENIED", fallback.call_args.kwargs["initial_warnings"][0])
+
+    def test_harmony_brightness_analysis_marks_suspected_confirmed_and_recovery(self) -> None:
+        def snapshot(uptime_s: float, effective: float, discount: float, temperature: float) -> ThermalSnapshot:
+            return ThermalSnapshot(
+                uptime_s=uptime_s,
+                host_epoch_s=uptime_s,
+                temperatures=[{"name": "shell_back", "value_c": temperature}],
+                display_brightness={
+                    "available": True,
+                    "screen_state": "on",
+                    "power_state": "AWAKE",
+                    "setting_raw": 180.0,
+                    "setting_float": 180.0 / 255.0,
+                    "current_screen_brightness": 180.0 / 255.0,
+                    "last_user_set_brightness": 180.0 / 255.0,
+                    "screen_brightness": effective / 255.0,
+                    "adjusted_brightness": effective / 255.0,
+                    "effective_raw": effective,
+                    "brightness_discount": discount,
+                    "automatic": False,
+                    "render_backlight_raw": 22000.0,
+                },
+            )
+
+        analysis = analyze_brightness_throttling(
+            [],
+            [],
+            [
+                snapshot(100.0, 150.0, 0.83, 38.0),
+                snapshot(110.0, 145.0, 0.80, 44.0),
+                snapshot(120.0, 180.0, 1.0, 45.0),
+            ],
+            platform="harmony",
+        )
+        self.assertEqual(
+            [item["status"] for item in analysis["timeline"]],
+            ["suspected", "confirmed", "none"],
+        )
+        self.assertEqual(analysis["point_count"], 2)
+        self.assertEqual(analysis["confirmed_point_count"], 1)
+        self.assertEqual(analysis["event_count"], 1)
+        self.assertEqual(analysis["events"][0]["status"], "confirmed")
+        self.assertFalse(analysis["current_active"])
+
+    def test_dashboard_dispatches_harmony_brightness_read_and_set(self) -> None:
+        device = {
+            "serial": "harmony:device",
+            "state": "device",
+            "platform": "harmony",
+        }
+        calibration = {
+            "algorithm": "settings-slider-adaptive-v1",
+            "device": "harmony:device",
+            "slider_bounds": "[185,2065][1135,2205]",
+            "track_bounds": [249, 2135, 1071],
+            "selectable_values": [1, 105, 107, 237],
+            "position_by_value": {"1": 274, "105": 743, "107": 745, "237": 1045},
+            "unavailable_values": [106],
+        }
+        capability = {
+            "current": 105,
+            "minimum": 1,
+            "maximum": 237,
+            "step": 1,
+            "writable": True,
+            "setter_mode": "settings_fallback",
+            "selectable_values": calibration["selectable_values"],
+        }
+        applied = {**capability, "current": 107, "requested": 107, "applied": True}
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("adb", Path(directory), hdc="hdc")
+            manager._harmony_brightness_calibrations["harmony:device"] = calibration
+            with patch.object(manager, "devices", return_value=([device], None)), patch(
+                "mobile_profiler.ui.harmony_brightness_capability",
+                return_value=capability,
+            ) as read, patch(
+                "mobile_profiler.ui.set_harmony_brightness",
+                return_value=applied,
+            ) as write:
+                read_result = manager.brightness(
+                    {"platform": "harmony", "device": "harmony:device", "action": "read"}
+                )
+                set_result = manager.brightness(
+                    {
+                        "platform": "harmony",
+                        "device": "harmony:device",
+                        "action": "set",
+                        "value": 107,
+                    }
+                )
+                with self.assertRaisesRegex(ValueError, "not reachable"):
+                    manager.brightness(
+                        {
+                            "platform": "harmony",
+                            "device": "harmony:device",
+                            "action": "set",
+                            "value": 106,
+                        }
+                    )
+        read.assert_called()
+        write.assert_called_once_with("hdc", "harmony:device", 107, calibration)
+        self.assertEqual(read_result["current"], 105)
+        self.assertTrue(set_result["applied"])
+
+    def test_dashboard_calibrates_and_persists_harmony_brightness_values(self) -> None:
+        device = {
+            "serial": "harmony:device",
+            "state": "device",
+            "platform": "harmony",
+        }
+        before = {
+            "current": 106,
+            "minimum": 1,
+            "maximum": 255,
+            "step": 1,
+            "writable": True,
+            "setter_mode": "settings_fallback",
+            "selectable_values": [],
+        }
+        calibration = {
+            "algorithm": "settings-slider-adaptive-v1",
+            "device": "harmony:device",
+            "slider_bounds": "[185,2065][1135,2205]",
+            "track_bounds": [249, 2135, 1071],
+            "selectable_values": [1, 105, 107, 237],
+            "position_by_value": {"1": 274, "105": 743, "107": 745, "237": 1045},
+            "unavailable_values": [106],
+            "query_count": 12,
+            "original_value": 106,
+            "restored_value": 105,
+            "warnings": ["Original brightness 106 is not reachable"],
+        }
+        after = {
+            **before,
+            "current": 105,
+            "minimum": 1,
+            "maximum": 237,
+            "calibrated": True,
+            "calibration_required": False,
+            "selectable_values": calibration["selectable_values"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("adb", Path(directory), hdc="hdc")
+            with patch.object(manager, "devices", return_value=([device], None)), patch(
+                "mobile_profiler.ui.harmony_brightness_capability",
+                side_effect=[before, after],
+            ), patch(
+                "mobile_profiler.ui.calibrate_harmony_brightness",
+                return_value=calibration,
+            ) as calibrate:
+                result = manager.brightness(
+                    {
+                        "platform": "harmony",
+                        "device": "harmony:device",
+                        "action": "calibrate",
+                    }
+                )
+            cache = json.loads(
+                manager._harmony_brightness_cache_path.read_text(encoding="utf-8")
+            )
+        calibrate.assert_called_once_with("hdc", "harmony:device")
+        self.assertEqual(result["selectable_values"], [1, 105, 107, 237])
+        self.assertEqual(result["original_value"], 106)
+        self.assertEqual(result["restored_value"], 105)
+        self.assertEqual(
+            cache["devices"]["harmony:device"]["unavailable_values"],
+            [106],
+        )
 
     def test_harmony_display_frame_window_touch_and_gpu_parsers(self) -> None:
         screen = parse_harmony_render_screen(
@@ -5274,6 +5813,70 @@ class IosAdapterTests(unittest.TestCase):
         self.assertEqual(payload["devices"][0]["udid"], "00008150-TEST")
         self.assertEqual(payload["devices"][0]["state"], "device")
         self.assertIn("Bonjour socket failed", payload["warnings"][0])
+    def test_ios_tunnel_runtime_rejects_incompatible_pytcp_release(self) -> None:
+        with patch(
+            "mobile_profiler.ios_bridge.importlib.metadata.version",
+            return_value="0.1.0",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "pmd-pytcp==0.0.6"):
+                _require_tunnel_runtime()
+
+    def test_ios_backlight_parser_exposes_user_raw_and_nits_values(self) -> None:
+        parsed = _display_brightness_payload(
+            {
+                "IOClass": "AppleARMBacklight",
+                "IODisplayParameters": {
+                    "brightness": {"min": 0, "max": 65536, "value": 38947},
+                    "rawBrightness": {"min": 0, "max": 2047, "value": 802},
+                    "BrightnessMilliNits": {
+                        "min": 1000,
+                        "max": 2175000,
+                        "value": 276811,
+                        "uncalMilliNits": 276811,
+                    },
+                },
+            }
+        )
+
+        self.assertTrue(parsed["available"])
+        self.assertFalse(parsed["writable"])
+        self.assertEqual(parsed["current"], 59)
+        self.assertAlmostEqual(parsed["current_precise"], 59.4284, places=3)
+        self.assertEqual(parsed["raw_backlight_raw"], 802.0)
+        self.assertAlmostEqual(parsed["luminance_nits"], 276.811)
+        self.assertAlmostEqual(parsed["maximum_luminance_nits"], 2175.0)
+
+    def test_ios_brightness_capability_uses_sidecar_read_command(self) -> None:
+        device = {
+            "serial": "ios:00008150-TEST",
+            "udid": "00008150-TEST",
+            "host": "192.0.2.10",
+            "port": "49152",
+        }
+        with (
+            patch("mobile_profiler.ios.select_ios_device", return_value=device),
+            patch(
+                "mobile_profiler.ios._run_bridge_json",
+                return_value={"current": 60, "writable": False, "luminance_nits": 300.0},
+            ) as bridge,
+        ):
+            result = ios_brightness_capability("ios:00008150-TEST", "ios-python")
+
+        self.assertEqual(result["platform"], "ios")
+        self.assertFalse(result["writable"])
+        self.assertEqual(result["device"], "ios:00008150-TEST")
+        self.assertEqual(
+            bridge.call_args.args[1],
+            [
+                "brightness",
+                "--udid",
+                "00008150-TEST",
+                "--host",
+                "192.0.2.10",
+                "--port",
+                49152,
+            ],
+        )
 
     def test_project_cache_is_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5826,11 +6429,17 @@ class IosAdapterTests(unittest.TestCase):
             def wait(self, timeout: object = None) -> int:
                 return 0
 
+        commands = []
+
+        def fake_popen(command: object, *args: object, **kwargs: object) -> FakeProcess:
+            commands.append(list(command))
+            return FakeProcess()
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
                 RunJournal(root) as journal,
-                patch("mobile_profiler.ios.subprocess.Popen", return_value=FakeProcess()),
+                patch("mobile_profiler.ios.subprocess.Popen", side_effect=fake_popen),
             ):
                 result = collect_ios_session(
                     "ios-python",
@@ -5846,6 +6455,7 @@ class IosAdapterTests(unittest.TestCase):
                     reconnect_timeout_s=10.0,
                     system_monitor_enabled=True,
                     process_interval_s=10.0,
+                    display_brightness_enabled=False,
                 )
             stream = (root / "raw" / "sampler-stream.txt").read_text(encoding="utf-8")
             contexts = load_contexts(root)
@@ -5854,6 +6464,7 @@ class IosAdapterTests(unittest.TestCase):
         self.assertEqual(result.stats["average_collector_cpu_pct"], 6.0)
         self.assertIn('N|{"index":0', stream)
         self.assertEqual(contexts[0].source, "ios_dvt_notifications")
+        self.assertIn("--no-display-brightness", commands[0])
 
 
 class ReportTests(unittest.TestCase):
@@ -6169,6 +6780,43 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(final_raw, original_raw)
         self.assertEqual(final_contexts, original_contexts)
         self.assertEqual(final_events, original_events)
+    def test_ios_brightness_report_shows_nits_raw_backlight_and_thermal_evidence(self) -> None:
+        section = _brightness_throttling_section(
+            {
+                "platform": "ios",
+                "brightness_throttling": {
+                    "available": True,
+                    "platform": "ios",
+                    "point_count": 1,
+                    "confirmed_point_count": 1,
+                    "event_count": 1,
+                    "evidence_summary": "AppleARMBacklight evidence",
+                    "limitations": "iOS read-only brightness diagnostics",
+                    "points": [
+                        {
+                            "elapsed_s": 10.0,
+                            "status": "confirmed",
+                            "setting_raw": 60.0,
+                            "setting_unchanged": True,
+                            "luminance_nits": 250.0,
+                            "baseline_luminance_nits": 300.0,
+                            "luminance_drop_pct": 16.7,
+                            "raw_backlight_raw": 730.0,
+                            "battery_temperature_c": 40.0,
+                            "thermal_notification": "com.apple.system.thermalpressurelevel",
+                            "foreground_package": "com.example.iosgame",
+                            "reason": "same-setting luminance drop",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertIn("250.0 nits", section)
+        self.assertIn("rawBrightness", section)
+        self.assertIn("电池温度", section)
+        self.assertIn("thermalpressurelevel", section)
+        self.assertIn("AppleARMBacklight evidence", section)
 
     def test_report_lists_and_marks_each_brightness_throttling_point(self) -> None:
         samples = [
@@ -6270,6 +6918,104 @@ class ReportTests(unittest.TestCase):
         self.assertIn("appendBrightnessMarkers", fragment)
         self.assertIn("确认热降亮", fragment)
         self.assertIn("疑似热降亮", fragment)
+
+    def test_harmony_report_uses_logical_brightness_discount_and_rs_backlight(self) -> None:
+        samples = [
+            Sample(
+                index=index,
+                elapsed_s=float(index * 10),
+                uptime_s=100.0 + index * 10,
+                current_ma=320.0,
+                signed_current_ma=-320.0,
+                voltage_mv=3900.0,
+                power_mw=1248.0,
+                direction="discharging",
+                cpu_pct=50.0,
+            )
+            for index in range(4)
+        ]
+        contexts = [
+            ContextSample(
+                100.0,
+                foreground_package="com.example.harmony.game",
+                foreground_activity="GameAbility",
+                screen_state="on",
+                brightness_raw=180.0,
+                refresh_rate_hz=60.0,
+            )
+        ]
+
+        def display(effective: float, discount: float) -> Dict[str, object]:
+            return {
+                "available": True,
+                "screen_state": "on",
+                "power_state": "AWAKE",
+                "setting_raw": 180.0,
+                "setting_float": 180.0 / 255.0,
+                "current_screen_brightness": 180.0 / 255.0,
+                "last_user_set_brightness": 180.0 / 255.0,
+                "screen_brightness": effective / 255.0,
+                "adjusted_brightness": effective / 255.0,
+                "effective_raw": effective,
+                "brightness_discount": discount,
+                "automatic": False,
+                "render_backlight_raw": 22000.0,
+            }
+
+        thermal_snapshots = [
+            ThermalSnapshot(
+                uptime_s=uptime_s,
+                host_epoch_s=1000.0 + uptime_s,
+                temperatures=[{"name": "shell_back", "value_c": temperature}],
+                display_brightness=display(effective, discount),
+            )
+            for uptime_s, effective, discount, temperature in (
+                (100.0, 180.0, 1.0, 38.0),
+                (110.0, 150.0, 0.83, 39.0),
+                (120.0, 145.0, 0.80, 44.0),
+                (130.0, 180.0, 1.0, 45.0),
+            )
+        ]
+        metadata = {
+            "platform": "harmony",
+            "test_mode": "performance",
+            "title": "Harmony brightness throttle markers",
+            "sample_interval_s": 10.0,
+            "cpu_policies": [],
+            "gpu_source": None,
+            "battery_start": {"level_pct": 80, "temperature_c": 32.0},
+            "battery_end": {"level_pct": 80, "temperature_c": 33.0},
+            "device": {"brand": "Huawei", "model": "Test", "platform": "HarmonyOS"},
+            "system_monitor": {"enabled": True},
+            "capture_configuration": resolve_capture_configuration(
+                "performance",
+                "harmony",
+                "performance-standard",
+            ),
+        }
+        analysis = analyze_run(
+            samples,
+            metadata,
+            {},
+            [],
+            contexts=contexts,
+            thermal_snapshots=thermal_snapshots,
+        )
+        fragment = build_report_fragment(
+            {
+                "metadata": metadata,
+                "analysis": analysis,
+                "samples": [item.__dict__ for item in samples],
+                "contexts": [item.__dict__ for item in contexts],
+            }
+        )
+        self.assertEqual(analysis["brightness_throttling"]["point_count"], 2)
+        self.assertEqual(fragment.count('class="brightness-point-row"'), 2)
+        self.assertIn("逻辑亮度", fragment)
+        self.assertIn("显示折扣", fragment)
+        self.assertIn("RS 背光", fragment)
+        self.assertIn("外壳/系统温度", fragment)
+        self.assertIn("DisplayPowerManagerService", fragment)
 
     def test_power_and_performance_modes_separate_analysis_and_report_focus(self) -> None:
         samples = [

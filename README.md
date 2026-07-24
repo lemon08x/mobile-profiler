@@ -412,6 +412,24 @@ sampling rate, so the report leaves it unavailable instead of inferring 240/300 
 Android BatteryStats, ActivityManager, ADPF, and `dumpsys gpu` are likewise not
 relabeled as HarmonyOS evidence.
 
+Harmony brightness monitoring reads logical brightness, device brightness,
+discount, auto mode, and the device's 1–255 limits from
+DisplayPowerManagerService, then combines them with RenderService backlight and
+ThermalService temperature for dimming markers. Brightness writes prefer the
+official `ohos-displayManager set-brightness` command when a system image ships
+it. Production images commonly omit that command, and the underlying
+SetBrightness/AutoAdjustBrightness service calls require system-application
+identity; in that case the UI explicitly reports and uses the system Settings
+page as a compatibility fallback. Because the DPM 1–255 service limit is not the
+same as the Settings slider's reachable values, HarmonyOS exposes a one-time
+**Scan selectable values** action. It moves the slider from the opposite endpoint,
+uses DPM stable readback to discover the monotonic discrete mapping, caches it by
+HDC device and slider layout, and changes the editor to a dropdown containing
+only verified values. The setting path rejects uncalibrated/unreachable numbers,
+verifies an exact result, and restores the foreground app and original screen
+state. On the connected nova used for validation, the slider exposes 191 stable
+values in 1–237; 106 is not reachable and the nearest lower value is 105.
+
 In Performance mode, the optional **Harmony SmartPerf capture** preset uses the
 device `SP_daemon` at its native approximately one-second cadence. When the
 device exposes it, this adds target-app FPS/frame jitter, target PID CPU/PSS,
@@ -489,6 +507,18 @@ presented as a verified Wi-Fi power-test path. The iOS
 cadence. The report retains `power_sample_age_s` and `collector_cpu_pct`, and
 never converts DVT `powerScore` into mW or mixes it with SystemLoad or the
 separate battery current × voltage flow channel.
+
+iPhone brightness monitoring reads `AppleARMBacklight` IORegistry parameters:
+the 0-100% user-brightness request, `rawBrightness`, and calibrated
+`BrightnessMilliNits`. During recording these values are sampled with the
+thermal channel, combined with iOS thermal-pressure notifications and battery
+temperature, and shown as suspected/confirmed dimming markers in the live UI
+and report. The sidecar does not expose a trusted generic iOS brightness setter
+or the Auto-Brightness switch, so the UI is deliberately read-only for iPhone:
+adjust brightness on the phone and use **Read brightness** to verify it before
+recording. A same-setting nits drop without thermal evidence remains
+"suspected" because ambient-light policy and OLED content limiting can produce
+similar changes.
 
 For long-lived test evidence, keep `profiler-runs` outside the versioned program
 directory and pass it explicitly when starting either source or portable UI:

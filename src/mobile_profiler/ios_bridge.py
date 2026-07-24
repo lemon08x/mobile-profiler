@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import dataclasses
 import inspect
+import importlib.metadata
 import json
 import math
 import os
@@ -184,6 +185,7 @@ except BaseException as exc:  # pragma: no cover - exercised through pairing/pro
 
 try:
     from pymobiledevice3.services.diagnostics import DiagnosticsService
+    from pymobiledevice3.services.notification_proxy import NotificationProxyService
     try:
         from pymobiledevice3.services.dvt.instruments.application_listing import ApplicationListing
     except ImportError:
@@ -272,6 +274,18 @@ def _require_collection_runtime() -> None:
         raise RuntimeError(
             "pymobiledevice3 DVT collection support is unavailable in the selected "
             f"iOS Python runtime: {COLLECTION_IMPORT_ERROR}"
+        )
+
+
+def _require_tunnel_runtime() -> None:
+    try:
+        version = importlib.metadata.version("pmd-pytcp")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    if version.startswith("0.1."):
+        raise RuntimeError(
+            "pymobiledevice3 9.34.0 is incompatible with pmd-pytcp "
+            f"{version}; install pmd-pytcp==0.0.6 in the selected iOS Python runtime"
         )
 
 
@@ -605,6 +619,7 @@ async def _open_rsd(
     host: Optional[str],
     port: Optional[int],
 ) -> AsyncIterator[object]:
+    _require_tunnel_runtime()
     previous_provider = userspace_tunnel._create_no_root_tunnel_provider
 
     if host and port:
@@ -744,6 +759,116 @@ def _power_valid_for_consumption(
     )
 
 
+def _display_parameter(
+    parameters: dict[str, object],
+    name: str,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    value = parameters.get(name)
+    value = value if isinstance(value, dict) else {}
+
+    def number(key: str) -> Optional[float]:
+        raw = value.get(key)
+        if not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+            return None
+        return float(raw)
+
+    return number("value"), number("min"), number("max"), number("uncalMilliNits")
+
+
+def _display_brightness_payload(raw: dict[str, object]) -> dict[str, object]:
+    parameters = raw.get("IODisplayParameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    user_value, user_minimum, user_maximum, _ = _display_parameter(parameters, "brightness")
+    raw_value, raw_minimum, raw_maximum, _ = _display_parameter(parameters, "rawBrightness")
+    millinits, millinits_minimum, millinits_maximum, uncal_millinits = _display_parameter(
+        parameters,
+        "BrightnessMilliNits",
+    )
+
+    def fraction(
+        value: Optional[float],
+        minimum: Optional[float],
+        maximum: Optional[float],
+    ) -> Optional[float]:
+        if value is None or minimum is None or maximum is None or maximum <= minimum:
+            return None
+        return max(0.0, min(1.0, (value - minimum) / (maximum - minimum)))
+
+    user_fraction = fraction(user_value, user_minimum, user_maximum)
+    raw_fraction = fraction(raw_value, raw_minimum, raw_maximum)
+    luminance_nits = millinits / 1000.0 if millinits is not None else None
+    uncalibrated_nits = uncal_millinits / 1000.0 if uncal_millinits is not None else None
+    minimum_nits = millinits_minimum / 1000.0 if millinits_minimum is not None else None
+    maximum_nits = millinits_maximum / 1000.0 if millinits_maximum is not None else None
+    available = any(value is not None for value in (user_fraction, raw_value, luminance_nits))
+    user_percent = user_fraction * 100.0 if user_fraction is not None else None
+    screen_state = None
+    if luminance_nits is not None or raw_value is not None:
+        screen_state = (
+            "OFF"
+            if (luminance_nits or 0.0) <= 0.5 and (raw_value or 0.0) <= 0.0
+            else "ON"
+        )
+    return {
+        "available": available,
+        "supported": available,
+        "platform": "ios",
+        "source": "AppleARMBacklight IODisplayParameters",
+        "writable": False,
+        "setter_mode": "read_only",
+        "minimum": 0,
+        "maximum": 100,
+        "step": 1,
+        "normalized_minimum": 0.0,
+        "normalized_maximum": 1.0,
+        "normalized_step": 0.01,
+        "current": int(round(user_percent)) if user_percent is not None else None,
+        "current_precise": user_percent,
+        "setting_raw": user_percent,
+        "setting_float": user_fraction,
+        "current_screen_brightness": user_fraction,
+        "user_brightness_pct": user_percent,
+        "user_brightness_raw": user_value,
+        "user_brightness_minimum_raw": user_minimum,
+        "user_brightness_maximum_raw": user_maximum,
+        "raw_backlight_raw": raw_value,
+        "raw_backlight_minimum": raw_minimum,
+        "raw_backlight_maximum": raw_maximum,
+        "raw_backlight_fraction": raw_fraction,
+        "luminance_nits": luminance_nits,
+        "uncalibrated_luminance_nits": uncalibrated_nits,
+        "minimum_luminance_nits": minimum_nits,
+        "maximum_luminance_nits": maximum_nits,
+        "automatic": None,
+        "screen_state": screen_state,
+        "limitations": (
+            "iOS exposes AppleARMBacklight user brightness, raw backlight and calibrated milli-nits "
+            "through diagnostics IORegistry, but it does not expose a trusted generic external setter "
+            "or a public Auto-Brightness state through this sidecar."
+        ),
+    }
+
+
+async def read_brightness_device(
+    udid: str,
+    host: Optional[str],
+) -> dict[str, object]:
+    _require_runtime()
+    client = await (_open_tcp_lockdown(udid, host) if host else _open_usb_lockdown(udid, autopair=False))
+    try:
+        async with DiagnosticsService(client) as diagnostics:
+            raw = dict(await diagnostics.ioregistry(ioclass="AppleARMBacklight") or {})
+        result = _display_brightness_payload(raw)
+        result["udid"] = udid
+        if not result.get("available"):
+            raise RuntimeError(
+                "the iPhone did not expose AppleARMBacklight brightness parameters"
+            )
+        return result
+    finally:
+        await client.close()
+
+
 async def probe_device(
     udid: str,
     host: Optional[str],
@@ -754,6 +879,12 @@ async def probe_device(
     async with _open_rsd(udid, host, port) as rsd:
         async with DiagnosticsService(rsd) as diagnostics:
             raw_battery = await diagnostics.get_battery()
+            try:
+                raw_brightness = dict(
+                    await diagnostics.ioregistry(ioclass="AppleARMBacklight") or {}
+                )
+            except Exception:
+                raw_brightness = {}
         hardware: dict[str, object] = {}
         process_attributes: list[str] = []
         system_attributes: list[str] = []
@@ -775,12 +906,14 @@ async def probe_device(
     cpu_count = hardware.get("numberOfCpus") or hardware.get("numberOfPhysicalCpus")
     device["cpu_count"] = cpu_count
     battery = _battery_payload(dict(raw_battery or {}))
+    brightness = _display_brightness_payload(raw_brightness)
     power_telemetry = battery.get("power_telemetry")
     power_telemetry = power_telemetry if isinstance(power_telemetry, dict) else {}
     return {
         "platform": "ios",
         "device": device,
         "battery": battery,
+        "brightness": brightness,
         "current_command": "IORegistry IOPMPowerSource / PowerTelemetryData",
         "current_command_ok": isinstance(battery.get("current_ma"), (int, float)),
         "cpu_policies": [],
@@ -824,6 +957,12 @@ async def probe_device(
             "application_state_notifications": None,
             "application_state_notifications_status": "not_probed",
             "battery_power_update_hint_s": 20,
+            "brightness_read": bool(brightness.get("available")),
+            "brightness_control": False,
+            "physical_luminance_nits": isinstance(
+                brightness.get("luminance_nits"),
+                (int, float),
+            ),
         },
         "connection": {"type": "wireless" if host and port else "usb", "host": host, "port": port},
     }
@@ -917,10 +1056,22 @@ async def record_device(args: argparse.Namespace) -> None:
     async with _open_rsd(udid, host, port) as rsd:
         async with DiagnosticsService(rsd) as diagnostics:
             initial_raw = dict(await diagnostics.get_battery() or {})
+            if args.no_display_brightness:
+                initial_brightness_raw: dict[str, object] = {}
+            else:
+                try:
+                    initial_brightness_raw = dict(
+                        await diagnostics.ioregistry(ioclass="AppleARMBacklight") or {}
+                    )
+                except Exception:
+                    initial_brightness_raw = {}
         latest_battery = initial_raw
         latest_battery_revision = _battery_revision(initial_raw)
         latest_power_revision = _selected_power_revision(initial_raw)
         latest_power_monotonic = time.monotonic()
+        latest_brightness = _display_brightness_payload(initial_brightness_raw)
+        latest_thermal_notification: dict[str, object] = {}
+        brightness_sample_count = 0
         latest_graphics: dict[str, object] = {}
         latest_graphics_monotonic: Optional[float] = None
         latest_uptime = 0.0
@@ -983,6 +1134,7 @@ async def record_device(args: argparse.Namespace) -> None:
                 device={**device, "cpu_count": int(cpu_count)},
                 hardware=hardware,
                 battery=_battery_payload(initial_raw),
+                brightness=latest_brightness,
                 process_attributes=sorted(process_attributes),
                 system_attributes=sorted(system_attributes),
                 clock={
@@ -996,11 +1148,28 @@ async def record_device(args: argparse.Namespace) -> None:
             async def battery_loop() -> None:
                 nonlocal latest_battery, latest_battery_revision
                 nonlocal latest_power_revision, latest_power_monotonic
-                warned = False
+                nonlocal latest_brightness, brightness_sample_count
+                warned_battery = False
+                warned_brightness = False
                 while not stop.is_set():
                     try:
                         async with DiagnosticsService(rsd) as service:
                             value = dict(await service.get_battery() or {})
+                            if args.no_display_brightness:
+                                raw_brightness: dict[str, object] = {}
+                            else:
+                                try:
+                                    raw_brightness = dict(
+                                        await service.ioregistry(ioclass="AppleARMBacklight") or {}
+                                    )
+                                except Exception as exc:
+                                    raw_brightness = {}
+                                    if not warned_brightness:
+                                        _emit(
+                                            "warning",
+                                            message=f"iOS display brightness polling failed: {exc}",
+                                        )
+                                        warned_brightness = True
                         latest_battery = value
                         power_revision = _selected_power_revision(value)
                         if power_revision != latest_power_revision:
@@ -1009,37 +1178,93 @@ async def record_device(args: argparse.Namespace) -> None:
                         revision = _battery_revision(value)
                         if revision != latest_battery_revision:
                             latest_battery_revision = revision
-                            battery = _battery_payload(value)
-                            temperature = battery.get("temperature_c")
-                            if isinstance(temperature, (int, float)):
-                                _emit(
-                                    "thermal",
-                                    snapshot={
-                                        "uptime_s": latest_uptime,
-                                        "host_epoch_s": time.time(),
-                                        "status": None,
-                                        "hal_ready": True,
-                                        "temperatures": [
-                                            {
-                                                "name": "Battery",
-                                                "type": "BATTERY",
-                                                "value_c": temperature,
-                                                "status": None,
-                                            }
-                                        ],
-                                        "cooling_devices": [],
-                                        "thresholds": [],
-                                        "headroom_thresholds": [],
-                                    },
-                                )
+                        battery = _battery_payload(value)
+                        temperature = battery.get("temperature_c")
+                        if raw_brightness:
+                            latest_brightness = _display_brightness_payload(raw_brightness)
+                            brightness_sample_count += 1
+                        display_brightness = dict(latest_brightness)
+                        notification_time = latest_thermal_notification.get("host_epoch_s")
+                        notification_age = (
+                            max(0.0, time.time() - float(notification_time))
+                            if isinstance(notification_time, (int, float))
+                            else None
+                        )
+                        if notification_age is not None and notification_age <= 120.0:
+                            display_brightness.update(
+                                {
+                                    "thermal_notification": latest_thermal_notification.get("name"),
+                                    "thermal_notification_age_s": notification_age,
+                                    "thermal_notification_active": bool(
+                                        latest_thermal_notification.get("active")
+                                    ),
+                                }
+                            )
+                        temperatures = (
+                            [
+                                {
+                                    "name": "Battery",
+                                    "type": "BATTERY",
+                                    "value_c": temperature,
+                                    "status": None,
+                                }
+                            ]
+                            if isinstance(temperature, (int, float))
+                            else []
+                        )
+                        if temperatures or display_brightness.get("available"):
+                            _emit(
+                                "thermal",
+                                snapshot={
+                                    "uptime_s": latest_uptime,
+                                    "host_epoch_s": time.time(),
+                                    "status": None,
+                                    "hal_ready": True,
+                                    "temperatures": temperatures,
+                                    "cooling_devices": [],
+                                    "thresholds": [],
+                                    "headroom_thresholds": [],
+                                    "display_brightness": display_brightness,
+                                },
+                            )
                     except Exception as exc:
-                        if not warned:
+                        if not warned_battery:
                             _emit("warning", message=f"iOS battery polling failed: {exc}")
-                            warned = True
+                            warned_battery = True
                     try:
                         await asyncio.wait_for(stop.wait(), timeout=5.0)
                     except asyncio.TimeoutError:
                         pass
+
+            async def thermal_notifications_loop() -> None:
+                nonlocal latest_thermal_notification
+                names = (
+                    "com.apple.system.earlythermalnotification",
+                    "com.apple.system.thermalpressurelevel",
+                    "com.apple.system.thermalpressurelevel.cold",
+                )
+                try:
+                    async with NotificationProxyService(rsd) as notifications:
+                        for name in names:
+                            await notifications.notify_register_dispatch(name)
+                        async for event in notifications.receive_notification():
+                            if stop.is_set():
+                                return
+                            if not isinstance(event, dict):
+                                continue
+                            name = str(event.get("Name") or "").strip()
+                            if name not in names:
+                                continue
+                            latest_thermal_notification = {
+                                "name": name,
+                                "host_epoch_s": time.time(),
+                                "active": not name.endswith(".cold"),
+                            }
+                except Exception as exc:
+                    _emit(
+                        "warning",
+                        message=f"iOS thermal-pressure notifications unavailable: {exc}",
+                    )
 
             async def graphics_loop() -> None:
                 nonlocal latest_graphics, latest_graphics_monotonic
@@ -1093,7 +1318,8 @@ async def record_device(args: argparse.Namespace) -> None:
                                         "foreground_package": bundle_id,
                                         "foreground_activity": executable,
                                         "screen_state": None,
-                                        "brightness_raw": None,
+                                        "screen_state": latest_brightness.get("screen_state"),
+                                        "brightness_raw": latest_brightness.get("setting_raw"),
                                         "refresh_rate_hz": None,
                                         "source": "ios_dvt_notifications",
                                     },
@@ -1111,7 +1337,8 @@ async def record_device(args: argparse.Namespace) -> None:
                                         "foreground_package": None,
                                         "foreground_activity": None,
                                         "screen_state": None,
-                                        "brightness_raw": None,
+                                        "screen_state": latest_brightness.get("screen_state"),
+                                        "brightness_raw": latest_brightness.get("setting_raw"),
                                         "refresh_rate_hz": None,
                                         "source": "ios_dvt_notifications",
                                     },
@@ -1131,6 +1358,13 @@ async def record_device(args: argparse.Namespace) -> None:
                 asyncio.create_task(graphics_loop(), name="ios-graphics"),
                 asyncio.create_task(notifications_loop(), name="ios-notifications"),
             ]
+            if not args.no_display_brightness:
+                tasks.append(
+                    asyncio.create_task(
+                        thermal_notifications_loop(),
+                        name="ios-thermal-notifications",
+                    )
+                )
             interval_s = max(0.001, float(args.interval))
             target_coverage_s = _ios_collection_target_coverage_s(
                 duration_s,
@@ -1318,6 +1552,12 @@ async def record_device(args: argparse.Namespace) -> None:
             battery=_battery_payload(final_raw),
             stats={
                 "sample_count": sample_index,
+                "brightness_sample_count": brightness_sample_count,
+                "brightness_source": (
+                    "AppleARMBacklight IODisplayParameters"
+                    if brightness_sample_count
+                    else None
+                ),
                 "average_collector_cpu_pct": (
                     sum(collector_values) / len(collector_values) if collector_values else None
                 ),
@@ -1348,6 +1588,11 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--host")
     probe.add_argument("--port", type=int)
 
+    brightness = subparsers.add_parser("brightness")
+    brightness.add_argument("--udid", required=True)
+    brightness.add_argument("--host")
+    brightness.add_argument("--port", type=int)
+
     record = subparsers.add_parser("record")
     record.add_argument("--udid", required=True)
     record.add_argument("--host")
@@ -1359,6 +1604,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--process-interval", type=float, default=10.0)
     record.add_argument("--clock-interval", type=float, default=30.0)
     record.add_argument("--no-system-monitor", action="store_true")
+    record.add_argument("--no-display-brightness", action="store_true")
     return parser
 
 
@@ -1369,6 +1615,8 @@ async def async_main(args: argparse.Namespace) -> int:
         _print_json(await pair_device(args.udid, args.timeout))
     elif args.command == "probe":
         _print_json(await probe_device(args.udid, args.host, args.port))
+    elif args.command == "brightness":
+        _print_json(await read_brightness_device(args.udid, args.host))
     elif args.command == "record":
         await record_device(args)
     return 0

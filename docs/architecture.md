@@ -525,7 +525,7 @@ same indices, preserving cross-chart alignment.
 | `collector.py` | ADB execution, probing, framing, reconnects, clock capture, isolated system-monitor worker |
 | `harmony.py` | HDC discovery/TCP setup, HarmonyOS probing/parsing, framed normalized sampling, reconnects, RenderService/WindowManager/MultimodalInput performance context, platform snapshots |
 | `ios.py` | Optional sidecar process orchestration, endpoint cache, normalized event journaling, wireless reconnect |
-| `ios_bridge.py` | `pymobiledevice3` USB trust/RemotePairing, RSD, DiagnosticsService and DVT collection |
+| `ios_bridge.py` | `pymobiledevice3` USB trust/RemotePairing, RSD, DiagnosticsService/DVT collection, AppleARMBacklight brightness and thermal-pressure notifications |
 | `parsers.py` | Android text-to-structure conversion |
 | `log_import.py` | Generic host-log parsing and clock alignment |
 | `analysis.py` | Measurement conversion, gaps, CPU/GPU/app/phase conclusions |
@@ -558,6 +558,9 @@ The portable builder intentionally does not install or redistribute the
 optional GPL-3.0-or-later `pymobiledevice3` runtime. iOS users supply a separate
 Python interpreter through global `--ios-python`; Android remains fully
 self-contained in the standard portable bundle.
+The documented sidecar install pins `pymobiledevice3==9.34.0` together with
+`pmd-pytcp==0.0.6`; `pmd-pytcp 0.1.0` changed the user-space tunnel API and is
+not compatible with that fixed sidecar release.
 
 ## Evidence and comparison
 

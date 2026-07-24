@@ -44,14 +44,18 @@ from .features import capture_feature_names, capture_preset_names
 from .ios import (
     DEFAULT_IOS_PYTHON,
     connect_ios_bluetooth as connect_ios_bluetooth_device,
+    ios_brightness_capability,
     list_ios_devices,
     pair_ios_device,
 )
 from .harmony import (
     DEFAULT_HDC,
+    calibrate_harmony_brightness,
     connect_harmony_device,
     enable_harmony_tcp,
+    harmony_brightness_capability,
     list_harmony_devices,
+    set_harmony_brightness,
 )
 from .models import (
     ContextSample,
@@ -1800,8 +1804,13 @@ class LiveTelemetryReader:
                 "application_state_change_observed": notifications_observed,
             }
         brightness_throttling = (
-            analyze_brightness_throttling(samples, contexts, self.thermal_snapshots)
-            if platform == "android"
+            analyze_brightness_throttling(
+                samples,
+                contexts,
+                self.thermal_snapshots,
+                platform=platform,
+            )
+            if platform in {"android", "ios", "harmony"}
             else {
                 "available": False,
                 "timeline": [],
@@ -2528,6 +2537,20 @@ class DashboardManager:
         self._ios_device_cache_at = 0.0
         self._maintenance_operation: Optional[str] = None
         self._lock = threading.RLock()
+        self._harmony_brightness_cache_path = (
+            self.output_root
+            / ".mobile-profiler-cache"
+            / "harmony-brightness-calibration.json"
+        )
+        cache_payload = _read_json(self._harmony_brightness_cache_path)
+        cached_devices = cache_payload.get("devices")
+        self._harmony_brightness_calibrations: Dict[str, Dict[str, object]] = {
+            str(device): dict(calibration)
+            for device, calibration in (
+                cached_devices.items() if isinstance(cached_devices, dict) else []
+            )
+            if isinstance(calibration, dict)
+        }
         self.source_root = self._discover_source_root()
         self.default_rules_path = self._discover_default_rules_path()
         self.campaign = CampaignController(
@@ -2536,6 +2559,33 @@ class DashboardManager:
             self._discover_campaign_config_path(),
         )
         self._automation_surface = "agent"
+
+    def _harmony_brightness_calibration(
+        self,
+        device: str,
+    ) -> Optional[Dict[str, object]]:
+        with self._lock:
+            calibration = self._harmony_brightness_calibrations.get(device)
+            return dict(calibration) if calibration is not None else None
+
+    def _save_harmony_brightness_calibration(
+        self,
+        device: str,
+        calibration: Dict[str, object],
+    ) -> None:
+        with self._lock:
+            self._harmony_brightness_calibrations[device] = dict(calibration)
+            payload = {
+                "version": 1,
+                "devices": self._harmony_brightness_calibrations,
+            }
+        self._harmony_brightness_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._harmony_brightness_cache_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self._harmony_brightness_cache_path)
 
     def _base_command(self) -> List[str]:
         return [
@@ -3318,15 +3368,15 @@ class DashboardManager:
     def brightness(self, payload: Dict[str, object]) -> Dict[str, object]:
         device = str(payload.get("device") or "").strip()
         if not device:
-            raise ValueError("Select an Android device before reading brightness")
+            raise ValueError("Select an Android, iOS, or HarmonyOS device before reading brightness")
         requested_platform = str(payload.get("platform") or "android").strip().lower()
-        if requested_platform != "android":
-            raise ValueError("Numeric brightness control is currently available only for Android")
+        if requested_platform not in {"android", "ios", "harmony"}:
+            raise ValueError("Brightness monitoring is available for Android, iOS, and HarmonyOS")
         devices, error = self.devices(
             force=True,
-            refresh_android=True,
-            refresh_ios=False,
-            refresh_harmony=False,
+            refresh_android=requested_platform == "android",
+            refresh_ios=requested_platform == "ios",
+            refresh_harmony=requested_platform == "harmony",
         )
         if error:
             raise RuntimeError(error)
@@ -3336,24 +3386,64 @@ class DashboardManager:
                 for item in devices
                 if item.get("serial") == device
                 and item.get("state") == "device"
-                and str(item.get("platform") or "android") == "android"
+                and str(item.get("platform") or "android") == requested_platform
             ),
             None,
         )
         if selected is None:
-            raise RuntimeError(f"Android device {device!r} is not ready")
+            raise RuntimeError(f"{requested_platform} device {device!r} is not ready")
 
         action = str(payload.get("action") or "read").strip().lower()
-        if action not in {"read", "set"}:
-            raise ValueError("brightness action must be read or set")
-        if action == "set":
+        if action not in {"read", "set", "calibrate"}:
+            raise ValueError("brightness action must be read, set, or calibrate")
+        if action in {"set", "calibrate"}:
             with self._lock:
                 active = self.active
             if active is not None and active.running:
                 raise RuntimeError("Stop the active recording before changing device brightness")
-        capability = self._android_brightness_capability(device)
+        calibration = (
+            self._harmony_brightness_calibration(device)
+            if requested_platform == "harmony"
+            else None
+        )
+        capability = (
+            self._android_brightness_capability(device)
+            if requested_platform == "android"
+            else ios_brightness_capability(device, self.ios_python)
+            if requested_platform == "ios"
+            else harmony_brightness_capability(self.hdc, device, calibration)
+        )
         if action == "read":
             return capability
+        if action == "calibrate":
+            if requested_platform != "harmony":
+                raise ValueError("Brightness slider calibration is only required for HarmonyOS")
+            if capability.get("setter_mode") == "direct":
+                raise RuntimeError(
+                    "This HarmonyOS device exposes the direct brightness setter and does not require slider calibration"
+                )
+            self._begin_maintenance("HarmonyOS brightness slider calibration")
+            try:
+                calibration = calibrate_harmony_brightness(self.hdc, device)
+                self._save_harmony_brightness_calibration(device, calibration)
+                refreshed = harmony_brightness_capability(self.hdc, device, calibration)
+                refreshed.update(
+                    {
+                        "calibration_query_count": calibration.get("query_count"),
+                        "calibration_warnings": list(calibration.get("warnings") or []),
+                        "restored_value": calibration.get("restored_value"),
+                        "original_value": calibration.get("original_value"),
+                    }
+                )
+                return refreshed
+            finally:
+                self._finish_maintenance()
+        if requested_platform == "ios":
+            raise RuntimeError(
+                "iOS exposes AppleARMBacklight brightness and luminance as read-only diagnostics, "
+                "but does not provide a trusted generic external brightness setter. Adjust brightness "
+                "on the iPhone before recording, then use Read Brightness to verify it."
+            )
         raw_value = payload.get("value")
         try:
             numeric_value = float(raw_value)  # type: ignore[arg-type]
@@ -3368,6 +3458,21 @@ class DashboardManager:
             raise ValueError(
                 f"brightness value must be between {minimum} and {maximum}"
             )
+
+        if requested_platform == "harmony":
+            if capability.get("setter_mode") == "settings_fallback":
+                selectable_values = [
+                    int(item) for item in capability.get("selectable_values") or []
+                ]
+                if not selectable_values:
+                    raise RuntimeError(
+                        "Scan the HarmonyOS brightness slider before selecting a brightness value"
+                    )
+                if value not in selectable_values:
+                    raise ValueError(
+                        f"brightness value {value} is not reachable; choose one of the calibrated slider values"
+                    )
+            return set_harmony_brightness(self.hdc, device, value, calibration)
 
         previous_mode = capability.get("mode")
         mode_changed = previous_mode != 0

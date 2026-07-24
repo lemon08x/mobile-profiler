@@ -1508,6 +1508,54 @@ class UiServerTests(unittest.TestCase):
                     manager.brightness({"device": "ANDROID", "action": "set", "value": 100})
             shell.assert_not_called()
 
+    def test_ios_brightness_is_read_only_and_uses_sidecar_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager(
+                "custom-adb",
+                Path(directory),
+                ios_python="ios-python",
+            )
+            ready_devices = ([{
+                "serial": "ios:IPHONE",
+                "state": "device",
+                "platform": "ios",
+            }], None)
+            capability = {
+                "device": "ios:IPHONE",
+                "platform": "ios",
+                "current": 59,
+                "current_precise": 59.4,
+                "minimum": 0,
+                "maximum": 100,
+                "step": 1,
+                "writable": False,
+                "luminance_nits": 276.8,
+            }
+            with (
+                patch.object(manager, "devices", return_value=ready_devices),
+                patch(
+                    "mobile_profiler.ui.ios_brightness_capability",
+                    return_value=capability,
+                ) as brightness,
+            ):
+                result = manager.brightness({
+                    "device": "ios:IPHONE",
+                    "platform": "ios",
+                    "action": "read",
+                })
+                with self.assertRaisesRegex(RuntimeError, "read-only diagnostics"):
+                    manager.brightness({
+                        "device": "ios:IPHONE",
+                        "platform": "ios",
+                        "action": "set",
+                        "value": 60,
+                    })
+
+        self.assertEqual(result["luminance_nits"], 276.8)
+        self.assertFalse(result["writable"])
+        self.assertEqual(brightness.call_count, 2)
+        brightness.assert_called_with("ios:IPHONE", "ios-python")
+
     def test_android_application_parsers_prioritize_launchable_user_apps(self) -> None:
         third_party = parse_android_package_list(
             "package:com.example.game\npackage:com.example.reader\ninvalid\n"
@@ -2010,9 +2058,9 @@ class UiServerTests(unittest.TestCase):
             try:
                 with urlopen(base + "/", timeout=5) as response:
                     html = response.read().decode("utf-8")
-                with urlopen(base + "/app.css?v=platform-ui-43", timeout=5) as response:
+                with urlopen(base + "/app.css?v=platform-ui-64", timeout=5) as response:
                     css = response.read().decode("utf-8").replace("\r\n", "\n")
-                with urlopen(base + "/app.js?v=platform-ui-43", timeout=5) as response:
+                with urlopen(base + "/app.js?v=platform-ui-64", timeout=5) as response:
                     javascript = response.read().decode("utf-8").replace("\r\n", "\n")
                 with urlopen(base + "/api/state", timeout=5) as response:
                     state = json.loads(response.read().decode("utf-8"))
@@ -2058,6 +2106,12 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("测试窗口平均电池侧功率", html)
             self.assertIn("与顶部当前值同源 · 有效区间平均", html)
             self.assertNotIn("<dt>整机功耗记录</dt>", html)
+            self.assertIn('id="brightness-select"', html)
+            self.assertIn('id="brightness-calibrate"', html)
+            self.assertIn('data-platforms="android ios harmony"', html)
+            self.assertIn("选择在线 HarmonyOS 设备后读取亮度能力", javascript)
+            self.assertIn("选择在线 iPhone 后读取用户亮度", javascript)
+            self.assertNotIn("选择在线 ${platformLabel} 设备后读取亮度能力", javascript)
             self.assertIn("屏幕热降亮监控", html)
             self.assertNotIn('<details class="advanced-settings" open', html)
             self.assertIn(".capture-feature-card input", css)
@@ -2191,6 +2245,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("name.trim() || defaultName", javascript)
             self.assertIn("JSON.stringify({ name: resolvedName })", javascript)
             self.assertIn('api("/api/brightness"', javascript)
+            self.assertIn('action: "calibrate"', javascript)
+            self.assertIn("selectable_values", javascript)
             self.assertIn("renderBrightnessThrottling", javascript)
             self.assertIn("renderFrameFlowHistory", javascript)
             self.assertIn('lane.key === "display_scanout"', javascript)
@@ -2205,6 +2261,7 @@ class UiServerTests(unittest.TestCase):
             self.assertNotIn(".cluster-frequency { display: none; }", css)
             self.assertIn("let minimum = finite(axis.fixedMin) ? Number(axis.fixedMin) : 0", javascript)
             self.assertIn("const minimum = 0", javascript)
+            self.assertIn("AppleARMBacklight", javascript)
             self.assertIn("brightness-dim-marker", css)
             self.assertIn("flow-history-line", css)
             self.assertIn('id="live-timeline-source"', html)

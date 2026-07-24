@@ -1263,6 +1263,11 @@ body:not([data-platform="android"]) .config-app-placeholder {
   border-radius: 8px;
 }
 
+#essential-package-slot,
+#optional-package-slot {
+  display: contents;
+}
+
 .brightness-setting {
   display: grid;
   gap: 9px;
@@ -1312,7 +1317,7 @@ body:not([data-platform="android"]) .config-app-placeholder {
 
 .brightness-setting-controls {
   display: grid;
-  grid-template-columns: minmax(72px, 1fr) auto auto;
+  grid-template-columns: minmax(96px, 1fr) auto auto auto;
   gap: 7px;
 }
 
@@ -1321,11 +1326,13 @@ body:not([data-platform="android"]) .config-app-placeholder {
 }
 
 .brightness-setting-controls input,
+.brightness-setting-controls select,
 .brightness-setting-controls button {
   height: 34px;
 }
 
-.brightness-setting-controls input {
+.brightness-setting-controls input,
+.brightness-setting-controls select {
   width: 100%;
   padding: 0 34px 0 10px;
   border: 1px solid var(--border);
@@ -1336,7 +1343,13 @@ body:not([data-platform="android"]) .config-app-placeholder {
   font-size: 11px;
 }
 
-.brightness-setting-controls input:focus {
+.brightness-setting-controls select {
+  appearance: none;
+  cursor: pointer;
+}
+
+.brightness-setting-controls input:focus,
+.brightness-setting-controls select:focus {
   border-color: rgb(75 198 232 / 58%);
   box-shadow: 0 0 0 3px rgb(75 198 232 / 8%);
 }
@@ -1362,7 +1375,14 @@ body:not([data-platform="android"]) .config-app-placeholder {
   color: var(--accent);
 }
 
+.brightness-setting-controls button.calibrate {
+  border-color: rgb(75 198 232 / 30%);
+  background: rgb(75 198 232 / 8%);
+  color: var(--cyan);
+}
+
 .brightness-setting-controls input:disabled,
+.brightness-setting-controls select:disabled,
 .brightness-setting-controls button:disabled {
   cursor: not-allowed;
   opacity: .45;
@@ -1443,6 +1463,10 @@ body:not([data-platform="android"]) .config-app-placeholder {
 }
 
 .input-with-unit input {
+  padding-right: 39px;
+}
+
+.input-with-unit select {
   padding-right: 39px;
 }
 
