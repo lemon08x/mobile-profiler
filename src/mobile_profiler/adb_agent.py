@@ -37,6 +37,7 @@ from .automation import (
 from .adb_agent_prompts import (
     ADB_AGENT_SYSTEM_PROMPT_VERSION,
     DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+    finish_message_contradiction,
     task_templates_snapshot,
 )
 
@@ -206,6 +207,32 @@ PHONE_ACTION_TOOL: Dict[str, object] = {
         },
     },
 }
+
+# ``tap_element`` is injected only for semantic/hybrid engines, but task-level
+# action limits must be validated independently of the selected engine.
+SUPPORTED_PHONE_ACTIONS = frozenset(
+    {
+        "tap",
+        "tap_element",
+        "double_tap",
+        "long_press",
+        "swipe",
+        "swipe_fast",
+        "back",
+        "home",
+        "recent",
+        "wake",
+        "enter",
+        "delete",
+        "input_text",
+        "input_secret",
+        "launch_app",
+        "wait",
+        "finish",
+        "skip",
+        "take_over",
+    }
+)
 
 
 def automation_engine_definitions_snapshot() -> List[Dict[str, object]]:
@@ -459,6 +486,119 @@ def normalize_agent_tasks(payload: Dict[str, object]) -> List[Dict[str, object]]
         on_failure = str(raw_task.get("on_failure") or "stop").strip().lower()
         if on_failure not in {"stop", "continue"}:
             raise ValueError(f"第 {index} 个测试任务的失败策略必须是 stop 或 continue")
+        raw_action_limits = raw_task.get("action_limits")
+        if raw_action_limits is None:
+            raw_action_limits = []
+        if not isinstance(raw_action_limits, list):
+            raise ValueError(f"第 {index} 个测试任务的 action_limits 必须是数组")
+        action_limits: List[Dict[str, object]] = []
+        for limit_index, raw_limit in enumerate(raw_action_limits, 1):
+            if not isinstance(raw_limit, dict):
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {limit_index} 个动作上限必须是对象"
+                )
+            raw_actions = raw_limit.get("actions")
+            if not isinstance(raw_actions, list) or not raw_actions:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {limit_index} 个动作上限缺少 actions"
+                )
+            actions: List[str] = []
+            for raw_action in raw_actions:
+                action_name = str(raw_action or "").strip().lower()
+                if action_name not in SUPPORTED_PHONE_ACTIONS:
+                    raise ValueError(
+                        f"第 {index} 个测试任务的动作上限包含不支持的动作：{raw_action}"
+                    )
+                if action_name not in actions:
+                    actions.append(action_name)
+            raw_maximum = raw_limit.get("maximum", 1)
+            try:
+                maximum = int(raw_maximum)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {limit_index} 个 maximum 必须是整数"
+                ) from exc
+            if maximum < 0 or maximum > 200:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {limit_index} 个 maximum 必须在 0 到 200 之间"
+                )
+            raw_maximum_per_signature = raw_limit.get("maximum_per_signature")
+            maximum_per_signature: Optional[int] = None
+            if raw_maximum_per_signature is not None:
+                try:
+                    maximum_per_signature = int(raw_maximum_per_signature)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"第 {index} 个测试任务的第 {limit_index} 个 "
+                        "maximum_per_signature 必须是整数"
+                    ) from exc
+                if maximum_per_signature <= 0 or maximum_per_signature > 200:
+                    raise ValueError(
+                        f"第 {index} 个测试任务的第 {limit_index} 个 "
+                        "maximum_per_signature 必须在 1 到 200 之间"
+                    )
+            normalized_limit: Dict[str, object] = {
+                "actions": actions,
+                "maximum": maximum,
+                "label": _short_text(
+                    raw_limit.get("label") or "/".join(actions),
+                    120,
+                ),
+            }
+            if maximum_per_signature is not None:
+                normalized_limit["maximum_per_signature"] = maximum_per_signature
+            action_limits.append(normalized_limit)
+        raw_finish_requirements = raw_task.get("finish_action_requirements")
+        if raw_finish_requirements is None:
+            raw_finish_requirements = []
+        if not isinstance(raw_finish_requirements, list):
+            raise ValueError(
+                f"第 {index} 个测试任务的 finish_action_requirements 必须是数组"
+            )
+        finish_action_requirements: List[Dict[str, object]] = []
+        for requirement_index, raw_requirement in enumerate(
+            raw_finish_requirements,
+            1,
+        ):
+            if not isinstance(raw_requirement, dict):
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {requirement_index} 个 finish 动作要求必须是对象"
+                )
+            raw_actions = raw_requirement.get("actions")
+            if not isinstance(raw_actions, list) or not raw_actions:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {requirement_index} 个 finish 动作要求缺少 actions"
+                )
+            actions: List[str] = []
+            for raw_action in raw_actions:
+                action_name = str(raw_action or "").strip().lower()
+                if action_name not in SUPPORTED_PHONE_ACTIONS:
+                    raise ValueError(
+                        f"第 {index} 个测试任务的 finish 动作要求包含不支持的动作：{raw_action}"
+                    )
+                if action_name not in actions:
+                    actions.append(action_name)
+            raw_minimum = raw_requirement.get("minimum", 1)
+            try:
+                minimum = int(raw_minimum)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {requirement_index} 个 minimum 必须是整数"
+                ) from exc
+            if minimum <= 0 or minimum > 200:
+                raise ValueError(
+                    f"第 {index} 个测试任务的第 {requirement_index} 个 minimum 必须在 1 到 200 之间"
+                )
+            finish_action_requirements.append(
+                {
+                    "actions": actions,
+                    "minimum": minimum,
+                    "label": _short_text(
+                        raw_requirement.get("label") or "/".join(actions),
+                        120,
+                    ),
+                }
+            )
         normalized.append(
             {
                 "id": task_id,
@@ -472,6 +612,8 @@ def normalize_agent_tasks(payload: Dict[str, object]) -> List[Dict[str, object]]
                     raw_task.get("timeout_s"), 5.0, 7200.0, 300.0
                 ),
                 "on_failure": on_failure,
+                "action_limits": action_limits,
+                "finish_action_requirements": finish_action_requirements,
             }
         )
     return normalized
@@ -886,6 +1028,151 @@ def _history_text(history: Sequence[Dict[str, object]]) -> str:
         result = _short_text(item.get("result"), 180)
         lines.append(f"步骤 {item.get('step')}: {action_text} -> {result}")
     return "\n".join(lines)
+
+
+def _valid_action_counts(history: Sequence[Dict[str, object]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in history:
+        if item.get("action_valid") is False:
+            continue
+        action = item.get("action")
+        if not isinstance(action, dict):
+            continue
+        name = str(action.get("action") or "").strip().lower()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _action_limits_attention(
+    action_limits: object,
+    history: Sequence[Dict[str, object]],
+) -> str:
+    if not isinstance(action_limits, list) or not action_limits:
+        return ""
+    counts = _valid_action_counts(history)
+    lines = ["宿主动作上限（硬约束，超过上限的动作不会执行）："]
+    for limit in action_limits:
+        if not isinstance(limit, dict):
+            continue
+        actions = [
+            str(action).strip().lower()
+            for action in limit.get("actions", [])
+            if str(action).strip()
+        ]
+        maximum = _integer(limit.get("maximum"), 0)
+        observed = sum(counts.get(action, 0) for action in actions)
+        label = _short_text(limit.get("label") or "/".join(actions), 120)
+        signature_limit = _integer(limit.get("maximum_per_signature"), 0)
+        signature_note = (
+            f"；同一动作参数最多 {signature_limit} 次"
+            if signature_limit > 0
+            else ""
+        )
+        lines.append(
+            f"- {label}：已执行 {observed}/{maximum}（{', '.join(actions)}）"
+            f"{signature_note}"
+        )
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _action_limit_violation(
+    action_limits: object,
+    history: Sequence[Dict[str, object]],
+    action: Dict[str, object],
+) -> str:
+    if not isinstance(action_limits, list) or not action_limits:
+        return ""
+    action_name = str(action.get("action") or "").strip().lower()
+    if not action_name:
+        return ""
+    counts = _valid_action_counts(history)
+    for limit in action_limits:
+        if not isinstance(limit, dict):
+            continue
+        actions = {
+            str(item).strip().lower()
+            for item in limit.get("actions", [])
+            if str(item).strip()
+        }
+        if action_name not in actions:
+            continue
+        maximum = _integer(limit.get("maximum"), 0)
+        observed = sum(counts.get(item, 0) for item in actions)
+        if maximum >= 0 and observed >= maximum:
+            label = _short_text(limit.get("label") or "/".join(sorted(actions)), 120)
+            return f"动作上限已达到：{label} 已执行 {observed}/{maximum}，本次 {action_name} 被拒绝"
+        maximum_per_signature = _integer(limit.get("maximum_per_signature"), 0)
+        if maximum_per_signature > 0:
+            signature = _repeatable_action_signature(action)
+            signature_count = sum(
+                1
+                for item in history
+                if item.get("action_valid") is not False
+                and isinstance(item.get("action"), dict)
+                and _repeatable_action_signature(item["action"]) == signature
+            )
+            if signature and signature_count >= maximum_per_signature:
+                label = _short_text(
+                    limit.get("label") or "/".join(sorted(actions)),
+                    120,
+                )
+                return (
+                    f"相同动作参数上限已达到：{label} 的当前 {action_name} "
+                    f"已执行 {signature_count}/{maximum_per_signature}，本次动作被拒绝"
+                )
+    return ""
+
+
+def _finish_requirements_attention(
+    requirements: object,
+    history: Sequence[Dict[str, object]],
+) -> str:
+    if not isinstance(requirements, list) or not requirements:
+        return ""
+    counts = _valid_action_counts(history)
+    lines = ["finish 前置动作（宿主硬校验，未满足时 finish 不会执行）："]
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        actions = [
+            str(action).strip().lower()
+            for action in requirement.get("actions", [])
+            if str(action).strip()
+        ]
+        minimum = _integer(requirement.get("minimum"), 0)
+        observed = sum(counts.get(action, 0) for action in actions)
+        label = _short_text(requirement.get("label") or "/".join(actions), 120)
+        lines.append(f"- {label}：已执行 {observed}/{minimum}（{', '.join(actions)}）")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _finish_requirement_violation(
+    requirements: object,
+    history: Sequence[Dict[str, object]],
+) -> str:
+    if not isinstance(requirements, list) or not requirements:
+        return ""
+    counts = _valid_action_counts(history)
+    missing: List[str] = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        actions = [
+            str(action).strip().lower()
+            for action in requirement.get("actions", [])
+            if str(action).strip()
+        ]
+        minimum = _integer(requirement.get("minimum"), 0)
+        observed = sum(counts.get(action, 0) for action in actions)
+        if observed < minimum:
+            label = _short_text(requirement.get("label") or "/".join(actions), 120)
+            missing.append(f"{label} {observed}/{minimum}")
+    return (
+        "finish 前置动作尚未满足：" + "；".join(missing)
+        if missing
+        else ""
+    )
 
 
 def _repeatable_action_signature(action: Dict[str, object]) -> str:
@@ -1597,7 +1884,19 @@ def _normalized_pair(
 ) -> tuple[int, int]:
     value = action.get(key)
     if not isinstance(value, (list, tuple)) or len(value) < 2:
-        raise ValueError(f"{action.get('action')} requires {key}=[x,y]")
+        action_name = str(action.get("action") or "").strip().lower()
+        if action_name in {"tap", "double_tap", "long_press"}:
+            raise ValueError(
+                f'{action_name} requires element=[x,y], not start/end; '
+                f'example: {{"action":"{action_name}","element":[500,500]}}'
+            )
+        if action_name in {"swipe", "swipe_fast"}:
+            raise ValueError(
+                f'{action_name} requires both start=[x1,y1] and end=[x2,y2]; '
+                f'example: {{"action":"{action_name}",'
+                '"start":[500,800],"end":[500,200]}'
+            )
+        raise ValueError(f"{action_name or 'phone_action'} requires {key}=[x,y]")
     x = _bounded_int(value[0], 0, 999, 500)
     y = _bounded_int(value[1], 0, 999, 500)
     return (
@@ -2363,6 +2662,14 @@ class AdbAgentController:
                             for value in (
                                 device_identity_attention,
                                 secret_alias_attention,
+                                _action_limits_attention(
+                                    task.get("action_limits"),
+                                    task_history,
+                                ),
+                                _finish_requirements_attention(
+                                    task.get("finish_action_requirements"),
+                                    task_history,
+                                ),
                                 str(task.get("attention_prompt") or ""),
                             )
                             if value
@@ -2453,9 +2760,31 @@ class AdbAgentController:
                         phase="acting",
                         message=f"子任务 {task_index}/{len(tasks)} · 正在执行第 {step} 步",
                     )
-                    action_validation_error = ""
+                    action_validation_error = (
+                        finish_message_contradiction(action.get("message"))
+                        if str(action.get("action") or "").strip().lower()
+                        == "finish"
+                        else ""
+                    )
+                    if (
+                        not action_validation_error
+                        and str(action.get("action") or "").strip().lower()
+                        == "finish"
+                    ):
+                        action_validation_error = _finish_requirement_violation(
+                            task.get("finish_action_requirements"),
+                            task_history,
+                        )
+                    if not action_validation_error:
+                        action_validation_error = _action_limit_violation(
+                            task.get("action_limits"),
+                            task_history,
+                            action,
+                        )
                     action_execution_error = ""
                     try:
+                        if action_validation_error:
+                            raise ValueError(action_validation_error)
                         execution_action = dict(action)
                         secret_input_id = ""
                         if str(execution_action.get("action") or "").strip().lower() == (

@@ -38,6 +38,7 @@ from mobile_profiler.adb_agent import (
 from mobile_profiler.adb_agent_prompts import (
     ADB_AGENT_SYSTEM_PROMPT_VERSION,
     DEFAULT_ADB_AGENT_SYSTEM_PROMPT,
+    finish_message_contradiction,
     task_templates_snapshot,
 )
 from mobile_profiler.automation import (
@@ -78,7 +79,9 @@ class FakeHttpResponse:
 
 class AdbAgentProtocolTests(unittest.TestCase):
     def test_default_prompt_requires_visible_state_verification(self) -> None:
-        self.assertEqual(ADB_AGENT_SYSTEM_PROMPT_VERSION, "adb-phone-agent-v13")
+        self.assertEqual(ADB_AGENT_SYSTEM_PROMPT_VERSION, "adb-phone-agent-v17")
+        self.assertIn("不能代替应用内的正常导航", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("动作前锚点", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
         self.assertIn("目标控件已可见时直接操作，不要先滚动", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
         self.assertIn("只代表输入事件已发送，不代表应用状态已经改变", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
         self.assertIn("缺少中间状态证据时调用 `take_over`", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
@@ -90,6 +93,83 @@ class AdbAgentProtocolTests(unittest.TestCase):
         self.assertIn("`input_secret`", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
         self.assertIn("禁止对 canvas 元素使用 `tap_element`", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
         self.assertIn("`skip` 表示当前检查项不适用", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("禁止打开 APK 文件", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("安装未知应用/未知来源", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("`finish` 是成功断言", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("不得陈述失败、错误结果或未完成", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+        self.assertIn("真实执行账本", DEFAULT_ADB_AGENT_SYSTEM_PROMPT)
+
+    def test_finish_message_contradiction_detects_explicit_failure_claims(self) -> None:
+        self.assertTrue(finish_message_contradiction("游戏已结束，无法完成横向移动测试"))
+        self.assertTrue(finish_message_contradiction("结果为 8，与任务要求不一致"))
+        self.assertTrue(finish_message_contradiction("当前页面需要人工处理"))
+        self.assertEqual(
+            finish_message_contradiction("结果明确为 19，已完成算术验证"),
+            "",
+        )
+
+    def test_controller_rejects_contradictory_finish_and_allows_correction(self) -> None:
+        class ContradictThenCorrectClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def decide(self, **_kwargs: object) -> ModelDecision:
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelDecision(
+                        {"action": "finish", "message": "结果错误，无法完成验证"}
+                    )
+                return ModelDecision(
+                    {"action": "finish", "message": "结果明确为 19，验证完成"}
+                )
+
+        executed: list[dict] = []
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            executed.append(dict(action))
+            return ActionExecution(
+                "模型确认任务完成",
+                str(action.get("message") or ""),
+                "completed",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: ContradictThenCorrectClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "task": "验证否定完成拦截",
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "max_steps": 3,
+                    "step_delay_s": 0.01,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(len(state["history"]), 2)
+        self.assertFalse(state["history"][0]["action_valid"])
+        self.assertIn("无法完成", state["history"][0]["action"]["message"])
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0]["message"], "结果明确为 19，验证完成")
 
     def test_two_campaign_stages_are_exposed_as_complete_workflow_templates(self) -> None:
         templates = task_templates_snapshot()
@@ -100,10 +180,12 @@ class AdbAgentProtocolTests(unittest.TestCase):
         )
         self.assertEqual(preparation["campaign_stage"], "prepare")
         self.assertEqual(endurance["campaign_stage"], "test")
+        self.assertEqual(preparation["revision"], "android-campaign-json-20260723-v2")
+        self.assertEqual(endurance["revision"], "android-campaign-json-20260723-v2")
         self.assertFalse(preparation["loop_enabled"])
         self.assertTrue(endurance["loop_enabled"])
         self.assertEqual(phone_configuration["kind"], "phone_configuration")
-        self.assertEqual(phone_configuration["revision"], "phone-config-20260722-v9")
+        self.assertEqual(phone_configuration["revision"], "phone-config-20260723-v10")
         self.assertFalse(phone_configuration["loop_enabled"])
         self.assertGreaterEqual(len(phone_configuration["tasks"]), 40)
         self.assertTrue(all(
@@ -121,13 +203,15 @@ class AdbAgentProtocolTests(unittest.TestCase):
         self.assertIn("recommend_download_list_layout", phone_configuration_text)
         self.assertIn("download_area", phone_configuration_text)
         self.assertIn("通知权限必须选择", phone_configuration_text)
-        self.assertIn("com.vivo.browser", phone_configuration_text)
-        self.assertIn("禁止打开任何应用商店", phone_configuration_text)
+        self.assertNotIn("com.vivo.browser", phone_configuration_text)
+        self.assertIn("立即调用 skip", phone_configuration_text)
+        self.assertIn("禁止打开浏览器、应用商店或文件管理器", phone_configuration_text)
+        self.assertIn("禁止下载、打开任何 APK", phone_configuration_text)
         self.assertIn("GENSHIN_ACCOUNT", phone_configuration_text)
         self.assertIn("不要因此 take_over", phone_configuration_text)
         self.assertGreaterEqual(len(preparation["tasks"]), 8)
         self.assertGreaterEqual(len(endurance["tasks"]), 5)
-        self.assertIn("2 小时/轮", endurance["label"])
+        self.assertIn("单轮 2 小时", endurance["label"])
         self.assertIn("store-install-tv.danmaku.bili", {
             task["id"] for task in preparation["tasks"]
         })
@@ -753,6 +837,76 @@ class AdbAgentTaskNormalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "失败策略"):
             normalize_agent_tasks({"tasks": [{"prompt": "test", "on_failure": "retry"}]})
 
+    def test_task_action_limits_are_normalized_and_validated(self) -> None:
+        tasks = normalize_agent_tasks(
+            {
+                "tasks": [
+                    {
+                        "prompt": "进入目录后返回",
+                        "action_limits": [
+                            {
+                                "actions": ["tap", "tap_element", "tap"],
+                                "maximum": 1,
+                                "maximum_per_signature": 1,
+                                "label": "打开目录",
+                            },
+                            {
+                                "actions": ["back"],
+                                "maximum": 0,
+                                "label": "禁止返回",
+                            },
+                        ],
+                        "finish_action_requirements": [
+                            {
+                                "actions": ["back"],
+                                "minimum": 1,
+                                "label": "返回原页",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(
+            tasks[0]["action_limits"],
+            [
+                {
+                    "actions": ["tap", "tap_element"],
+                    "maximum": 1,
+                    "maximum_per_signature": 1,
+                    "label": "打开目录",
+                },
+                {
+                    "actions": ["back"],
+                    "maximum": 0,
+                    "label": "禁止返回",
+                },
+            ],
+        )
+        self.assertEqual(
+            tasks[0]["finish_action_requirements"],
+            [
+                {
+                    "actions": ["back"],
+                    "minimum": 1,
+                    "label": "返回原页",
+                }
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "不支持的动作"):
+            normalize_agent_tasks(
+                {
+                    "tasks": [
+                        {
+                            "prompt": "bad",
+                            "action_limits": [
+                                {"actions": ["shell"], "maximum": 1}
+                            ],
+                        }
+                    ]
+                }
+            )
+
     def test_task_list_supports_large_application_catalogs(self) -> None:
         tasks = normalize_agent_tasks(
             {"tasks": [{"prompt": f"任务 {index}"} for index in range(MAX_AGENT_TASKS)]}
@@ -804,6 +958,33 @@ class AdbAgentActionTests(unittest.TestCase):
                 "adb",
                 "SERIAL",
                 {"action": "input_text", "text": "中文"},
+                1080,
+                2400,
+                threading.Event(),
+            )
+
+    def test_coordinate_validation_returns_a_complete_repair_example(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r'tap requires element=\[x,y\], not start/end.*"element":\[500,500\]',
+        ):
+            execute_adb_action(
+                "adb",
+                "SERIAL",
+                {"action": "tap", "start": [500, 500], "end": [500, 500]},
+                1080,
+                2400,
+                threading.Event(),
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            r'swipe_fast requires both start=\[x1,y1\] and end=\[x2,y2\].*'
+            r'"start":\[500,800\],"end":\[500,200\]',
+        ):
+            execute_adb_action(
+                "adb",
+                "SERIAL",
+                {"action": "swipe_fast", "end": [500, 200]},
                 1080,
                 2400,
                 threading.Event(),
@@ -1309,6 +1490,242 @@ class AdbAgentControllerTests(unittest.TestCase):
             self.assertFalse(state["history"][0]["action_valid"])
             self.assertIn("参数校验失败", state["history"][0]["result"])
             self.assertTrue(state["history"][1]["action_valid"])
+
+    def test_task_action_limit_rejects_repeat_before_executor(self) -> None:
+        attention_prompts: list[str] = []
+        executed: list[str] = []
+
+        class RepeatingClient:
+            def decide(self, **kwargs: object) -> ModelDecision:
+                attention_prompts.append(str(kwargs["attention_prompt"]))
+                history = kwargs["history"]
+                if isinstance(history, list) and len(history) < 2:
+                    return ModelDecision({"action": "tap", "element": [500, 500]})
+                return ModelDecision(
+                    {"action": "finish", "message": "一次点击后的目标状态已确认"}
+                )
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            executed.append(str(action["action"]))
+            if action["action"] == "finish":
+                return ActionExecution(
+                    "模型确认任务完成",
+                    str(action.get("message")),
+                    "completed",
+                )
+            return ActionExecution("点击完成")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: RepeatingClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "tasks": [
+                        {
+                            "name": "单次点击",
+                            "prompt": "只点击一次后确认",
+                            "max_steps": 3,
+                            "action_limits": [
+                                {
+                                    "actions": ["tap", "tap_element"],
+                                    "maximum": 1,
+                                    "label": "唯一点击",
+                                }
+                            ],
+                        }
+                    ],
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "step_delay_s": 0.2,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(executed, ["tap", "finish"])
+            self.assertEqual(
+                [item["action_valid"] for item in state["history"]],
+                [True, False, True],
+            )
+            self.assertIn("动作上限已达到", state["history"][1]["result"])
+            self.assertIn("已执行 0/1", attention_prompts[0])
+            self.assertIn("已执行 1/1", attention_prompts[1])
+
+    def test_task_action_limit_can_reject_only_the_same_action_signature(self) -> None:
+        executed: list[dict] = []
+
+        class DuplicateThenCorrectClient:
+            def decide(self, **kwargs: object) -> ModelDecision:
+                history = kwargs["history"]
+                count = len(history) if isinstance(history, list) else 0
+                if count < 2:
+                    return ModelDecision({"action": "tap", "element": [600, 700]})
+                if count == 2:
+                    return ModelDecision({"action": "tap", "element": [400, 700]})
+                return ModelDecision(
+                    {"action": "finish", "message": "两个不同按键后的结果已确认"}
+                )
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            executed.append(dict(action))
+            if action["action"] == "finish":
+                return ActionExecution(
+                    "模型确认任务完成",
+                    str(action.get("message")),
+                    "completed",
+                )
+            return ActionExecution("点击完成")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: DuplicateThenCorrectClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "tasks": [
+                        {
+                            "name": "不同计算器按键",
+                            "prompt": "两个不同坐标各点击一次",
+                            "max_steps": 4,
+                            "action_limits": [
+                                {
+                                    "actions": ["tap"],
+                                    "maximum": 4,
+                                    "maximum_per_signature": 1,
+                                    "label": "计算器按键",
+                                }
+                            ],
+                        }
+                    ],
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "step_delay_s": 0.2,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual([item["action"] for item in executed], ["tap", "tap", "finish"])
+        self.assertEqual(
+            [item["action_valid"] for item in state["history"]],
+            [True, False, True, True],
+        )
+        self.assertIn("相同动作参数上限已达到", state["history"][1]["result"])
+
+    def test_finish_is_rejected_until_required_actions_are_observed(self) -> None:
+        attention_prompts: list[str] = []
+        executed: list[str] = []
+
+        class EarlyFinishClient:
+            def decide(self, **kwargs: object) -> ModelDecision:
+                attention_prompts.append(str(kwargs["attention_prompt"]))
+                history = kwargs["history"]
+                count = len(history) if isinstance(history, list) else 0
+                if count == 0:
+                    return ModelDecision(
+                        {"action": "finish", "message": "页面已恢复"}
+                    )
+                if count == 1:
+                    return ModelDecision({"action": "back"})
+                return ModelDecision(
+                    {"action": "finish", "message": "返回动作后页面已恢复"}
+                )
+
+        def execute(
+            _adb: str,
+            _device: str,
+            action: dict,
+            _width: int,
+            _height: int,
+            _stop: threading.Event,
+        ) -> ActionExecution:
+            executed.append(str(action["action"]))
+            if action["action"] == "finish":
+                return ActionExecution(
+                    "模型确认任务完成",
+                    str(action.get("message")),
+                    "completed",
+                )
+            return ActionExecution("按键 back")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = AdbAgentController(
+                "adb",
+                Path(temporary),
+                client_factory=lambda _config: EarlyFinishClient(),
+                screenshot_capture=lambda _adb, _device: (sample_png(), 1080, 2400),
+                action_executor=execute,
+            )
+            controller.start(
+                {
+                    "device": "SERIAL",
+                    "tasks": [
+                        {
+                            "name": "必须返回",
+                            "prompt": "返回后完成",
+                            "max_steps": 3,
+                            "finish_action_requirements": [
+                                {
+                                    "actions": ["back"],
+                                    "minimum": 1,
+                                    "label": "返回原页",
+                                }
+                            ],
+                        }
+                    ],
+                    "api_base_url": "http://127.0.0.1:8000",
+                    "model": "test-model",
+                    "step_delay_s": 0.2,
+                }
+            )
+            deadline = time.time() + 3
+            state = controller.snapshot()
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.02)
+                state = controller.snapshot()
+
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(executed, ["back", "finish"])
+            self.assertEqual(
+                [item["action_valid"] for item in state["history"]],
+                [False, True, True],
+            )
+            self.assertIn("finish 前置动作尚未满足", state["history"][0]["result"])
+            self.assertIn("已执行 0/1", attention_prompts[0])
+            self.assertIn("已执行 1/1", attention_prompts[2])
 
     def test_default_prompt_version_ignores_transport_whitespace(self) -> None:
         class FinishClient:

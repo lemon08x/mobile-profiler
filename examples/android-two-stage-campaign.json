@@ -294,8 +294,8 @@
           {
             "id": "astrosmash-entry-ready",
             "name": "AstroSmash stable entry",
-            "prompt": "若出现系统切换显示设置提示，选择取消以保留当前显示模式。在 AstroSmash 设置首页不要修改复选框或分辨率，只确认 RUN ASTROSMASH! 按钮清晰可见后 finish。预备阶段不要进入游戏。",
-            "attention_prompt": "不要修改显示模式、游戏设置或高分表；只验证可重复进入的稳定设置首页。",
+            "prompt": "若出现系统切换显示设置提示，选择取消以保留当前显示模式。以下两个稳定入口任一可见都立即 finish：A. AstroSmash 设置首页且 RUN ASTROSMASH! 按钮清晰可见；B. 已在运行中的主玩法，黑色游戏区、绿色地面、白色炮台和底部左右大箭头同时可见。不要为了从 B 返回 A 而退出游戏。",
+            "attention_prompt": "已有主玩法是合法稳定入口，不得因此 skip 或 take_over。不要修改显示模式、游戏设置、分辨率、复选框或高分表，也不要在本步骤操作方向箭头。",
             "max_steps": 8,
             "timeout_s": 120,
             "on_failure": "continue"
@@ -373,8 +373,8 @@
           {
             "id": "material-files-entry-ready",
             "name": "Material Files stable entry",
-            "prompt": "启动质感文件并完成文件浏览所需的初始化。如果跳到系统“管理所有文件”页面，必须点击右侧开关本体将“允许管理所有文件”设为开启，再按返回回到质感文件；不要反复点击文字行中心。确认内部存储目录列表可见后 finish，不要打开、修改、移动或删除文件。",
-            "attention_prompt": "只允许为 me.zhanghai.android.files 开启管理本机文件权限；禁止云登录、删除、改名、移动、上传或打开文件内容。",
+            "prompt": "启动质感文件并完成文件浏览所需的初始化。如果跳到系统‘管理所有文件’页面，必须点击右侧开关本体将‘允许管理所有文件’设为开启，再按返回回到质感文件；不要反复点击文字行中心。用目录内容而不是顶部灰色文字判断根目录：当标题下显示较大的文件夹/文件总数，并且列表同时可见 Alarms、Android、DCIM、Documents、Download 等多个标准目录中的至少三个时，就是内部存储根目录，必须立即 finish。若列表只剩少量子项且没有这组根目录锚点，才按一次 Android back 后重新观察。",
+            "attention_prompt": "当前版本即使在真实根目录，顶部‘内部存储设备 > 下载’中的灰色‘下载’也可能仍可见，不能据此 back。根目录内容锚点优先于面包屑灰字。只允许为 me.zhanghai.android.files 开启管理本机文件权限；禁止云登录、删除、改名、移动、上传、创建或打开文件内容。",
             "max_steps": 18,
             "timeout_s": 240,
             "on_failure": "continue"
@@ -712,36 +712,6 @@
         ]
       },
       {
-        "name": "京东",
-        "package": "com.jingdong.app.mall",
-        "software_type": "app",
-        "install_mode": "external",
-        "install_channel": "app_store",
-        "install_source": "手机应用商店（保持商店最新版）",
-        "official_url": "https://www.jd.com/",
-        "supported_engines": ["vision", "uiautomator2", "hybrid"],
-        "description": "免登录公开首页，只执行滚动，不进入商品、购物车或支付。",
-        "required": false,
-        "install_prompt": "在当前设备的应用商店中搜索“京东”，确认官方购物应用后安装。安装完成并能从商店打开后 finish。",
-        "allow_terms_acceptance": true,
-        "permissions": [
-          {
-            "name": "android.permission.POST_NOTIFICATIONS",
-            "required": false
-          }
-        ],
-        "setup_tasks": [
-          {
-            "id": "jd-public-home",
-            "name": "京东公开首页准备",
-            "prompt": "处理首次启动协议、通知、更新、定位和营销弹窗。定位不是本场景必需权限，不要允许；不要登录。最终停在免登录公开首页并 finish。",
-            "max_steps": 18,
-            "timeout_s": 180,
-            "on_failure": "stop"
-          }
-        ]
-      },
-      {
         "name": "崩坏：星穹铁道",
         "package": "com.miHoYo.hkrpg",
         "software_type": "game",
@@ -805,17 +775,39 @@
         "id": "sgtpuzzles-light-up-toggle",
         "name": "SGTPuzzles Light Up reversible move",
         "package": "name.boyle.chris.sgtpuzzles",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "Light Up 的完整棋盘可见，且至少有一个未标记灰色格",
+          "success_evidence": "同一坐标依次出现灯泡、黑色标记并恢复灰色，最新截图仍是 Light Up 棋盘",
+          "forbidden_states": ["其他谜题", "帮助页", "红色冲突状态"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap"], "minimum": 3, "label": "同格落子"}]
+        },
         "required": true,
         "home_after": true,
         "launch_wait_s": 2,
         "idle_after_s": 15,
+        "initialization_tasks": [
+          {
+            "id": "light-up-clean-board-ready",
+            "name": "Light Up 干净棋盘初始化",
+            "prompt": "把 SGTPuzzles 恢复到一张刚开始、可操作的 Light Up 棋盘。若在谜题列表，只点击 Light Up；若已在 Light Up 但棋盘有红色冲突灯、大面积黄色已照亮区域或黑色标记，点击顶部棋盘/新游戏图标一次，并在随后页面保持默认尺寸与难度开始新局。只有标题为 Light Up、完整棋盘可见、至少有一个灰色无标记空格，且没有红色冲突灯时 finish。",
+            "attention_prompt": "本步骤只进入 Light Up 并建立新棋盘，不在棋盘空格落子，不打开帮助，不切换其他谜题。点击新游戏后每轮只处理一个明确的默认确认动作。",
+            "max_steps": 6,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "light-up-toggle",
             "name": "Light Up 可逆落子",
-            "prompt": "进入或保持在 Light Up 棋盘，只选择一个当前灰色且没有灯或黑色标记的空格。该游戏同一格按“灰色空格 → 白色灯泡 → 小黑色标记 → 灰色空格”循环：第一次点击后必须在下一张图看到白色灯泡；第二次点击同一坐标后必须看到小黑色标记；第三次点击同一坐标后必须看到最初的灰色空格。历史中同一坐标正好出现三次 tap 且最新图已恢复灰色空格时立即 finish，不要再点击任何格，也不要声称解完整谜题。",
-            "attention_prompt": "三次点击必须是同一个归一化坐标；这是允许连续三次相同 tap 的明确例外。只操作这一个棋盘空格；红色冲突灯代表无效解，不能称为成功。",
-            "max_steps": 7,
+            "prompt": "当前应是初始化刚建立的干净 Light Up 棋盘，不再做列表或新游戏导航。选择一个灰色、无灯、无小黑标记的空格，点击位置必须在格子中心而不是边线。记住第一次使用的归一化 element=[x,y]，后两次点击必须原样复用这一对坐标。每次点击后都先比较同一格：第 1 次看到白色灯泡，第 2 次看到小黑色标记，第 3 次看到恢复最初灰色空格。最近动作历史已有 3 次 tap/tap_element，且最新截图目标格已恢复灰色时，闭环已经成功，必须立即 finish；第 3 次点击之后禁止任何其他界面动作。",
+            "attention_prompt": "宿主最多执行 3 次 tap/tap_element；达到上限后 Undo、Redo、第 4 次点击或其他控件点击都会被拒绝。三种状态必须来自同一格紧邻动作后的截图。灯泡照亮其他黄色格以及第 2 次时数字短暂变红是允许的中间态；只看第 3 次后的目标格是否恢复灰色。",
+            "action_limits": [
+              {"actions": ["tap", "tap_element"], "maximum": 3, "label": "同一灰格三态循环"}
+            ],
+            "max_steps": 5,
             "timeout_s": 120,
             "on_failure": "continue"
           }
@@ -825,18 +817,38 @@
         "id": "shattered-pixel-dungeon-move",
         "name": "Shattered Pixel Dungeon adjacent move",
         "package": "com.shatteredpixel.shatteredpixeldungeon",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "已有英雄位于可操作地牢地图，地图未被教程、日志或菜单遮挡",
+          "success_evidence": "动作前后英雄中心相差约一个地图格，旧位置空出，且仍在地牢地图",
+          "forbidden_states": ["商店", "删除存档", "攻击目标", "物品使用页"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap"], "minimum": 1, "label": "相邻格移动"}]
+        },
         "required": true,
         "home_after": true,
+        "repeat_after_success": false,
         "launch_wait_s": 3,
         "idle_after_s": 20,
+        "initialization_tasks": [
+          {
+            "id": "dungeon-map-ready",
+            "name": "地牢地图初始化",
+            "prompt": "把应用恢复到可操作地牢地图。如果地图和英雄已经可见且无遮挡，立即 finish。若在标题页，沿默认继续游戏或新游戏路径进入；若在‘选择一位英雄’，选择已解锁的默认战士并点击页面上的‘开始游戏/进入地牢’按钮。处理非敏感新手说明；若出现要求查看右上角闪光日志的教学，查看后按返回回到地图。只有英雄和相邻地板格清晰可见时 finish。",
+            "attention_prompt": "这一步只建立地图入口，不移动英雄、攻击、拾取或使用物品；不要把英雄已选中误认为已经进入地图。",
+            "max_steps": 18,
+            "timeout_s": 240,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "dungeon-adjacent-move",
             "name": "地牢相邻移动",
-            "prompt": "进入已有地牢或沿默认新手路径到达可操作地图，先关闭设置、网络和普通教程遮罩。如果出现要求点击右上角闪光日志的教学提示，这是允许处理的安全步骤：按提示点击闪光日志，阅读后用返回键回到地图。明确定位英雄精灵中心，再选择与英雄相差正好一个地图格、没有敌人的可通行地板或木板格，点击该格中心。比较动作前后两张图：只有英雄精灵中心确实移动约一个格、旧位置已空出时才 finish；若只有按钮图标或提示文字变化，继续修正或 take_over。",
-            "attention_prompt": "除明确的右上角闪光日志教学外，不要点击其他日志/菜单或底部提示文字；不要删除存档、打开商店、攻击角色或使用物品。必须用前后两张截图确认英雄坐标变化；语义树无法表达地图精灵移动时改用视觉引擎。",
-            "max_steps": 24,
-            "timeout_s": 240,
+            "prompt": "当前应已在无遮挡地牢地图。明确定位英雄精灵中心，选择与英雄相差正好一个地图格、没有敌人的可通行地板或木板格，只点击该格中心一次。比较紧邻动作前后的两张图：只有英雄精灵中心确实移动约一个格、旧位置已空出时才 finish；若只有按钮或提示变化，不得 finish。",
+            "attention_prompt": "不要再做标题页或选英雄导航；不要点击日志、菜单、底部提示文字、敌人或物品。必须用前后两张视觉截图确认英雄坐标变化。",
+            "max_steps": 8,
+            "timeout_s": 150,
             "on_failure": "continue"
           }
         ]
@@ -845,6 +857,14 @@
         "id": "fifteen-puzzle-move",
         "name": "15 Puzzle adjacent tile move",
         "package": "com.italankin.fifteen",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "完整 4×4 数字棋盘、一个空格和 MOVES 区域可见",
+          "success_evidence": "一个相邻数字进入原空格、原位置变空，MOVES 若可见则递增",
+          "forbidden_states": ["重置确认", "新开局菜单", "暂停遮罩仍存在"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap"], "minimum": 1, "label": "数字移动"}]
+        },
         "required": true,
         "home_after": true,
         "launch_wait_s": 2,
@@ -865,6 +885,14 @@
         "id": "minesweeper-compose-reveal",
         "name": "Minesweeper Compose reveal one cell",
         "package": "com.jayasuryat.minesweeperjc",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "New game 入口或完整未揭开棋盘可见",
+          "success_evidence": "本轮普通点击后棋盘从覆盖格变为数字、空白或地雷状态",
+          "forbidden_states": ["长按插旗", "外链", "设置页"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap", "tap_element"], "minimum": 1, "label": "揭开格子"}]
+        },
         "required": true,
         "home_after": true,
         "launch_wait_s": 2,
@@ -885,18 +913,39 @@
         "id": "tetris-controlled-move",
         "name": "Tetris controlled horizontal move",
         "package": "ds.tetris.android",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "活动方块、棋盘、Level/Score 与底部方向键同时可见",
+          "success_evidence": "根据动作前空余空间选择左或右后，同一活动方块水平中心向该方向移动约一格；垂直自然下落不计入",
+          "forbidden_states": ["暂停", "重开", "声音设置", "旋转或加速下落", "GAME OVER 或棋局结束"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap", "tap_element"], "minimum": 1, "label": "横向移动输入"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 2,
         "idle_after_s": 12,
+        "quarantine_after_failures": 3,
+        "retry_cooldown_s": 30,
+        "initialization_tasks": [
+          {
+            "id": "tetris-board-ready",
+            "name": "Tetris 活动棋盘初始化",
+            "prompt": "每次都为主验证建立全新棋局，禁止沿用旧棋盘。第一轮只要右侧 Restart 按钮可见，无论棋盘正在运行还是显示 GAME OVER，都必须点击 Restart 恰好一次，不能直接 finish。下一轮只有 GAME OVER 已消失、新活动方块位于棋盘上部、堆叠只在棋盘底部，且 Level/Score 与底部方向键同时可见时才 finish。",
+            "attention_prompt": "本步骤只允许点击一次 Restart 并确认全新活动棋盘；不要点击左右/上下方向键、Pause、Resume 或 Sound，不要在旧棋盘上 finish。",
+            "max_steps": 5,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "tetris-controlled-move",
             "name": "Tetris 方块横向移动",
-            "prompt": "确认棋盘正在运行，优先用语义元素点击左侧“<”方向键一次。下一轮只比较同一形状活动方块的水平中心，忽略自然向下移动；只要方块向左移动约一个格且棋局仍运行就 finish。若第一次没有水平变化，最多再点击一次左键，仍无变化则 take_over。",
-            "attention_prompt": "推荐混合引擎并优先 tap_element；不要点击右键、上下键、重开、暂停或声音。自然下落、方块换新和分数不算左移证据。",
+            "prompt": "确认这是初始化刚重置的活动棋盘。先从截图记住当前活动方块的形状、水平中心和左右空余空间：方块中心在棋盘左半边时选择底部最右侧“>”键，在右半边时选择底部最左侧“<”键；有准确语义元素时优先 tap_element。只点击所选方向键一次。下一轮锁定同一形状方块，忽略自然向下移动；水平中心向所选方向移动约一个格且棋局仍运行时立即 finish。若第一次因边界确实没有水平变化，只允许改点相反方向一次；第二次仍无法确认则 skip，禁止继续重复同一方向。",
+            "attention_prompt": "不要点击上下键、Restart、Pause 或 Sound。自然下落、方块落定换新和分数变化都不是横移证据；一旦方块换新就不能用新方块位置证明上一动作。GAME OVER、旧高堆叠或无法确认横移都不是成功。",
             "max_steps": 5,
-            "timeout_s": 120,
+            "timeout_s": 150,
             "on_failure": "continue"
           }
         ]
@@ -905,18 +954,40 @@
         "id": "super-snake-turn",
         "name": "Super Snake direction change",
         "package": "com.mdibaiee.supersnake",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "横屏游戏区、Points、Lives、玩家短线和目标可见",
+          "success_evidence": "玩家短线轴向由水平变垂直或由垂直变水平，Points/Lives 仍可见",
+          "forbidden_states": ["About 页面", "游戏结束页"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap"], "minimum": 1, "label": "转向输入"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 2,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "super-snake-playfield-ready",
+            "name": "Super Snake 活动游戏初始化",
+            "prompt": "把 Super Snake 恢复到活动横屏游戏区。若 Points、Lives、青色玩家短线和目标已可见，立即 finish。若出现 Game Over、Start、Restart 或重试入口，只点击对应按钮一次；下一轮确认青色玩家短线已经出现后 finish。",
+            "attention_prompt": "本步骤只恢复活动游戏，不点击游戏区转向，不打开 About。",
+            "max_steps": 5,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "super-snake-turn",
             "name": "Super Snake 转向验证",
-            "prompt": "确认横屏游戏正在运行并观察玩家短线当前是水平还是垂直。最多执行六次彼此间隔一轮截图的安全点击，优先在玩家前进方向一侧的空白游戏区点击。只有新截图明确显示玩家短线从水平变垂直或从垂直变水平，并且 Points/Lives 仍可见时才 finish。",
-            "attention_prompt": "同方向自然移动不算成功；必须看到玩家短线轴向改变。不要连续三次点击完全相同坐标，不要打开 About。",
-            "max_steps": 10,
-            "timeout_s": 180,
+            "prompt": "玩家是靠近屏幕边缘移动的青色短线，不是黄色星星、粉色旋涡或红色骷髅。第一轮先记住青色短线是水平还是垂直，只在中央空白游戏区点击一次；点击必须使用 element 参数，例如 {\"action\":\"tap\",\"element\":[500,500]}，不能把点击坐标写进 start/end。紧邻下一轮必须比较青色短线轴向：若已从水平变垂直或从垂直变水平，立即 finish；若确实未改变，换一个中央空白 element 坐标最多再点击一次，再用下一张图判断。",
+            "attention_prompt": "宿主最多执行两次 tap。每次点击后的下一轮先比较再决定，看到轴向改变时禁止继续点击。只认青色短线，不用位置移动、黄色星星、敌人或背景变化作证据；Points/Lives 必须仍可见，不要打开 About。",
+            "action_limits": [
+              {"actions": ["tap"], "maximum": 2, "label": "中央游戏区转向点击"}
+            ],
+            "max_steps": 4,
+            "timeout_s": 90,
             "on_failure": "continue"
           }
         ]
@@ -925,11 +996,19 @@
         "id": "astrosmash-cannon-move",
         "name": "AstroSmash enter and move cannon",
         "package": "ru.exlmoto.astrosmash",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "黑色游戏区、绿色地面、白色炮台和底部左右箭头可见",
+          "success_evidence": "一次左箭头长按后白色炮台从动作前位置明确向左移动，游戏仍运行",
+          "forbidden_states": ["显示设置修改", "高分表", "复选框修改"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["long_press"], "minimum": 1, "label": "炮台左移长按"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 2,
         "idle_after_s": 12,
-        "tasks": [
+        "initialization_tasks": [
           {
             "id": "astrosmash-enter-play",
             "name": "AstroSmash 进入主玩法",
@@ -937,13 +1016,18 @@
             "attention_prompt": "不要修改任何设置、分辨率、复选框或高分表；本子任务只进入主玩法。",
             "max_steps": 4,
             "timeout_s": 90,
-            "on_failure": "continue"
-          },
+            "on_failure": "stop"
+          }
+        ],
+        "tasks": [
           {
             "id": "astrosmash-cannon-left",
             "name": "AstroSmash 炮台左移",
             "prompt": "先观察绿色地面线上方白色炮台的水平位置，只在底部左箭头中心执行一次 long_press，duration_ms=1000。紧邻下一轮只有白色炮台明确从屏幕中心向左移动且游戏仍运行时才 finish；若炮台不动则 take_over。",
-            "attention_prompt": "必须使用 long_press，不能普通 tap 或重复操作。敌人、自动弹丸、分数和背景变化都不能替代白色炮台位置证据。",
+            "attention_prompt": "宿主只允许执行一次 long_press。必须长按左箭头，不能普通 tap 或重复操作。敌人、自动弹丸、分数和背景变化都不能替代白色炮台位置证据。",
+            "action_limits": [
+              {"actions": ["long_press"], "maximum": 1, "label": "炮台左移长按"}
+            ],
             "max_steps": 3,
             "timeout_s": 90,
             "on_failure": "continue"
@@ -954,17 +1038,37 @@
         "id": "opencalculator-arithmetic",
         "name": "OpenCalculator arithmetic",
         "package": "com.darkempire78.opencalculator",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "无遮挡计算器主界面与完整数字、运算符键盘可见",
+          "success_evidence": "本轮从空白输入区或清除旧值后输入，表达式为 12+7，结果为 19",
+          "forbidden_states": ["历史记录", "设置", "外部页面"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["tap", "tap_element"], "minimum": 4, "label": "输入 12+7"}]
+        },
         "required": false,
         "home_after": true,
+        "repeat_after_success": true,
         "launch_wait_s": 2,
         "idle_after_s": 10,
+        "initialization_tasks": [
+          {
+            "id": "opencalculator-empty-ready",
+            "name": "OpenCalculator 空白输入区初始化",
+            "prompt": "把 OpenCalculator 恢复到空白输入区。若当前表达式或结果区已有任何数字或算式，只点击一次 AC 并在下一轮确认表达式和结果已经清空；若启动时本来就是空白则立即 finish。",
+            "attention_prompt": "本步骤只清除上轮结果，不输入新算式，不打开历史记录、设置或外部页面。清空后立即 finish。",
+            "max_steps": 3,
+            "timeout_s": 60,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "opencalculator-arithmetic",
             "name": "OpenCalculator 算术验证",
-            "prompt": "确认处于 OpenCalculator 主界面，先用 AC 清除旧输入，再依次输入 12+7=。下一轮只有表达式明确显示 12+7、结果明确显示 19 时才 finish。",
-            "attention_prompt": "不要打开历史记录、设置或外部页面；必须从最新截图或语义树读取到结果 19。",
-            "max_steps": 10,
+            "prompt": "当前应是刚由初始化子任务确认过的空白输入区。本主任务必须依次点击 1、2、+、7 四个算式按键；有准确语义元素时优先 tap_element。视觉坐标回退时先核对键盘：数字行从上到下依次是 7/8/9、4/5/6、1/2/3、0；数字 7 与 1 在同一列，但 7 位于 AC 下方第一排数字、比 1 高两行，绝不能点击中间的 4。该应用会实时计算，不强制点击等号。即使启动截图已经显示 12+7=19，也绝不能直接 finish，必须先清除旧值并在本主任务重新完成四次按键。下一轮只有表达式明确显示 12+7、结果明确显示 19，且本主任务事件中至少有四次 tap/tap_element 时才 finish。",
+            "attention_prompt": "不要打开历史记录、设置或外部页面；只认本主任务动作产生的新结果，上一轮遗留的相同结果不是成功证据。若误点得到 12+4，先 AC 清空再从 1 重做；不要在错误表达式后追加。",
+            "max_steps": 12,
             "timeout_s": 150,
             "on_failure": "continue"
           }
@@ -974,18 +1078,35 @@
         "id": "fossify-calculator-arithmetic",
         "name": "Fossify Calculator arithmetic",
         "package": "org.fossify.math",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "无遮挡计算器主界面与完整数字、运算符键盘可见",
+          "success_evidence": "本轮清除并输入后表达式为 8×6，结果为 48",
+          "forbidden_states": ["历史记录", "设置", "外部页面"],
+          "login_policy": "forbidden",
+          "required_actions": [
+            {"actions": ["long_press"], "minimum": 1, "label": "长按清空"},
+            {"actions": ["tap", "tap_element"], "minimum": 4, "label": "算式按键"}
+          ]
+        },
         "required": false,
         "home_after": true,
+        "repeat_after_success": true,
         "launch_wait_s": 2,
         "idle_after_s": 10,
         "tasks": [
           {
             "id": "fossify-calculator-arithmetic",
             "name": "Fossify Calculator 算术验证",
-            "prompt": "确认处于 Fossify Calculator 主界面，先清除旧输入，再依次输入 8×6=。下一轮只有表达式明确显示 8×6、结果明确显示 48 时才 finish。",
-            "attention_prompt": "不要打开历史记录、设置或外部页面；必须从最新截图或语义树读取到结果 48。",
-            "max_steps": 10,
-            "timeout_s": 150,
+            "prompt": "确认处于 Fossify Calculator 主界面。先根据截图对底部 C 键中心执行一次 long_press，duration_ms=800；下一轮只有公式整体清空或显示 0 时，才开始算式。随后必须从当前语义控件树逐轮选择文字恰好为 8、×、6、= 的四个不同控件，各执行一次 tap_element，并原样携带当前 observation_revision。每轮先读公式再选下一个键：已经显示 8 时只点 ×，显示 8× 时只点 6，显示 8×6 时只点 =，此时绝对不能再点 6 或 9。最终截图或语义树只有公式明确为 8×6、结果明确为 48 时才 finish。",
+            "attention_prompt": "宿主禁止 double_tap，只允许一次长按清空和四次普通按键，并拒绝第二次使用同一动作参数。C 只用截图坐标 long_press；8、×、6、= 只用带准确文字的 tap_element，不猜坐标。普通点击 C 只会逐字符退格，必须长按一次清空整条旧表达式；不要在旧数字后追加算式，不要在看到 8×6 后再次点数字。不要打开历史记录、设置或外部页面。",
+            "action_limits": [
+              {"actions": ["double_tap"], "maximum": 0, "label": "禁止计算器双击"},
+              {"actions": ["long_press"], "maximum": 1, "label": "长按清空"},
+              {"actions": ["tap", "tap_element"], "maximum": 4, "maximum_per_signature": 1, "label": "8、×、6、= 四次单击"}
+            ],
+            "max_steps": 8,
+            "timeout_s": 120,
             "on_failure": "continue"
           }
         ]
@@ -994,38 +1115,93 @@
         "id": "material-files-directory-roundtrip",
         "name": "Material Files directory round trip",
         "package": "me.zhanghai.android.files",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "质感文件内部存储根目录中多个标准目录锚点同时可见，没有权限页或文件预览遮罩",
+          "success_evidence": "本轮打开 Documents 后根目录锚点集合消失或计数明确变化，再返回并恢复多个原根目录锚点与原计数",
+          "forbidden_states": ["文件预览", "删除改名移动", "上传或云登录", "创建文件或目录"],
+          "login_policy": "forbidden",
+          "required_actions": [
+            {"actions": ["tap", "tap_element"], "minimum": 1, "label": "打开子目录"},
+            {"actions": ["back"], "minimum": 1, "label": "返回原目录"}
+          ]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 2,
         "idle_after_s": 10,
+        "initialization_tasks": [
+          {
+            "id": "material-files-root-ready",
+            "name": "质感文件内部存储根目录初始化",
+            "prompt": "这是只读入口确认，不执行任何界面动作。若标题下显示较大的文件夹/文件总数，且列表同时可见 Alarms、Android、DCIM、Documents、Download 等标准目录中的至少三个，当前就是内部存储根目录，必须立即 finish。若缺少这组根目录锚点，调用 take_over 并准确说明可见状态；不得尝试 back、tap、swipe、launch_app 或 wait 修复。",
+            "attention_prompt": "宿主把全部非终止界面动作上限设为 0，因此本会话只能 finish、skip 或 take_over。当前版本在真实根目录也可能显示顶部灰色‘下载’，目录总数和标准目录锚点集合是最高优先级证据。",
+            "action_limits": [
+              {"actions": ["tap", "tap_element", "double_tap", "long_press", "swipe", "swipe_fast", "back", "home", "recent", "wake", "enter", "delete", "input_text", "input_secret", "launch_app", "wait"], "maximum": 0, "label": "初始化只读确认"}
+            ],
+            "max_steps": 3,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "material-files-directory-roundtrip",
             "name": "质感文件目录往返",
-            "prompt": "确认处于质感文件的普通目录列表，记住当前面包屑和一个可见子目录名。打开该子目录，下一轮确认面包屑或列表发生变化；再按返回回到原目录，只有原面包屑和原子目录项重新出现时才 finish。",
-            "attention_prompt": "只做只读目录导航；禁止打开文件内容、删除、改名、移动、上传、创建目录或云登录。",
-            "max_steps": 10,
-            "timeout_s": 180,
+            "prompt": "先把‘最近动作与结果’当作本会话的硬计数器，再决定动作。若历史中还没有 tap/tap_element：确认 Alarms、Android、DCIM、Documents、Download 等根目录锚点中至少三个同时可见后，只点击列表中的 Documents 目录行一次，禁止点击顶部灰色面包屑。若历史中已有打开目录动作但还没有 back：只有最新列表的根目录锚点集合消失或文件夹/文件计数明确变化时，调用一次 Android back。若历史中已经出现 back：最新截图只要重新同时出现至少三个原根目录锚点，必须立即 finish；此时禁止再次打开任何目录。",
+            "attention_prompt": "宿主会硬性拒绝第 2 次打开目录和第 2 次 back。顶部灰色‘下载’不是可靠路径证据，禁止点击；只根据根目录标准目录锚点集合与计数判断往返。整个会话只允许一次只读目录进入和一次返回；禁止打开文件内容、删除、改名、移动、上传、创建、长按、选择多项或云登录。不得把输入事件已发送当作状态变化证据。",
+            "action_limits": [
+              {"actions": ["tap", "tap_element"], "maximum": 1, "label": "打开一个普通子目录"},
+              {"actions": ["back"], "maximum": 1, "label": "返回内部存储根目录"}
+            ],
+            "max_steps": 5,
+            "timeout_s": 120,
             "on_failure": "continue"
           }
         ]
       },
       {
         "id": "edge-example-navigation",
-        "name": "Microsoft Edge example navigation",
+        "name": "Microsoft Edge Example/IANA link round trip",
         "package": "com.microsoft.emmx",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "Edge 中 Example Domain 正文与 More information 链接可见，无首次启动或默认浏览器遮罩",
+          "success_evidence": "本轮点击 More information 进入 IANA 页面后执行 back，并恢复 Example Domain 正文与链接",
+          "forbidden_states": ["账号登录", "同步", "默认浏览器设置", "下载页"],
+          "login_policy": "forbidden",
+          "required_actions": [
+            {"actions": ["tap", "tap_element"], "minimum": 1, "label": "打开 IANA 说明链接"},
+            {"actions": ["back"], "minimum": 1, "label": "返回 Example Domain"}
+          ]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "edge-address-bar-ready",
+            "name": "Microsoft Edge 地址栏初始化",
+            "prompt": "把 Edge 恢复到 Example Domain 正文和蓝色 More information... 链接都清晰可见的普通标签页。若有翻译栏、‘取消’、登录、同步、设为默认或其他覆盖层，只关闭或取消覆盖层；Example Domain 标题、说明正文和 More information 链接同时可见后 finish。",
+            "attention_prompt": "本步骤只确认 Example Domain 入口，不点击 More information 链接、不输入 URL、不按 Enter；若当前不是 Example Domain 页面，take_over 并记录地址栏与正文，不要尝试搜索。",
+            "max_steps": 4,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "edge-example-navigation",
-            "name": "Microsoft Edge 公开网页导航",
-            "prompt": "确认处于 Edge。读取当前地址栏：如果当前是 example.com，则输入并打开 https://example.org；否则输入并打开 https://example.com。文本输入后先确认地址栏内容已变化，再按 Enter。只有最新页面显示 Example Domain 正文且地址栏与本轮目标域名一致时才 finish。",
-            "attention_prompt": "只访问 example.com 或 example.org；禁止登录、同步、设为默认浏览器、下载文件或提交表单。",
-            "max_steps": 12,
-            "timeout_s": 240,
+            "name": "Microsoft Edge Example/IANA 链接往返",
+            "prompt": "先把最近动作历史当作硬计数器。若尚无 tap/tap_element，确认当前 Example Domain 标题和蓝色 More information... 链接可见，只点击该链接一次。下一轮只有地址栏或正文明确显示 IANA、iana.org、IANA-managed Reserved Domains 等新页面证据时，才调用一次 Android back。历史中已有 back 后，最新截图只要恢复 Example Domain 标题、说明正文和 More information 链接，就立即 finish。",
+            "attention_prompt": "宿主只允许一次链接点击和一次 back。禁止点击地址栏、清除 X、搜索联想、页面其他空白或再次点击链接；禁止输入文本、登录、同步、设为默认浏览器、下载文件或提交表单。",
+            "action_limits": [
+              {"actions": ["tap", "tap_element"], "maximum": 1, "label": "打开 More information 链接"},
+              {"actions": ["back"], "maximum": 1, "label": "返回 Example Domain"}
+            ],
+            "max_steps": 5,
+            "timeout_s": 180,
             "on_failure": "continue"
           }
         ]
@@ -1034,16 +1210,38 @@
         "id": "wps-local-document-discard",
         "name": "WPS local document edit and discard",
         "package": "cn.wps.moffice_eng",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "WPS 本地首页可见且可以新建空白文字文档",
+          "success_evidence": "正文先明确出现本轮 MPsmoke 文本，随后选择不保存或放弃更改并回到 WPS 首页",
+          "forbidden_states": ["账号登录", "云同步", "上传或分享", "会员购买", "现有文件修改"],
+          "login_policy": "forbidden",
+          "required_actions": [
+            {"actions": ["input_text"], "minimum": 1, "label": "输入临时正文"},
+            {"actions": ["tap", "tap_element", "back"], "minimum": 4, "label": "新建、收键盘、退出并不保存"}
+          ]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 15,
+        "initialization_tasks": [
+          {
+            "id": "wps-local-home-ready",
+            "name": "WPS 本地首页初始化",
+            "prompt": "把 WPS 恢复到可以看到‘空白文档’入口的本地首页。若当前仍在文字编辑器：键盘可见时先用 Android back 收起键盘；下一轮若顶部仍有返回箭头和‘保存’，再用 Android back 退出编辑器；若出现保存确认，只选择‘不保存/放弃更改’。看到‘空白文档’入口且没有编辑器或确认框后 finish。",
+            "attention_prompt": "本步骤只清理上轮未保存的临时空白文档；禁止保存、登录、云同步、上传、分享、购买会员、打开模板或现有文件。每轮只做一个返回或不保存动作。",
+            "max_steps": 8,
+            "timeout_s": 150,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "wps-local-document-discard",
             "name": "WPS 临时文档编辑并放弃",
-            "prompt": "从 WPS 首页新建空白文字文档，在正文输入 MP smoke 0722；下一轮必须确认文字清晰可见。随后按返回并选择“不保存/放弃更改”，只有确认回到 WPS 首页且临时文档未保存时才 finish。",
-            "attention_prompt": "禁止登录、云同步、上传、分享、购买会员、打开付费模板或修改现有文件；临时文档最终必须不保存。",
+            "prompt": "当前应在 WPS 首页。依次完成：点击‘空白文档’新建临时文档；在正文用 input_text 输入 MPsmoke；下一轮必须从正文确认 MPsmoke 清晰可见。若键盘可见，先用 Android back 收起键盘；只要顶部仍显示返回箭头和‘保存’，就仍在编辑器，绝对不能 finish，必须再用 Android back 退出。出现确认框时明确点击‘不保存/放弃更改’。只有本主任务已经完成新建、输入、收键盘、退出和不保存，并且最新截图重新显示 WPS 首页‘空白文档’入口时才 finish。",
+            "attention_prompt": "正文仍可见或顶部仍有‘保存’时禁止 finish；第一次 back 通常只收起键盘，不算退出编辑器。禁止保存、登录、云同步、上传、分享、购买会员、打开付费模板或修改现有文件。",
             "max_steps": 24,
             "timeout_s": 420,
             "on_failure": "continue"
@@ -1054,6 +1252,14 @@
         "id": "baidu-public-feed",
         "name": "百度公开推荐流",
         "package": "com.baidu.searchbox",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录公开推荐首页和多张内容卡片可见",
+          "success_evidence": "两次独立向上滚动后分别出现不同标题或卡片，最终仍在推荐流",
+          "forbidden_states": ["登录", "搜索", "详情页", "点赞评论关注", "购买"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "推荐流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
@@ -1062,8 +1268,11 @@
           {
             "id": "baidu-public-feed",
             "name": "百度公开推荐流滚动",
-            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次都必须从新标题、卡片或封面确认内容变化。最后仍停在公开推荐流时 finish。",
-            "attention_prompt": "禁止登录、搜索、打开详情、点赞、评论、关注、收藏、分享、消息或购买。",
+            "prompt": "确认处于免登录公开推荐首页并记住至少两个可见内容锚点。执行第 1 次向上滚动，下一轮确认出现新标题、卡片或封面；再执行第 2 次同样的向上滚动，下一轮再次确认内容变化。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，start 和 end 缺一不可。只有本主任务账本中已有两次有效滚动、且最新截图仍是公开推荐流时 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast；输入事件已发送不能替代滚动后的新内容证据。禁止登录、搜索、打开详情、点赞、评论、关注、收藏、分享、消息或购买。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "推荐流滚动"}
+            ],
             "max_steps": 8,
             "timeout_s": 150,
             "on_failure": "continue"
@@ -1074,6 +1283,14 @@
         "id": "zhihu-public-feed",
         "name": "知乎公开推荐流",
         "package": "com.zhihu.android",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录公开推荐首页和问题或回答卡片可见",
+          "success_evidence": "两次独立向上滚动后分别出现不同问题或回答卡片，最终仍在推荐流",
+          "forbidden_states": ["登录", "提问或回答", "详情页", "点赞评论关注"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "推荐流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
@@ -1082,8 +1299,11 @@
           {
             "id": "zhihu-public-feed",
             "name": "知乎公开推荐流滚动",
-            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次都必须从新问题标题或回答卡片确认内容变化。最后仍停在公开推荐流时 finish。",
-            "attention_prompt": "禁止登录、提问、回答、打开详情、点赞、评论、关注、收藏或消息。",
+            "prompt": "确认处于免登录公开推荐首页并记住至少两个可见问题或回答锚点。执行第 1 次向上滚动，下一轮确认出现新问题标题或回答卡片；再执行第 2 次同样的向上滚动，下一轮再次确认内容变化。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，start 和 end 缺一不可。只有本主任务账本中已有两次有效滚动、且最新截图仍是公开推荐流时 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast；输入事件已发送不能替代滚动后的新内容证据。禁止登录、提问、回答、打开详情、点赞、评论、关注、收藏或消息。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "推荐流滚动"}
+            ],
             "max_steps": 10,
             "timeout_s": 180,
             "on_failure": "continue"
@@ -1094,16 +1314,38 @@
         "id": "tencent-news-public-feed",
         "name": "腾讯新闻公开新闻流",
         "package": "com.tencent.news",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录新闻首页和多条新闻卡片可见",
+          "success_evidence": "两次独立向上滚动后分别出现不同新闻标题或封面，最终仍在新闻流",
+          "forbidden_states": ["登录", "新闻详情", "评论收藏分享", "消息"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "新闻流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "tencent-news-feed-ready",
+            "name": "腾讯新闻公开新闻流初始化",
+            "prompt": "把腾讯新闻恢复到免登录公开新闻首页。启动广告可只点右上角‘跳过’；分享面板可只点底部‘取消’；若在单篇新闻详情或早报正文，按左上角返回或 Android back 一次并重新观察。只有底部首页入口和多条独立新闻标题或卡片同时可见、且没有分享面板或详情页工具栏时 finish。",
+            "attention_prompt": "本步骤只清理启动广告、分享面板和详情页，不滚动新闻流，不打开新闻，不登录、不分享、不授予权限。每轮最多做一个关闭或返回动作。",
+            "max_steps": 6,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "tencent-news-public-feed",
             "name": "腾讯新闻公开新闻流滚动",
-            "prompt": "确认处于免登录公开新闻首页，连续完成两次向上滚动；每次都必须从不同新闻标题或封面确认内容变化。最后仍停在公开新闻流时 finish。",
-            "attention_prompt": "禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "prompt": "当前应已在免登录公开新闻首页。先记住至少两个可见标题。执行第 1 次向上滚动，下一轮从新标题或封面确认变化；再执行第 2 次同样的向上滚动，下一轮再次确认出现不同内容。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，不能省略 start。只有本主任务账本中已经实际产生两个有效 swipe/swipe_fast 动作，并且最新截图仍是多条新闻卡片组成的首页新闻流时才 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast。点击关闭弹层或返回都不算滚动，绝不能口头把它们算作第 1 次或第 2 次滚动；输入事件已发送也不能替代新标题证据。禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "新闻流滚动"}
+            ],
             "max_steps": 8,
             "timeout_s": 150,
             "on_failure": "continue"
@@ -1114,16 +1356,38 @@
         "id": "sohu-news-public-feed",
         "name": "搜狐新闻公开新闻流",
         "package": "com.sohu.newsclient",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录新闻首页和多条新闻卡片可见",
+          "success_evidence": "两次独立向上滚动后分别出现不同新闻标题或封面，最终仍在新闻流",
+          "forbidden_states": ["登录", "新闻详情", "评论收藏分享", "消息"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "新闻流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "sohu-news-feed-ready",
+            "name": "搜狐新闻公开新闻流初始化",
+            "prompt": "把搜狐新闻恢复到免登录公开新闻首页。启动全屏广告可只点右上角‘跳过’；若在单篇新闻详情，按左上角返回或 Android back 一次并重新观察。只有推荐频道、底部首页入口和多条独立新闻标题或卡片同时可见时 finish。",
+            "attention_prompt": "本步骤只关闭启动广告或退出详情，不滚动新闻流，不打开新闻，不登录、不分享、不授予权限。每轮最多做一个关闭或返回动作。",
+            "max_steps": 5,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "sohu-news-public-feed",
             "name": "搜狐新闻公开新闻流滚动",
-            "prompt": "确认处于免登录公开新闻首页，连续完成两次向上滚动；每次都必须从不同新闻标题或封面确认内容变化。最后仍停在公开新闻流时 finish。",
-            "attention_prompt": "禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "prompt": "当前应已在免登录公开新闻首页。先记住至少两个可见标题。执行第 1 次向上滚动，下一轮从新标题或封面确认变化；再执行第 2 次同样的向上滚动，下一轮再次确认出现不同内容。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，不能省略 start。只有本主任务账本中已经实际产生两个有效 swipe/swipe_fast 动作，并且最新截图仍是多条新闻卡片组成的首页新闻流时才 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast。点击关闭弹层或返回都不算滚动，绝不能口头把它们算作第 1 次或第 2 次滚动；输入事件已发送也不能替代新标题证据。禁止登录、打开详情、评论、收藏、分享、消息或授予权限。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "新闻流滚动"}
+            ],
             "max_steps": 9,
             "timeout_s": 180,
             "on_failure": "continue"
@@ -1131,41 +1395,82 @@
         ]
       },
       {
-        "id": "quark-baidu-navigation",
-        "name": "夸克百度公开页面导航",
+        "id": "quark-search-editor-roundtrip",
+        "name": "夸克搜索编辑器往返",
         "package": "com.quark.browser",
+        "automation_engine": "hybrid",
+        "contract": {
+          "entry_state": "夸克免登录首页、搜索框和公开功能卡片可见，搜索编辑器与键盘已关闭",
+          "success_evidence": "本轮点击首页搜索框后明确看到搜索编辑器与软键盘，再通过返回动作关闭编辑器并恢复首页搜索框与公开功能卡片",
+          "forbidden_states": ["提交搜索", "打开结果或广告", "登录同步", "默认浏览器设置", "下载"],
+          "login_policy": "forbidden",
+          "required_actions": [
+            {"actions": ["tap", "tap_element"], "minimum": 1, "label": "聚焦首页搜索框"},
+            {"actions": ["back"], "minimum": 1, "label": "退出搜索编辑器"}
+          ]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "quark-home-ready",
+            "name": "夸克免登录首页初始化",
+            "prompt": "把夸克恢复到免登录首页。如果当前是搜索编辑器或键盘界面，先用 Android back 收起键盘；仍在编辑器时再 back 一次。只有首页搜索框和多个公开功能卡片同时可见、键盘关闭时 finish。",
+            "attention_prompt": "最多返回两次；本步骤不要输入或提交搜索，不要打开结果、广告、登录、同步、下载或默认浏览器设置。",
+            "max_steps": 4,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
-            "id": "quark-baidu-navigation",
-            "name": "夸克公开网页导航",
-            "prompt": "点击地址栏并输入 https://www.baidu.com；先确认地址栏内容变化，再按 Enter。只有页面显示百度标志、搜索框或百度一下按钮，且仍在夸克内时才 finish；不要执行搜索。",
-            "attention_prompt": "只访问 www.baidu.com；禁止登录、同步、设为默认、导入、下载、提交搜索或点击广告。",
-            "max_steps": 14,
-            "timeout_s": 240,
+            "id": "quark-search-editor-roundtrip",
+            "name": "夸克搜索编辑器往返",
+            "prompt": "当前应在夸克免登录首页。先点击首页中央搜索框一次；下一轮只有标题‘搜索’和软键盘都明确出现时，才调用一次 Android back。若该次 back 已恢复首页搜索框和多个公开功能卡片，立即 finish；若只是收起键盘但仍停在标题为‘搜索’的编辑器，再调用一次 Android back。只有本主任务确实进入过搜索编辑器、至少执行过一次 back、最新截图又恢复夸克首页且键盘关闭时才 finish。",
+            "attention_prompt": "全程不要输入任何文字，不要点击联想词、搜索按钮、蓝色前往箭头、广告或公开功能卡片。已经回到首页后禁止继续 back，否则会退出应用并触发前台保护。禁止重新 launch_app 伪造往返，也禁止登录、同步、设为默认、导入或下载。",
+            "max_steps": 6,
+            "timeout_s": 120,
             "on_failure": "continue"
           }
         ]
       },
       {
         "id": "uc-baidu-navigation",
-        "name": "UC浏览器百度公开页面导航",
+        "name": "UC浏览器公开页面滚动",
         "package": "com.UCMobile",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "UC 浏览器内已有免登录公开网页，千问 AI 或编辑器覆盖层已关闭",
+          "success_evidence": "根据当前位置选择可滚动方向，两次独立垂直滚动后分别出现不同标题、卡片或正文，最终仍在 UC 公开内容页",
+          "forbidden_states": ["打开链接详情", "登录同步", "默认浏览器设置", "下载", "广告"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "公开页面滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 12,
+        "initialization_tasks": [
+          {
+            "id": "uc-public-page-ready",
+            "name": "UC浏览器公开页面初始化",
+            "prompt": "把 UC 浏览器恢复到已有的免登录公开网页。如果当前是千问 AI、模型选择、搜索编辑器或键盘页面，优先按左上角返回或 Android back，每轮只返回一次并重新观察，最多返回三次。看到公开网页的标题、正文或多张卡片后 finish。",
+            "attention_prompt": "不要输入或提交搜索，不要点击模型、结果、广告、登录、同步、下载或默认浏览器设置；只退出覆盖层回到已有公开网页。",
+            "max_steps": 5,
+            "timeout_s": 120,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "uc-baidu-navigation",
-            "name": "UC浏览器公开网页导航",
-            "prompt": "点击地址栏并输入 https://www.baidu.com；先确认地址栏内容变化，再按 Enter。只有页面显示百度标志、搜索框或百度一下按钮，且仍在 UC 浏览器内时才 finish；不要执行搜索。",
-            "attention_prompt": "只访问 www.baidu.com；禁止登录、同步、设为默认、导入、下载、提交搜索或点击广告。",
-            "max_steps": 14,
-            "timeout_s": 240,
+            "name": "UC浏览器公开页面滚动",
+            "prompt": "当前应已在 UC 免登录公开网页。先判断页面位置：若可见‘下一页’、百度页脚、备案号等底部标志，手指从上向下滑动以回到更靠上的内容；否则手指从下向上滑动。记住至少两个锚点，执行第 1 次垂直滚动，下一轮确认内容确实变化；再沿仍有内容空间的方向执行第 2 次滚动，下一轮再次确认变化。只有本主任务已实际产生两个 swipe/swipe_fast 动作、两次都带来可见变化且仍在 UC 公开内容页时 finish。",
+            "attention_prompt": "一次滚动后若截图完全不变，说明已到该方向边界，下一次必须反向，禁止重复同一无效方向。不要点击链接、结果、广告、搜索框、‘下一页’或千问入口；禁止登录、同步、设为默认、导入、下载或提交搜索。",
+            "max_steps": 7,
+            "timeout_s": 120,
             "on_failure": "continue"
           }
         ]
@@ -1174,6 +1479,14 @@
         "id": "baidu-map-pan",
         "name": "百度地图公开地图平移",
         "package": "com.baidu.BaiduMap",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "公开地图主界面、道路与至少两个地名标签可见",
+          "success_evidence": "一次水平拖动后多个道路或地名整体换位，地图仍可操作",
+          "forbidden_states": ["地点卡片", "搜索或路线", "打车签到", "广告", "个人中心"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe"], "minimum": 1, "label": "地图平移"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 4,
@@ -1194,6 +1507,14 @@
         "id": "tencent-map-pan",
         "name": "腾讯地图公开地图平移",
         "package": "com.tencent.map",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "公开地图主界面、道路与至少两个地名标签可见",
+          "success_evidence": "一次水平拖动后多个道路或地名整体换位，地图仍可操作",
+          "forbidden_states": ["地点卡片", "搜索或路线", "打车签到", "广告", "个人中心"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe"], "minimum": 1, "label": "地图平移"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 4,
@@ -1214,16 +1535,38 @@
         "id": "bilibili-public-feed",
         "name": "哔哩哔哩公开推荐流",
         "package": "tv.danmaku.bili",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录公开推荐首页和视频卡片可见，手机号登录页已关闭",
+          "success_evidence": "两次独立向上滚动后分别出现不同卡片，最终仍在公开推荐流",
+          "forbidden_states": ["视频详情", "点赞投币收藏关注", "评论", "消息"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "推荐流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
         "idle_after_s": 15,
+        "initialization_tasks": [
+          {
+            "id": "bilibili-public-home-ready",
+            "name": "哔哩哔哩免登录首页初始化",
+            "prompt": "若当前是手机号登录/注册页：键盘可见时先 back 收起键盘；下一轮仍在登录页时点击左上角返回箭头，或再 back 一次。看到公开首页视频卡片后 finish。两次返回后仍只有登录路径时才 take_over，并说明需要人工判断登录；不要输入手机号或验证码。若本来就在公开推荐首页，直接 finish。",
+            "attention_prompt": "最多执行两次返回操作；不要点击一键登录、其他登录方式、国家网络身份认证或推广入口。",
+            "max_steps": 5,
+            "timeout_s": 90,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "bilibili-scroll",
             "name": "公开推荐流滚动",
-            "prompt": "确认处于免登录公开推荐首页，连续完成两次向上滚动；每次滚动后都要从新卡片标题或封面确认内容变化。最后停在公开推荐流并 finish。",
-            "attention_prompt": "不要打开视频、点赞、投币、收藏、关注、评论、登录或进入消息/个人中心。",
+            "prompt": "确认处于免登录公开推荐首页并记住至少两个可见卡片锚点。执行第 1 次向上滚动，下一轮确认出现新卡片标题或封面；再执行第 2 次同样的向上滚动，下一轮再次确认内容变化。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，start 和 end 缺一不可。只有本主任务账本中已有两次有效滚动、且最新截图仍是公开推荐流时 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast；输入事件已发送不能替代滚动后的新卡片证据。不要打开视频、点赞、投币、收藏、关注、评论、登录或进入消息/个人中心。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "推荐流滚动"}
+            ],
             "max_steps": 7,
             "timeout_s": 120,
             "on_failure": "continue"
@@ -1234,6 +1577,14 @@
         "id": "xiaohongshu-public-feed",
         "name": "小红书公开发现流",
         "package": "com.xingin.xhs",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "免登录公开发现页或双列卡片流可见",
+          "success_evidence": "两次独立向上滚动后分别出现不同卡片，最终仍在发现流",
+          "forbidden_states": ["笔记详情", "点赞收藏关注评论", "搜索", "消息"],
+          "login_policy": "forbidden",
+          "required_actions": [{"actions": ["swipe", "swipe_fast"], "minimum": 2, "label": "发现流滚动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 3,
@@ -1242,28 +1593,11 @@
           {
             "id": "xhs-scroll",
             "name": "公开发现流滚动",
-            "prompt": "确认处于免登录公开发现页或卡片流，连续完成两次向上滚动；每次滚动后都要确认出现不同卡片。最后停在公开卡片流并 finish。",
-            "attention_prompt": "不要打开笔记、点赞、收藏、关注、评论、搜索、登录或进入消息/个人中心。",
-            "max_steps": 7,
-            "timeout_s": 120,
-            "on_failure": "continue"
-          }
-        ]
-      },
-      {
-        "id": "jd-public-home",
-        "name": "京东公开首页",
-        "package": "com.jingdong.app.mall",
-        "required": false,
-        "home_after": true,
-        "launch_wait_s": 3,
-        "idle_after_s": 20,
-        "tasks": [
-          {
-            "id": "jd-scroll",
-            "name": "公开首页滚动",
-            "prompt": "确认处于免登录公开首页，连续完成两次向上滚动；每次滚动后都要确认商品或频道卡片发生变化。最后停在公开首页并 finish。",
-            "attention_prompt": "不要打开商品、搜索、登录、领券、加入购物车、下单、支付、进入消息或个人中心。",
+            "prompt": "确认处于免登录公开发现页或卡片流并记住至少两个可见卡片锚点。执行第 1 次向上滚动，下一轮确认出现不同卡片；再执行第 2 次同样的向上滚动，下一轮再次确认内容变化。每次都必须完整调用 {\"action\":\"swipe_fast\",\"start\":[500,800],\"end\":[500,200]}，start 和 end 缺一不可。只有本主任务账本中已有两次有效滚动、且最新截图仍是公开卡片流时 finish。",
+            "attention_prompt": "宿主最多执行两次 swipe/swipe_fast；输入事件已发送不能替代滚动后的新卡片证据。不要打开笔记、点赞、收藏、关注、评论、搜索、登录或进入消息/个人中心。",
+            "action_limits": [
+              {"actions": ["swipe", "swipe_fast"], "maximum": 2, "label": "发现流滚动"}
+            ],
             "max_steps": 7,
             "timeout_s": 120,
             "on_failure": "continue"
@@ -1274,18 +1608,39 @@
         "id": "star-rail-safe-camera",
         "name": "崩坏：星穹铁道安全视角验证",
         "package": "com.miHoYo.hkrpg",
+        "automation_engine": "vision",
+        "contract": {
+          "entry_state": "已登录且进入可控制角色的安全主场景，公告、资源校验和更新遮罩均关闭",
+          "success_evidence": "右侧空白区一次短水平拖动后背景或角色相对朝向改变，仍在安全主场景",
+          "forbidden_states": ["登录验证码实名", "充值", "抽卡商店", "战斗", "领取奖励", "消息"],
+          "login_policy": "existing_session_only",
+          "required_actions": [{"actions": ["swipe"], "minimum": 1, "label": "视角拖动"}]
+        },
         "required": false,
         "home_after": true,
         "launch_wait_s": 8,
         "idle_after_s": 30,
+        "quarantine_after_failures": 2,
+        "retry_cooldown_s": 300,
+        "initialization_tasks": [
+          {
+            "id": "star-rail-scene-ready",
+            "name": "星穹铁道主场景初始化",
+            "prompt": "处理公告、资源校验和普通更新提示，等待加载，并恢复到可控制角色的安全主场景。若已经看到角色、摇杆和常规 HUD，立即 finish。若停在登录、验证码、实名或账号页面，take_over；不要尝试凭据。",
+            "attention_prompt": "只建立安全主场景入口，不拖动视角、移动角色、进入战斗、领取奖励或打开抽卡/商店。",
+            "max_steps": 18,
+            "timeout_s": 480,
+            "on_failure": "stop"
+          }
+        ],
         "tasks": [
           {
             "id": "star-rail-camera-drag",
             "name": "星穹铁道安全视角拖动",
-            "prompt": "处理公告、资源校验和普通更新提示后，确认已经进入可控制角色的游戏主场景。只在屏幕右侧无按钮区域完成一次短距离水平拖动以旋转视角；下一轮比较背景、地面或角色朝向，只有视角确实变化且仍处于安全主场景时才 finish。",
+            "prompt": "当前应已在可控制角色的安全主场景。记住背景、地面边线与角色朝向，只在屏幕右侧无按钮区域完成一次短距离水平拖动以旋转视角；下一轮比较同一锚点，只有视角确实变化且仍处于安全主场景时才 finish。",
             "attention_prompt": "如果停在登录、验证码、实名、下载付费资源、充值或账号页面，立即 take_over。不要移动角色、进入战斗、打开抽卡/商店、领取奖励、发送消息或修改账号。",
-            "max_steps": 24,
-            "timeout_s": 600,
+            "max_steps": 6,
+            "timeout_s": 150,
             "on_failure": "continue"
           }
         ]

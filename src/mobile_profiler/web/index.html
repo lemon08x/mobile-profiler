@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-63">
-  <script src="/app.js?v=platform-ui-63" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-68">
+  <script src="/app.js?v=platform-ui-68" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -140,90 +140,196 @@
               <form id="adb-agent-form" class="agent-form" novalidate>
                 <nav class="agent-config-tabs" role="tablist" aria-label="AI 自动化配置">
                   <button class="active" id="agent-config-tab-workflow" type="button" role="tab" aria-selected="true" aria-controls="agent-config-view-workflow" data-agent-config-tab="workflow"><i>01</i><span><strong>任务启动</strong><small id="agent-config-tab-task-meta">选择任务</small></span></button>
-                  <button id="agent-config-tab-software" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-software" data-agent-config-tab="software"><i>02</i><span><strong>应用与游戏</strong><small id="agent-config-tab-software-meta">支持目录</small></span></button>
-                  <button id="agent-config-tab-model" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-model" data-agent-config-tab="model"><i>03</i><span><strong>模型调度</strong><small id="agent-config-tab-model-meta">局域网千问</small></span></button>
-                  <button id="agent-config-tab-prompt" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-prompt" data-agent-config-tab="prompt"><i>04</i><span><strong>Prompt 编辑</strong><small id="agent-config-tab-prompt-meta">1 个任务</small></span></button>
+                  <button id="agent-config-tab-campaign" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-campaign" data-agent-config-tab="campaign"><i>02</i><span><strong>阶段配置</strong><small id="agent-config-tab-campaign-meta">JSON 基线</small></span></button>
+                  <button id="agent-config-tab-software" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-software" data-agent-config-tab="software"><i>03</i><span><strong>应用与游戏</strong><small id="agent-config-tab-software-meta">支持目录</small></span></button>
+                  <button id="agent-config-tab-model" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-model" data-agent-config-tab="model"><i>04</i><span><strong>模型调度</strong><small id="agent-config-tab-model-meta">局域网千问</small></span></button>
+                  <button id="agent-config-tab-prompt" type="button" role="tab" aria-selected="false" aria-controls="agent-config-view-prompt" data-agent-config-tab="prompt"><i>05</i><span><strong>Prompt 编辑</strong><small id="agent-config-tab-prompt-meta">1 个任务</small></span></button>
                 </nav>
 
                 <div class="agent-config-views">
                   <section class="agent-config-view active" id="agent-config-view-workflow" role="tabpanel" aria-labelledby="agent-config-tab-workflow" data-agent-config-view="workflow">
                     <div class="agent-config-view-heading"><small>TASK LAUNCH</small><h3>任务启动</h3><p>选择本次要运行的任务，确认循环方式和当前进度，然后开始或停止执行。</p></div>
-                    <section class="agent-launch-selection" aria-labelledby="agent-launch-selection-title">
-                      <div class="agent-task-editor-heading">
-                        <div><strong id="agent-launch-selection-title">选择运行任务</strong><small>此处只决定启动哪个模板；具体步骤、顺序和 Prompt 在“Prompt 编辑”中修改</small></div>
+                    <div class="agent-launch-workspace">
+                      <div class="agent-launch-controls">
+                        <section class="agent-launch-selection" aria-labelledby="agent-launch-selection-title">
+                          <div class="agent-task-editor-heading">
+                            <div><strong id="agent-launch-selection-title">选择运行任务</strong><small>此处只决定启动哪个模板；具体步骤、顺序和 Prompt 在“Prompt 编辑”中修改</small></div>
+                          </div>
+                          <div class="agent-template-toolbar">
+                            <select id="agent-task-template-select" aria-label="当前任务模板"></select>
+                            <button class="button ghost compact" id="agent-new-template-button" type="button">新建</button>
+                            <button class="button secondary compact" id="agent-edit-template-button" type="button" disabled>编辑模板</button>
+                          </div>
+                          <small class="agent-template-selection-hint" id="agent-template-selection-hint">选择任务后即可启动；需要修改执行细节时进入 Prompt 编辑。</small>
+                        </section>
+                        <section class="agent-phone-configuration-launcher" id="agent-phone-configuration-launcher" aria-labelledby="agent-phone-configuration-title">
+                          <div class="agent-phone-configuration-copy">
+                            <small>PHONE CONFIGURATION CHECK</small>
+                            <strong id="agent-phone-configuration-title">续航测试 5.0 · 手机配置检查</strong>
+                            <p>按 A0 初始化、A1 重点设置、A2 关闭项、A3 厂商特性和 B 应用配置逐项执行。包装、扫码、短信、系统升级等无法安全完成的项目会跳过并在结束后统一说明原因。</p>
+                            <div><span>A0 初始化</span><span>A1 特别关注</span><span>A2 功能开关</span><span>A3 特殊功能</span><span>B 应用配置</span></div>
+                          </div>
+                          <button class="button secondary compact" id="agent-select-phone-configuration-button" type="button">选择配置检查</button>
+                        </section>
+                        <label class="compact-check option-with-help agent-loop-control" id="agent-loop-control">
+                          <input id="agent-loop-workflow-input" type="checkbox">
+                          <span><strong>单轮内循环 workflow</strong><small id="agent-loop-workflow-hint">正式测试固定一轮 7200 秒；勾选后在该轮内持续调度可重试场景。</small></span>
+                        </label>
+                        <section class="agent-launch-progress" aria-labelledby="agent-launch-progress-title">
+                          <div class="agent-launch-progress-heading">
+                            <div><small>LIVE PROGRESS</small><strong id="agent-launch-progress-title">当前执行进度</strong></div>
+                            <em id="agent-launch-state">等待启动</em>
+                          </div>
+                          <div class="agent-launch-progress-grid">
+                            <article><small>CURRENT TASK</small><strong id="agent-launch-current-task">尚未开始</strong><span id="agent-launch-task-position">0 / 0</span></article>
+                            <article><small>CURRENT STEP</small><strong id="agent-launch-current-step">0 / 0</strong><span id="agent-launch-step-state">IDLE</span></article>
+                          </div>
+                          <p id="agent-launch-progress-detail">选择 Android 设备和任务后即可开始。</p>
+                        </section>
+                        <footer class="agent-control-dock agent-launch-control-dock">
+                          <div class="agent-form-actions">
+                            <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
+                            <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
+                          </div>
+                          <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单 ADB 动作。</p>
+                        </footer>
                       </div>
-                      <div class="agent-template-toolbar">
-                        <select id="agent-task-template-select" aria-label="当前任务模板"></select>
-                        <button class="button ghost compact" id="agent-new-template-button" type="button">新建</button>
-                        <button class="button secondary compact" id="agent-edit-template-button" type="button" disabled>编辑模板</button>
+
+                      <section class="agent-launch-observation" aria-labelledby="agent-launch-observation-title">
+                        <header class="agent-launch-observation-heading">
+                          <div><small>LIVE OBSERVATION</small><h4 id="agent-launch-observation-title">最新 ADB 截图</h4><p>Agent 每轮决策实际看到的最新设备画面。</p></div>
+                          <span class="data-source" id="agent-screen-meta">尚未截图</span>
+                        </header>
+                        <div class="agent-phone-stage">
+                          <div class="agent-phone-frame">
+                            <img id="agent-screen-image" alt="ADB Agent 最新手机截图" hidden>
+                            <div class="agent-screen-placeholder" id="agent-screen-placeholder"><span>ADB</span><strong>等待第一张截图</strong><small>任务启动后显示模型实际看到的手机画面</small></div>
+                          </div>
+                        </div>
+                        <div class="agent-runtime-stats">
+                          <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
+                          <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
+                          <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
+                          <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
+                          <article><small>ELAPSED</small><strong id="agent-elapsed-value">00:00</strong><span id="agent-device-value">未选择设备</span></article>
+                        </div>
+                      </section>
+                    </div>
+
+                    <section class="agent-run-console" aria-labelledby="agent-run-console-title">
+                      <header class="agent-run-console-heading">
+                        <div><small>RUN CONSOLE</small><strong id="agent-run-console-title">本轮执行记录</strong><p>最近决策、子任务结果和完整日志统一归档在任务启动中；左侧切换后只展示当前需要查看的一类信息。</p></div>
+                        <span>实时更新</span>
+                      </header>
+                      <div class="agent-module-layout agent-run-console-layout">
+                        <nav class="agent-module-directory agent-run-console-directory" aria-label="本轮执行记录分类">
+                          <div class="agent-module-directory-heading"><small>运行记录</small><strong>查看分类</strong></div>
+                          <div class="agent-module-directory-group">
+                            <button class="active" id="agent-run-tab-decision" type="button" data-agent-run-tab="decision" aria-pressed="true" aria-controls="agent-run-view-decision"><span><small>DECISION</small><strong>最近决策</strong></span></button>
+                            <button id="agent-run-tab-results" type="button" data-agent-run-tab="results" aria-pressed="false" aria-controls="agent-run-view-results"><span><small>SUBTASKS</small><strong>子任务结果</strong></span></button>
+                            <button id="agent-run-tab-logs" type="button" data-agent-run-tab="logs" aria-pressed="false" aria-controls="agent-run-view-logs"><span><small>JOURNAL</small><strong>执行日志</strong></span></button>
+                          </div>
+                        </nav>
+                        <div class="agent-module-content agent-run-console-content">
+                          <section class="agent-run-console-panel agent-decision-panel active" id="agent-run-view-decision" aria-labelledby="agent-run-tab-decision" data-agent-run-view="decision">
+                            <div class="panel-heading"><div><small>MODEL DECISION</small><h2>最近决策</h2></div><span class="data-source" id="agent-action-state">等待模型</span></div>
+                            <div class="agent-decision-grid">
+                              <article><small>REASONING</small><p id="agent-reasoning-output">任务启动后显示模型的简短判断。</p></article>
+                              <article><small>PHONE ACTION</small><pre id="agent-action-output">--</pre><p id="agent-action-result">尚未执行动作</p></article>
+                            </div>
+                            <div class="agent-completion-message" id="agent-completion-message" hidden></div>
+                          </section>
+
+                          <section class="agent-run-console-panel agent-task-progress-panel" id="agent-run-view-results" aria-labelledby="agent-run-tab-results" data-agent-run-view="results" hidden>
+                            <div class="panel-heading"><div><small>WORKFLOW PROGRESS</small><h2>子任务执行结果</h2></div><span class="data-source" id="agent-task-progress-summary">尚未启动流程</span></div>
+                            <div class="agent-task-results" id="agent-task-results"><div class="agent-log-empty">配置任务后启动流程</div></div>
+                            <section class="agent-workflow-report" id="agent-workflow-report" aria-labelledby="agent-workflow-report-title" hidden>
+                              <header><div><small>FINAL CHECK SUMMARY</small><strong id="agent-workflow-report-title">统一汇总</strong></div><em id="agent-workflow-report-state">WAITING</em></header>
+                              <div class="agent-workflow-report-metrics">
+                                <article><small>完成</small><strong id="agent-workflow-report-completed">0</strong></article>
+                                <article><small>跳过</small><strong id="agent-workflow-report-skipped">0</strong></article>
+                                <article><small>未完成</small><strong id="agent-workflow-report-failed">0</strong></article>
+                                <article><small>未执行</small><strong id="agent-workflow-report-pending">0</strong></article>
+                              </div>
+                              <div class="agent-workflow-report-reasons"><strong>跳过与未完成原因</strong><ul id="agent-workflow-report-reason-list"></ul></div>
+                            </section>
+                          </section>
+
+                          <section class="agent-run-console-panel agent-log-panel" id="agent-run-view-logs" aria-labelledby="agent-run-tab-logs" data-agent-run-view="logs" hidden>
+                            <div class="panel-heading"><div><small>AGENT JOURNAL</small><h2>执行日志</h2></div><span class="data-source" id="agent-output-directory">运行后保存截图与 events.jsonl</span></div>
+                            <div class="agent-log" id="agent-log-output" aria-live="polite"><div class="agent-log-empty">等待任务启动</div></div>
+                          </section>
+                        </div>
                       </div>
-                      <small class="agent-template-selection-hint" id="agent-template-selection-hint">选择任务后即可启动；需要修改执行细节时进入 Prompt 编辑。</small>
                     </section>
-                    <section class="agent-phone-configuration-launcher" id="agent-phone-configuration-launcher" aria-labelledby="agent-phone-configuration-title">
-                      <div class="agent-phone-configuration-copy">
-                        <small>PHONE CONFIGURATION CHECK</small>
-                        <strong id="agent-phone-configuration-title">续航测试 5.0 · 手机配置检查</strong>
-                        <p>按 A0 初始化、A1 重点设置、A2 关闭项、A3 厂商特性和 B 应用配置逐项执行。包装、扫码、短信、系统升级等无法安全完成的项目会跳过并在结束后统一说明原因。</p>
-                        <div><span>A0 初始化</span><span>A1 特别关注</span><span>A2 功能开关</span><span>A3 特殊功能</span><span>B 应用配置</span></div>
-                      </div>
-                      <button class="button secondary compact" id="agent-select-phone-configuration-button" type="button">选择配置检查</button>
+                  </section>
+
+                  <section class="agent-config-view" id="agent-config-view-campaign" role="tabpanel" aria-labelledby="agent-config-tab-campaign" data-agent-config-view="campaign" hidden>
+                    <div class="agent-config-view-heading"><small>CAMPAIGN CONFIG</small><h3>两阶段配置</h3><p>直接读取 Campaign JSON，分别说明预备阶段与两小时测试的目的、执行链路、软件分组、安全边界和验收条件。</p></div>
+                    <section class="agent-campaign-config-source" aria-label="Campaign 配置来源">
+                      <div><small>CONFIG SOURCE</small><strong id="agent-campaign-config-source-name">等待 Campaign JSON</strong><code id="agent-campaign-config-source-path">--</code></div>
+                      <span id="agent-campaign-config-source-state">JSON BASELINE</span>
                     </section>
-                    <label class="compact-check option-with-help agent-loop-control" id="agent-loop-control">
-                      <input id="agent-loop-workflow-input" type="checkbox">
-                      <span><strong>完成整套任务后循环</strong><small id="agent-loop-workflow-hint">实际测试可循环至设备关机；其他任务固定执行一次。</small></span>
-                    </label>
-                    <section class="agent-launch-progress" aria-labelledby="agent-launch-progress-title">
-                      <div class="agent-launch-progress-heading">
-                        <div><small>LIVE PROGRESS</small><strong id="agent-launch-progress-title">当前执行进度</strong></div>
-                        <em id="agent-launch-state">等待启动</em>
-                      </div>
-                      <div class="agent-launch-progress-grid">
-                        <article><small>CURRENT TASK</small><strong id="agent-launch-current-task">尚未开始</strong><span id="agent-launch-task-position">0 / 0</span></article>
-                        <article><small>CURRENT STEP</small><strong id="agent-launch-current-step">0 / 0</strong><span id="agent-launch-step-state">IDLE</span></article>
-                      </div>
-                      <p id="agent-launch-progress-detail">选择 Android 设备和任务后即可开始。</p>
+                    <nav class="agent-campaign-stage-tabs" role="tablist" aria-label="Campaign 阶段配置">
+                      <button class="active" id="agent-campaign-stage-tab-prepare" type="button" role="tab" aria-selected="true" aria-controls="agent-campaign-stage-panel" data-agent-campaign-stage="prepare"><i>1</i><span><strong>预备环境</strong><small id="agent-campaign-stage-prepare-meta">设置 · 安装 · 复验</small></span></button>
+                      <button id="agent-campaign-stage-tab-test" type="button" role="tab" aria-selected="false" aria-controls="agent-campaign-stage-panel" data-agent-campaign-stage="test"><i>2</i><span><strong>两小时测试</strong><small id="agent-campaign-stage-test-meta">循环 · 录制 · 验收</small></span></button>
+                    </nav>
+                    <section class="agent-campaign-stage-panel" id="agent-campaign-stage-panel" role="tabpanel" aria-live="polite">
+                      <p class="agent-campaign-config-empty">正在读取两阶段 Campaign 配置…</p>
                     </section>
-                    <footer class="agent-control-dock agent-launch-control-dock">
-                      <div class="agent-form-actions">
-                        <button class="button primary" id="agent-start-button" type="submit">启动测试流程</button>
-                        <button class="button danger" id="agent-stop-button" type="button" disabled>停止流程</button>
-                      </div>
-                      <p class="agent-safety-note"><strong>执行边界：</strong>模型不能下发任意 shell；服务端只接受白名单 ADB 动作。</p>
-                    </footer>
                   </section>
 
                   <section class="agent-config-view" id="agent-config-view-software" role="tabpanel" aria-labelledby="agent-config-tab-software" data-agent-config-view="software" hidden>
                     <div class="agent-config-view-heading"><small>SUPPORTED SOFTWARE</small><h3>应用与游戏</h3><p>展示当前已适配的软件、安装来源，以及最近一次预备阶段的安装和支持验证结果。</p></div>
-                    <section class="agent-software-summary" aria-label="支持软件汇总">
-                      <article><small>全部软件</small><strong id="agent-software-total">0</strong><span>应用与游戏</span></article>
-                      <article><small>项目安装包</small><strong id="agent-software-project-count">0</strong><span>固定版本，无需商店更新</span></article>
-                      <article><small>商店 / 官网</small><strong id="agent-software-external-count">0</strong><span>安装时获取当前版本</span></article>
-                      <article><small>最近已验证</small><strong id="agent-software-verified-count">0</strong><span id="agent-software-failed-count">0 项待处理</span></article>
-                      <article><small>待正式检验</small><strong id="agent-software-pending-count">0</strong><span>手机烟测通过，等待预备复验</span></article>
-                    </section>
-                    <section class="agent-software-validation" id="agent-software-validation">
-                      <div><small>PREPARATION VALIDATION</small><strong id="agent-software-validation-title">尚未运行预备验证</strong><p id="agent-software-validation-detail">预备模式会逐项完成安装、初始化，并让 Qwen 验证正常流程。</p></div>
-                      <button class="button secondary compact" id="agent-open-preparation-button" type="button">前往预备验证</button>
-                    </section>
-                    <nav class="agent-software-categories" aria-label="软件分类">
-                      <button class="active" type="button" data-agent-software-category="all" aria-pressed="true"><span><small>ALL</small><strong>全部</strong></span><em data-agent-software-count="all">0</em></button>
-                      <button type="button" data-agent-software-category="app" aria-pressed="false"><span><small>APPS</small><strong>应用</strong></span><em data-agent-software-count="app">0</em></button>
-                      <button type="button" data-agent-software-category="game" aria-pressed="false"><span><small>GAMES</small><strong>游戏</strong></span><em data-agent-software-count="game">0</em></button>
-                      <button type="button" data-agent-software-category="project" aria-pressed="false"><span><small>PROJECT</small><strong>项目安装包</strong></span><em data-agent-software-count="project">0</em></button>
-                      <button type="button" data-agent-software-category="app_store" aria-pressed="false"><span><small>STORE</small><strong>应用商店</strong></span><em data-agent-software-count="app_store">0</em></button>
-                      <button type="button" data-agent-software-category="official" aria-pressed="false"><span><small>OFFICIAL</small><strong>官网</strong></span><em data-agent-software-count="official">0</em></button>
-                      <button type="button" data-agent-software-category="pending" aria-pressed="false"><span><small>PENDING</small><strong>待检验</strong></span><em data-agent-software-count="pending">0</em></button>
-                    </nav>
-                    <div class="agent-software-toolbar">
-                      <label for="agent-software-search-input">筛选软件</label>
-                      <input id="agent-software-search-input" type="search" autocomplete="off" placeholder="名称、包名、安装来源或引擎">
-                      <button class="button ghost compact" id="agent-software-refresh-button" type="button">刷新图标与安装状态</button>
+                    <div class="agent-module-layout agent-software-layout">
+                      <aside class="agent-module-directory agent-software-directory">
+                        <div class="agent-module-directory-heading"><small>软件目录</small><strong>分类查看</strong><p>按内容、来源或验证状态定位。</p></div>
+                        <nav class="agent-software-categories" aria-label="软件分类">
+                          <section><small>总览</small><button class="active" type="button" data-agent-software-category="overview" aria-pressed="true"><span><small>OVERVIEW</small><strong>目录概览</strong></span><em data-agent-software-count="overview">0</em></button></section>
+                          <section><small>内容类型</small>
+                            <button type="button" data-agent-software-category="all" aria-pressed="false"><span><small>ALL</small><strong>全部软件</strong></span><em data-agent-software-count="all">0</em></button>
+                            <button type="button" data-agent-software-category="app" aria-pressed="false"><span><small>APPS</small><strong>应用</strong></span><em data-agent-software-count="app">0</em></button>
+                            <button type="button" data-agent-software-category="game" aria-pressed="false"><span><small>GAMES</small><strong>游戏</strong></span><em data-agent-software-count="game">0</em></button>
+                          </section>
+                          <section><small>安装来源</small>
+                            <button type="button" data-agent-software-category="project" aria-pressed="false"><span><small>PROJECT</small><strong>项目安装包</strong></span><em data-agent-software-count="project">0</em></button>
+                            <button type="button" data-agent-software-category="app_store" aria-pressed="false"><span><small>STORE</small><strong>应用商店</strong></span><em data-agent-software-count="app_store">0</em></button>
+                            <button type="button" data-agent-software-category="official" aria-pressed="false"><span><small>OFFICIAL</small><strong>官网</strong></span><em data-agent-software-count="official">0</em></button>
+                          </section>
+                          <section><small>验证状态</small><button type="button" data-agent-software-category="pending" aria-pressed="false"><span><small>PENDING</small><strong>待检验</strong></span><em data-agent-software-count="pending">0</em></button></section>
+                        </nav>
+                      </aside>
+
+                      <div class="agent-module-content agent-software-content">
+                        <section class="agent-module-section agent-software-overview" id="agent-software-overview" aria-label="软件目录概览">
+                          <header class="agent-module-section-heading"><div><small>CATALOG OVERVIEW</small><strong>支持范围与最近验证</strong><p>先看覆盖规模和预备验证状态，再从左侧进入具体应用、游戏或安装来源。</p></div></header>
+                          <section class="agent-software-summary" aria-label="支持软件汇总">
+                            <article><small>全部软件</small><strong id="agent-software-total">0</strong><span>应用与游戏</span></article>
+                            <article><small>项目安装包</small><strong id="agent-software-project-count">0</strong><span>固定版本，无需商店更新</span></article>
+                            <article><small>商店 / 官网</small><strong id="agent-software-external-count">0</strong><span>安装时获取当前版本</span></article>
+                            <article><small>最近已验证</small><strong id="agent-software-verified-count">0</strong><span id="agent-software-failed-count">0 项待处理</span></article>
+                            <article><small>待正式检验</small><strong id="agent-software-pending-count">0</strong><span>手机烟测通过，等待预备复验</span></article>
+                          </section>
+                          <section class="agent-software-validation" id="agent-software-validation">
+                            <div><small>PREPARATION VALIDATION</small><strong id="agent-software-validation-title">尚未运行预备验证</strong><p id="agent-software-validation-detail">预备模式会逐项完成安装、初始化，并让 Qwen 验证正常流程。</p></div>
+                            <button class="button secondary compact" id="agent-open-preparation-button" type="button">前往预备验证</button>
+                          </section>
+                        </section>
+
+                        <section class="agent-module-section agent-software-catalog" id="agent-software-catalog" aria-labelledby="agent-software-browser-title" hidden>
+                          <div class="agent-software-toolbar">
+                            <label for="agent-software-search-input">筛选当前分类</label>
+                            <input id="agent-software-search-input" type="search" autocomplete="off" placeholder="名称、包名、安装来源或引擎">
+                            <button class="button ghost compact" id="agent-software-refresh-button" type="button">刷新图标与安装状态</button>
+                          </div>
+                          <section class="agent-software-browser" aria-labelledby="agent-software-browser-title">
+                            <header><div><small id="agent-software-browser-kicker">ALL SOFTWARE</small><strong id="agent-software-browser-title">全部应用与游戏</strong></div><span id="agent-software-browser-count">0 项</span></header>
+                            <p id="agent-software-browser-description">从左侧选择分类查看具体软件；每张卡片提供与安装来源匹配的操作。</p>
+                            <div class="agent-software-list" id="agent-software-catalog-list"></div>
+                          </section>
+                        </section>
+                      </div>
                     </div>
-                    <section class="agent-software-browser" aria-labelledby="agent-software-browser-title">
-                      <header><div><small id="agent-software-browser-kicker">ALL SOFTWARE</small><strong id="agent-software-browser-title">全部应用与游戏</strong></div><span id="agent-software-browser-count">0 项</span></header>
-                      <p id="agent-software-browser-description">点击上方分类查看具体软件；每张卡片提供与安装来源匹配的操作。</p>
-                      <div class="agent-software-list" id="agent-software-catalog-list"></div>
-                    </section>
                   </section>
 
                   <section class="agent-config-view" id="agent-config-view-model" role="tabpanel" aria-labelledby="agent-config-tab-model" data-agent-config-view="model" hidden>
@@ -266,104 +372,106 @@
 
                   <section class="agent-config-view" id="agent-config-view-prompt" role="tabpanel" aria-labelledby="agent-config-tab-prompt" data-agent-config-view="prompt" hidden>
                     <div class="agent-config-view-heading"><small>PROMPT DESIGN</small><h3>任务配置、Prompt 与 Agent 规则</h3><p>任务顺序、名称、步骤/时间限制、失败策略和具体 Prompt 都在这里编辑。</p></div>
-                    <nav class="agent-prompt-tabs" role="tablist" aria-label="Prompt 编辑类型">
-                      <button class="active" id="agent-prompt-tab-task" type="button" role="tab" aria-selected="true" aria-controls="agent-prompt-view-task" data-agent-prompt-tab="task"><span><strong>任务配置与 Prompt</strong><small id="agent-prompt-tab-task-meta">1 个任务</small></span></button>
-                      <button id="agent-prompt-tab-system" type="button" role="tab" aria-selected="false" aria-controls="agent-prompt-view-system" data-agent-prompt-tab="system"><span><strong>系统级 Prompt</strong><small id="agent-prompt-tab-system-meta">内置规则</small></span></button>
-                    </nav>
-                    <div class="agent-prompt-views">
-                      <section class="agent-prompt-view active" id="agent-prompt-view-task" role="tabpanel" aria-labelledby="agent-prompt-tab-task" data-agent-prompt-view="task">
-                        <div class="form-field">
-                          <label for="agent-workflow-name-input">流程名称</label>
-                          <input id="agent-workflow-name-input" type="text" maxlength="160" placeholder="例如：续航测试前手机初始化" value="ADB 测试流程">
+                    <div class="agent-module-layout agent-prompt-layout">
+                      <aside class="agent-module-directory agent-prompt-directory">
+                        <div class="agent-module-directory-heading"><small>Prompt 目录</small><strong>分类编辑</strong><p>任务结构、任务指令和系统规则分开维护。</p></div>
+                        <nav class="agent-prompt-tabs" role="tablist" aria-label="Prompt 编辑分类">
+                          <section><small>任务设计</small>
+                            <button class="active" id="agent-prompt-tab-workflow" type="button" role="tab" aria-selected="true" aria-controls="agent-prompt-view-workflow" data-agent-prompt-tab="workflow"><span><small>WORKFLOW</small><strong>任务编排</strong></span><em id="agent-prompt-tab-workflow-meta">1 个任务</em></button>
+                            <button id="agent-prompt-tab-task" type="button" role="tab" aria-selected="false" aria-controls="agent-prompt-view-task" data-agent-prompt-tab="task"><span><small>TASK PROMPT</small><strong>任务 Prompt</strong></span><em id="agent-prompt-tab-task-meta">1 / 1</em></button>
+                          </section>
+                          <section><small>全局策略</small>
+                            <button id="agent-prompt-tab-system" type="button" role="tab" aria-selected="false" aria-controls="agent-prompt-view-system" data-agent-prompt-tab="system"><span><small>SYSTEM POLICY</small><strong>系统级 Prompt</strong></span><em id="agent-prompt-tab-system-meta">内置规则</em></button>
+                          </section>
+                        </nav>
+                      </aside>
+
+                      <div class="agent-module-content agent-prompt-content">
+                        <div class="agent-prompt-views">
+                          <section class="agent-prompt-view agent-module-section active" id="agent-prompt-view-workflow" role="tabpanel" aria-labelledby="agent-prompt-tab-workflow" data-agent-prompt-view="workflow">
+                            <header class="agent-module-section-heading"><div><small>WORKFLOW DESIGN</small><strong>任务编排</strong><p>配置流程名称、子任务顺序、步骤限制、超时和失败策略。</p></div></header>
+                            <div class="form-field">
+                              <label for="agent-workflow-name-input">流程名称</label>
+                              <input id="agent-workflow-name-input" type="text" maxlength="160" placeholder="例如：续航测试前手机初始化" value="ADB 测试流程">
+                            </div>
+                            <section class="agent-task-editor" aria-labelledby="agent-task-editor-title">
+                              <div class="agent-task-editor-heading">
+                                <div><strong id="agent-task-editor-title">执行顺序与限制</strong><small id="agent-task-count-label">按顺序执行；finish 只完成当前子任务</small></div>
+                                <button class="button ghost compact" id="agent-add-task-button" type="button">＋ 空白任务</button>
+                              </div>
+                              <div class="agent-task-orchestration">
+                                <aside class="agent-task-sequence" aria-labelledby="agent-task-sequence-title">
+                                  <div class="agent-task-sequence-heading">
+                                    <div><small>EXECUTION ORDER</small><strong id="agent-task-sequence-title">任务序列</strong></div>
+                                    <span id="agent-task-filter-summary">0 项</span>
+                                  </div>
+                                  <label class="agent-task-filter" for="agent-task-filter-input"><span>筛选任务</span><input id="agent-task-filter-input" type="search" autocomplete="off" placeholder="名称、编号或 Prompt 状态"></label>
+                                  <div class="agent-task-list" id="agent-task-list"></div>
+                                </aside>
+
+                                <section class="agent-task-detail" id="agent-task-detail" aria-labelledby="agent-task-detail-title">
+                                  <header class="agent-task-detail-heading">
+                                    <div><small id="agent-task-detail-index">TASK 01</small><strong id="agent-task-detail-title">选择一个任务</strong><p>右侧只编辑当前任务；顺序调整在左侧完成。</p></div>
+                                    <em id="agent-task-detail-position">0 / 0</em>
+                                  </header>
+                                  <div class="agent-task-detail-fields">
+                                    <div class="form-field agent-task-detail-name"><label for="agent-task-name-editor-input">任务名称</label><input id="agent-task-name-editor-input" type="text" maxlength="120" data-agent-task-editor-field="name" placeholder="例如：打开系统设置"></div>
+                                    <div class="form-field"><label for="agent-task-max-steps-editor-input">最大步骤</label><input id="agent-task-max-steps-editor-input" type="number" min="1" max="200" step="1" data-agent-task-editor-field="max_steps"></div>
+                                    <div class="form-field"><label for="agent-task-timeout-editor-input">任务超时</label><div class="input-with-unit"><input id="agent-task-timeout-editor-input" type="number" min="5" max="7200" step="1" data-agent-task-editor-field="timeout_s"><span>秒</span></div></div>
+                                    <div class="form-field"><label for="agent-task-failure-editor-input">失败策略</label><select id="agent-task-failure-editor-input" data-agent-task-editor-field="on_failure"><option value="stop">停止流程</option><option value="continue">记录并继续</option></select></div>
+                                  </div>
+                                  <footer class="agent-task-detail-footer">
+                                    <div class="agent-task-detail-states">
+                                      <span><small>PROMPT</small><strong id="agent-task-detail-prompt-state">等待选择</strong></span>
+                                      <span><small>ACTION LIMITS</small><strong id="agent-task-detail-action-limits">未配置</strong></span>
+                                    </div>
+                                    <button class="button secondary compact" id="agent-open-task-prompt-button" type="button">编辑此任务 Prompt</button>
+                                  </footer>
+                                </section>
+                              </div>
+                              <small class="field-hint">左侧列表负责选择与调整顺序；右侧集中编辑当前任务的名称、步骤上限、超时和失败策略。</small>
+                            </section>
+                          </section>
+
+                          <section class="agent-prompt-view agent-module-section" id="agent-prompt-view-task" role="tabpanel" aria-labelledby="agent-prompt-tab-task" data-agent-prompt-view="task" hidden>
+                            <header class="agent-module-section-heading"><div><small>TASK INSTRUCTION</small><strong>任务 Prompt</strong><p>逐个维护任务目标、成功证据、禁止动作和异常恢复要求。</p></div></header>
+                            <div class="form-field agent-task-prompt-select-field">
+                              <label for="agent-prompt-task-select">编辑任务 Prompt</label>
+                              <select id="agent-prompt-task-select" aria-label="选择要编辑 Prompt 的任务"></select>
+                            </div>
+                            <div class="agent-task-prompt-editor">
+                              <div class="agent-task-prompt-editor-heading"><span><small id="agent-task-prompt-index">TASK 01</small><strong id="agent-task-prompt-name">任务 1</strong></span><em id="agent-task-prompt-state">Prompt 未填写</em></div>
+                              <div class="form-field">
+                                <label for="agent-task-prompt-input">任务目标 Prompt</label>
+                                <textarea id="agent-task-prompt-input" rows="8" maxlength="6000" spellcheck="false" placeholder="说明本轮需要在手机上完成、持续操作并验证的具体目标"></textarea>
+                              </div>
+                              <div class="form-field">
+                                <label for="agent-task-attention-input">注意事项 <span>可选</span></label>
+                                <textarea id="agent-task-attention-input" rows="4" maxlength="3000" spellcheck="false" placeholder="限定入口、禁止动作、成功证据、异常恢复或厂商差异"></textarea>
+                              </div>
+                              <small>编辑内容会先保留在当前页面；点击下方“保存”后才会用于启动并写入本机模板草稿。</small>
+                            </div>
+                          </section>
+
+                          <section class="agent-prompt-view agent-module-section" id="agent-prompt-view-system" role="tabpanel" aria-labelledby="agent-prompt-tab-system" data-agent-prompt-view="system" hidden>
+                            <header class="agent-module-section-heading"><div><small>SYSTEM POLICY</small><strong>ADB Agent 系统级 Prompt</strong><p id="agent-system-prompt-version">坐标协议、动作边界与安全规则</p></div></header>
+                            <div class="agent-system-prompt-editor">
+                              <textarea id="agent-system-prompt-input" rows="18" maxlength="24000" spellcheck="false" aria-label="ADB Agent System Prompt"></textarea>
+                              <div><small>点击“保存”后，完整 prompt 会用于模板任务和手动临时任务；API Key 不会写入运行记录。</small><button class="button ghost compact" id="agent-reset-system-prompt-button" type="button">恢复默认</button></div>
+                            </div>
+                            <p class="agent-policy-callout"><strong>人工接管边界</strong><span>验证码、账号授权、支付、发送、删除和其他不可逆操作不会由模型自行确认。</span></p>
+                          </section>
                         </div>
-                        <section class="agent-task-editor" aria-labelledby="agent-task-editor-title">
-                          <div class="agent-task-editor-heading">
-                            <div><strong id="agent-task-editor-title">执行顺序与限制</strong><small id="agent-task-count-label">按顺序执行；finish 只完成当前子任务</small></div>
-                            <button class="button ghost compact" id="agent-add-task-button" type="button">＋ 空白任务</button>
-                          </div>
-                          <div class="agent-task-list" id="agent-task-list"></div>
-                          <small class="field-hint">使用卡片右上角按钮调整顺序；每项可修改名称、最大步骤、任务超时和失败策略。</small>
-                        </section>
-                        <div class="form-field agent-task-prompt-select-field">
-                          <label for="agent-prompt-task-select">编辑任务 Prompt</label>
-                          <select id="agent-prompt-task-select" aria-label="选择要编辑 Prompt 的任务"></select>
-                        </div>
-                        <div class="agent-task-prompt-editor">
-                          <div class="agent-task-prompt-editor-heading"><span><small id="agent-task-prompt-index">TASK 01</small><strong id="agent-task-prompt-name">任务 1</strong></span><em id="agent-task-prompt-state">Prompt 未填写</em></div>
-                          <div class="form-field">
-                            <label for="agent-task-prompt-input">任务目标 Prompt</label>
-                            <textarea id="agent-task-prompt-input" rows="8" maxlength="6000" spellcheck="false" placeholder="说明本轮需要在手机上完成、持续操作并验证的具体目标"></textarea>
-                          </div>
-                          <div class="form-field">
-                            <label for="agent-task-attention-input">注意事项 <span>可选</span></label>
-                            <textarea id="agent-task-attention-input" rows="4" maxlength="3000" spellcheck="false" placeholder="限定入口、禁止动作、成功证据、异常恢复或厂商差异"></textarea>
-                          </div>
-                          <small>编辑内容会先保留在当前页面；点击下方“保存”后才会用于启动并写入本机模板草稿。</small>
-                        </div>
-                      </section>
-                      <section class="agent-prompt-view" id="agent-prompt-view-system" role="tabpanel" aria-labelledby="agent-prompt-tab-system" data-agent-prompt-view="system" hidden>
-                        <div class="agent-system-prompt-heading"><div><small>SYSTEM POLICY</small><strong>ADB Agent 系统级 Prompt</strong></div><p id="agent-system-prompt-version">坐标协议、动作边界与安全规则</p></div>
-                        <div class="agent-system-prompt-editor">
-                          <textarea id="agent-system-prompt-input" rows="18" maxlength="24000" spellcheck="false" aria-label="ADB Agent System Prompt"></textarea>
-                          <div><small>点击“保存”后，完整 prompt 会用于模板任务和手动临时任务；API Key 不会写入运行记录。</small><button class="button ghost compact" id="agent-reset-system-prompt-button" type="button">恢复默认</button></div>
-                        </div>
-                        <p class="agent-policy-callout"><strong>人工接管边界</strong><span>验证码、账号授权、支付、发送、删除和其他不可逆操作不会由模型自行确认。</span></p>
-                      </section>
+                        <footer class="agent-prompt-save-bar">
+                          <div><strong>保存后生效</strong><small id="agent-prompt-save-state">当前配置已保存</small></div>
+                          <button class="button primary compact" id="agent-save-prompt-button" type="button">保存</button>
+                        </footer>
+                      </div>
                     </div>
-                    <footer class="agent-prompt-save-bar">
-                      <div><strong>保存后生效</strong><small id="agent-prompt-save-state">当前配置已保存</small></div>
-                      <button class="button primary compact" id="agent-save-prompt-button" type="button">保存</button>
-                    </footer>
                   </section>
                 </div>
 
               </form>
-            </section>
-
-            <section class="panel agent-screen-panel">
-              <div class="panel-heading"><div><small>LIVE OBSERVATION</small><h2>最新 ADB 截图</h2></div><span class="data-source" id="agent-screen-meta">尚未截图</span></div>
-              <div class="agent-phone-stage">
-                <div class="agent-phone-frame">
-                  <img id="agent-screen-image" alt="ADB Agent 最新手机截图" hidden>
-                  <div class="agent-screen-placeholder" id="agent-screen-placeholder"><span>ADB</span><strong>等待第一张截图</strong><small>任务启动后显示模型实际看到的手机画面</small></div>
-                </div>
-              </div>
-              <div class="agent-runtime-stats">
-                <article><small>TASK</small><strong id="agent-task-progress-value">0 / 0</strong><span id="agent-current-task-value">尚未开始</span></article>
-                <article><small>STEP</small><strong id="agent-step-value">0 / 0</strong><span id="agent-phase-value">IDLE</span></article>
-                <article><small>MODEL</small><strong id="agent-model-value">--</strong><span id="agent-latency-value">等待请求</span></article>
-                <article><small>TOKENS</small><strong id="agent-token-value">0 / 0</strong><span>输入 / 输出</span></article>
-                <article><small>ELAPSED</small><strong id="agent-elapsed-value">00:00</strong><span id="agent-device-value">未选择设备</span></article>
-              </div>
-            </section>
-
-            <section class="panel agent-decision-panel">
-              <div class="panel-heading"><div><small>MODEL DECISION</small><h2>最近决策</h2></div><span class="data-source" id="agent-action-state">等待模型</span></div>
-              <div class="agent-decision-grid">
-                <article><small>REASONING</small><p id="agent-reasoning-output">任务启动后显示模型的简短判断。</p></article>
-                <article><small>PHONE ACTION</small><pre id="agent-action-output">--</pre><p id="agent-action-result">尚未执行动作</p></article>
-              </div>
-              <div class="agent-completion-message" id="agent-completion-message" hidden></div>
-            </section>
-
-            <section class="panel agent-task-progress-panel">
-              <div class="panel-heading"><div><small>WORKFLOW PROGRESS</small><h2>子任务执行结果</h2></div><span class="data-source" id="agent-task-progress-summary">尚未启动流程</span></div>
-              <div class="agent-task-results" id="agent-task-results"><div class="agent-log-empty">配置任务后启动流程</div></div>
-              <section class="agent-workflow-report" id="agent-workflow-report" aria-labelledby="agent-workflow-report-title" hidden>
-                <header><div><small>FINAL CHECK SUMMARY</small><strong id="agent-workflow-report-title">统一汇总</strong></div><em id="agent-workflow-report-state">WAITING</em></header>
-                <div class="agent-workflow-report-metrics">
-                  <article><small>完成</small><strong id="agent-workflow-report-completed">0</strong></article>
-                  <article><small>跳过</small><strong id="agent-workflow-report-skipped">0</strong></article>
-                  <article><small>未完成</small><strong id="agent-workflow-report-failed">0</strong></article>
-                  <article><small>未执行</small><strong id="agent-workflow-report-pending">0</strong></article>
-                </div>
-                <div class="agent-workflow-report-reasons"><strong>跳过与未完成原因</strong><ul id="agent-workflow-report-reason-list"></ul></div>
-              </section>
-            </section>
-
-            <section class="panel agent-log-panel">
-              <div class="panel-heading"><div><small>AGENT JOURNAL</small><h2>闭环日志</h2></div><span class="data-source" id="agent-output-directory">运行后保存截图与 events.jsonl</span></div>
-              <div class="agent-log" id="agent-log-output" aria-live="polite"><div class="agent-log-empty">等待任务启动</div></div>
             </section>
           </div>
         </section>

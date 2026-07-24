@@ -18,7 +18,9 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Mapping, Optional, Protocol, Sequence
 
 from .adb_agent import AdbAgentController
+from .adb_agent_prompts import finish_message_contradiction
 from .campaign_config import (
+    ActionRequirementConfig,
     AgentTaskConfig,
     CampaignConfig,
     InstallSetConfig,
@@ -34,7 +36,7 @@ PREPARATION_DEFAULT_PROMPT = """这是正式测试前的设备预备阶段。目
 
 PREPARATION_DEFAULT_ATTENTION = """只处理配置中明确指定的应用和权限。不得登录账号、输入手机号/验证码、实名认证、支付、下单、发送消息、清除数据或操作其他应用；遇到这些边界立即 take_over。"""
 
-TEST_DEFAULT_PROMPT = """这是两小时续航轮次中的实际操作任务。只在当前目标应用内完成可逆、可重复的主功能操作；每次输入后必须用下一张截图确认页面、卡片、棋子或角色状态确实发生变化，再根据当前子任务决定 finish。"""
+TEST_DEFAULT_PROMPT = """这是两小时续航轮次中的实际操作任务。只在当前目标应用内完成可逆、可重复的主功能操作；每次输入后必须用下一张截图确认页面、卡片、棋子或角色状态确实发生变化，再根据当前子任务决定 finish。当前页面处于可安全导航的前置状态时应继续完成最小导航，不能仅因还没到主功能页面就 skip。"""
 
 TEST_DEFAULT_ATTENTION = """不要登录、注册、实名、购买、支付、点赞、评论、关注、发送消息、修改账号或授予任务未声明的敏感权限。离开目标应用、出现验证码或无法判断的风险提示时立即 take_over。"""
 
@@ -145,6 +147,70 @@ def _write_json(path: Path, value: object) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _recording_artifact_evidence(recording_dir: Path) -> dict[str, object]:
+    """Return strict, user-consumable evidence for a completed recording."""
+
+    checkpoint_path = recording_dir / "checkpoint.json"
+    errors: list[str] = []
+    checkpoint: Mapping[str, object] = {}
+    try:
+        decoded = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if isinstance(decoded, Mapping):
+            checkpoint = decoded
+        else:
+            errors.append("checkpoint.json is not a JSON object")
+    except FileNotFoundError:
+        errors.append("checkpoint.json is missing")
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"checkpoint.json is unreadable: {exc}")
+
+    def checkpoint_count(name: str) -> int:
+        try:
+            return max(0, int(checkpoint.get(name) or 0))
+        except (TypeError, ValueError):
+            errors.append(f"checkpoint {name} is not an integer")
+            return 0
+
+    checkpoint_status = str(checkpoint.get("status") or "").strip().lower()
+    sample_count = checkpoint_count("sample_count")
+    if checkpoint_status != "complete":
+        errors.append(
+            f"checkpoint status is {checkpoint_status or 'missing'}, expected complete"
+        )
+    if sample_count <= 0:
+        errors.append("checkpoint sample_count is zero")
+
+    artifact_sizes: dict[str, int] = {}
+    for name in ("samples.csv", "analysis.json", "report.html"):
+        path = recording_dir / name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        artifact_sizes[name] = size
+        if size <= 0:
+            errors.append(f"{name} is missing or empty")
+
+    return {
+        "checkpoint_status": checkpoint_status or "missing",
+        "sample_count": sample_count,
+        "context_count": checkpoint_count("context_count"),
+        "thermal_snapshot_count": checkpoint_count("thermal_snapshot_count"),
+        "reconnect_count": checkpoint_count("reconnect_count"),
+        "stop_reason": str(checkpoint.get("stop_reason") or ""),
+        "artifact_sizes": artifact_sizes,
+        "artifacts_complete": not errors,
+        "artifact_errors": errors,
+    }
+
+
+def _minimum_recording_sample_count(duration_s: float, interval_s: float) -> int:
+    """Require at least 80% of the nominal fixed-interval sample count."""
+
+    expected = max(1, math.floor(max(0.0, duration_s) / max(0.1, interval_s)))
+    return max(1, math.floor(expected * 0.8))
 
 
 class CampaignJournal:
@@ -282,8 +348,9 @@ class AndroidCampaignRunner:
         if result.returncode != 0:
             return None
         patterns = (
-            r"(?:mResumedActivity|ResumedActivity|mFocusedApp)[:=].*?\s([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)",
-            r"topResumedActivity=.*?\s([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)",
+            r"topResumedActivity=.*?\s(?:u\d+\s+)?([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)",
+            r"(?:mResumedActivity|ResumedActivity)[:=].*?\s(?:u\d+\s+)?([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)",
+            r"mFocusedApp[:=].*?\s(?:u\d+\s+)?([A-Za-z0-9_.$]+)/(?:[A-Za-z0-9_.$]+)",
         )
         for pattern in patterns:
             match = re.search(pattern, result.stdout)
@@ -400,7 +467,19 @@ class AndroidCampaignRunner:
             20.0,
         )
 
-    def _launch(self, package: str) -> CommandResult:
+    def _launch(
+        self,
+        package: str,
+        *,
+        force_stop_before_launch: bool = False,
+    ) -> CommandResult:
+        if force_stop_before_launch:
+            stopped = self._adb(
+                ["shell", "am", "force-stop", package],
+                20.0,
+            )
+            if stopped.returncode != 0:
+                return stopped
         return self._adb(
             [
                 "shell",
@@ -433,11 +512,64 @@ class AndroidCampaignRunner:
             20.0,
         )
         actual = get.stdout.strip()
+        fallback: Optional[CommandResult] = None
+        fallback_command: list[str] = []
+        if (
+            put.returncode == 0
+            and get.returncode == 0
+            and not self._setting_matches(setting.value, actual)
+            and setting.namespace == "system"
+        ):
+            if setting.key == "accelerometer_rotation" and setting.value in {"0", "1"}:
+                if setting.value == "0":
+                    rotation_get = self._adb(
+                        ["shell", "settings", "get", "system", "user_rotation"],
+                        20.0,
+                    )
+                    rotation = rotation_get.stdout.strip()
+                    if rotation not in {"0", "1", "2", "3"}:
+                        rotation = "0"
+                    fallback_command = [
+                        "shell",
+                        "cmd",
+                        "window",
+                        "user-rotation",
+                        "lock",
+                        rotation,
+                    ]
+                else:
+                    fallback_command = [
+                        "shell",
+                        "cmd",
+                        "window",
+                        "user-rotation",
+                        "free",
+                    ]
+            elif setting.key == "user_rotation" and setting.value in {"0", "1", "2", "3"}:
+                fallback_command = [
+                    "shell",
+                    "cmd",
+                    "window",
+                    "user-rotation",
+                    "lock",
+                    setting.value,
+                ]
+            if fallback_command:
+                fallback = self._adb(fallback_command, 20.0)
+                get = self._adb(
+                    ["shell", "settings", "get", setting.namespace, setting.key],
+                    20.0,
+                )
+                actual = get.stdout.strip()
         succeeded = (
             put.returncode == 0
+            and (fallback is None or fallback.returncode == 0)
             and get.returncode == 0
             and self._setting_matches(setting.value, actual)
         )
+        errors = [put.stderr, get.stderr]
+        if fallback is not None:
+            errors.append(fallback.stderr)
         return {
             "namespace": setting.namespace,
             "key": setting.key,
@@ -445,7 +577,8 @@ class AndroidCampaignRunner:
             "actual": actual,
             "required": setting.required,
             "succeeded": succeeded,
-            "error": (put.stderr or get.stderr).strip(),
+            "compatibility_fallback": " ".join(fallback_command),
+            "error": "\n".join(value.strip() for value in errors if value.strip()),
         }
 
     @contextmanager
@@ -582,13 +715,30 @@ class AndroidCampaignRunner:
         tasks: Sequence[AgentTaskConfig],
         prompt_prefix: str,
         attention_prefix: str,
+        payload_overrides: Optional[Mapping[str, object]] = None,
+        finish_action_requirements: Sequence[ActionRequirementConfig] = (),
     ) -> dict[str, object]:
+        task_payloads = [
+            task.payload(prompt_prefix, attention_prefix) for task in tasks
+        ]
+        if finish_action_requirements:
+            requirements_payload = [
+                {
+                    "actions": list(requirement.actions),
+                    "minimum": requirement.minimum,
+                    "label": requirement.label,
+                }
+                for requirement in finish_action_requirements
+            ]
+            for task_payload in task_payloads:
+                task_payload["finish_action_requirements"] = requirements_payload
         payload = {
             "device": self.device,
             "workflow_name": workflow_name,
-            "tasks": [task.payload(prompt_prefix, attention_prefix) for task in tasks],
+            "tasks": task_payloads,
         }
         payload.update(self.config.model.payload())
+        payload.update(payload_overrides or {})
         payload.update(self._model_payload_overrides)
         return payload
 
@@ -668,6 +818,11 @@ class AndroidCampaignRunner:
         journal: CampaignJournal,
         *,
         device_offline_grace_s: float,
+        payload_overrides: Optional[Mapping[str, object]] = None,
+        deadline: Optional[float] = None,
+        progress_callback: Optional[Callable[[], None]] = None,
+        allowed_foreground_packages: Optional[Sequence[str]] = None,
+        finish_action_requirements: Sequence[ActionRequirementConfig] = (),
     ) -> dict[str, object]:
         agent = self._agent_factory(self.adb, output_root)
         self._active_agent = agent
@@ -676,9 +831,16 @@ class AndroidCampaignRunner:
             tasks,
             prompt_prefix,
             attention_prefix,
+            payload_overrides,
+            finish_action_requirements,
         )
         offline_grace_s = max(0.0, float(device_offline_grace_s))
         payload["screenshot_retry_timeout_s"] = offline_grace_s
+        allowed_foreground = {
+            str(package).strip()
+            for package in (allowed_foreground_packages or ())
+            if str(package).strip()
+        }
         journal.emit(
             "agent_start",
             workflow_name=workflow_name,
@@ -687,11 +849,34 @@ class AndroidCampaignRunner:
         try:
             state = agent.start(payload)  # type: ignore[attr-defined]
             offline_since: Optional[float] = None
+            next_progress_at = self._clock()
             while bool(state.get("running")):
                 if self._stop_event.is_set():
                     agent.stop()  # type: ignore[attr-defined]
                     break
                 now = self._clock()
+                if progress_callback is not None and now >= next_progress_at:
+                    progress_callback()
+                    next_progress_at = now + 5.0
+                if deadline is not None and now >= deadline:
+                    agent.stop()  # type: ignore[attr-defined]
+                    state = agent.snapshot()  # type: ignore[attr-defined]
+                    compact = self._compact_agent_state(state)
+                    compact.update(
+                        {
+                            "status": "round_deadline",
+                            "running": False,
+                            "message": "two-hour round deadline reached during workflow",
+                        }
+                    )
+                    journal.emit(
+                        "agent_round_deadline",
+                        workflow_name=workflow_name,
+                    )
+                    journal.emit(
+                        "agent_end", workflow_name=workflow_name, state=compact
+                    )
+                    return compact
                 if not self.device_available():
                     if offline_since is None:
                         offline_since = now
@@ -739,7 +924,40 @@ class AndroidCampaignRunner:
                         unavailable_s=max(0.0, now - offline_since),
                     )
                     offline_since = None
-                self._sleep(poll_interval_s)
+                if allowed_foreground:
+                    foreground_package = self._foreground_package()
+                    if (
+                        foreground_package is not None
+                        and foreground_package not in allowed_foreground
+                    ):
+                        agent.stop()  # type: ignore[attr-defined]
+                        state = agent.snapshot()  # type: ignore[attr-defined]
+                        compact = self._compact_agent_state(state)
+                        compact.update(
+                            {
+                                "status": "forbidden_foreground",
+                                "running": False,
+                                "message": (
+                                    "workflow left its allowed foreground packages; "
+                                    f"observed {foreground_package}"
+                                ),
+                                "foreground_package": foreground_package,
+                            }
+                        )
+                        journal.emit(
+                            "agent_forbidden_foreground",
+                            workflow_name=workflow_name,
+                            foreground_package=foreground_package,
+                            allowed_foreground_packages=sorted(allowed_foreground),
+                        )
+                        journal.emit(
+                            "agent_end", workflow_name=workflow_name, state=compact
+                        )
+                        return compact
+                sleep_for = poll_interval_s
+                if deadline is not None:
+                    sleep_for = min(sleep_for, max(0.01, deadline - now))
+                self._sleep(sleep_for)
                 state = agent.snapshot()  # type: ignore[attr-defined]
             state = agent.snapshot()  # type: ignore[attr-defined]
             compact = self._compact_agent_state(state)
@@ -811,17 +1029,34 @@ class AndroidCampaignRunner:
     def _preparation_validation_policy(
         self,
         workflow: WorkflowConfig,
+        *,
+        phase: str = "validation",
     ) -> tuple[str, str]:
+        contract_prompt, contract_attention = self._workflow_contract_policy(workflow)
+        phase_prompt = (
+            "当前是独立初始化阶段，只把应用恢复到契约入口，不执行主功能验证动作。"
+            if phase == "initialization"
+            else "当前是主验证阶段，必须完成本次新的功能动作和动作后证据。"
+        )
         prompt = "\n\n".join(
             part
             for part in (
                 self.config.test.prompt_prefix or TEST_DEFAULT_PROMPT,
                 "这是预备阶段安装和初始化之后的正式流程支持验证。必须按实际测试阶段相同的成功标准完成当前任务，不能只确认应用能够打开。",
                 f"目标应用是 {workflow.name}（{workflow.package}），应用已由宿主启动。",
+                phase_prompt,
+                contract_prompt,
             )
             if part
         )
-        attention = self.config.test.attention_prompt or TEST_DEFAULT_ATTENTION
+        attention = "\n\n".join(
+            part
+            for part in (
+                self.config.test.attention_prompt or TEST_DEFAULT_ATTENTION,
+                contract_attention,
+            )
+            if part
+        )
         return prompt, attention
 
     def _validate_prepared_app(
@@ -873,48 +1108,129 @@ class AndroidCampaignRunner:
                 results.append(result)
                 journal.emit("support_validation_end", result=result)
                 continue
-            launch = self._launch(workflow.package)
+            launch = self._launch(
+                workflow.package,
+                force_stop_before_launch=workflow.force_stop_before_launch,
+            )
             if workflow.launch_wait_s:
                 self._sleep(workflow.launch_wait_s)
-            prompt, attention = self._preparation_validation_policy(workflow)
             journal.emit(
                 "support_validation_start",
                 workflow_id=workflow.workflow_id,
                 package=workflow.package,
             )
-            agent_state = self._run_agent(
-                output_dir,
-                f"prepare-validate-{_slug(workflow.name)}",
-                self._overridden_tasks(workflow.tasks),
-                prompt,
-                attention,
-                self.config.preparation.agent_poll_interval_s,
-                journal,
-                device_offline_grace_s=30.0,
+            initialization_state: dict[str, object] = {}
+            initialization_ok = launch.returncode == 0
+            initialization_agent_complete = True
+            initialization_foreground_package: Optional[str] = None
+            allowed_packages = set(
+                workflow.contract.allowed_foreground_packages
+                or (workflow.package,)
+            )
+            if launch.returncode == 0 and workflow.initialization_tasks:
+                init_prompt, init_attention = self._preparation_validation_policy(
+                    workflow,
+                    phase="initialization",
+                )
+                initialization_state = self._run_agent(
+                    output_dir,
+                    f"prepare-initialize-{_slug(workflow.workflow_id)}",
+                    self._overridden_tasks(workflow.initialization_tasks),
+                    init_prompt,
+                    init_attention,
+                    self.config.preparation.agent_poll_interval_s,
+                    journal,
+                    device_offline_grace_s=30.0,
+                    payload_overrides=self._workflow_payload_overrides(workflow),
+                    allowed_foreground_packages=tuple(allowed_packages),
+                )
+                initialization_agent_complete = self._agent_evidence_complete(
+                    initialization_state
+                )
+                if self.device_available():
+                    initialization_foreground_package = self._foreground_package()
+                initialization_ok = (
+                    initialization_agent_complete
+                    and initialization_foreground_package in allowed_packages
+                )
+            prompt, attention = self._preparation_validation_policy(workflow)
+            agent_state = (
+                self._run_agent(
+                    output_dir,
+                    f"prepare-validate-{_slug(workflow.workflow_id)}",
+                    self._overridden_tasks(workflow.tasks),
+                    prompt,
+                    attention,
+                    self.config.preparation.agent_poll_interval_s,
+                    journal,
+                    device_offline_grace_s=30.0,
+                    payload_overrides=self._workflow_payload_overrides(workflow),
+                    allowed_foreground_packages=tuple(allowed_packages),
+                    finish_action_requirements=workflow.contract.required_actions,
+                )
+                if launch.returncode == 0 and initialization_ok
+                else {}
             )
             agent_status = str(agent_state.get("status") or "")
+            initialization_status = str(initialization_state.get("status") or "")
+            agent_result_complete = self._agent_result_complete(agent_state)
+            completion_claim = self._agent_completion_claim(agent_state)
+            initialization_completion_claim = self._agent_completion_claim(
+                initialization_state
+            )
+            action_evidence = self._agent_action_evidence(agent_state, workflow)
             foreground_package = (
                 self._foreground_package()
                 if self.device_available()
-                and agent_status in {"completed", "completed_with_warnings"}
+                and (agent_status or initialization_state)
                 else None
             )
             foreground_verified = bool(foreground_package)
-            foreground_matches = (
-                not foreground_verified or foreground_package == workflow.package
+            allowed_packages = set(
+                workflow.contract.allowed_foreground_packages
+                or (workflow.package,)
             )
+            foreground_matches = foreground_package in allowed_packages
             effective_status = (
-                "wrong_foreground"
-                if agent_status in {"completed", "completed_with_warnings"}
-                and foreground_verified
-                and not foreground_matches
-                else agent_status
+                "launch_failed"
+                if launch.returncode != 0
+                else "device_unavailable"
+                if initialization_status == "device_unavailable"
+                else "take_over"
+                if initialization_status == "take_over"
+                else "forbidden_foreground"
+                if initialization_status == "forbidden_foreground"
+                else "wrong_foreground"
+                if workflow.initialization_tasks
+                and initialization_agent_complete
+                and initialization_foreground_package not in allowed_packages
+                else "initialization_failed"
+                if not initialization_ok
+                else "forbidden_foreground"
+                if agent_status == "forbidden_foreground"
+                else "wrong_foreground"
+                if foreground_verified and not foreground_matches
+                else "contradicted_completion_claim"
+                if agent_result_complete
+                and completion_claim["satisfied"] is not True
+                else "foreground_unverified"
+                if self._agent_evidence_complete(agent_state) and not foreground_verified
+                else "incomplete_action_evidence"
+                if self._agent_evidence_complete(agent_state)
+                and action_evidence["satisfied"] is not True
+                else (
+                    "incomplete_evidence"
+                    if agent_status == "completed_with_warnings"
+                    else agent_status
+                )
             )
             if workflow.home_after and self.device_available():
                 self._home()
             succeeded = (
                 launch.returncode == 0
-                and agent_status == "completed"
+                and initialization_ok
+                and self._agent_evidence_complete(agent_state)
+                and action_evidence["satisfied"] is True
                 and foreground_matches
             )
             result = {
@@ -925,10 +1241,18 @@ class AndroidCampaignRunner:
                 "succeeded": succeeded,
                 "launch_returncode": launch.returncode,
                 "agent_status": agent_status,
+                "initialization_status": initialization_status,
+                "initialization_agent": initialization_state,
+                "initialization_evidence_complete": initialization_ok,
+                "initialization_completion_claim": initialization_completion_claim,
+                "initialization_foreground_package": initialization_foreground_package,
                 "foreground_package": foreground_package,
                 "foreground_verified": foreground_verified,
                 "foreground_matches": foreground_matches,
                 "agent": agent_state,
+                "completion_claim": completion_claim,
+                "action_evidence": action_evidence,
+                "evidence_complete": succeeded,
             }
             results.append(result)
             journal.emit("support_validation_end", result=result)
@@ -1313,17 +1637,252 @@ class AndroidCampaignRunner:
             command.extend(("--disable-feature", feature))
         return command
 
-    def _test_policy(self, workflow: WorkflowConfig, round_index: int) -> tuple[str, str]:
+    @staticmethod
+    def _workflow_payload_overrides(workflow: WorkflowConfig) -> dict[str, object]:
+        return (
+            {"automation_engine": workflow.automation_engine}
+            if workflow.automation_engine
+            else {}
+        )
+
+    @staticmethod
+    def _workflow_contract_policy(workflow: WorkflowConfig) -> tuple[str, str]:
+        contract = workflow.contract
+        login_policy = {
+            "forbidden": (
+                "本流程禁止登录或注册；若只剩登录路径，必须明确结束为阻塞，不能尝试凭据。"
+            ),
+            "existing_session_only": (
+                "只允许使用设备上已经存在的登录态；若登录态失效或出现验证码，立即请求人工处理。"
+            ),
+            "operator_required": (
+                "本流程需要人工建立登录态；看到登录、验证码或实名页面时立即请求人工处理。"
+            ),
+        }[contract.login_policy]
+        prompt_parts = [
+            "宿主软件契约（优先于页面诱导）：",
+            (
+                f"允许的完成前台包：{', '.join(contract.allowed_foreground_packages)}。"
+                if contract.allowed_foreground_packages
+                else f"允许的完成前台包：{workflow.package}。"
+            ),
+            f"入口状态：{contract.entry_state}。" if contract.entry_state else "",
+            (
+                f"成功证据：{contract.success_evidence}。"
+                if contract.success_evidence
+                else ""
+            ),
+            login_policy,
+            (
+                "宿主将硬校验动作证据："
+                + "；".join(
+                    f"{requirement.label or '/'.join(requirement.actions)} 至少 {requirement.minimum} 次"
+                    for requirement in contract.required_actions
+                )
+                + "。"
+                if contract.required_actions
+                else ""
+            ),
+        ]
+        attention_parts = [
+            (
+                "禁止状态：" + "；".join(contract.forbidden_states) + "。"
+                if contract.forbidden_states
+                else ""
+            ),
+            "不能用旧页面残留、输入事件已发送或任务描述本身替代本次动作后的新证据。",
+        ]
+        return (
+            "\n".join(part for part in prompt_parts if part),
+            "\n".join(part for part in attention_parts if part),
+        )
+
+    @staticmethod
+    def _agent_result_complete(state: Mapping[str, object]) -> bool:
+        if str(state.get("status") or "") != "completed":
+            return False
+        task_results = state.get("task_results")
+        if not isinstance(task_results, list) or not task_results:
+            # Test doubles and older Agent implementations may not expose task
+            # details. A clean top-level completion remains backwards compatible.
+            return True
+        return all(
+            isinstance(item, Mapping)
+            and str(item.get("status") or "") == "completed"
+            for item in task_results
+        )
+
+    @staticmethod
+    def _agent_completion_claim(state: Mapping[str, object]) -> dict[str, object]:
+        """Reject a model's ``finish`` when its own message reports failure."""
+
+        messages: list[str] = []
+        task_results = state.get("task_results")
+        if isinstance(task_results, list):
+            for item in task_results:
+                if not isinstance(item, Mapping):
+                    continue
+                message = str(item.get("message") or "").strip()
+                if message and message not in messages:
+                    messages.append(message)
+        latest_action = state.get("latest_action")
+        if (
+            isinstance(latest_action, Mapping)
+            and str(latest_action.get("action") or "").strip().lower() == "finish"
+        ):
+            message = str(latest_action.get("message") or "").strip()
+            if message and message not in messages:
+                messages.append(message)
+        contradictions = [
+            {"message": message, "reason": reason}
+            for message in messages
+            if (reason := finish_message_contradiction(message))
+        ]
+        return {
+            "satisfied": not contradictions,
+            "messages": messages,
+            "contradictions": contradictions,
+        }
+
+    @classmethod
+    def _agent_evidence_complete(cls, state: Mapping[str, object]) -> bool:
+        return (
+            cls._agent_result_complete(state)
+            and cls._agent_completion_claim(state)["satisfied"] is True
+        )
+
+    @staticmethod
+    def _agent_action_evidence(
+        state: Mapping[str, object],
+        workflow: WorkflowConfig,
+    ) -> dict[str, object]:
+        requirements = workflow.contract.required_actions
+        counts: dict[str, int] = {}
+        events_path = Path(str(state.get("output_dir") or "")) / "events.jsonl"
+        if requirements:
+            try:
+                lines = events_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, Mapping) or event.get("event_type") != "action":
+                    continue
+                if event.get("action_valid") is False:
+                    continue
+                action = event.get("action")
+                if not isinstance(action, Mapping):
+                    continue
+                action_name = str(action.get("action") or "")
+                if action_name:
+                    counts[action_name] = counts.get(action_name, 0) + 1
+        checks = [
+            {
+                "label": requirement.label or "/".join(requirement.actions),
+                "actions": list(requirement.actions),
+                "minimum": requirement.minimum,
+                "observed": sum(counts.get(action, 0) for action in requirement.actions),
+            }
+            for requirement in requirements
+        ]
+        for check in checks:
+            check["satisfied"] = check["observed"] >= check["minimum"]
+        return {
+            "satisfied": all(check["satisfied"] for check in checks),
+            "counts": counts,
+            "requirements": checks,
+            "events_path": str(events_path) if requirements else "",
+        }
+
+    @staticmethod
+    def _workflow_status_counts(
+        results: Sequence[Mapping[str, object]],
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for result in results:
+            status = str(result.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    def _round_coverage(
+        self,
+        results: Sequence[Mapping[str, object]],
+        available_workflow_ids: set[str],
+        quarantined: Mapping[str, str],
+    ) -> dict[str, object]:
+        ordered = self._ordered_test_workflows()
+        required_ids = {
+            workflow.workflow_id
+            for workflow in ordered
+            if workflow.required and workflow.workflow_id in available_workflow_ids
+        }
+        attempted_ids = {
+            str(result.get("workflow_id") or "")
+            for result in results
+            if str(result.get("workflow_id") or "") in available_workflow_ids
+        }
+        successful_ids = {
+            str(result.get("workflow_id") or "")
+            for result in results
+            if result.get("evidence_complete") is True
+            and str(result.get("workflow_id") or "") in available_workflow_ids
+        }
+        available_count = len(available_workflow_ids)
+        return {
+            "configured_count": len(ordered),
+            "available_count": available_count,
+            "attempted_count": len(attempted_ids),
+            "successful_count": len(successful_ids),
+            "successful_ratio": (
+                len(successful_ids) / available_count if available_count else 1.0
+            ),
+            "required_count": len(required_ids),
+            "required_successful_count": len(required_ids & successful_ids),
+            "all_available_attempted": attempted_ids >= available_workflow_ids,
+            "all_available_completed": successful_ids >= available_workflow_ids,
+            "all_required_completed": successful_ids >= required_ids,
+            "successful_workflow_ids": sorted(successful_ids),
+            "quarantined": dict(quarantined),
+            "status_counts": self._workflow_status_counts(results),
+        }
+
+    def _test_policy(
+        self,
+        workflow: WorkflowConfig,
+        round_index: int,
+        *,
+        phase: str = "validation",
+    ) -> tuple[str, str]:
+        contract_prompt, contract_attention = self._workflow_contract_policy(workflow)
+        phase_prompt = (
+            "当前是独立初始化阶段：只把应用恢复到软件契约的确定入口，不执行主验证动作。"
+            if phase == "initialization"
+            else (
+                "当前是主验证阶段：宿主已单独完成配置中的初始化。必须执行并验证本次新的主功能动作；"
+                "若仍看到可安全处理的普通前置页，先做最小修正，不能直接 skip。"
+            )
+        )
         prompt = "\n\n".join(
             part
             for part in (
                 self.config.test.prompt_prefix or TEST_DEFAULT_PROMPT,
                 f"当前是第 {round_index} 个两小时轮次，目标应用是 {workflow.name}（{workflow.package}）。",
-                "应用已由宿主启动；只完成当前任务卡要求的操作。",
+                phase_prompt,
+                contract_prompt,
             )
             if part
         )
-        attention = self.config.test.attention_prompt or TEST_DEFAULT_ATTENTION
+        attention = "\n\n".join(
+            part
+            for part in (
+                self.config.test.attention_prompt or TEST_DEFAULT_ATTENTION,
+                contract_attention,
+            )
+            if part
+        )
         return prompt, attention
 
     def _wait_recorder(self, recorder: RecorderProcess, timeout_s: float) -> Optional[int]:
@@ -1381,6 +1940,7 @@ class AndroidCampaignRunner:
             "exit_code": exit_code,
             "terminated": terminated,
             "output_dir": str(recording_dir),
+            **_recording_artifact_evidence(recording_dir),
         }
 
     @staticmethod
@@ -1472,15 +2032,98 @@ class AndroidCampaignRunner:
         )
         started = self._clock()
         deadline = started + self.config.test.cycle_duration_s
+        ordered_workflows = self._ordered_test_workflows()
         workflow_results: list[dict[str, object]] = []
         disabled_workflows: set[str] = set()
         attempted_workflows: set[str] = set()
+        successful_workflows: set[str] = set()
+        failure_counts: dict[str, int] = {}
+        cooldown_until: dict[str, float] = {}
+        quarantined: dict[str, str] = {}
         workflow_index = 0
         offline_since: Optional[float] = None
         device_unavailable = False
         record_failed = False
         interaction_failed = False
         workflow_pass_complete = False
+
+        package_available = {
+            workflow.workflow_id: self.package_installed(workflow.package)
+            for workflow in ordered_workflows
+        }
+        available_workflow_ids = {
+            workflow_id
+            for workflow_id, available in package_available.items()
+            if available
+        }
+        for workflow in ordered_workflows:
+            if package_available[workflow.workflow_id]:
+                continue
+            disabled_workflows.add(workflow.workflow_id)
+            result = {
+                "workflow_id": workflow.workflow_id,
+                "name": workflow.name,
+                "package": workflow.package,
+                "status": "missing",
+                "required": workflow.required,
+                "evidence_complete": False,
+            }
+            workflow_results.append(result)
+            journal.emit("workflow_end", round_index=round_index, result=result)
+
+        def persist_progress(
+            phase: str,
+            current_workflow: Optional[WorkflowConfig] = None,
+        ) -> None:
+            now = self._clock()
+            coverage = self._round_coverage(
+                workflow_results,
+                available_workflow_ids,
+                quarantined,
+            )
+            recent_results = [
+                {
+                    "workflow_id": result.get("workflow_id"),
+                    "status": result.get("status"),
+                    "evidence_complete": result.get("evidence_complete", False),
+                    "attempt": result.get("attempt"),
+                }
+                for result in workflow_results[-50:]
+            ]
+            progress = {
+                "stage": "test",
+                "status": "running",
+                "campaign_id": self.config.campaign_id,
+                "device": self.device,
+                "output_dir": str(campaign_dir),
+                "round_index": round_index,
+                "round_dir": str(round_dir),
+                "phase": phase,
+                "current_workflow": (
+                    {
+                        "id": current_workflow.workflow_id,
+                        "name": current_workflow.name,
+                        "package": current_workflow.package,
+                    }
+                    if current_workflow is not None
+                    else None
+                ),
+                "round_elapsed_s": max(0.0, now - started),
+                "round_remaining_s": max(0.0, deadline - now),
+                "coverage": coverage,
+                "failure_counts": dict(failure_counts),
+                "cooldown_workflow_ids": sorted(
+                    workflow_id
+                    for workflow_id, until in cooldown_until.items()
+                    if until > now
+                ),
+                "recent_workflow_results": recent_results,
+                "updated_at": time.time(),
+            }
+            journal.state(**progress)
+            _write_json(round_dir / "round-progress.json", progress)
+
+        persist_progress("recording_start_delay")
 
         if self.config.test.recording_start_delay_s:
             delay_deadline = min(
@@ -1527,41 +2170,38 @@ class AndroidCampaignRunner:
                     )
                     break
 
-            enabled = [
-                workflow
-                for workflow in self._ordered_test_workflows()
-                if workflow.workflow_id not in disabled_workflows
-                and (
+            selected: Optional[WorkflowConfig] = None
+            for offset in range(len(ordered_workflows)):
+                candidate_index = (workflow_index + offset) % len(ordered_workflows)
+                candidate = ordered_workflows[candidate_index]
+                workflow_id = candidate.workflow_id
+                if workflow_id in disabled_workflows:
+                    continue
+                if not package_available[workflow_id]:
+                    continue
+                if not self.repeat_workflows and workflow_id in attempted_workflows:
+                    continue
+                if (
                     self.repeat_workflows
-                    or workflow.workflow_id not in attempted_workflows
-                )
-            ]
-            if not enabled:
+                    and not candidate.repeat_after_success
+                    and workflow_id in successful_workflows
+                ):
+                    continue
+                if cooldown_until.get(workflow_id, 0.0) > now:
+                    continue
+                selected = candidate
+                workflow_index = (candidate_index + 1) % len(ordered_workflows)
+                break
+            if selected is None:
                 if not self.repeat_workflows:
                     workflow_pass_complete = True
                     break
+                persist_progress("waiting_for_retry")
                 self._sleep(self.config.test.device_poll_interval_s)
                 continue
-            workflow = (
-                enabled[workflow_index % len(enabled)]
-                if self.repeat_workflows
-                else enabled[0]
-            )
-            workflow_index += 1
+            workflow = selected
             attempted_workflows.add(workflow.workflow_id)
-            if not self.package_installed(workflow.package):
-                result = {
-                    "workflow_id": workflow.workflow_id,
-                    "name": workflow.name,
-                    "package": workflow.package,
-                    "status": "missing",
-                    "required": workflow.required,
-                }
-                disabled_workflows.add(workflow.workflow_id)
-                workflow_results.append(result)
-                journal.emit("workflow_end", round_index=round_index, result=result)
-                continue
-
+            persist_progress("ensuring_interactive", workflow)
             interaction = self._ensure_interactive()
             journal.emit(
                 "interaction_ready",
@@ -1584,55 +2224,200 @@ class AndroidCampaignRunner:
                 )
                 break
 
-            launch = self._launch(workflow.package)
+            launch = self._launch(
+                workflow.package,
+                force_stop_before_launch=workflow.force_stop_before_launch,
+            )
             if workflow.launch_wait_s:
                 self._sleep(workflow.launch_wait_s)
-            prompt, attention = self._test_policy(workflow, round_index)
-            agent_state = self._run_agent(
-                round_dir,
-                f"round-{round_index:04d}-{_slug(workflow.name)}",
-                self._overridden_tasks(workflow.tasks),
-                prompt,
-                attention,
-                self.config.test.agent_poll_interval_s,
-                journal,
-                device_offline_grace_s=self.config.test.offline_grace_s,
+            payload_overrides = self._workflow_payload_overrides(workflow)
+            initialization_state: dict[str, object] = {}
+            initialization_evidence_complete = not workflow.initialization_tasks
+            initialization_agent_complete = not workflow.initialization_tasks
+            initialization_foreground_package: Optional[str] = None
+            allowed_packages = set(
+                workflow.contract.allowed_foreground_packages
+                or (workflow.package,)
             )
+            if launch.returncode == 0 and workflow.initialization_tasks:
+                persist_progress("initializing", workflow)
+                init_prompt, init_attention = self._test_policy(
+                    workflow,
+                    round_index,
+                    phase="initialization",
+                )
+                initialization_state = self._run_agent(
+                    round_dir,
+                    f"round-{round_index:04d}-{_slug(workflow.workflow_id)}-initialize",
+                    self._overridden_tasks(workflow.initialization_tasks),
+                    init_prompt,
+                    init_attention,
+                    self.config.test.agent_poll_interval_s,
+                    journal,
+                    device_offline_grace_s=self.config.test.offline_grace_s,
+                    payload_overrides=payload_overrides,
+                    deadline=deadline,
+                    progress_callback=lambda: persist_progress(
+                        "initializing", workflow
+                    ),
+                    allowed_foreground_packages=tuple(allowed_packages),
+                )
+                initialization_agent_complete = self._agent_evidence_complete(
+                    initialization_state
+                )
+                if self.device_available():
+                    initialization_foreground_package = self._foreground_package()
+                initialization_evidence_complete = (
+                    initialization_agent_complete
+                    and initialization_foreground_package in allowed_packages
+                )
+
+            agent_state: dict[str, object] = {}
+            if launch.returncode == 0 and initialization_evidence_complete:
+                persist_progress("validating", workflow)
+                prompt, attention = self._test_policy(workflow, round_index)
+                agent_state = self._run_agent(
+                    round_dir,
+                    f"round-{round_index:04d}-{_slug(workflow.workflow_id)}-validate",
+                    self._overridden_tasks(workflow.tasks),
+                    prompt,
+                    attention,
+                    self.config.test.agent_poll_interval_s,
+                    journal,
+                    device_offline_grace_s=self.config.test.offline_grace_s,
+                    payload_overrides=payload_overrides,
+                    deadline=deadline,
+                    progress_callback=lambda: persist_progress(
+                        "validating", workflow
+                    ),
+                    allowed_foreground_packages=tuple(allowed_packages),
+                    finish_action_requirements=workflow.contract.required_actions,
+                )
             agent_status = str(agent_state.get("status") or "")
             foreground_package = (
                 self._foreground_package()
                 if self.device_available()
-                and agent_status in {"completed", "completed_with_warnings"}
+                and agent_state
                 else None
             )
             foreground_verified = bool(foreground_package)
-            foreground_matches = (
-                not foreground_verified or foreground_package == workflow.package
+            foreground_matches = foreground_package in allowed_packages
+            agent_result_complete = self._agent_result_complete(agent_state)
+            completion_claim = self._agent_completion_claim(agent_state)
+            initialization_completion_claim = self._agent_completion_claim(
+                initialization_state
             )
+            agent_status_complete = self._agent_evidence_complete(agent_state)
+            action_evidence = self._agent_action_evidence(agent_state, workflow)
+            agent_evidence_complete = (
+                agent_status_complete and action_evidence["satisfied"] is True
+            )
+            initialization_status = str(initialization_state.get("status") or "")
             effective_status = (
-                "wrong_foreground"
+                "launch_failed"
+                if launch.returncode != 0
+                else "device_unavailable"
+                if initialization_status == "device_unavailable"
+                else "take_over"
+                if initialization_status == "take_over"
+                else "forbidden_foreground"
+                if initialization_status == "forbidden_foreground"
+                else "wrong_foreground"
+                if workflow.initialization_tasks
+                and initialization_agent_complete
+                and initialization_foreground_package not in allowed_packages
+                else "initialization_failed"
+                if not initialization_evidence_complete
+                else "device_unavailable"
+                if agent_status == "device_unavailable"
+                else "take_over"
+                if agent_status == "take_over"
+                else "forbidden_foreground"
+                if agent_status == "forbidden_foreground"
+                else "wrong_foreground"
+                if foreground_verified and not foreground_matches
+                else "contradicted_completion_claim"
+                if agent_result_complete
+                and completion_claim["satisfied"] is not True
+                else "foreground_unverified"
+                if agent_status_complete and not foreground_verified
+                else "incomplete_action_evidence"
+                if agent_status_complete and action_evidence["satisfied"] is not True
+                else "completed"
+                if agent_evidence_complete and foreground_matches
+                else "incomplete_evidence"
                 if agent_status in {"completed", "completed_with_warnings"}
-                and foreground_verified
-                and not foreground_matches
-                else agent_status
+                else agent_status or "error"
             )
+            evidence_complete = effective_status == "completed"
             if workflow.home_after and self.device_available():
                 self._home()
+            attempt = 1 + sum(
+                str(item.get("workflow_id") or "") == workflow.workflow_id
+                for item in workflow_results
+            )
             result = {
                 "workflow_id": workflow.workflow_id,
                 "name": workflow.name,
                 "package": workflow.package,
                 "required": workflow.required,
+                "attempt": attempt,
+                "automation_engine": (
+                    workflow.automation_engine
+                    or self.config.model.automation_engine
+                ),
                 "launch_returncode": launch.returncode,
                 "status": effective_status,
                 "agent_status": agent_status,
+                "initialization_status": initialization_status,
+                "initialization_evidence_complete": initialization_evidence_complete,
+                "initialization_completion_claim": initialization_completion_claim,
+                "initialization_foreground_package": initialization_foreground_package,
+                "initialization_agent": initialization_state,
                 "foreground_package": foreground_package,
                 "foreground_verified": foreground_verified,
                 "foreground_matches": foreground_matches,
                 "agent": agent_state,
+                "completion_claim": completion_claim,
+                "action_evidence": action_evidence,
+                "evidence_complete": evidence_complete,
             }
             workflow_results.append(result)
             journal.emit("workflow_end", round_index=round_index, result=result)
+            if evidence_complete:
+                successful_workflows.add(workflow.workflow_id)
+                failure_counts[workflow.workflow_id] = 0
+                cooldown_until.pop(workflow.workflow_id, None)
+            else:
+                failure_count = failure_counts.get(workflow.workflow_id, 0) + 1
+                failure_counts[workflow.workflow_id] = failure_count
+                terminal_failure = effective_status in {
+                    "take_over",
+                    "forbidden_foreground",
+                    "wrong_foreground",
+                    "foreground_unverified",
+                }
+                if terminal_failure or failure_count >= workflow.quarantine_after_failures:
+                    disabled_workflows.add(workflow.workflow_id)
+                    quarantined[workflow.workflow_id] = effective_status
+                    journal.emit(
+                        "workflow_quarantined",
+                        round_index=round_index,
+                        workflow_id=workflow.workflow_id,
+                        reason=effective_status,
+                        failure_count=failure_count,
+                    )
+                else:
+                    retry_at = self._clock() + workflow.retry_cooldown_s
+                    cooldown_until[workflow.workflow_id] = retry_at
+                    journal.emit(
+                        "workflow_cooldown",
+                        round_index=round_index,
+                        workflow_id=workflow.workflow_id,
+                        reason=effective_status,
+                        failure_count=failure_count,
+                        cooldown_s=workflow.retry_cooldown_s,
+                    )
             if effective_status in {"take_over", "wrong_foreground"}:
                 disabled_workflows.add(workflow.workflow_id)
                 journal.emit(
@@ -1641,7 +2426,8 @@ class AndroidCampaignRunner:
                     workflow_id=workflow.workflow_id,
                     reason=effective_status,
                 )
-            if agent_state.get("status") == "device_unavailable":
+            persist_progress("workflow_complete", workflow)
+            if effective_status == "device_unavailable":
                 device_unavailable = True
                 break
             idle_deadline = min(deadline, self._clock() + workflow.idle_after_s)
@@ -1653,6 +2439,8 @@ class AndroidCampaignRunner:
                     )
                 )
 
+        active_finished = self._clock()
+        persist_progress("finalizing_recording")
         record_result = self._finalize_recorder(
             recorder,
             recording_dir,
@@ -1664,6 +2452,66 @@ class AndroidCampaignRunner:
                 or self._stop_event.is_set()
             ),
         )
+        coverage = self._round_coverage(
+            workflow_results,
+            available_workflow_ids,
+            quarantined,
+        )
+        active_duration_s = max(0.0, active_finished - started)
+        duration_reached = active_finished >= deadline
+        duration_requirement_met = duration_reached or workflow_pass_complete
+        minimum_recording_samples = _minimum_recording_sample_count(
+            active_duration_s,
+            self.config.test.recording.interval_s,
+        )
+        recording_sample_coverage_ok = (
+            not record_result.get("enabled")
+            or int(record_result.get("sample_count") or 0)
+            >= minimum_recording_samples
+        )
+        recording_ok = (
+            not record_result.get("enabled")
+            or (
+                record_result.get("exit_code") == 0
+                and record_result.get("terminated") is not True
+                and record_result.get("artifacts_complete") is True
+                and recording_sample_coverage_ok
+            )
+        )
+        no_operator_takeover = not any(
+            str(item.get("status") or "") == "take_over"
+            for item in workflow_results
+        )
+        acceptance = {
+            "passed": bool(
+                duration_requirement_met
+                and recording_ok
+                and coverage["all_available_completed"]
+                and coverage["all_required_completed"]
+                and no_operator_takeover
+                and not quarantined
+                and not device_unavailable
+                and not interaction_failed
+                and not record_failed
+                and not self._stop_event.is_set()
+            ),
+            "duration_reached": duration_reached,
+            "duration_requirement_met": duration_requirement_met,
+            "recording_ok": recording_ok,
+            "recording_artifacts_complete": (
+                not record_result.get("enabled")
+                or record_result.get("artifacts_complete") is True
+            ),
+            "recording_sample_coverage_ok": recording_sample_coverage_ok,
+            "recording_sample_count": int(record_result.get("sample_count") or 0),
+            "minimum_recording_sample_count": (
+                minimum_recording_samples if record_result.get("enabled") else 0
+            ),
+            "all_available_completed": coverage["all_available_completed"],
+            "all_required_completed": coverage["all_required_completed"],
+            "agent_only": no_operator_takeover,
+            "no_quarantined_workflows": not quarantined,
+        }
         status = (
             "device_unavailable"
             if device_unavailable
@@ -1674,20 +2522,28 @@ class AndroidCampaignRunner:
             else "stopped"
             if self._stop_event.is_set()
             else "completed"
+            if acceptance["passed"]
+            else "completed_with_warnings"
         )
         result = {
             "round_index": round_index,
             "status": status,
             "round_dir": str(round_dir),
             "duration_s": max(0.0, self._clock() - started),
+            "active_duration_s": active_duration_s,
             "workflow_results": workflow_results,
             "recording": record_result,
+            "coverage": coverage,
+            "acceptance": acceptance,
+            "quarantined_workflows": dict(quarantined),
+            "failure_counts": dict(failure_counts),
             "device_unavailable": device_unavailable,
             "interaction_failed": interaction_failed,
             "record_failed": record_failed,
             "workflow_pass_complete": workflow_pass_complete,
         }
         _write_json(round_dir / "round-summary.json", result)
+        _write_json(round_dir / "round-progress.json", result)
         journal.emit("round_end", result=result)
         return result
 
@@ -1711,8 +2567,33 @@ class AndroidCampaignRunner:
                     "name": workflow.name,
                     "package": workflow.package,
                     "required": workflow.required,
+                    "automation_engine": (
+                        workflow.automation_engine
+                        or self.config.model.automation_engine
+                    ),
+                    "initialization_task_count": len(workflow.initialization_tasks),
                     "task_count": len(workflow.tasks),
                     "idle_after_s": workflow.idle_after_s,
+                    "quarantine_after_failures": workflow.quarantine_after_failures,
+                    "retry_cooldown_s": workflow.retry_cooldown_s,
+                    "contract": {
+                        "entry_state": workflow.contract.entry_state,
+                        "success_evidence": workflow.contract.success_evidence,
+                        "forbidden_states": list(workflow.contract.forbidden_states),
+                        "login_policy": workflow.contract.login_policy,
+                        "allowed_foreground_packages": list(
+                            workflow.contract.allowed_foreground_packages
+                            or (workflow.package,)
+                        ),
+                        "required_actions": [
+                            {
+                                "actions": list(requirement.actions),
+                                "minimum": requirement.minimum,
+                                "label": requirement.label,
+                            }
+                            for requirement in workflow.contract.required_actions
+                        ],
+                    },
                 }
                 for workflow in self._ordered_test_workflows()
             ],
@@ -1813,6 +2694,16 @@ class AndroidCampaignRunner:
                     pass
                 self._active_recorder = None
 
+        accepted_rounds = sum(
+            isinstance(round_result.get("acceptance"), Mapping)
+            and round_result["acceptance"].get("passed") is True
+            for round_result in rounds
+        )
+        strict_acceptance = {
+            "passed": bool(rounds) and accepted_rounds == len(rounds),
+            "round_count": len(rounds),
+            "accepted_round_count": accepted_rounds,
+        }
         result = {
             "stage": "test",
             "campaign_id": self.config.campaign_id,
@@ -1822,6 +2713,7 @@ class AndroidCampaignRunner:
             "output_dir": str(campaign_dir),
             "round_count": len(rounds),
             "rounds": rounds,
+            "acceptance": strict_acceptance,
             "repeat_workflows": self.repeat_workflows,
             "interaction": interaction,
             "missing_required_packages": missing_required_packages,

@@ -8,7 +8,12 @@ import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from mobile_profiler.campaign import AndroidCampaignRunner, CommandResult
+from mobile_profiler.campaign import (
+    AndroidCampaignRunner,
+    CommandResult,
+    _minimum_recording_sample_count,
+    _recording_artifact_evidence,
+)
 from mobile_profiler.campaign_controller import CampaignController
 from mobile_profiler.campaign_config import (
     AgentTaskConfig,
@@ -217,7 +222,75 @@ class CampaignConfigTests(unittest.TestCase):
             "tencent-map-pan",
             {item.workflow_id for item in config.test.workflows},
         )
-
+        workflows = {item.workflow_id: item for item in config.test.workflows}
+        dungeon = workflows["shattered-pixel-dungeon-move"]
+        self.assertEqual(dungeon.automation_engine, "vision")
+        self.assertEqual(dungeon.initialization_tasks[0].task_id, "dungeon-map-ready")
+        self.assertIn("英雄", dungeon.contract.entry_state)
+        self.assertEqual(
+            dungeon.contract.allowed_foreground_packages,
+            ("com.shatteredpixel.shatteredpixeldungeon",),
+        )
+        self.assertEqual(
+            workflows["opencalculator-arithmetic"].automation_engine,
+            "hybrid",
+        )
+        self.assertEqual(
+            workflows["fossify-calculator-arithmetic"].automation_engine,
+            "hybrid",
+        )
+        quark = workflows["quark-search-editor-roundtrip"]
+        self.assertNotIn("input_text", {
+            action
+            for requirement in quark.contract.required_actions
+            for action in requirement.actions
+        })
+        self.assertIn("软键盘", quark.contract.success_evidence)
+        material = workflows["material-files-directory-roundtrip"]
+        self.assertEqual(
+            material.tasks[0].action_limits[0].actions,
+            ("tap", "tap_element"),
+        )
+        self.assertEqual(material.tasks[0].action_limits[0].maximum, 1)
+        self.assertEqual(material.tasks[0].action_limits[1].actions, ("back",))
+        self.assertIn(
+            "back",
+            material.initialization_tasks[0].action_limits[0].actions,
+        )
+        self.assertEqual(material.initialization_tasks[0].action_limits[0].maximum, 0)
+        self.assertEqual(
+            workflows["minesweeper-compose-reveal"].automation_engine,
+            "hybrid",
+        )
+        self.assertEqual(
+            workflows["star-rail-safe-camera"].contract.login_policy,
+            "existing_session_only",
+        )
+        self.assertTrue(workflows["sgtpuzzles-light-up-toggle"].repeat_after_success)
+        self.assertEqual(
+            workflows["sgtpuzzles-light-up-toggle"].tasks[0].action_limits[0].maximum,
+            3,
+        )
+        self.assertEqual(
+            workflows["super-snake-turn"].tasks[0].action_limits[0].maximum,
+            2,
+        )
+        for workflow_id in (
+            "baidu-public-feed",
+            "zhihu-public-feed",
+            "tencent-news-public-feed",
+            "sohu-news-public-feed",
+            "bilibili-public-feed",
+            "xiaohongshu-public-feed",
+        ):
+            task = workflows[workflow_id].tasks[0]
+            self.assertIn('"start":[500,800]', task.prompt)
+            self.assertEqual(task.action_limits[0].actions, ("swipe", "swipe_fast"))
+            self.assertEqual(task.action_limits[0].maximum, 2)
+        fossil = workflows["fossify-calculator-arithmetic"].tasks[0]
+        self.assertEqual(fossil.action_limits[2].maximum, 4)
+        self.assertEqual(fossil.action_limits[2].maximum_per_signature, 1)
+        self.assertFalse(workflows["star-rail-safe-camera"].repeat_after_success)
     def test_campaign_recording_allows_external_power_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -266,6 +339,20 @@ class CampaignConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not allowlisted"):
                 load_campaign_config(write_config(root, data))
 
+    def test_unknown_required_action_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config()
+            data["test"]["workflows"][0]["contract"] = {
+                "required_actions": [
+                    {"actions": ["shell"], "minimum": 1}
+                ]
+            }
+
+            with self.assertRaisesRegex(ValueError, "unknown actions: shell"):
+                load_campaign_config(write_config(root, data))
+
     def test_cli_parser_exposes_independent_prepare_and_test_commands(self) -> None:
         parser = build_parser()
         prepare = parser.parse_args(
@@ -280,6 +367,266 @@ class CampaignConfigTests(unittest.TestCase):
 
 
 class CampaignRunnerTests(unittest.TestCase):
+    def test_recording_evidence_requires_final_samples_analysis_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recording_dir = Path(temporary)
+            missing = _recording_artifact_evidence(recording_dir)
+            self.assertFalse(missing["artifacts_complete"])
+            self.assertIn("checkpoint.json is missing", missing["artifact_errors"])
+
+            (recording_dir / "checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "sample_count": 59,
+                        "context_count": 31,
+                        "thermal_snapshot_count": 31,
+                        "reconnect_count": 0,
+                        "stop_reason": "completed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for name in ("samples.csv", "analysis.json", "report.html"):
+                (recording_dir / name).write_text("usable", encoding="utf-8")
+            complete = _recording_artifact_evidence(recording_dir)
+
+        self.assertTrue(complete["artifacts_complete"])
+        self.assertEqual(complete["sample_count"], 59)
+        self.assertEqual(complete["checkpoint_status"], "complete")
+        self.assertEqual(_minimum_recording_sample_count(300, 5), 48)
+        self.assertGreaterEqual(59, _minimum_recording_sample_count(300, 5))
+
+    def test_zero_artifact_recorder_cannot_pass_round_acceptance(self) -> None:
+        class ExitZeroRecorder:
+            def __init__(self, clock: FakeClock, deadline: float) -> None:
+                self.clock = clock
+                self.deadline = deadline
+
+            def poll(self):
+                return 0 if self.clock() >= self.deadline else None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=5)
+            data["test"]["workflows"][0]["repeat_after_success"] = False
+            data["test"]["recording"] = {"enabled": True, "interval_s": 1}
+            config = load_campaign_config(write_config(root, data))
+            clock = FakeClock()
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                recorder_factory=lambda _command, _log: ExitZeroRecorder(clock, 5),
+                agent_factory=lambda _adb, _root: FakeAgent([]),
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            round_result = result["rounds"][0]
+
+        self.assertEqual(round_result["recording"]["exit_code"], 0)
+        self.assertFalse(round_result["recording"]["artifacts_complete"])
+        self.assertFalse(round_result["acceptance"]["recording_ok"])
+        self.assertFalse(round_result["acceptance"]["passed"])
+
+    def test_rotation_setting_uses_window_service_fallback_when_vendor_reverts_it(self) -> None:
+        class RotationCommands(FakeCommands):
+            def __call__(self, command, timeout_s: float) -> CommandResult:
+                args = [str(item) for item in command]
+                tail = args[3:]
+                if tail[:5] == [
+                    "shell",
+                    "settings",
+                    "put",
+                    "system",
+                    "accelerometer_rotation",
+                ]:
+                    self.calls.append(args)
+                    self.settings[("system", "accelerometer_rotation")] = "1"
+                    self.settings[("system", "user_rotation")] = "0"
+                    return CommandResult(0)
+                if tail[:5] == [
+                    "shell",
+                    "cmd",
+                    "window",
+                    "user-rotation",
+                    "lock",
+                ]:
+                    self.calls.append(args)
+                    self.settings[("system", "accelerometer_rotation")] = "0"
+                    self.settings[("system", "user_rotation")] = tail[5]
+                    return CommandResult(0)
+                return super().__call__(command, timeout_s)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = minimal_config()
+            data["preparation"]["settings"] = [
+                {
+                    "namespace": "system",
+                    "key": "accelerometer_rotation",
+                    "value": "0",
+                    "required": True,
+                }
+            ]
+            config = load_campaign_config(write_config(root, data))
+            commands = RotationCommands()
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=commands,
+            )
+
+            result = runner._apply_setting(config.preparation.settings[0])
+
+        self.assertTrue(result["succeeded"])
+        self.assertEqual(result["actual"], "0")
+        self.assertIn("cmd window user-rotation lock 0", result["compatibility_fallback"])
+
+    def test_workflow_stops_when_an_action_opens_a_forbidden_foreground_package(self) -> None:
+        class RunningAgent:
+            def __init__(self) -> None:
+                self.stopped = False
+                self.state = {"running": False, "status": "idle"}
+
+            def start(self, payload: dict) -> dict:
+                self.state = {
+                    "running": True,
+                    "status": "running",
+                    "output_dir": "agent-run",
+                }
+                return dict(self.state)
+
+            def snapshot(self) -> dict:
+                return dict(self.state)
+
+            def stop(self) -> dict:
+                self.stopped = True
+                self.state.update({"running": False, "status": "stopped"})
+                return dict(self.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            config = load_campaign_config(write_config(root, minimal_config()))
+            commands = FakeCommands(
+                installed={"com.example.app"},
+                foreground_package="com.android.packageinstaller",
+            )
+            agent = RunningAgent()
+            clock = FakeClock()
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=commands,
+                agent_factory=lambda _adb, _root: agent,
+                repeat_workflows=False,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            result = runner.run_test(max_rounds=1)
+
+        workflow = result["rounds"][0]["workflow_results"][0]
+        self.assertTrue(agent.stopped)
+        self.assertEqual(workflow["status"], "forbidden_foreground")
+        self.assertEqual(
+            workflow["agent"]["foreground_package"],
+            "com.android.packageinstaller",
+        )
+        self.assertEqual(
+            result["rounds"][0]["quarantined_workflows"],
+            {"browse": "forbidden_foreground"},
+        )
+
+    def test_workflow_can_force_stop_before_each_launcher_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=100)
+            data["test"]["workflows"][0]["force_stop_before_launch"] = True
+            config = load_campaign_config(write_config(root, data))
+            commands = FakeCommands(
+                installed={"com.example.app"},
+                foreground_package="com.example.app",
+            )
+            clock = FakeClock()
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=commands,
+                agent_factory=lambda _adb, _root: FakeAgent([]),
+                repeat_workflows=False,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            runner.run_test(max_rounds=1)
+
+        tails = [call[3:] for call in commands.calls]
+        force_stop = ["shell", "am", "force-stop", "com.example.app"]
+        launcher = [
+            "shell",
+            "monkey",
+            "-p",
+            "com.example.app",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        ]
+        self.assertIn(force_stop, tails)
+        self.assertIn(launcher, tails)
+        self.assertLess(tails.index(force_stop), tails.index(launcher))
+
+    def test_workflow_can_stop_repeating_after_its_first_strict_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=5)
+            data["test"]["workflows"][0]["repeat_after_success"] = False
+            config = load_campaign_config(write_config(root, data))
+            commands = FakeCommands(
+                installed={"com.example.app"},
+                foreground_package="com.example.app",
+            )
+            clock = FakeClock()
+            agent_calls: list[dict] = []
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=commands,
+                agent_factory=lambda _adb, _root: FakeAgent(agent_calls),
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            result = runner.run_test(max_rounds=1)
+
+        self.assertEqual(len(agent_calls), 1)
+        self.assertFalse(config.test.workflows[0].repeat_after_success)
+        self.assertTrue(result["rounds"][0]["acceptance"]["passed"])
+        self.assertTrue(result["rounds"][0]["acceptance"]["duration_reached"])
+
     def test_preparation_applies_setting_installs_grants_and_runs_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -523,6 +870,7 @@ class CampaignRunnerTests(unittest.TestCase):
                 clock=clock,
                 sleep=clock.sleep,
             )
+            runner._command_runner.foreground_package = "com.example.app"  # type: ignore[attr-defined]
 
             result = runner.run_test(max_rounds=1)
             events = [
@@ -636,6 +984,336 @@ class CampaignRunnerTests(unittest.TestCase):
         ]
         self.assertEqual(len(disabled), 1)
         self.assertEqual(disabled[0]["reason"], "wrong_foreground")
+
+    def test_workflow_runs_initialization_before_validation_with_its_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=100)
+            workflow = data["test"]["workflows"][0]
+            workflow["automation_engine"] = "hybrid"
+            workflow["contract"] = {
+                "entry_state": "stable app home",
+                "success_evidence": "fresh card change",
+                "forbidden_states": ["login page"],
+            }
+            workflow["initialization_tasks"] = [
+                {
+                    "id": "initialize-home",
+                    "name": "Initialize home",
+                    "prompt": "Reach the stable app home.",
+                    "on_failure": "stop",
+                }
+            ]
+            config = load_campaign_config(write_config(root, data))
+            calls: list[dict] = []
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                agent_factory=lambda _adb, _root: FakeAgent(calls),
+                repeat_workflows=False,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            workflow_result = result["rounds"][0]["workflow_results"][0]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["tasks"][0]["id"], "initialize-home")
+        self.assertEqual(calls[1]["tasks"][0]["id"], "scroll")
+        self.assertEqual(calls[0]["automation_engine"], "hybrid")
+        self.assertEqual(calls[1]["automation_engine"], "hybrid")
+        self.assertIn("独立初始化阶段", calls[0]["tasks"][0]["prompt"])
+        self.assertIn("stable app home", calls[1]["tasks"][0]["prompt"])
+        self.assertIn("fresh card change", calls[1]["tasks"][0]["prompt"])
+        self.assertTrue(workflow_result["initialization_evidence_complete"])
+        self.assertTrue(workflow_result["evidence_complete"])
+        self.assertTrue(result["rounds"][0]["acceptance"]["passed"])
+        self.assertTrue(result["acceptance"]["passed"])
+
+    def test_incomplete_evidence_is_retried_then_quarantined(self) -> None:
+        class SkippingAgent(FakeAgent):
+            def start(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                self.state = {
+                    "running": False,
+                    "status": "completed_with_warnings",
+                    "message": "skipped",
+                    "task_results": [
+                        {
+                            "id": payload["tasks"][0]["id"],
+                            "status": "skipped",
+                            "message": "blocked",
+                        }
+                    ],
+                }
+                return dict(self.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=4)
+            workflow = data["test"]["workflows"][0]
+            workflow["quarantine_after_failures"] = 2
+            workflow["retry_cooldown_s"] = 0
+            config = load_campaign_config(write_config(root, data))
+            clock = FakeClock()
+            calls: list[dict] = []
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                agent_factory=lambda _adb, _root: SkippingAgent(calls),
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            round_result = result["rounds"][0]
+            events = [
+                json.loads(line)
+                for line in Path(result["output_dir"], "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [item["status"] for item in round_result["workflow_results"]],
+            ["incomplete_evidence", "incomplete_evidence"],
+        )
+        self.assertEqual(
+            round_result["quarantined_workflows"],
+            {"browse": "incomplete_evidence"},
+        )
+        self.assertFalse(round_result["acceptance"]["passed"])
+        self.assertFalse(result["acceptance"]["passed"])
+        self.assertIn(
+            "workflow_quarantined",
+            [event["event_type"] for event in events],
+        )
+
+    def test_completed_agent_must_satisfy_host_action_evidence(self) -> None:
+        class OneSwipeAgent(FakeAgent):
+            def __init__(self, calls: list[dict], output_root: Path) -> None:
+                super().__init__(calls)
+                self.output_dir = output_root / "synthetic-agent"
+
+            def start(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                (self.output_dir / "events.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "event_type": "action",
+                            "action": {"action": "swipe_fast"},
+                            "action_valid": True,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.state = {
+                    "running": False,
+                    "status": "completed",
+                    "message": "claimed complete",
+                    "output_dir": str(self.output_dir),
+                    "task_results": [
+                        {
+                            "id": payload["tasks"][0]["id"],
+                            "status": "completed",
+                            "message": "claimed complete",
+                        }
+                    ],
+                }
+                return dict(self.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=100)
+            data["test"]["workflows"][0]["contract"] = {
+                "required_actions": [
+                    {
+                        "actions": ["swipe", "swipe_fast"],
+                        "minimum": 2,
+                        "label": "two scrolls",
+                    }
+                ]
+            }
+            config = load_campaign_config(write_config(root, data))
+            calls: list[dict] = []
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                agent_factory=lambda _adb, output_root: OneSwipeAgent(
+                    calls, output_root
+                ),
+                repeat_workflows=False,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            workflow_result = result["rounds"][0]["workflow_results"][0]
+
+        self.assertEqual(workflow_result["status"], "incomplete_action_evidence")
+        self.assertFalse(workflow_result["evidence_complete"])
+        requirement = workflow_result["action_evidence"]["requirements"][0]
+        self.assertEqual(requirement["observed"], 1)
+        self.assertFalse(requirement["satisfied"])
+        self.assertFalse(result["acceptance"]["passed"])
+
+    def test_completed_agent_with_failure_message_is_not_accepted(self) -> None:
+        class ContradictingAgent(FakeAgent):
+            def __init__(self, calls: list[dict], output_root: Path) -> None:
+                super().__init__(calls)
+                self.output_dir = output_root / "synthetic-agent"
+
+            def start(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                (self.output_dir / "events.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "event_type": "action",
+                            "action": {"action": "tap"},
+                            "action_valid": True,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                message = "游戏已结束，无法完成横向移动测试"
+                self.state = {
+                    "running": False,
+                    "status": "completed",
+                    "message": "claimed complete",
+                    "output_dir": str(self.output_dir),
+                    "task_results": [
+                        {
+                            "id": payload["tasks"][0]["id"],
+                            "status": "completed",
+                            "message": message,
+                        }
+                    ],
+                    "latest_action": {"action": "finish", "message": message},
+                }
+                return dict(self.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            data = minimal_config(cycle_duration_s=100)
+            data["test"]["workflows"][0]["contract"] = {
+                "required_actions": [
+                    {"actions": ["tap"], "minimum": 1, "label": "one tap"}
+                ]
+            }
+            config = load_campaign_config(write_config(root, data))
+            calls: list[dict] = []
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                agent_factory=lambda _adb, output_root: ContradictingAgent(
+                    calls, output_root
+                ),
+                repeat_workflows=False,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            workflow_result = result["rounds"][0]["workflow_results"][0]
+
+        self.assertEqual(
+            workflow_result["status"], "contradicted_completion_claim"
+        )
+        self.assertFalse(workflow_result["evidence_complete"])
+        self.assertFalse(workflow_result["completion_claim"]["satisfied"])
+        self.assertTrue(workflow_result["action_evidence"]["satisfied"])
+        self.assertFalse(result["acceptance"]["passed"])
+
+    def test_agent_is_stopped_at_round_deadline(self) -> None:
+        class NeverEndingAgent:
+            def __init__(self, calls: list[dict]) -> None:
+                self.calls = calls
+                self.stop_calls = 0
+                self.state = {"running": False, "status": "idle"}
+
+            def start(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                self.state = {"running": True, "status": "running"}
+                return dict(self.state)
+
+            def snapshot(self) -> dict:
+                return dict(self.state)
+
+            def stop(self) -> dict:
+                self.stop_calls += 1
+                self.state = {"running": False, "status": "stopped"}
+                return dict(self.state)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app.apk").write_bytes(b"apk")
+            config = load_campaign_config(
+                write_config(root, minimal_config(cycle_duration_s=3))
+            )
+            clock = FakeClock()
+            calls: list[dict] = []
+            agents: list[NeverEndingAgent] = []
+
+            def agent_factory(_adb: str, _root: Path) -> NeverEndingAgent:
+                agent = NeverEndingAgent(calls)
+                agents.append(agent)
+                return agent
+
+            runner = AndroidCampaignRunner(
+                "adb",
+                config,
+                root / "output",
+                command_runner=FakeCommands(
+                    installed={"com.example.app"},
+                    foreground_package="com.example.app",
+                ),
+                agent_factory=agent_factory,
+                clock=clock,
+                sleep=clock.sleep,
+            )
+
+            result = runner.run_test(max_rounds=1)
+            round_result = result["rounds"][0]
+            progress = json.loads(
+                Path(round_result["round_dir"], "round-progress.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(agents[0].stop_calls, 1)
+        self.assertEqual(
+            round_result["workflow_results"][0]["status"],
+            "round_deadline",
+        )
+        self.assertLess(round_result["active_duration_s"], 4)
+        self.assertFalse(round_result["acceptance"]["passed"])
+        self.assertIn("coverage", progress)
+        self.assertIn("acceptance", progress)
 
     def test_keyboard_interrupt_finalizes_and_recovers_active_round(self) -> None:
         class InterruptingAgent(FakeAgent):
@@ -863,6 +1541,132 @@ class CampaignRunnerTests(unittest.TestCase):
 
 
 class CampaignControllerTests(unittest.TestCase):
+    def test_controller_task_results_include_host_action_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = CampaignController("adb", Path(temporary), None)
+            tasks = [
+                {
+                    "id": "scroll",
+                    "name": "Scroll",
+                    "prompt": "Scroll twice",
+                }
+            ]
+            results = controller._completed_task_results(
+                "test",
+                {
+                    "status": "max_rounds",
+                    "rounds": [
+                        {
+                            "workflow_results": [
+                                {
+                                    "status": "incomplete_action_evidence",
+                                    "evidence_complete": False,
+                                    "initialization_evidence_complete": True,
+                                    "action_evidence": {
+                                        "requirements": [
+                                            {
+                                                "label": "two scrolls",
+                                                "observed": 1,
+                                                "minimum": 2,
+                                                "satisfied": False,
+                                            }
+                                        ]
+                                    },
+                                    "agent": {
+                                        "task_results": [
+                                            {
+                                                "id": "scroll",
+                                                "status": "completed",
+                                                "message": "model claimed complete",
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    ],
+                },
+                tasks,
+            )
+
+        self.assertEqual(results[0]["status"], "incomplete_action_evidence")
+        self.assertIn("1/2", results[0]["message"])
+
+    def test_controller_surfaces_failed_strict_round_acceptance(self) -> None:
+        status, message = CampaignController._presentation_status(
+            "test",
+            {
+                "status": "max_rounds",
+                "message": "completed requested 1 rounds",
+                "acceptance": {
+                    "passed": False,
+                    "accepted_round_count": 0,
+                    "round_count": 1,
+                },
+            },
+        )
+
+        self.assertEqual(status, "completed_with_warnings")
+        self.assertIn("0/1", message)
+
+    def test_controller_exposes_json_derived_stage_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = CampaignController(
+                "adb",
+                Path(temporary),
+                Path("examples/android-two-stage-campaign.json"),
+            )
+
+            overview = controller.stage_config_snapshot()
+            snapshot = controller.snapshot()
+            controller.close()
+
+        self.assertTrue(overview["available"])
+        self.assertTrue(str(overview["source_path"]).endswith("android-two-stage-campaign.json"))
+        preparation = overview["stages"]["prepare"]
+        test = overview["stages"]["test"]
+        preparation_metrics = {
+            item["label"]: item["value"] for item in preparation["metrics"]
+        }
+        self.assertEqual(preparation_metrics["系统设置"], 10)
+        self.assertEqual(preparation_metrics["固定安装包"], 7)
+        self.assertEqual(preparation_metrics["预备应用"], 23)
+        self.assertEqual(preparation_metrics["已映射 workflow"], 23)
+        self.assertEqual(len(preparation["flow"]), 6)
+        warning_titles = {item["title"] for item in preparation["warnings"]}
+        self.assertNotIn("预备应用没有正式 workflow", warning_titles)
+        self.assertIn("存在浏览器下载 / APK 安装路径", warning_titles)
+
+        test_metrics = {item["label"]: item["value"] for item in test["metrics"]}
+        self.assertEqual(test_metrics["单轮时长"], "120")
+        self.assertEqual(test_metrics["workflow"], 23)
+        self.assertEqual(test_metrics["成功后继续循环"], 5)
+        self.assertEqual(len(test["flow"]), 6)
+        groups = {item["id"]: item for item in test["workflow_groups"]}
+        self.assertEqual(groups["required_baseline"]["count"], 4)
+        self.assertEqual(
+            sum(group["count"] for group in test["workflow_groups"]),
+            23,
+        )
+        workflow_ids = {
+            workflow["id"]
+            for group in test["workflow_groups"]
+            for workflow in group["items"]
+        }
+        self.assertIn("material-files-directory-roundtrip", workflow_ids)
+        material = next(
+            workflow
+            for group in test["workflow_groups"]
+            for workflow in group["items"]
+            if workflow["id"] == "material-files-directory-roundtrip"
+        )
+        self.assertEqual(
+            material["initialization_tasks"][0]["action_limits"][0]["maximum"],
+            0,
+        )
+        self.assertEqual(material["tasks"][0]["action_limits"][0]["maximum"], 1)
+        self.assertIs(snapshot["stage_config"]["available"], True)
+
     def test_project_software_install_uses_only_configured_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1031,6 +1835,14 @@ class CampaignControllerTests(unittest.TestCase):
                     "device": "serial-1",
                     "model": "ui-model",
                     "api_key": "secret",
+                    "system_prompt": "stale browser prompt",
+                    "tasks": [
+                        {
+                            "id": "puzzle-home-ready",
+                            "name": "stale",
+                            "prompt": "stale browser task",
+                        }
+                    ],
                 }
             )
             deadline = time.time() + 2
@@ -1042,13 +1854,44 @@ class CampaignControllerTests(unittest.TestCase):
             self.assertGreaterEqual(len(state["tasks"]), 8)
             self.assertEqual(calls[0][1]["model"]["model"], "ui-model")
             self.assertEqual(calls[0][1]["model"]["api_key"], "secret")
+            self.assertNotIn("system_prompt", calls[0][1]["model"])
+            self.assertEqual(calls[0][1]["task_overrides"], {})
+            self.assertEqual(calls[0][1]["task_order"], [])
+            self.assertNotEqual(state["tasks"][0]["prompt"], "stale browser task")
+
+            state = controller.start(
+                {
+                    "stage": "test",
+                    "device": "serial-1",
+                    "tasks": [
+                        {
+                            "id": "light-up-toggle",
+                            "name": "stale browser task",
+                            "prompt": "must be ignored without explicit override",
+                        }
+                    ],
+                }
+            )
+            deadline = time.time() + 2
+            while state["running"] and time.time() < deadline:
+                time.sleep(0.01)
+                state = controller.snapshot()
+            default_test_init = [item for item in calls if item[0] == "init"][-1][1]
+            self.assertTrue(default_test_init["repeat_workflows"])
+            self.assertEqual(default_test_init["task_overrides"], {})
+            self.assertEqual(default_test_init["task_order"], [])
+            self.assertTrue(state["repeat_workflows"])
+            self.assertEqual(state["max_rounds"], 1)
+            self.assertEqual(calls[-1][1]["max_rounds"], 1)
 
             state = controller.start(
                 {
                     "stage": "test",
                     "device": "serial-1",
                     "workflow_name": "UI custom workflow",
-                    "loop_enabled": False,
+                    "repeat_workflows": False,
+                    "max_rounds": 1,
+                    "runtime_task_overrides": True,
                     "tasks": [
                         {
                             "id": "light-up-toggle",
@@ -1058,6 +1901,14 @@ class CampaignControllerTests(unittest.TestCase):
                             "max_steps": 33,
                             "timeout_s": 444,
                             "on_failure": "continue",
+                            "action_limits": [
+                                {
+                                    "actions": ["tap", "tap_element"],
+                                    "maximum": 1,
+                                    "maximum_per_signature": 1,
+                                    "label": "UI unique tap",
+                                }
+                            ],
                         }
                     ],
                 }
@@ -1077,6 +1928,9 @@ class CampaignControllerTests(unittest.TestCase):
             self.assertEqual(override.prompt, "UI custom prompt")
             self.assertEqual(override.max_steps, 33)
             self.assertEqual(override.timeout_s, 444)
+            self.assertEqual(override.action_limits[0].actions, ("tap", "tap_element"))
+            self.assertEqual(override.action_limits[0].maximum, 1)
+            self.assertEqual(override.action_limits[0].maximum_per_signature, 1)
             self.assertEqual(test_init["task_order"], ["light-up-toggle"])
             self.assertEqual(calls[-1][1]["max_rounds"], 1)
             controller.close()
