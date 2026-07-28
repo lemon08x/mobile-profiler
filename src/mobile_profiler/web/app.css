@@ -6407,6 +6407,12 @@ body[data-view="opensource"] .platform-bar {
   background: rgb(246 199 96 / 5%);
 }
 
+.opensource-feature-meta > em.unverified {
+  border-color: rgb(255 116 116 / 34%);
+  color: var(--bad);
+  background: rgb(255 116 116 / 6%);
+}
+
 .opensource-feature-card small {
   color: var(--cyan);
   font: 700 7px var(--mono);

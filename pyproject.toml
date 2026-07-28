@@ -27,4 +27,11 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-mobile_profiler = ["web/*.html", "web/*.css", "web/*.js", "assets/*.jar"]
+mobile_profiler = [
+    "web/*.html",
+    "web/*.css",
+    "web/*.js",
+    "assets/*.jar",
+    "maa_guard_policy.json",
+    "maaend_guard_policy.json",
+]

@@ -9,3 +9,6 @@ power-runs/
 profiler-runs/
 .tmp-*
 .coverage
+.codex-adb/
+.codex-research/
+debug/

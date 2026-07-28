@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "MaaEnd",
+    "version": "v2.20.0",
+    "task_count": 41,
+    "adb_task_count": 24
+  },
+  "resource_fingerprint": {
+    "algorithm": "sha256-tree-v1",
+    "paths": [
+      "interface.json",
+      "tasks",
+      "resource",
+      "resource_adb"
+    ],
+    "expected_sha256": "f64ee629ad9fbff13edbfe7f3e7f91b2612a17cbebbc7d34b83fe4edd1b993f2"
+  },
+  "authorization_contract": {
+    "task_field": "authorized_tasks",
+    "baker_entry_field": "allow_baker_entry",
+    "unknown_task": "deny",
+    "resource_drift": "deny",
+    "authorization_scope": "exact_task_name"
+  },
+  "tasks": [
+    {"name": "AccountSwitch", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "AndroidOpenGame", "entry": "AndroidOpenGame", "adb_supported": true, "wave": 0, "risk": "app_lifecycle", "authorization": "none", "terminal_contract": "android_open_game"},
+    {"name": "AutoCollect", "entry": "AutoCollectSchedule", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoCollectEnd"]},
+    {"name": "AutoEcoFarm", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "AutoEssence", "entry": "AutoEssenceMain", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "AutoSell", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "AutoStockpile", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "AutoStockStaple", "entry": "AutoStockStapleSchedule", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoStockStapleDone"]},
+    {"name": "AutoUseSpMedication", "entry": "AutoUseSpMedicationEntry", "adb_supported": true, "wave": 4, "risk": "resource_consumption", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "BakerEntry", "entry": "BakerEntry", "adb_supported": true, "wave": "independent_high_risk", "risk": "external_message", "authorization": "baker_entry", "terminal_contract": "pipeline_entry"},
+    {"name": "BatchAddFriends", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "BatchUseDetector", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "ClaimSimulationRewards", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "CloseGame", "entry": "CloseGame", "adb_supported": true, "wave": 0, "risk": "app_lifecycle", "authorization": "none", "terminal_contract": "close_game"},
+    {"name": "Crafting", "entry": "CraftingStart", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "CreditShoppingN2", "entry": "CreditShoppingMain", "adb_supported": true, "wave": 4, "risk": "purchase", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["CreditShoppingNothingToBuy"]},
+    {"name": "DailyRewards", "entry": "DailyRewardStart", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["DailyRewardEnd"]},
+    {"name": "DeliveryJobs", "entry": "DeliveryJobsMain", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["DeliveryJobsFinished"]},
+    {"name": "DijiangRewards", "entry": "DijiangRewards", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["FinishDijiangRewards"]},
+    {"name": "EnvironmentMonitoring", "entry": "EnvironmentMonitoringMain", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["EnvironmentMonitoringFinish"]},
+    {"name": "EssenceFilter", "entry": "EssenceFilterMain", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "GearAssembly", "entry": "GearAssemblyStart", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "GiftOperator", "entry": "GiftOperatorMain", "adb_supported": true, "wave": 4, "risk": "resource_consumption", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "ImportBluePrints", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "ItemTransfer", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "ProtocolSpace", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "PullCountCalculator", "entry": "PullCountCalculatorMain", "adb_supported": true, "wave": 1, "risk": "read_only_probe", "authorization": "none", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["PullCountCalculatorFinish"]},
+    {"name": "PuzzleSolver", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "ReadAllWiki", "entry": "WikiReadAll", "adb_supported": true, "wave": 2, "risk": "account_state_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "RealTimeTask", "adb_supported": false, "wave": "unsupported", "risk": "realtime_unsupported", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "ReceiveProdManual", "entry": "ProdManualStart", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["ProdManualDone"]},
+    {"name": "ResourceRecycleStation", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "SeizeDeliveryJobs", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "SellProduct", "entry": "SellProductSchedule", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["SellProductScheduleEnd", "SellProductTaskEnd"]},
+    {"name": "SimpleProductionBatchStart", "entry": "SimpleProductionBatchStart", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "StashBackpack", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "SwitchTeam", "entry": "SwitchTeamMain", "adb_supported": true, "wave": 2, "risk": "account_state_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "TrialOfSwordmancy", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "VisitFriends", "entry": "VisitFriendsMain", "adb_supported": true, "wave": 2, "risk": "social_state_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["VisitFriendsFull", "VisitFriendsMenuScanFriendsFull", "VisitFriendsMenuScanScrollFinish", "VisitFriendsMenuScanScrollFinishSpecial"]},
+    {"name": "WeaponUpgrade", "entry": "WeaponUpgradeStart", "adb_supported": true, "wave": 4, "risk": "resource_consumption", "authorization": "task", "terminal_contract": "pipeline_entry"},
+    {"name": "WebEvent202605", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"}
+  ],
+  "internal_probes": [
+    {
+      "name": "SceneProbe",
+      "entry": "InWorld",
+      "selected_task_id": "internal-scene-probe",
+      "wave": 1,
+      "risk": "read_only",
+      "authorization": "none",
+      "input_allowed": false,
+      "terminal_contract": "scene_identified",
+      "pipeline_override": [
+        {
+          "InWorld": {
+            "next": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "CaptureUidProbe",
+      "entry": "AutoStockpileGetUid",
+      "selected_task_id": "internal-capture-uid-probe",
+      "wave": 1,
+      "risk": "privacy_sensitive_read_only",
+      "authorization": "none",
+      "input_allowed": false,
+      "stores": "sha256_only",
+      "terminal_contract": "uid_hash_captured",
+      "pipeline_override": [
+        {
+          "AutoStockpileGetUid": {
+            "action": {
+              "type": "Custom",
+              "param": {
+                "custom_action": "CaptureUid",
+                "custom_action_param": {
+                  "use_cache": false,
+                  "stay_on_current_screen": true,
+                  "allow_unknown": false
+                }
+              }
+            },
+            "next": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "ViewportInputProbe",
+      "entry": "InWorld",
+      "precondition_entry": "InWorld",
+      "selected_task_id": "internal-viewport-input-probe",
+      "wave": 1,
+      "risk": "reversible_input",
+      "authorization": "viewport_input_probe",
+      "input_allowed": true,
+      "precondition": "safe_open_world",
+      "terminal_contract": "input_reversed",
+      "pipeline_override": [
+        {
+          "InWorld": {
+            "next": [
+              "ViewportInputProbeActionNode"
+            ]
+          },
+          "ViewportInputProbeActionNode": {
+            "recognition": "DirectHit",
+            "action": {
+              "type": "Custom",
+              "param": {
+                "custom_action": "ViewportInputProbeAction",
+                "custom_action_param": {}
+              }
+            },
+            "next": []
+          }
+        }
+      ]
+    }
+  ],
+  "watchdogs": {
+    "poll_interval_seconds": 0.5,
+    "no_progress_seconds": 180,
+    "same_node_start_limit": 8,
+    "same_node_loop_seconds": 90,
+    "screenshot_interval_seconds": 15,
+    "static_snapshot_limit": 12,
+    "slow_screenshot_seconds": 3,
+    "slow_screenshot_consecutive_limit": 3,
+    "screenshot_backend_switch_limit": 3,
+    "tasker_idle_grace_seconds": 15,
+    "active_touch_grace_seconds": 2,
+    "api_error_limit": 10,
+    "runtime_integrity_interval_seconds": 2,
+    "stop_on_slow_screenshot": false
+  }
+}

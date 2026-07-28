@@ -1,0 +1,1873 @@
+diff --git a/module/device/geometry.py b/module/device/geometry.py
+new file mode 100644
+--- /dev/null
++++ b/module/device/geometry.py
+@@ -0,0 +1,374 @@
++"""Coordinate contracts for running SRC's 1280x720 logic on wide displays.
++
++The existing recognition resources stay in a 1280x720 logical coordinate
++space.  A physical screenshot can expose three overlapping 16:9 viewports:
++left, center, and right.  Geometry is immutable and attached to every frame so
++an input never depends on mutable process-wide "active viewport" state.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Optional, Tuple
++
++import cv2
++import numpy as np
++
++
++ADAPTIVE_GEOMETRY_PATCH_VERSION = "mobile-profiler-src-0f2aaf8c-v1"
++LOGICAL_WIDTH = 1280
++LOGICAL_HEIGHT = 720
++LOGICAL_SIZE = (LOGICAL_WIDTH, LOGICAL_HEIGHT)
++LOGICAL_ASPECT_RATIO = LOGICAL_WIDTH / LOGICAL_HEIGHT
++MAX_SUPPORTED_ASPECT_RATIO = 3.0
++
++Point = Tuple[float, float]
++
++
++class GeometryError(ValueError):
++    """Raised when a display/capture relationship cannot be mapped safely."""
++
++
++class Alignment(str, Enum):
++    LEFT = "left"
++    CENTER = "center"
++    RIGHT = "right"
++
++    @classmethod
++    def coerce(cls, value: "Alignment | str") -> "Alignment":
++        if isinstance(value, cls):
++            return value
++        try:
++            return cls(str(value).strip().lower())
++        except ValueError as exc:
++            choices = ", ".join(item.value for item in cls)
++            raise GeometryError(
++                f"Unknown viewport alignment {value!r}; expected one of {choices}"
++            ) from exc
++
++
++@dataclass(frozen=True)
++class Insets:
++    left: float = 0
++    top: float = 0
++    right: float = 0
++    bottom: float = 0
++
++    def __post_init__(self):
++        if min(self.left, self.top, self.right, self.bottom) < 0:
++            raise GeometryError(f"Insets must be non-negative: {self}")
++
++
++@dataclass(frozen=True)
++class Rect:
++    left: float
++    top: float
++    right: float
++    bottom: float
++
++    def __post_init__(self):
++        if self.right <= self.left or self.bottom <= self.top:
++            raise GeometryError(f"Rectangle must have positive area: {self}")
++
++    @property
++    def width(self) -> float:
++        return self.right - self.left
++
++    @property
++    def height(self) -> float:
++        return self.bottom - self.top
++
++    @property
++    def center(self) -> Point:
++        return (
++            self.left + self.width / 2,
++            self.top + self.height / 2,
++        )
++
++    def contains(self, point: Point, *, tolerance: float = 1e-6) -> bool:
++        x, y = point
++        return (
++            self.left - tolerance <= x <= self.right + tolerance
++            and self.top - tolerance <= y <= self.bottom + tolerance
++        )
++
++
++@dataclass(frozen=True)
++class DisplayGeometry:
++    """The oriented physical display used by Android input backends."""
++
++    width: int
++    height: int
++    rotation: int = 0
++    safe_insets: Insets = field(default_factory=Insets)
++
++    def __post_init__(self):
++        if self.width <= 0 or self.height <= 0:
++            raise GeometryError(
++                f"Display dimensions must be positive: {self.width}x{self.height}"
++            )
++        if self.width <= self.height:
++            raise GeometryError(
++                f"Adaptive geometry requires an oriented landscape display: "
++                f"{self.width}x{self.height}"
++            )
++        if self.rotation not in (0, 1, 2, 3):
++            raise GeometryError(f"Invalid Android display rotation: {self.rotation}")
++        if (
++            self.safe_insets.left + self.safe_insets.right >= self.width
++            or self.safe_insets.top + self.safe_insets.bottom >= self.height
++        ):
++            raise GeometryError(
++                f"Safe insets consume the complete display: {self.safe_insets}"
++            )
++
++    @property
++    def bounds(self) -> Rect:
++        return Rect(0, 0, self.width, self.height)
++
++    @property
++    def safe_bounds(self) -> Rect:
++        return Rect(
++            self.safe_insets.left,
++            self.safe_insets.top,
++            self.width - self.safe_insets.right,
++            self.height - self.safe_insets.bottom,
++        )
++
++    def oriented_to_natural(self, point: Point) -> tuple[Point, tuple[int, int]]:
++        """Map an oriented screenshot point to the touch device's natural axes."""
++
++        if not self.bounds.contains(point):
++            raise GeometryError(f"Display point is outside {self.bounds}: {point}")
++        x, y = point
++        if self.rotation == 0:
++            return (x, y), (self.width, self.height)
++        if self.rotation == 1:
++            return (self.height - y, x), (self.height, self.width)
++        if self.rotation == 2:
++            return (self.width - x, self.height - y), (self.width, self.height)
++        return (y, self.width - x), (self.height, self.width)
++
++
++@dataclass(frozen=True)
++class CaptureGeometry:
++    """A screenshot/video frame and the physical display region it represents."""
++
++    width: int
++    height: int
++    display: DisplayGeometry
++    display_rect: Optional[Rect] = None
++
++    def __post_init__(self):
++        if self.width <= 0 or self.height <= 0:
++            raise GeometryError(
++                f"Capture dimensions must be positive: {self.width}x{self.height}"
++            )
++        if self.width <= self.height:
++            raise GeometryError(
++                f"Adaptive geometry requires a landscape capture: "
++                f"{self.width}x{self.height}"
++            )
++        if self.height < LOGICAL_HEIGHT:
++            raise GeometryError(
++                f"Capture height {self.height} is below the "
++                f"{LOGICAL_HEIGHT}px logical baseline"
++            )
++        display_rect = self.display_rect or self.display.bounds
++        if (
++            display_rect.left < 0
++            or display_rect.top < 0
++            or display_rect.right > self.display.width
++            or display_rect.bottom > self.display.height
++        ):
++            raise GeometryError(
++                f"Capture display rect {display_rect} exceeds {self.display.bounds}"
++            )
++        object.__setattr__(self, "display_rect", display_rect)
++
++    @property
++    def bounds(self) -> Rect:
++        return Rect(0, 0, self.width, self.height)
++
++    def capture_to_display(self, point: Point) -> Point:
++        if not self.bounds.contains(point):
++            raise GeometryError(f"Capture point is outside {self.bounds}: {point}")
++        x, y = point
++        rect = self.display_rect
++        return (
++            rect.left + x / self.width * rect.width,
++            rect.top + y / self.height * rect.height,
++        )
++
++    def display_to_capture(self, point: Point) -> Point:
++        rect = self.display_rect
++        if not rect.contains(point):
++            raise GeometryError(f"Display point is outside capture rect {rect}: {point}")
++        x, y = point
++        return (
++            (x - rect.left) / rect.width * self.width,
++            (y - rect.top) / rect.height * self.height,
++        )
++
++    @property
++    def safe_bounds(self) -> Rect:
++        safe = self.display.safe_bounds
++        top_left = self.display_to_capture((safe.left, safe.top))
++        bottom_right = self.display_to_capture((safe.right, safe.bottom))
++        return Rect(*top_left, *bottom_right)
++
++    def viewport(self, alignment: "Alignment | str") -> "Viewport":
++        alignment = Alignment.coerce(alignment)
++        available = self.safe_bounds
++        aspect_ratio = available.width / available.height
++        if aspect_ratio + 1e-6 < LOGICAL_ASPECT_RATIO:
++            raise GeometryError(
++                f"Safe capture area is narrower than 16:9: "
++                f"{available.width:.3f}x{available.height:.3f}"
++            )
++        if aspect_ratio > MAX_SUPPORTED_ASPECT_RATIO:
++            raise GeometryError(
++                f"Safe capture aspect ratio {aspect_ratio:.4f} exceeds "
++                f"the supported maximum {MAX_SUPPORTED_ASPECT_RATIO:.4f}"
++            )
++
++        viewport_width = available.height * LOGICAL_ASPECT_RATIO
++        spare = max(0.0, available.width - viewport_width)
++        if alignment is Alignment.LEFT:
++            offset = 0.0
++        elif alignment is Alignment.CENTER:
++            offset = spare / 2
++        else:
++            offset = spare
++        rect = Rect(
++            available.left + offset,
++            available.top,
++            available.left + offset + viewport_width,
++            available.bottom,
++        )
++        return Viewport(alignment=alignment, capture=self, capture_rect=rect)
++
++    def logical_to_capture(
++        self, point: Point, alignment: "Alignment | str" = Alignment.CENTER
++    ) -> Point:
++        return self.viewport(alignment).logical_to_capture(point)
++
++    def logical_to_display(
++        self, point: Point, alignment: "Alignment | str" = Alignment.CENTER
++    ) -> Point:
++        return self.capture_to_display(self.logical_to_capture(point, alignment))
++
++    def for_capture_size(self, width: int, height: int) -> "CaptureGeometry":
++        """Describe another full-display capture, for example scrcpy control video."""
++
++        return CaptureGeometry(
++            width=width,
++            height=height,
++            display=self.display,
++            display_rect=self.display_rect,
++        )
++
++
++@dataclass(frozen=True)
++class Viewport:
++    alignment: Alignment
++    capture: CaptureGeometry
++    capture_rect: Rect
++
++    @property
++    def logical_bounds(self) -> Rect:
++        return Rect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT)
++
++    def logical_to_capture(self, point: Point) -> Point:
++        if not self.logical_bounds.contains(point):
++            raise GeometryError(
++                f"Logical point is outside {self.logical_bounds}: {point}"
++            )
++        x, y = point
++        return (
++            self.capture_rect.left + x / LOGICAL_WIDTH * self.capture_rect.width,
++            self.capture_rect.top + y / LOGICAL_HEIGHT * self.capture_rect.height,
++        )
++
++    def capture_to_logical(self, point: Point) -> Point:
++        if not self.capture_rect.contains(point):
++            raise GeometryError(
++                f"Capture point is outside {self.alignment.value} viewport "
++                f"{self.capture_rect}: {point}"
++            )
++        x, y = point
++        return (
++            (x - self.capture_rect.left) / self.capture_rect.width * LOGICAL_WIDTH,
++            (y - self.capture_rect.top) / self.capture_rect.height * LOGICAL_HEIGHT,
++        )
++
++    def crop(self, raw_image: np.ndarray) -> np.ndarray:
++        """Crop this viewport once and normalize it to SRC's logical size."""
++
++        if raw_image.ndim < 2:
++            raise GeometryError(f"Screenshot has invalid shape: {raw_image.shape}")
++        raw_height, raw_width = raw_image.shape[:2]
++        if (raw_width, raw_height) != (self.capture.width, self.capture.height):
++            raise GeometryError(
++                f"Screenshot shape {raw_width}x{raw_height} does not match "
++                f"capture geometry {self.capture.width}x{self.capture.height}"
++            )
++        left = max(0, min(raw_width - 1, int(round(self.capture_rect.left))))
++        top = max(0, min(raw_height - 1, int(round(self.capture_rect.top))))
++        right = max(left + 1, min(raw_width, int(round(self.capture_rect.right))))
++        bottom = max(top + 1, min(raw_height, int(round(self.capture_rect.bottom))))
++        cropped = raw_image[top:bottom, left:right]
++        if (cropped.shape[1], cropped.shape[0]) == LOGICAL_SIZE:
++            return cropped
++        interpolation = (
++            cv2.INTER_AREA
++            if cropped.shape[1] >= LOGICAL_WIDTH
++            and cropped.shape[0] >= LOGICAL_HEIGHT
++            else cv2.INTER_LINEAR
++        )
++        return cv2.resize(cropped, LOGICAL_SIZE, interpolation=interpolation)
++
++
++@dataclass(frozen=True)
++class LogicalFrame:
++    frame_id: int
++    alignment: Alignment
++    image: np.ndarray
++    geometry: CaptureGeometry
++
++    @property
++    def viewport(self) -> Viewport:
++        return self.geometry.viewport(self.alignment)
++
++
++@dataclass(frozen=True)
++class Action:
++    point: Point
++    alignment: Alignment = Alignment.CENTER
++    contact_id: int = 0
++    frame_id: Optional[int] = None
++
++    def __post_init__(self):
++        object.__setattr__(self, "alignment", Alignment.coerce(self.alignment))
++        if self.contact_id < 0:
++            raise GeometryError(f"Contact id must be non-negative: {self.contact_id}")
++
++
++@dataclass(frozen=True)
++class Hit:
++    rect: Rect
++    alignment: Alignment
++    frame_id: int
++
++    def __post_init__(self):
++        object.__setattr__(self, "alignment", Alignment.coerce(self.alignment))
++
++    def action(self, contact_id: int = 0) -> Action:
++        return Action(
++            point=self.rect.center,
++            alignment=self.alignment,
++            contact_id=contact_id,
++            frame_id=self.frame_id,
++        )
++
+diff --git a/module/base/base.py b/module/base/base.py
+index 86585e8..2a0d609 100644
+--- a/module/base/base.py
++++ b/module/base/base.py
+@@ -4,6 +4,7 @@ from module.base.timer import Timer
+ from module.base.utils import *
+ from module.config.config import AzurLaneConfig
+ from module.device.device import Device
++from module.device.geometry import Alignment
+ from module.device.method.utils import HierarchyButton
+ from module.logger import logger
+ from module.webui.setting import cached_class_property
+@@ -154,7 +155,8 @@ class ModuleBase:
+                 self.device.dump_hierarchy()
+             yield self.device.image, self.device.hierarchy
+ 
+-    def match_template(self, button, interval=0, similarity=0.85):
++    def match_template(self, button, interval=0, similarity=0.85,
++                       alignment=Alignment.CENTER):
+         """
+         Args:
+             button (ButtonWrapper):
+@@ -177,14 +179,16 @@ class ModuleBase:
+         if interval and not self.interval_is_reached(button, interval=interval):
+             return False
+ 
+-        appear = button.match_template(self.device.image, similarity=similarity)
++        appear = button.match_template(
++            self.device.image_for(alignment), similarity=similarity)
+ 
+         if appear and interval:
+             self.interval_reset(button, interval=interval)
+ 
+         return appear
+ 
+-    def match_template_luma(self, button, interval=0, similarity=0.85):
++    def match_template_luma(self, button, interval=0, similarity=0.85,
++                            alignment=Alignment.CENTER):
+         """
+         Args:
+             button (ButtonWrapper):
+@@ -207,14 +211,16 @@ class ModuleBase:
+         if interval and not self.interval_is_reached(button, interval=interval):
+             return False
+ 
+-        appear = button.match_template_luma(self.device.image, similarity=similarity)
++        appear = button.match_template_luma(
++            self.device.image_for(alignment), similarity=similarity)
+ 
+         if appear and interval:
+             self.interval_reset(button, interval=interval)
+ 
+         return appear
+ 
+-    def match_color(self, button, interval=0, threshold=10):
++    def match_color(self, button, interval=0, threshold=10,
++                    alignment=Alignment.CENTER):
+         """
+         Args:
+             button (ButtonWrapper):
+@@ -229,14 +235,16 @@ class ModuleBase:
+         if interval and not self.interval_is_reached(button, interval=interval):
+             return False
+ 
+-        appear = button.match_color(self.device.image, threshold=threshold)
++        appear = button.match_color(
++            self.device.image_for(alignment), threshold=threshold)
+ 
+         if appear and interval:
+             self.interval_reset(button, interval=interval)
+ 
+         return appear
+ 
+-    def match_template_color(self, button, interval=0, similarity=0.85, threshold=30):
++    def match_template_color(self, button, interval=0, similarity=0.85,
++                             threshold=30, alignment=Alignment.CENTER):
+         """
+         Args:
+             button (ButtonWrapper):
+@@ -252,7 +260,11 @@ class ModuleBase:
+         if interval and not self.interval_is_reached(button, interval=interval):
+             return False
+ 
+-        appear = button.match_template_color(self.device.image, similarity=similarity, threshold=threshold)
++        appear = button.match_template_color(
++            self.device.image_for(alignment),
++            similarity=similarity,
++            threshold=threshold,
++        )
+ 
+         if appear and interval:
+             self.interval_reset(button, interval=interval)
+@@ -280,7 +292,8 @@ class ModuleBase:
+ 
+         return appear
+ 
+-    def appear(self, button, interval=0, similarity=0.85):
++    def appear(self, button, interval=0, similarity=0.85,
++               alignment=Alignment.CENTER):
+         """
+         Args:
+             button (Button, ButtonWrapper, HierarchyButton, str):
+@@ -305,21 +318,38 @@ class ModuleBase:
+         if isinstance(button, (HierarchyButton, str)):
+             return self.xpath_appear(button, interval=interval)
+         else:
+-            return self.match_template(button, interval=interval, similarity=similarity)
+-
+-    def appear_then_click(self, button, interval=5, similarity=0.85):
++            return self.match_template(
++                button,
++                interval=interval,
++                similarity=similarity,
++                alignment=alignment,
++            )
++
++    def appear_then_click(self, button, interval=5, similarity=0.85,
++                          alignment=Alignment.CENTER, contact_id=None):
+         button = self.xpath(button)
+-        appear = self.appear(button, interval=interval, similarity=similarity)
++        appear = self.appear(
++            button,
++            interval=interval,
++            similarity=similarity,
++            alignment=alignment,
++        )
+         if appear:
+-            self.device.click(button)
++            self.device.click(
++                button,
++                alignment=alignment,
++                frame_id=self.device.frame_id,
++                contact_id=contact_id,
++            )
+         return appear
+ 
+-    def wait_until_stable(self, button, timer=Timer(0.3, count=1), timeout=Timer(5, count=10)):
++    def wait_until_stable(self, button, timer=Timer(0.3, count=1),
++                          timeout=Timer(5, count=10), alignment=Alignment.CENTER):
+         """
+         A terrible method, don't rely too much on it.
+         """
+         logger.info(f'Wait until stable: {button}')
+-        prev_image = self.image_crop(button)
++        prev_image = self.image_crop(button, alignment=alignment)
+         timer.reset()
+         timeout.reset()
+         while 1:
+@@ -329,7 +359,7 @@ class ModuleBase:
+                 logger.warning(f'wait_until_stable({button}) timeout')
+                 break
+ 
+-            image = self.image_crop(button)
++            image = self.image_crop(button, alignment=alignment)
+             if match_template(image, prev_image):
+                 if timer.reached():
+                     logger.info(f'{button} stabled')
+@@ -338,23 +368,25 @@ class ModuleBase:
+                 prev_image = image
+                 timer.reset()
+ 
+-    def image_crop(self, button, copy=True):
++    def image_crop(self, button, copy=True, alignment=Alignment.CENTER):
+         """Extract the area from image.
+ 
+         Args:
+             button(Button, tuple): Button instance or area tuple.
+             copy:
+         """
++        image = self.device.image_for(alignment)
+         if isinstance(button, Button):
+-            return crop(self.device.image, button.area, copy=copy)
++            return crop(image, button.area, copy=copy)
+         elif isinstance(button, ButtonWrapper):
+-            return crop(self.device.image, button.area, copy=copy)
++            return crop(image, button.area, copy=copy)
+         elif hasattr(button, 'area'):
+-            return crop(self.device.image, button.area, copy=copy)
++            return crop(image, button.area, copy=copy)
+         else:
+-            return crop(self.device.image, button, copy=copy)
++            return crop(image, button, copy=copy)
+ 
+-    def image_color_count(self, button, color, threshold=221, count=50):
++    def image_color_count(self, button, color, threshold=221, count=50,
++                          alignment=Alignment.CENTER):
+         """
+         Args:
+             button (Button, tuple): Button instance or area.
+@@ -368,7 +400,7 @@ class ModuleBase:
+         if isinstance(button, np.ndarray):
+             image = button
+         else:
+-            image = self.image_crop(button, copy=False)
++            image = self.image_crop(button, copy=False, alignment=alignment)
+         mask = color_similarity_2d(image, color=color)
+         cv2.inRange(mask, threshold, 255, dst=mask)
+         sum_ = cv2.countNonZero(mask)
+diff --git a/module/device/control.py b/module/device/control.py
+index 287b016..d45124a 100644
+--- a/module/device/control.py
++++ b/module/device/control.py
+@@ -2,11 +2,13 @@ from module.base.button import ClickButton
+ from module.base.decorator import cached_property
+ from module.base.timer import Timer
+ from module.base.utils import *
++from module.device.geometry import Action, Alignment, GeometryError
+ from module.device.method.hermit import Hermit
+ from module.device.method.maatouch import MaaTouch
+ from module.device.method.minitouch import Minitouch
+ from module.device.method.nemu_ipc import NemuIpc
+ from module.device.method.scrcpy import Scrcpy
++from module.exception import ScriptError
+ from module.logger import logger
+ 
+ 
+@@ -23,30 +25,73 @@ class Control(Hermit, Minitouch, Scrcpy, MaaTouch, NemuIpc):
+             'minitouch': self.click_minitouch,
+             'Hermit': self.click_hermit,
+             'MaaTouch': self.click_maatouch,
++            'scrcpy': self.click_scrcpy,
+             'nemu_ipc': self.click_nemu_ipc,
+         }
+ 
+-    def click(self, button, control_check=True):
++    def _logical_to_backend(self, point, alignment, method, frame_id=None):
++        """Resolve a logical point exactly once for the selected backend."""
++        alignment = Alignment.coerce(alignment)
++        try:
++            if frame_id is not None and int(frame_id) != self.frame_id:
++                raise GeometryError(
++                    f'Frame {frame_id} is stale; current frame is {self.frame_id}'
++                )
++            if method == 'scrcpy':
++                # scrcpy packets use the video/capture dimensions in their header.
++                self.scrcpy_ensure_running()
++                geometry = self.capture_geometry_for(*self._scrcpy_resolution)
++                mapped = geometry.logical_to_capture(point, alignment)
++            else:
++                # ADB/uiautomator2/MaaTouch/minitouch operate in display space.
++                mapped = self.capture_geometry.logical_to_display(point, alignment)
++        except (AttributeError, GeometryError, TypeError, ValueError) as exc:
++            raise ScriptError(f'Unable to map input point {point}: {exc}') from exc
++        return tuple(int(round(value)) for value in mapped)
++
++    @staticmethod
++    def _contact_kwargs(contact_id, method=None):
++        if contact_id is None or method not in ('minitouch', 'MaaTouch', 'scrcpy'):
++            return {}
++        return {'contact': int(contact_id)}
++
++    def click(self, button, control_check=True, alignment=Alignment.CENTER,
++              frame_id=None, contact_id=None):
+         """Method to click a button.
+ 
+         Args:
+             button (button.Button): AzurLane Button instance.
+             control_check (bool):
++            alignment (Alignment, str): Logical viewport that produced the point.
++            frame_id (int, None): Optional source frame freshness guard.
++            contact_id (int, None): Explicit touch contact, or backend default.
+         """
+         if control_check:
+             self.handle_control_check(button)
+-        x, y = random_rectangle_point(button.button)
+-        x, y = ensure_int(x, y)
++        if isinstance(button, Action):
++            action = button
++            x, y = action.point
++            alignment = action.alignment
++            frame_id = action.frame_id
++            contact_id = action.contact_id
++        else:
++            x, y = random_rectangle_point(button.button)
++        logical = ensure_int(x, y)
++        method_name = self.config.Emulator_ControlMethod
++        x, y = self._logical_to_backend(logical, alignment, method_name, frame_id)
+         logger.info(
+-            'Click %s @ %s' % (point2str(x, y), button)
++            'Click %s -> %s [%s] @ %s' % (
++                point2str(*logical), point2str(x, y),
++                Alignment.coerce(alignment).value, button)
+         )
+         method = self.click_methods.get(
+-            self.config.Emulator_ControlMethod,
++            method_name,
+             self.click_adb
+         )
+-        method(x, y)
++        method(x, y, **self._contact_kwargs(contact_id, method_name))
+ 
+-    def multi_click(self, button, n, interval=(0.1, 0.2)):
++    def multi_click(self, button, n, interval=(0.1, 0.2),
++                    alignment=Alignment.CENTER, frame_id=None, contact_id=None):
+         self.handle_control_check(button)
+         click_timer = Timer(0.1)
+         for _ in range(n):
+@@ -55,9 +100,16 @@ class Control(Hermit, Minitouch, Scrcpy, MaaTouch, NemuIpc):
+                 self.sleep(remain)
+             click_timer.reset()
+ 
+-            self.click(button, control_check=False)
++            self.click(
++                button,
++                control_check=False,
++                alignment=alignment,
++                frame_id=frame_id,
++                contact_id=contact_id,
++            )
+ 
+-    def long_click(self, button, duration=(1, 1.2)):
++    def long_click(self, button, duration=(1, 1.2), alignment=Alignment.CENTER,
++                   frame_id=None, contact_id=None):
+         """Method to long click a button.
+ 
+         Args:
+@@ -66,61 +118,74 @@ class Control(Hermit, Minitouch, Scrcpy, MaaTouch, NemuIpc):
+         """
+         self.handle_control_check(button)
+         x, y = random_rectangle_point(button.button)
+-        x, y = ensure_int(x, y)
++        logical = ensure_int(x, y)
+         duration = ensure_time(duration)
++        method = self.config.Emulator_ControlMethod
++        x, y = self._logical_to_backend(logical, alignment, method, frame_id)
+         logger.info(
+-            'Click %s @ %s, %s' % (point2str(x, y), button, duration)
++            'Click %s -> %s [%s] @ %s, %s' % (
++                point2str(*logical), point2str(x, y),
++                Alignment.coerce(alignment).value, button, duration)
+         )
+-        method = self.config.Emulator_ControlMethod
++        contact = self._contact_kwargs(contact_id, method)
+         if method == 'minitouch':
+-            self.long_click_minitouch(x, y, duration)
++            self.long_click_minitouch(x, y, duration, **contact)
+         elif method == 'uiautomator2':
+             self.long_click_uiautomator2(x, y, duration)
+         elif method == 'scrcpy':
+-            self.long_click_scrcpy(x, y, duration)
++            self.long_click_scrcpy(x, y, duration, **contact)
+         elif method == 'MaaTouch':
+-            self.long_click_maatouch(x, y, duration)
++            self.long_click_maatouch(x, y, duration, **contact)
+         elif method == 'nemu_ipc':
+             self.long_click_nemu_ipc(x, y, duration)
+         else:
+             self.swipe_adb((x, y), (x, y), duration)
+ 
+-    def swipe(self, p1, p2, duration=(0.1, 0.2), name='SWIPE', distance_check=True):
++    def swipe(self, p1, p2, duration=(0.1, 0.2), name='SWIPE', distance_check=True,
++              alignment=Alignment.CENTER, frame_id=None, contact_id=None):
+         self.handle_control_check(name)
+-        p1, p2 = ensure_int(p1, p2)
++        logical_p1, logical_p2 = ensure_int(p1, p2)
+         duration = ensure_time(duration)
+         method = self.config.Emulator_ControlMethod
+         if method == 'uiautomator2':
+-            logger.info('Swipe %s -> %s, %s' % (point2str(*p1), point2str(*p2), duration))
++            logger.info('Swipe %s -> %s, %s' % (
++                point2str(*logical_p1), point2str(*logical_p2), duration))
+         elif method in ['minitouch', 'MaaTouch', 'scrcpy', 'nemu_ipc']:
+-            logger.info('Swipe %s -> %s' % (point2str(*p1), point2str(*p2)))
++            logger.info('Swipe %s -> %s [%s]' % (
++                point2str(*logical_p1), point2str(*logical_p2),
++                Alignment.coerce(alignment).value))
+         else:
+             # ADB needs to be slow, or swipe doesn't work
+             duration *= 2.5
+-            logger.info('Swipe %s -> %s, %s' % (point2str(*p1), point2str(*p2), duration))
++            logger.info('Swipe %s -> %s, %s' % (
++                point2str(*logical_p1), point2str(*logical_p2), duration))
+ 
+         if distance_check:
+-            if np.linalg.norm(np.subtract(p1, p2)) < 10:
++            if np.linalg.norm(np.subtract(logical_p1, logical_p2)) < 10:
+                 # Should swipe a certain distance, otherwise AL will treat it as click.
+                 # uiautomator2 should >= 6px, minitouch should >= 5px
+                 logger.info('Swipe distance < 10px, dropped')
+                 return
+ 
++        p1 = self._logical_to_backend(logical_p1, alignment, method, frame_id)
++        p2 = self._logical_to_backend(logical_p2, alignment, method, frame_id)
++        contact = self._contact_kwargs(contact_id, method)
+         if method == 'minitouch':
+-            self.swipe_minitouch(p1, p2)
++            self.swipe_minitouch(p1, p2, **contact)
+         elif method == 'uiautomator2':
+             self.swipe_uiautomator2(p1, p2, duration=duration)
+         elif method == 'scrcpy':
+-            self.swipe_scrcpy(p1, p2)
++            self.swipe_scrcpy(p1, p2, **contact)
+         elif method == 'MaaTouch':
+-            self.swipe_maatouch(p1, p2)
++            self.swipe_maatouch(p1, p2, **contact)
+         elif method == 'nemu_ipc':
+             self.swipe_nemu_ipc(p1, p2)
+         else:
+             self.swipe_adb(p1, p2, duration=duration)
+ 
+     def swipe_vector(self, vector, box=(123, 159, 1175, 628), random_range=(0, 0, 0, 0), padding=15,
+-                     duration=(0.1, 0.2), whitelist_area=None, blacklist_area=None, name='SWIPE', distance_check=True):
++                     duration=(0.1, 0.2), whitelist_area=None, blacklist_area=None, name='SWIPE', distance_check=True,
++                     alignment=Alignment.CENTER, frame_id=None, contact_id=None):
+         """Method to swipe.
+ 
+         Args:
+@@ -145,30 +210,43 @@ class Control(Hermit, Minitouch, Scrcpy, MaaTouch, NemuIpc):
+             whitelist_area=whitelist_area,
+             blacklist_area=blacklist_area
+         )
+-        self.swipe(p1, p2, duration=duration, name=name, distance_check=distance_check)
++        self.swipe(
++            p1, p2, duration=duration, name=name, distance_check=distance_check,
++            alignment=alignment, frame_id=frame_id, contact_id=contact_id)
+ 
+     def drag(self, p1, p2, segments=1, shake=(0, 15), point_random=(-10, -10, 10, 10), shake_random=(-5, -5, 5, 5),
+-             swipe_duration=0.25, shake_duration=0.1, name='DRAG'):
++             swipe_duration=0.25, shake_duration=0.1, name='DRAG', alignment=Alignment.CENTER,
++             frame_id=None, contact_id=None):
+         self.handle_control_check(name)
+-        p1, p2 = ensure_int(p1, p2)
++        logical_p1, logical_p2 = ensure_int(p1, p2)
+         logger.info(
+-            'Drag %s -> %s' % (point2str(*p1), point2str(*p2))
++            'Drag %s -> %s [%s]' % (
++                point2str(*logical_p1), point2str(*logical_p2),
++                Alignment.coerce(alignment).value)
+         )
+         method = self.config.Emulator_ControlMethod
++        p1 = self._logical_to_backend(logical_p1, alignment, method, frame_id)
++        p2 = self._logical_to_backend(logical_p2, alignment, method, frame_id)
++        contact = self._contact_kwargs(contact_id, method)
+         if method == 'minitouch':
+-            self.drag_minitouch(p1, p2, point_random=point_random)
++            self.drag_minitouch(p1, p2, point_random=point_random, **contact)
+         elif method == 'uiautomator2':
+             self.drag_uiautomator2(
+                 p1, p2, segments=segments, shake=shake, point_random=point_random, shake_random=shake_random,
+                 swipe_duration=swipe_duration, shake_duration=shake_duration)
+         elif method == 'scrcpy':
+-            self.drag_scrcpy(p1, p2, point_random=point_random)
++            self.drag_scrcpy(p1, p2, point_random=point_random, **contact)
+         elif method == 'MaaTouch':
+-            self.drag_maatouch(p1, p2, point_random=point_random)
++            self.drag_maatouch(p1, p2, point_random=point_random, **contact)
+         elif method == 'nemu_ipc':
+             self.drag_nemu_ipc(p1, p2, point_random=point_random)
+         else:
+             logger.warning(f'Control method {method} does not support drag well, '
+                            f'falling back to ADB swipe may cause unexpected behaviour')
+             self.swipe_adb(p1, p2, duration=ensure_time(swipe_duration * 2))
+-            self.click(ClickButton(area=area_offset(point_random, p2), name=name))
++            self.click(
++                ClickButton(area=area_offset(point_random, logical_p2), name=name),
++                alignment=alignment,
++                frame_id=frame_id,
++                contact_id=contact_id,
++            )
+diff --git a/module/device/method/maatouch.py b/module/device/method/maatouch.py
+index 56973a0..bd44f95 100644
+--- a/module/device/method/maatouch.py
++++ b/module/device/method/maatouch.py
+@@ -9,6 +9,7 @@ from module.base.decorator import cached_property, del_cached_property, has_cach
+ from module.base.timer import Timer
+ from module.base.utils import *
+ from module.device.connection import Connection
++from module.device.geometry import Alignment
+ from module.device.method.minitouch import CommandBuilder, insert_swipe
+ from module.device.method.utils import RETRY_TRIES, handle_adb_error, handle_unknown_host_service, retry_sleep
+ from module.exception import RequestHumanTakeover
+@@ -85,13 +86,22 @@ def retry(func):
+ 
+ 
+ class MaatouchBuilder(CommandBuilder):
+-    def __init__(self, device, contact=0, handle_orientation=False):
++    def __init__(self, device, contact=0, handle_orientation=False,
++                 coordinate_space='display', alignment=Alignment.CENTER,
++                 frame_id=None):
+         """
+         Args:
+             device (MaaTouch):
+         """
+ 
+-        super().__init__(device, contact, handle_orientation)
++        super().__init__(
++            device,
++            contact,
++            handle_orientation,
++            coordinate_space=coordinate_space,
++            alignment=alignment,
++            frame_id=frame_id,
++        )
+ 
+     def send(self):
+         return self.device.maatouch_send(builder=self)
+@@ -247,7 +257,7 @@ class MaaTouch(Connection):
+         byte_content = content.encode('utf-8')
+         self._maatouch_stream.sendall(byte_content)
+         self._maatouch_stream.recv(0)
+-        self.sleep(self.maatouch_builder.delay / 1000 + builder.DEFAULT_DELAY)
++        self.sleep(builder.delay / 1000 + builder.DEFAULT_DELAY)
+         builder.clear()
+ 
+     def maatouch_install(self):
+@@ -258,25 +268,31 @@ class MaaTouch(Connection):
+         logger.hr('MaaTouch uninstall')
+         self.adb_shell(["rm", self.config.MAATOUCH_FILEPATH_REMOTE])
+ 
++    def _maatouch_builder_for(self, contact=None):
++        if contact is None:
++            return self.maatouch_builder
++        _ = self.maatouch_builder
++        return MaatouchBuilder(self, contact=int(contact), coordinate_space='display')
++
+     @retry
+-    def click_maatouch(self, x, y):
+-        builder = self.maatouch_builder
++    def click_maatouch(self, x, y, contact=None):
++        builder = self._maatouch_builder_for(contact)
+         builder.down(x, y).commit()
+         builder.up().commit()
+         builder.send()
+ 
+     @retry
+-    def long_click_maatouch(self, x, y, duration=1.0):
++    def long_click_maatouch(self, x, y, duration=1.0, contact=None):
+         duration = int(duration * 1000)
+-        builder = self.maatouch_builder
++        builder = self._maatouch_builder_for(contact)
+         builder.down(x, y).commit().wait(duration)
+         builder.up().commit()
+         builder.send()
+ 
+     @retry
+-    def swipe_maatouch(self, p1, p2):
++    def swipe_maatouch(self, p1, p2, contact=None):
+         points = insert_swipe(p0=p1, p3=p2)
+-        builder = self.maatouch_builder
++        builder = self._maatouch_builder_for(contact)
+ 
+         builder.down(*points[0]).commit().wait(10)
+         builder.send()
+@@ -289,11 +305,11 @@ class MaaTouch(Connection):
+         builder.send()
+ 
+     @retry
+-    def drag_maatouch(self, p1, p2, point_random=(-10, -10, 10, 10)):
++    def drag_maatouch(self, p1, p2, point_random=(-10, -10, 10, 10), contact=None):
+         p1 = np.array(p1) - random_rectangle_point(point_random)
+         p2 = np.array(p2) - random_rectangle_point(point_random)
+         points = insert_swipe(p0=p1, p3=p2, speed=20)
+-        builder = self.maatouch_builder
++        builder = self._maatouch_builder_for(contact)
+ 
+         builder.down(*points[0]).commit().wait(10)
+         builder.send()
+@@ -312,4 +328,4 @@ class MaaTouch(Connection):
+ 
+ if __name__ == '__main__':
+     self = MaaTouch('src')
+-    self.maatouch_uninstall()
+\ No newline at end of file
++    self.maatouch_uninstall()
+diff --git a/module/device/method/minitouch.py b/module/device/method/minitouch.py
+index b049e0b..e8c3619 100644
+--- a/module/device/method/minitouch.py
++++ b/module/device/method/minitouch.py
+@@ -14,6 +14,7 @@ from module.base.decorator import Config, cached_property, del_cached_property,
+ from module.base.timer import Timer
+ from module.base.utils import *
+ from module.device.connection import Connection
++from module.device.geometry import Alignment, DisplayGeometry, GeometryError
+ from module.device.method.utils import RETRY_TRIES, handle_adb_error, handle_unknown_host_service, retry_sleep
+ from module.exception import RequestHumanTakeover, ScriptError
+ from module.logger import logger
+@@ -186,7 +187,9 @@ class CommandBuilder:
+     max_x = 1280
+     max_y = 720
+ 
+-    def __init__(self, device, contact=0, handle_orientation=True):
++    def __init__(self, device, contact=0, handle_orientation=True,
++                 coordinate_space='display', alignment=Alignment.CENTER,
++                 frame_id=None):
+         """
+         Args:
+             device:
+@@ -196,6 +199,9 @@ class CommandBuilder:
+         self.delay = 0
+         self.contact = contact
+         self.handle_orientation = handle_orientation
++        self.coordinate_space = coordinate_space
++        self.alignment = Alignment.coerce(alignment)
++        self.frame_id = frame_id
+ 
+     @property
+     def orientation(self):
+@@ -205,29 +211,39 @@ class CommandBuilder:
+             return 0
+ 
+     def convert(self, x, y):
+-        max_x, max_y = self.device.max_x, self.device.max_y
+-        orientation = self.orientation
+-
+-        if orientation == 0:
+-            pass
+-        elif orientation == 1:
+-            x, y = 720 - y, x
+-            max_x, max_y = max_y, max_x
+-        elif orientation == 2:
+-            x, y = 1280 - x, 720 - y
+-        elif orientation == 3:
+-            x, y = y, 1280 - x
+-            max_x, max_y = max_y, max_x
+-        else:
+-            raise ScriptError(f'Invalid device orientation: {orientation}')
+-
++        try:
++            capture = self.device.capture_geometry
++            if self.frame_id is not None and int(self.frame_id) != self.device.frame_id:
++                raise GeometryError(
++                    f'Frame {self.frame_id} is stale; current frame is '
++                    f'{self.device.frame_id}'
++                )
++            if self.coordinate_space == 'logical':
++                x, y = capture.logical_to_display((x, y), self.alignment)
++            elif self.coordinate_space != 'display':
++                raise GeometryError(
++                    f'Unknown builder coordinate space: {self.coordinate_space}'
++                )
++            source_display = capture.display
++            display = DisplayGeometry(
++                width=source_display.width,
++                height=source_display.height,
++                rotation=self.orientation,
++                safe_insets=source_display.safe_insets,
++            )
++            (x, y), (source_width, source_height) = display.oriented_to_natural((x, y))
++        except AttributeError:
++            # Preserve startup/development behavior before the first screenshot.
++            display = DisplayGeometry(1280, 720, rotation=self.orientation)
++            (x, y), (source_width, source_height) = display.oriented_to_natural((x, y))
++        except GeometryError as exc:
++            raise ScriptError(f'Unable to convert touch coordinate: {exc}') from exc
++
++        # minitouch/MaaTouch maxima are transport axes, not screenshot size.
++        max_x, max_y = int(self.device.max_x), int(self.device.max_y)
+         self.max_x, self.max_y = max_x, max_y
+-        if not self.device.config.DEVICE_OVER_HTTP:
+-            # Maximum X and Y coordinates may, but usually do not, match the display size.
+-            x, y = int(x / 1280 * max_x), int(y / 720 * max_y)
+-        else:
+-            # When over http, max_x and max_y are default to 1280 and 720, skip matching display size
+-            x, y = int(x), int(y)
++        x = max(0, min(max_x, int(round(x / source_width * max_x))))
++        y = max(0, min(max_y, int(round(y / source_height * max_y))))
+         return x, y
+ 
+     def commit(self):
+@@ -510,7 +526,7 @@ class Minitouch(Connection):
+         byte_content = content.encode('utf-8')
+         self._minitouch_client.sendall(byte_content)
+         self._minitouch_client.recv(0)
+-        time.sleep(self.minitouch_builder.delay / 1000 + builder.DEFAULT_DELAY)
++        time.sleep(builder.delay / 1000 + builder.DEFAULT_DELAY)
+         builder.clear()
+ 
+     @cached_property
+@@ -584,25 +600,31 @@ class Minitouch(Connection):
+         time.sleep(builder.delay / 1000 + builder.DEFAULT_DELAY)
+         builder.clear()
+ 
++    def _minitouch_builder_for(self, contact=None):
++        if contact is None:
++            return self.minitouch_builder
++        _ = self.minitouch_builder
++        return CommandBuilder(self, contact=int(contact), coordinate_space='display')
++
+     @retry
+-    def click_minitouch(self, x, y):
+-        builder = self.minitouch_builder
++    def click_minitouch(self, x, y, contact=None):
++        builder = self._minitouch_builder_for(contact)
+         builder.down(x, y).commit()
+         builder.up().commit()
+         builder.send()
+ 
+     @retry
+-    def long_click_minitouch(self, x, y, duration=1.0):
++    def long_click_minitouch(self, x, y, duration=1.0, contact=None):
+         duration = int(duration * 1000)
+-        builder = self.minitouch_builder
++        builder = self._minitouch_builder_for(contact)
+         builder.down(x, y).commit().wait(duration)
+         builder.up().commit()
+         builder.send()
+ 
+     @retry
+-    def swipe_minitouch(self, p1, p2):
++    def swipe_minitouch(self, p1, p2, contact=None):
+         points = insert_swipe(p0=p1, p3=p2)
+-        builder = self.minitouch_builder
++        builder = self._minitouch_builder_for(contact)
+ 
+         builder.down(*points[0]).commit().wait(10)
+         builder.send()
+@@ -615,11 +637,11 @@ class Minitouch(Connection):
+         builder.send()
+ 
+     @retry
+-    def drag_minitouch(self, p1, p2, point_random=(-10, -10, 10, 10)):
++    def drag_minitouch(self, p1, p2, point_random=(-10, -10, 10, 10), contact=None):
+         p1 = np.array(p1) - random_rectangle_point(point_random)
+         p2 = np.array(p2) - random_rectangle_point(point_random)
+         points = insert_swipe(p0=p1, p3=p2, speed=20)
+-        builder = self.minitouch_builder
++        builder = self._minitouch_builder_for(contact)
+ 
+         builder.down(*points[0]).commit().wait(10)
+         builder.send()
+diff --git a/module/device/method/scrcpy/options.py b/module/device/method/scrcpy/options.py
+index dff59f4..bddfaf7 100644
+--- a/module/device/method/scrcpy/options.py
++++ b/module/device/method/scrcpy/options.py
+@@ -1,3 +1,4 @@
++import os
+ import typing as t
+ 
+ import module.device.method.scrcpy.const as const
+@@ -5,6 +6,17 @@ import module.device.method.scrcpy.const as const
+ 
+ class ScrcpyOptions:
+     frame_rate = 10
++    default_max_size = 1920
++
++    @classmethod
++    def max_size(cls) -> int:
++        """Keep enough vertical pixels for a 720p logical viewport on wide phones."""
++        raw = os.environ.get('SRC_SCRCPY_MAX_SIZE', str(cls.default_max_size))
++        try:
++            value = int(raw)
++        except (TypeError, ValueError):
++            value = cls.default_max_size
++        return max(1280, min(value, 2560))
+ 
+     @classmethod
+     def codec_options(cls) -> str:
+@@ -50,7 +62,7 @@ class ScrcpyOptions:
+         """
+         options = [
+             'log_level=info',
+-            'max_size=1280',
++            f'max_size={cls.max_size()}',
+             # 20Mbps, the maximum output bitrate of scrcpy
+             # If a higher value is set, scrcpy fallback to 8Mbps default.
+             'bit_rate=20000000',
+@@ -110,7 +122,7 @@ class ScrcpyOptions:
+             "com.genymobile.scrcpy.Server",
+             "1.20",  # Scrcpy server version
+             "info",  # Log level: info, verbose...
+-            f"1280",  # Max screen width (long side)
++            f"{cls.max_size()}",  # Max screen width (long side)
+             f"20000000",  # Bitrate of video
+             f"{cls.frame_rate}",  # Max frame per second
+             f"{const.LOCK_SCREEN_ORIENTATION_UNLOCKED}",  # Lock screen orientation: LOCK_SCREEN_ORIENTATION
+diff --git a/module/device/method/scrcpy/scrcpy.py b/module/device/method/scrcpy/scrcpy.py
+index ef0192b..d7e115f 100644
+--- a/module/device/method/scrcpy/scrcpy.py
++++ b/module/device/method/scrcpy/scrcpy.py
+@@ -106,61 +106,65 @@ class Scrcpy(ScrcpyCore, Uiautomator2):
+                     return screenshot
+ 
+     @retry
+-    def click_scrcpy(self, x, y):
++    def click_scrcpy(self, x, y, contact=None):
+         self.scrcpy_ensure_running()
++        touch_id = -1 if contact is None else int(contact)
+ 
+         with self._scrcpy_control_socket_lock:
+-            self._scrcpy_control.touch(x, y, const.ACTION_DOWN)
+-            self._scrcpy_control.touch(x, y, const.ACTION_UP)
++            self._scrcpy_control.touch(x, y, const.ACTION_DOWN, touch_id)
++            self._scrcpy_control.touch(x, y, const.ACTION_UP, touch_id)
+             self.sleep(0.05)
+ 
+     @retry
+-    def long_click_scrcpy(self, x, y, duration=1.0):
++    def long_click_scrcpy(self, x, y, duration=1.0, contact=None):
+         self.scrcpy_ensure_running()
++        touch_id = -1 if contact is None else int(contact)
+ 
+         with self._scrcpy_control_socket_lock:
+-            self._scrcpy_control.touch(x, y, const.ACTION_DOWN)
++            self._scrcpy_control.touch(x, y, const.ACTION_DOWN, touch_id)
+             self.sleep(duration)
+-            self._scrcpy_control.touch(x, y, const.ACTION_UP)
++            self._scrcpy_control.touch(x, y, const.ACTION_UP, touch_id)
+             self.sleep(0.05)
+ 
+     @retry
+-    def swipe_scrcpy(self, p1, p2):
++    def swipe_scrcpy(self, p1, p2, contact=None):
+         self.scrcpy_ensure_running()
++        touch_id = -1 if contact is None else int(contact)
+ 
+         with self._scrcpy_control_socket_lock:
+             # Unlike minitouch, scrcpy swipes needs to be continuous
+             # So 5 times smother
+             points = insert_swipe(p0=p1, p3=p2, speed=4, min_distance=2)
+-            self._scrcpy_control.touch(*p1, const.ACTION_DOWN)
++            self._scrcpy_control.touch(*p1, const.ACTION_DOWN, touch_id)
+ 
+             for point in points[1:-1]:
+-                self._scrcpy_control.touch(*point, const.ACTION_MOVE)
++                self._scrcpy_control.touch(*point, const.ACTION_MOVE, touch_id)
+                 self.sleep(0.002)
+ 
+-            self._scrcpy_control.touch(*p2, const.ACTION_MOVE)
+-            self._scrcpy_control.touch(*p2, const.ACTION_UP)
++            self._scrcpy_control.touch(*p2, const.ACTION_MOVE, touch_id)
++            self._scrcpy_control.touch(*p2, const.ACTION_UP, touch_id)
+             self.sleep(0.05)
+ 
+     @retry
+-    def drag_scrcpy(self, p1, p2, point_random=(-10, -10, 10, 10)):
++    def drag_scrcpy(self, p1, p2, point_random=(-10, -10, 10, 10), contact=None):
+         self.scrcpy_ensure_running()
++        touch_id = -1 if contact is None else int(contact)
+ 
+         with self._scrcpy_control_socket_lock:
+             p1 = np.array(p1) - random_rectangle_point(point_random)
+             p2 = np.array(p2) - random_rectangle_point(point_random)
+             points = insert_swipe(p0=p1, p3=p2, speed=4, min_distance=2)
+ 
+-            self._scrcpy_control.touch(*p1, const.ACTION_DOWN)
++            self._scrcpy_control.touch(*p1, const.ACTION_DOWN, touch_id)
+ 
+             for point in points[1:-1]:
+-                self._scrcpy_control.touch(*point, const.ACTION_MOVE)
++                self._scrcpy_control.touch(*point, const.ACTION_MOVE, touch_id)
+                 self.sleep(0.002)
+ 
+             # Hold 280ms
+             for _ in range(int(0.14 // 0.002) * 2):
+-                self._scrcpy_control.touch(*p2, const.ACTION_MOVE)
++                self._scrcpy_control.touch(*p2, const.ACTION_MOVE, touch_id)
+                 self.sleep(0.002)
+ 
+-            self._scrcpy_control.touch(*p2, const.ACTION_UP)
++            self._scrcpy_control.touch(*p2, const.ACTION_UP, touch_id)
+             self.sleep(0.05)
+diff --git a/module/device/method/uiautomator_2.py b/module/device/method/uiautomator_2.py
+index b8eb0ad..38b7646 100644
+--- a/module/device/method/uiautomator_2.py
++++ b/module/device/method/uiautomator_2.py
+@@ -11,6 +11,7 @@ from lxml import etree
+ from module.base.utils import *
+ from module.config.server import DICT_PACKAGE_TO_ACTIVITY
+ from module.device.connection import Connection
++from module.device.geometry import Alignment, CaptureGeometry, DisplayGeometry, GeometryError
+ from module.device.method.utils import (ImageTruncated, PackageNotInstalled, RETRY_TRIES, handle_adb_error,
+                                         handle_unknown_host_service, possible_reasons, retry_sleep)
+ from module.exception import RequestHumanTakeover
+@@ -409,25 +410,31 @@ class Uiautomator2(Connection):
+ 
+     def resolution_check_uiautomator2(self):
+         """
+-        Alas does not actively check resolution but the width and height of screenshots.
+-        However, some screenshot methods do not provide device resolution, so check it here.
++        Check that the display can contain a 1280x720 logical viewport.
+ 
+         Returns:
+             (width, height)
+ 
+         Raises:
+-            RequestHumanTakeover: If resolution is not 1280x720
++            RequestHumanTakeover: If adaptive geometry cannot represent the display
+         """
+         width, height = self.resolution_uiautomator2()
+         logger.attr('Screen_size', f'{width}x{height}')
+-        if width == 1280 and height == 720:
+-            return (width, height)
+-        if width == 720 and height == 1280:
+-            return (width, height)
+-
+-        logger.critical(f'Resolution not supported: {width}x{height}')
+-        logger.critical('Please set emulator resolution to 1280x720')
+-        raise RequestHumanTakeover
++        landscape_width, landscape_height = max(width, height), min(width, height)
++        self._physical_display_size = (landscape_width, landscape_height)
++        try:
++            if landscape_height < 720:
++                raise GeometryError(
++                    f'Capture height {landscape_height} is below the 720px logical baseline'
++                )
++            display = DisplayGeometry(landscape_width, landscape_height)
++            capture = CaptureGeometry(landscape_width, landscape_height, display)
++            for alignment in Alignment:
++                capture.viewport(alignment)
++        except GeometryError as exc:
++            logger.critical(f'Resolution not supported: {width}x{height}: {exc}')
++            raise RequestHumanTakeover from exc
++        return (width, height)
+ 
+     @retry
+     def proc_list_uiautomator2(self) -> t.List[ProcessInfo]:
+diff --git a/module/device/screenshot.py b/module/device/screenshot.py
+index 2e402eb..2e9a22f 100644
+--- a/module/device/screenshot.py
++++ b/module/device/screenshot.py
+@@ -10,6 +10,13 @@ from PIL import Image
+ from module.base.decorator import cached_property
+ from module.base.timer import Timer
+ from module.base.utils import get_color, image_size, limit_in, save_image
++from module.device.geometry import (
++    Alignment,
++    CaptureGeometry,
++    DisplayGeometry,
++    GeometryError,
++    LogicalFrame,
++)
+ from module.device.method.adb import Adb
+ from module.device.method.ascreencap import AScreenCap
+ from module.device.method.droidcast import DroidCast
+@@ -27,7 +34,10 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
+     _minicap_uninstalled = False
+     _screenshot_interval = Timer(0.1)
+     _last_save_time = {}
++    _frame_id = 0
+     image: np.ndarray
++    raw_image: np.ndarray
++    capture_geometry: CaptureGeometry
+ 
+     @cached_property
+     def screenshot_methods(self):
+@@ -72,15 +82,24 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
+                 method = self.config.Emulator_ScreenshotMethod
+             method = self.screenshot_methods.get(method, self.screenshot_adb)
+ 
+-            self.image = method()
++            raw_image = method()
+ 
+             # if self.config.Emulator_ScreenshotDedithering:
+             #     # This will take 40-60ms
+-            #     cv2.fastNlMeansDenoising(self.image, self.image, h=17, templateWindowSize=1, searchWindowSize=2)
+-            self.image = self._handle_orientated_image(self.image)
++            #     cv2.fastNlMeansDenoising(raw_image, raw_image, h=17, templateWindowSize=1, searchWindowSize=2)
++            raw_image = self._handle_orientated_image(raw_image)
++            if image_size(raw_image)[0] < image_size(raw_image)[1]:
++                self.get_orientation()
++                raw_image = self._handle_orientated_image(raw_image)
++            self._publish_raw_frame(raw_image)
+ 
+             if self.config.Error_SaveError:
+-                self.screenshot_deque.append({'time': datetime.now(), 'image': self.image})
++                self.screenshot_deque.append({
++                    'time': datetime.now(),
++                    'image': self.image,
++                    'raw_image': self.raw_image,
++                    'frame_id': self.frame_id,
++                })
+ 
+             if self.check_screen_size() and self.check_screen_black():
+                 break
+@@ -93,6 +112,90 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
+     def has_cached_image(self):
+         return hasattr(self, 'image') and self.image is not None
+ 
++    @property
++    def has_cached_raw_image(self):
++        return hasattr(self, 'raw_image') and self.raw_image is not None
++
++    @property
++    def frame_id(self):
++        return self._frame_id
++
++    def _publish_raw_frame(self, image):
++        """Attach immutable geometry and reset lazy logical views for one frame."""
++        width, height = image_size(image)
++        signature = (width, height)
++        if getattr(self, '_capture_signature', None) != signature:
++            self._screen_size_checked = False
++            self._screen_black_checked = False
++            self._capture_signature = signature
++        try:
++            display_width, display_height = getattr(
++                self, '_physical_display_size', signature)
++            capture_aspect = width / height
++            display_aspect = display_width / display_height
++            if abs(capture_aspect - display_aspect) / display_aspect > 0.02:
++                raise GeometryError(
++                    f'Capture aspect {capture_aspect:.4f} does not match physical '
++                    f'display aspect {display_aspect:.4f}'
++                )
++            display = DisplayGeometry(
++                width=display_width,
++                height=display_height,
++                rotation=int(getattr(self, 'orientation', 0)),
++            )
++            geometry = CaptureGeometry(
++                width=width,
++                height=height,
++                display=display,
++            )
++            # Validate all alignments before exposing any view from this frame.
++            for alignment in Alignment:
++                geometry.viewport(alignment)
++        except GeometryError as exc:
++            logger.critical(f'Unsupported display geometry: {exc}')
++            raise RequestHumanTakeover from exc
++
++        self._frame_id += 1
++        self.raw_image = image
++        self.capture_geometry = geometry
++        self._logical_frames = {}
++        self.image = self.logical_frame(Alignment.CENTER).image
++
++    def logical_frame(self, alignment=Alignment.CENTER, frame_id=None):
++        """Return one lazy 1280x720 view without taking another screenshot."""
++        alignment = Alignment.coerce(alignment)
++        if not self.has_cached_raw_image:
++            raise GeometryError('No screenshot is available')
++        if frame_id is not None and int(frame_id) != self.frame_id:
++            raise GeometryError(
++                f'Frame {frame_id} is stale; current frame is {self.frame_id}'
++            )
++        try:
++            return self._logical_frames[alignment]
++        except KeyError:
++            viewport = self.capture_geometry.viewport(alignment)
++            logical = LogicalFrame(
++                frame_id=self.frame_id,
++                alignment=alignment,
++                image=viewport.crop(self.raw_image),
++                geometry=self.capture_geometry,
++            )
++            self._logical_frames[alignment] = logical
++            return logical
++
++    def image_for(self, alignment=Alignment.CENTER, frame_id=None):
++        if not self.has_cached_raw_image and self.has_cached_image:
++            # Development helpers may inject an already-logical image directly.
++            if image_size(self.image) == (1280, 720):
++                return self.image
++        return self.logical_frame(alignment, frame_id=frame_id).image
++
++    def capture_geometry_for(self, width, height):
++        """Return geometry for another full-display capture such as scrcpy video."""
++        if not hasattr(self, 'capture_geometry'):
++            raise GeometryError('No screenshot geometry is available')
++        return self.capture_geometry.for_capture_size(int(width), int(height))
++
+     def _handle_orientated_image(self, image):
+         """
+         Args:
+@@ -101,11 +204,12 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
+         Returns:
+             np.ndarray:
+         """
+-        width, height = image_size(self.image)
+-        if width == 1280 and height == 720:
++        width, height = image_size(image)
++        if width > height:
+             return image
+ 
+-        # Rotate screenshots only when they're not 1280x720
++        # A wide phone may be larger than 1280x720 and is already oriented.
++        # Only portrait captures need Android-orientation handling.
+         if self.orientation == 0:
+             pass
+         elif self.orientation == 1:
+@@ -219,41 +323,28 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
+ 
+     def check_screen_size(self):
+         """
+-        Screen size must be 1280x720.
++        Screen must provide a valid landscape 16:9 (or wider) viewport.
+         Take a screenshot before call.
+         """
+         if self._screen_size_checked:
+             return True
+ 
+-        orientated = False
+-        for _ in range(2):
+-            # Check screen size
+-            width, height = image_size(self.image)
+-            logger.attr('Screen_size', f'{width}x{height}')
+-            if width == 1280 and height == 720:
+-                self._screen_size_checked = True
+-                return True
+-            elif not orientated and (width == 720 and height == 1280):
+-                logger.info('Received orientated screenshot, handling')
+-                self.get_orientation()
+-                self.image = self._handle_orientated_image(self.image)
+-                orientated = True
+-                width, height = image_size(self.image)
+-                if width == 720 and height == 1280:
+-                    logger.info('Unable to handle orientated screenshot, continue for now')
+-                    return True
+-                else:
+-                    continue
+-            elif self.config.Emulator_Serial == 'wsa-0':
++        width, height = image_size(self.raw_image)
++        logger.attr('Screen_size', f'{width}x{height}')
++        try:
++            for alignment in Alignment:
++                self.capture_geometry.viewport(alignment)
++        except GeometryError as exc:
++            if self.config.Emulator_Serial == 'wsa-0':
+                 self.display_resize_wsa(0)
+                 return False
+-            elif hasattr(self, 'app_is_running') and not self.app_is_running():
+-                logger.warning('Received orientated screenshot, game not running')
++            if hasattr(self, 'app_is_running') and not self.app_is_running():
++                logger.warning('Received unsupported screenshot while game is not running')
+                 return True
+-            else:
+-                logger.critical(f'Resolution not supported: {width}x{height}')
+-                logger.critical('Please set emulator resolution to 1280x720')
+-                raise RequestHumanTakeover
++            logger.critical(f'Resolution not supported: {width}x{height}: {exc}')
++            raise RequestHumanTakeover from exc
++        self._screen_size_checked = True
++        return True
+ 
+     def check_screen_black(self):
+         if self._screen_black_checked:
+diff --git a/tasks/base/daemon.py b/tasks/base/daemon.py
+index 517181a..ecab31f 100644
+--- a/tasks/base/daemon.py
++++ b/tasks/base/daemon.py
+@@ -1,5 +1,6 @@
+ from module.base.timer import Timer
+ from module.daemon.daemon_base import DaemonBase
++from module.device.geometry import Alignment
+ from module.device.method import maatouch
+ from module.logger import logger
+ from tasks.base.assets.assets_base_daemon import *
+@@ -15,13 +16,18 @@ from tasks.rogue.route.base import RouteBase
+ 
+ 
+ class SecondaryMaatouchBuilder(maatouch.MaatouchBuilder):
+-    def __init__(self, device, contact=0, handle_orientation=False):
++    def __init__(self, device, contact=None, handle_orientation=False, **kwargs):
+         """
+         Click on secondary contact to avoid interruption of real-person contact
+         """
+-        if contact == 0:
++        if contact is None:
+             contact = 2
+-        super().__init__(device, contact=contact, handle_orientation=handle_orientation)
++        super().__init__(
++            device,
++            contact=contact,
++            handle_orientation=handle_orientation,
++            **kwargs,
++        )
+ 
+ 
+ maatouch.MaatouchBuilder = SecondaryMaatouchBuilder
+@@ -108,7 +114,11 @@ class Daemon(RouteBase, RadarMixin, DaemonBase, AimDetectorMixin):
+                 # self.interval_reset(INTERACT_INVESTIGATE)
+                 continue
+             if in_story_timeout.started() and not in_story_timeout.reached():
+-                if self.appear_then_click(DUNGEON_COMBAT_INTERACT, interval=1):
++                if self.appear_then_click(
++                    DUNGEON_COMBAT_INTERACT,
++                    interval=1,
++                    alignment=Alignment.RIGHT,
++                ):
+                     in_story_timeout.reset()
+                     continue
+             # Map interact
+diff --git a/tasks/combat/interact.py b/tasks/combat/interact.py
+index cb81852..fefd89b 100644
+--- a/tasks/combat/interact.py
++++ b/tasks/combat/interact.py
+@@ -1,4 +1,5 @@
+ from module.base.utils import color_similar, get_color
++from module.device.geometry import Alignment
+ from module.logger import logger
+ from tasks.base.ui import UI
+ from tasks.combat.assets.assets_combat_interact import DUNGEON_COMBAT_INTERACT, MAP_LOADING
+@@ -13,7 +14,11 @@ class CombatInteract(UI):
+         Returns:
+             bool: If clicked.
+         """
+-        if self.appear_then_click(DUNGEON_COMBAT_INTERACT, interval=interval):
++        if self.appear_then_click(
++            DUNGEON_COMBAT_INTERACT,
++            interval=interval,
++            alignment=Alignment.RIGHT,
++        ):
+             return True
+ 
+         return False
+@@ -54,7 +59,8 @@ class CombatInteract(UI):
+         return False
+ 
+     def is_map_loading_black(self):
+-        color = get_color(self.device.image, A_BUTTON.area)
++        color = get_color(
++            self.device.image_for(Alignment.RIGHT), A_BUTTON.area)
+         if color_similar(color, (0, 0, 0)):
+             return True
+         return False
+diff --git a/tasks/combat/popup.py b/tasks/combat/popup.py
+index caac33b..831473b 100644
+--- a/tasks/combat/popup.py
++++ b/tasks/combat/popup.py
+@@ -1,4 +1,5 @@
+ from module.logger import logger
++from module.device.geometry import Alignment
+ from tasks.base.ui import UI
+ from tasks.combat.assets.assets_combat_popup import *
+ from tasks.map.assets.assets_map_control import RUN_BUTTON
+@@ -14,9 +15,9 @@ class CombatPopup(UI):
+         if self.match_template_color(Rusted_Crypt_1, interval=5):
+             # RUN_BUTTON is somewhere safe to click, no side effect and not clicking the popup itself
+             logger.info(f'{Rusted_Crypt_1} -> {RUN_BUTTON}')
+-            self.device.click(RUN_BUTTON)
++            self.device.click(RUN_BUTTON, alignment=Alignment.RIGHT)
+             return True
+         if self.match_template_color(Rusted_Crypt_2, interval=5):
+             logger.info(f'{Rusted_Crypt_2} -> {RUN_BUTTON}')
+-            self.device.click(RUN_BUTTON)
++            self.device.click(RUN_BUTTON, alignment=Alignment.RIGHT)
+             return True
+diff --git a/tasks/combat/state.py b/tasks/combat/state.py
+index 124915a..8b38b7c 100644
+--- a/tasks/combat/state.py
++++ b/tasks/combat/state.py
+@@ -3,6 +3,7 @@ from scipy import signal
+ 
+ from module.base.timer import Timer
+ from module.base.utils import rgb2luma
++from module.device.geometry import Alignment
+ from module.logger import logger
+ from tasks.base.ui import UI
+ from tasks.combat.assets.assets_combat_state import *
+@@ -17,7 +18,7 @@ class CombatState(UI):
+     _combat_damage_image = None
+ 
+     def is_combat_executing(self) -> bool:
+-        appear = self.appear(COMBAT_PAUSE)
++        appear = self.appear(COMBAT_PAUSE, alignment=Alignment.RIGHT)
+         if appear:
+             if COMBAT_PAUSE.button_offset[0] < 3:
+                 return True
+@@ -25,7 +26,8 @@ class CombatState(UI):
+         return False
+ 
+     def _is_combat_button_active(self, button):
+-        image = rgb2luma(self.image_crop(button, copy=False))
++        image = rgb2luma(self.image_crop(
++            button, copy=False, alignment=Alignment.RIGHT))
+         lines = cv2.reduce(image, 1, cv2.REDUCE_AVG).flatten()
+         # [122 122 122 182 141 127 139 135 130 135 136 141 147 149 149 150 147 145
+         #  148 150 150 150 150 150 144 138 134 141 136 133 173 183 130 128 127 126]
+@@ -87,13 +89,15 @@ class CombatState(UI):
+                     self._combat_2x_checked = True
+                 else:
+                     if self._combat_enter_timer.reached() and self._combat_click_interval.reached():
+-                        self.device.click(COMBAT_SPEED_2X)
++                        self.device.click(
++                            COMBAT_SPEED_2X, alignment=Alignment.RIGHT)
+                         self._combat_click_interval.reset()
+                         return True
+             else:
+                 if self.is_combat_speed_2x():
+                     if self._combat_enter_timer.reached() and self._combat_click_interval.reached():
+-                        self.device.click(COMBAT_SPEED_2X)
++                        self.device.click(
++                            COMBAT_SPEED_2X, alignment=Alignment.RIGHT)
+                         self._combat_click_interval.reset()
+                         return True
+                 else:
+@@ -107,13 +111,13 @@ class CombatState(UI):
+                     self._combat_auto_checked = True
+                 else:
+                     if self._combat_enter_timer.reached() and self._combat_click_interval.reached():
+-                        self.device.click(COMBAT_AUTO)
++                        self.device.click(COMBAT_AUTO, alignment=Alignment.RIGHT)
+                         self._combat_click_interval.reset()
+                         return True
+             else:
+                 if self.is_combat_auto():
+                     if self._combat_enter_timer.reached() and self._combat_click_interval.reached():
+-                        self.device.click(COMBAT_AUTO)
++                        self.device.click(COMBAT_AUTO, alignment=Alignment.RIGHT)
+                         self._combat_click_interval.reset()
+                         return True
+                 else:
+diff --git a/tasks/map/control/control.py b/tasks/map/control/control.py
+index e0825d0..2e8240e 100644
+--- a/tasks/map/control/control.py
++++ b/tasks/map/control/control.py
+@@ -4,6 +4,7 @@ from functools import cached_property
+ import numpy as np
+ 
+ from module.base.timer import Timer
++from module.device.geometry import Alignment
+ from module.logger import logger
+ from tasks.base.assets.assets_base_page import CLOSE
+ from tasks.combat.combat import Combat
+@@ -46,7 +47,13 @@ class MapControl(Combat, AimDetectorMixin):
+         diff = min(diff, self.minimap.ROTATION_SWIPE_MAX_DISTANCE)
+         diff = max(diff, -self.minimap.ROTATION_SWIPE_MAX_DISTANCE)
+ 
+-        self.device.swipe_vector((-diff, 0), box=ROTATION_SWIPE_AREA.area, duration=(0.2, 0.5))
++        self.device.swipe_vector(
++            (-diff, 0),
++            box=ROTATION_SWIPE_AREA.area,
++            duration=(0.2, 0.5),
++            alignment=Alignment.CENTER,
++            contact_id=0,
++        )
+         return True
+ 
+     def rotation_set(self, target, threshold=15, skip_first_screenshot=False):
+@@ -70,7 +77,7 @@ class MapControl(Combat, AimDetectorMixin):
+                 skip_first_screenshot = False
+             else:
+                 self.device.screenshot()
+-                self.minimap.update_rotation(self.device.image)
++                self.minimap.update_rotation(self.device.image_for(Alignment.LEFT))
+                 self.minimap.log_minimap()
+ 
+             # Additional
+@@ -196,9 +203,9 @@ class MapControl(Combat, AimDetectorMixin):
+                 continue
+ 
+             # Update
+-            self.minimap.update(self.device.image)
++            self.minimap.update(self.device.image_for(Alignment.LEFT))
+             if aim_interval.reached_and_reset():
+-                self.aim.predict(self.device.image)
++                self.aim.predict(self.device.image_for(Alignment.CENTER))
+             diff = self.minimap.position_diff(waypoint.position)
+             direction = self.minimap.position2direction(waypoint.position)
+             rotation_diff = self.minimap.rotation_diff(direction)
+diff --git a/tasks/map/control/joystick.py b/tasks/map/control/joystick.py
+index a74353d..a914149 100644
+--- a/tasks/map/control/joystick.py
++++ b/tasks/map/control/joystick.py
+@@ -5,7 +5,8 @@ import cv2
+ import numpy as np
+ 
+ from module.base.timer import Timer
+-from module.base.utils import area_offset
++from module.base.utils import area_offset, crop
++from module.device.geometry import Alignment
+ from module.device.method.maatouch import MaatouchBuilder, retry as maatouch_retry
+ from module.device.method.minitouch import (
+     CommandBuilder, insert_swipe, random_normal_distribution, retry as minitouch_retry)
+@@ -60,11 +61,21 @@ class JoystickContact:
+         if method == 'MaaTouch':
+             # Get the very first builder to initialize MaaTouch
+             _ = self.main.device.maatouch_builder
+-            builder = MaatouchBuilder(self.main.device, contact=1)
++            builder = MaatouchBuilder(
++                self.main.device,
++                contact=1,
++                coordinate_space='logical',
++                alignment=Alignment.LEFT,
++            )
+         elif method == 'minitouch':
+             # Get the very first builder to initialize minitouch
+             _ = self.main.device.minitouch_builder
+-            builder = CommandBuilder(self.main.device, contact=1)
++            builder = CommandBuilder(
++                self.main.device,
++                contact=1,
++                coordinate_space='logical',
++                alignment=Alignment.LEFT,
++            )
+         else:
+             raise ScriptError(f'Control method {method} does not support multi-finger, '
+                               f'please use MaaTouch or minitouch instead')
+@@ -205,7 +216,11 @@ class MapControlJoystick(UI):
+         # About 1.5ms
+         x, y = self.joystick_center
+         radius = JoystickContact.RADIUS_RUN[1]
+-        image = self.image_crop((x - radius, y - radius, x + radius, y + radius), copy=False)
++        image = crop(
++            self.device.image_for(Alignment.LEFT),
++            (x - radius, y - radius, x + radius, y + radius),
++            copy=False,
++        )
+         image = cv2.remap(image, *self.DirectionRemapData, cv2.INTER_CUBIC)
+ 
+         # 190~205
+@@ -226,11 +241,12 @@ class MapControlJoystick(UI):
+         """
+         confirm = Timer(3, count=0).start()
+         while 1:
+-            matched = TECHNIQUE_POINT_1.match_template(self.device.image)
++            image = self.device.image_for(Alignment.RIGHT)
++            matched = TECHNIQUE_POINT_1.match_template(image)
+             if matched:
+                 matched_button = TECHNIQUE_POINT_1
+                 break
+-            matched = TECHNIQUE_POINT_0.match_template(self.device.image)
++            matched = TECHNIQUE_POINT_0.match_template(image)
+             if matched:
+                 matched_button = TECHNIQUE_POINT_0
+                 break
+@@ -249,8 +265,10 @@ class MapControlJoystick(UI):
+         ]:
+             if matched_button is not None:
+                 button.load_offset(matched_button)
+-            points.append(self.image_color_count(area_offset(button.area, button.button_offset), color=(255, 255, 255),
+-                                                 threshold=221, count=20))
++            area = area_offset(button.area, button.button_offset)
++            points.append(self.image_color_count(
++                crop(self.device.image_for(Alignment.RIGHT), area, copy=False),
++                color=(255, 255, 255), threshold=221, count=20))
+         count = sum(points)
+         logger.attr('TechniquePoints', count)
+         return count
+@@ -263,7 +281,7 @@ class MapControlJoystick(UI):
+             bool: If clicked.
+         """
+         if self.map_A_timer.reached():
+-            self.device.click(A_BUTTON)
++            self.device.click(A_BUTTON, alignment=Alignment.RIGHT)
+             self.map_A_timer.reset()
+             return True
+ 
+@@ -278,7 +296,7 @@ class MapControlJoystick(UI):
+             bool: If clicked.
+         """
+         if self.map_E_timer.reached():
+-            self.device.click(E_BUTTON)
++            self.device.click(E_BUTTON, alignment=Alignment.RIGHT)
+             self.map_E_timer.reset()
+             return True
+ 
+@@ -292,14 +310,20 @@ class MapControlJoystick(UI):
+         Returns:
+             bool: If clicked.
+         """
+-        is_running = self.image_color_count(RUN_BUTTON, color=(208, 183, 138), threshold=221, count=100)
++        is_running = self.image_color_count(
++            crop(
++                self.device.image_for(Alignment.RIGHT),
++                RUN_BUTTON.area,
++                copy=False,
++            ),
++            color=(208, 183, 138), threshold=221, count=100)
+ 
+         if run and not is_running and self.map_run_2x_timer.reached():
+-            self.device.click(RUN_BUTTON)
++            self.device.click(RUN_BUTTON, alignment=Alignment.RIGHT)
+             self.map_run_2x_timer.reset()
+             return True
+         if not run and is_running and self.map_run_2x_timer.reached():
+-            self.device.click(RUN_BUTTON)
++            self.device.click(RUN_BUTTON, alignment=Alignment.RIGHT)
+             self.map_run_2x_timer.reset()
+             return True
+ 
+diff --git a/tasks/map/minimap/radar.py b/tasks/map/minimap/radar.py
+index eea8bda..6c00bf9 100644
+--- a/tasks/map/minimap/radar.py
++++ b/tasks/map/minimap/radar.py
+@@ -4,6 +4,7 @@ import numpy as np
+ from module.base.decorator import cached_property
+ from module.base.timer import Timer
+ from module.base.utils import Points, color_similarity_2d
++from module.device.geometry import Alignment
+ from module.logger import logger
+ from tasks.base.page import page_main
+ from tasks.combat.assets.assets_combat_interact import DUNGEON_COMBAT_INTERACT
+@@ -67,7 +68,7 @@ class RadarMixin(MapControl):
+ 
+     def handle_radar_rotation_update(self):
+         if self.radar_rotation_timer.reached():
+-            self.minimap.update_rotation(self.device.image)
++            self.minimap.update_rotation(self.device.image_for(Alignment.LEFT))
+             self.radar_rotation_timer.reset()
+ 
+     def handle_mission_interact(self):
+@@ -89,7 +90,9 @@ class RadarMixin(MapControl):
+         self.radar_direction_timer.reset()
+ 
+         # Update target
+-        direction = self.radar.predict_mission(self.device.image)
++        direction = self.radar.predict_mission(
++            self.device.image_for(Alignment.LEFT)
++        )
+         if direction is None:
+             if self.radar_lost_timout.started():
+                 if self.radar_lost_timout.reached():

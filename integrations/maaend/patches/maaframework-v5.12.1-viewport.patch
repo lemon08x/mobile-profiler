@@ -1,0 +1,3312 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1e1289f..57150ad 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -27,6 +27,8 @@ option(WITH_MAA_AGENT "build with MaaAgent" ON)
+ option(BUILD_PICLI "build maa picli" ON)
+ option(BUILD_SAMPLE "build a demo" OFF)
+ option(BUILD_PIPELINE_TESTING "build pipeline testing" OFF)
++option(BUILD_VIEWPORT_TESTING "build screenshot viewport transform testing" OFF)
++option(BUILD_SCREENCAP_FAILOVER_TESTING "build ADB screencap failover testing" OFF)
+ option(BUILD_DLOPEN_TESTING "build dlopen testing" OFF)
+ option(BUILD_NODE_TEST "build node test" OFF)
+ option(BUILD_MACOS_TEST "build macOS test" OFF)
+@@ -103,6 +105,16 @@ if(BUILD_PIPELINE_TESTING)
+     add_subdirectory(test/TestingDataSet)
+ endif()
+ 
++if(BUILD_VIEWPORT_TESTING)
++    enable_testing()
++    add_subdirectory(test/viewport)
++endif()
++
++if(BUILD_SCREENCAP_FAILOVER_TESTING)
++    enable_testing()
++    add_subdirectory(test/screencap)
++endif()
++
+ if(BUILD_DLOPEN_TESTING)
+     add_subdirectory(test/dlopen)
+ endif()
+diff --git a/include/MaaFramework/MaaDef.h b/include/MaaFramework/MaaDef.h
+index 0bb9035..35d5acd 100644
+--- a/include/MaaFramework/MaaDef.h
++++ b/include/MaaFramework/MaaDef.h
+@@ -187,6 +187,18 @@ enum MaaResOptionEnum
+ 
+ typedef MaaOption MaaCtrlOption;
+ 
++/**
++ * @brief Alignment used to select a logical screenshot viewport from an adaptive raw frame.
++ */
++typedef int32_t MaaViewportAlignment;
++
++enum MaaViewportAlignmentEnum
++{
++    MaaViewportAlignment_Center = 0,
++    MaaViewportAlignment_Left = 1,
++    MaaViewportAlignment_Right = 2,
++};
++
+ /**
+  * @brief Option keys for controller instance options. See MaaControllerSetOption().
+  *
+@@ -242,6 +254,14 @@ enum MaaCtrlOptionEnum
+     ///
+     /// value: int32_t array of virtual key codes; val_size: sizeof(int32_t) * count
+     MaaCtrlOption_BackgroundManagedKeys = 7,
++
++    /// Select which logical viewport is rendered from the current raw screenshot frame.
++    /// Center is the only valid value when adaptive viewport mode is inactive. Left and Right
++    /// require an active adaptive viewport. A valid cached raw frame is required for all values.
++    /// Changing this option re-renders the cached raw frame and does not capture a new frame.
++    ///
++    /// value: MaaViewportAlignment; val_size: sizeof(MaaViewportAlignment)
++    MaaCtrlOption_ScreenshotViewportAlignment = 8,
+ };
+ 
+ typedef MaaOption MaaTaskerOption;
+diff --git a/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp b/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp
+index a839ebb..52d9c18 100644
+--- a/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp
++++ b/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp
+@@ -1,5 +1,6 @@
+ #include "ScreencapAgent.h"
+ 
++#include <algorithm>
+ #include <format>
+ #include <ranges>
+ #include <unordered_set>
+@@ -155,12 +156,18 @@ bool ScreencapAgent::init()
+         }
+     }
+ 
+-    active_unit_ = speed_test();
+-    if (!active_unit_) {
++    ranked_units_ = speed_test();
++    const auto active = std::ranges::find_if(ranked_units_, &RankedUnit::benchmark_succeeded);
++    if (active == ranked_units_.end()) {
+         LogError << "No available screencap method";
+         return false;
+     }
+ 
++    if (active != ranked_units_.begin()) {
++        std::ranges::iter_swap(ranked_units_.begin(), active);
++    }
++    active_unit_ = ranked_units_.front().unit;
++    failover_policy_.reset(ranked_units_.size());
+     units_.clear();
+     return true;
+ }
+@@ -172,64 +179,102 @@ std::optional<cv::Mat> ScreencapAgent::screencap()
+         return std::nullopt;
+     }
+ 
+-    return active_unit_->screencap();
++    const auto previous_active = failover_policy_.active_candidate();
++    std::optional<cv::Mat> image;
++    bool attempted = false;
++    const auto selected = failover_policy_.try_candidates([&](size_t candidate) {
++        attempted = true;
++        if (candidate >= ranked_units_.size()) {
++            LogError << "Invalid screencap failover candidate" << VAR(candidate) << VAR(ranked_units_.size());
++            return false;
++        }
++
++        auto& ranked = ranked_units_[candidate];
++        image = ranked.unit->screencap();
++        if (!image) {
++            LogWarn << "Screencap method failed at runtime" << VAR(ranked.method) << VAR(candidate);
++            return false;
++        }
++        return true;
++    });
++
++    if (!selected) {
++        if (!attempted) {
++            LogDebug << "All screencap methods are temporarily backed off";
++        }
++        else {
++            LogError << "All eligible screencap methods failed at runtime";
++        }
++        return std::nullopt;
++    }
++
++    auto& ranked = ranked_units_[*selected];
++    active_unit_ = ranked.unit;
++    if (!previous_active || *previous_active != *selected) {
++        const Method previous_method =
++            previous_active && *previous_active < ranked_units_.size() ? ranked_units_[*previous_active].method : Method::UnknownYet;
++        LogWarn << "Switched active screencap method after runtime failure" << VAR(previous_method) << VAR(ranked.method);
++    }
++    return image;
+ }
+ 
+ void ScreencapAgent::on_image_resolution_changed(const std::pair<int, int>& pre, const std::pair<int, int>& cur)
+ {
+-    if (!active_unit_) {
++    if (ranked_units_.empty()) {
+         LogError << "active_unit_ is null";
+         return;
+     }
+ 
+-    active_unit_->on_image_resolution_changed(pre, cur);
++    for (auto& ranked : ranked_units_) {
++        ranked.unit->on_image_resolution_changed(pre, cur);
++    }
++    reset_failover_backoff();
+ }
+ 
+ void ScreencapAgent::on_app_started(const std::string& intent)
+ {
+-    if (!active_unit_) {
++    if (ranked_units_.empty()) {
+         LogError << "active_unit_ is null";
+         return;
+     }
+ 
+-    active_unit_->on_app_started(intent);
++    for (auto& ranked : ranked_units_) {
++        ranked.unit->on_app_started(intent);
++    }
++    reset_failover_backoff();
+ }
+ 
+ void ScreencapAgent::on_app_stopped(const std::string& intent)
+ {
+-    if (!active_unit_) {
++    if (ranked_units_.empty()) {
+         LogError << "active_unit_ is null";
+         return;
+     }
+ 
+-    active_unit_->on_app_stopped(intent);
++    for (auto& ranked : ranked_units_) {
++        ranked.unit->on_app_stopped(intent);
++    }
++    reset_failover_backoff();
+ }
+ 
+-std::shared_ptr<ScreencapBase> ScreencapAgent::speed_test()
++std::vector<ScreencapAgent::RankedUnit> ScreencapAgent::speed_test()
+ {
+     LogFunc;
+ 
+-    Method fastest = Method::UnknownYet;
+-    std::chrono::milliseconds cost(INT64_MAX);
+-
+-    auto check = [&fastest, &cost](Method method, std::chrono::steady_clock::time_point start) {
+-        auto duration = duration_since(start);
+-        if (duration < cost) {
+-            fastest = method;
+-            cost = duration;
+-        }
+-        LogInfo << VAR(method) << VAR(duration);
+-    };
++    std::vector<RankedUnit> ranked_units;
++    ranked_units.reserve(units_.size());
+ 
+     // RawByNetcat 第一次速度很慢，但后面快
+     // MinicapStream 是从缓存拉数据，只取一次不准
+     static const std::unordered_set<Method> kDropFirst = { Method::RawByNetcat, Method::MinicapStream };
+ 
+     for (auto& [method, unit] : units_) {
++        RankedUnit ranked { .method = method, .unit = unit };
+         if (kDropFirst.contains(method)) {
+             LogInfo << "Testing" << method << "drop first";
+             if (!unit->screencap()) {
+                 LogWarn << "failed to test" << method;
++                ranked_units.emplace_back(std::move(ranked));
+                 continue;
+             }
+         }
+@@ -238,18 +283,38 @@ std::shared_ptr<ScreencapBase> ScreencapAgent::speed_test()
+         auto now = std::chrono::steady_clock::now();
+         if (!unit->screencap()) {
+             LogWarn << "failed to test" << method;
++            ranked_units.emplace_back(std::move(ranked));
+             continue;
+         }
+-        check(method, now);
++        ranked.cost = duration_since(now);
++        ranked.benchmark_succeeded = true;
++        LogInfo << VAR(method) << VAR(ranked.cost);
++        ranked_units.emplace_back(std::move(ranked));
+     }
+ 
+-    if (fastest == Method::UnknownYet) {
++    std::ranges::sort(ranked_units, [](const RankedUnit& lhs, const RankedUnit& rhs) {
++        if (lhs.benchmark_succeeded != rhs.benchmark_succeeded) {
++            return lhs.benchmark_succeeded > rhs.benchmark_succeeded;
++        }
++        if (lhs.cost != rhs.cost) {
++            return lhs.cost < rhs.cost;
++        }
++        return static_cast<int>(lhs.method) < static_cast<int>(rhs.method);
++    });
++
++    const auto fastest = std::ranges::find_if(ranked_units, &RankedUnit::benchmark_succeeded);
++    if (fastest == ranked_units.end()) {
+         LogError << "cannot find any method to screencap!";
+-        return nullptr;
++        return ranked_units;
+     }
+ 
+-    LogInfo << "The fastest method is" << fastest << VAR(cost);
+-    return units_[fastest];
++    LogInfo << "The fastest method is" << fastest->method << VAR(fastest->cost);
++    return ranked_units;
++}
++
++void ScreencapAgent::reset_failover_backoff()
++{
++    failover_policy_.reset_backoff();
+ }
+ 
+ MAA_CTRL_UNIT_NS_END
+diff --git a/source/MaaAdbControlUnit/Manager/ScreencapAgent.h b/source/MaaAdbControlUnit/Manager/ScreencapAgent.h
+index c6ab828..bcfc159 100644
+--- a/source/MaaAdbControlUnit/Manager/ScreencapAgent.h
++++ b/source/MaaAdbControlUnit/Manager/ScreencapAgent.h
+@@ -1,8 +1,11 @@
+ #pragma once
+ 
+-#include <unordered_set>
++#include <chrono>
++#include <unordered_map>
++#include <vector>
+ 
+ #include "Base/UnitBase.h"
++#include "Manager/ScreencapFailoverPolicy.h"
+ 
+ #include "Common/Conf.h"
+ 
+@@ -44,9 +47,20 @@ public: // from ControlUnitSink
+     virtual void on_app_stopped(const std::string& intent) override;
+ 
+ private:
+-    std::shared_ptr<ScreencapBase> speed_test();
++    struct RankedUnit
++    {
++        Method method = Method::UnknownYet;
++        std::shared_ptr<ScreencapBase> unit;
++        std::chrono::milliseconds cost = std::chrono::milliseconds::max();
++        bool benchmark_succeeded = false;
++    };
++
++    std::vector<RankedUnit> speed_test();
++    void reset_failover_backoff();
+ 
+     std::unordered_map<Method, std::shared_ptr<ScreencapBase>> units_;
++    std::vector<RankedUnit> ranked_units_;
++    ScreencapFailoverPolicy failover_policy_;
+     std::shared_ptr<ScreencapBase> active_unit_;
+ };
+ 
+diff --git a/source/MaaAgentClient/Client/AgentClient.cpp b/source/MaaAgentClient/Client/AgentClient.cpp
+index aa3b1df..06c19d9 100644
+--- a/source/MaaAgentClient/Client/AgentClient.cpp
++++ b/source/MaaAgentClient/Client/AgentClient.cpp
+@@ -2449,13 +2449,22 @@ bool AgentClient::handle_controller_set_option(const json::value& j)
+     switch (key) {
+     case MaaCtrlOption_ScreenshotTargetLongSide:
+     case MaaCtrlOption_ScreenshotTargetShortSide:
+-    case MaaCtrlOption_ScreenshotResizeMethod: {
++    case MaaCtrlOption_ScreenshotResizeMethod:
++    case MaaCtrlOption_ScreenshotViewportAlignment: {
++        if (!req.value.is_number()) {
++            LogError << "controller int32 option value must be a number" << VAR(key) << VAR(req.value.type_name());
++            break;
++        }
+         int32_t v = static_cast<int32_t>(req.value.as_integer());
+         ret = controller->set_option(key, &v, sizeof(v));
+         break;
+     }
+     case MaaCtrlOption_ScreenshotUseRawSize:
+     case MaaCtrlOption_MouseLockFollow: {
++        if (!req.value.is_boolean()) {
++            LogError << "controller bool option value must be a boolean" << VAR(key) << VAR(req.value.type_name());
++            break;
++        }
+         bool v = req.value.as_boolean();
+         ret = controller->set_option(key, &v, sizeof(v));
+         break;
+@@ -2467,18 +2476,19 @@ bool AgentClient::handle_controller_set_option(const json::value& j)
+             break;
+         }
+         std::vector<int32_t> keys;
++        bool valid = true;
+         for (const auto& item : req.value.as_array()) {
+             if (!item.is_number()) {
+                 LogError << "BackgroundManagedKeys array element must be a number" << VAR(item.type_name());
+-                ret = false;
++                valid = false;
+                 break;
+             }
+             keys.push_back(static_cast<int32_t>(item.as_integer()));
+         }
+-        if (!ret) {
++        if (!valid) {
+             break;
+         }
+-        ret = controller->set_option(key, keys.data(), sizeof(int32_t) * keys.size());
++        ret = controller->set_option(key, keys.empty() ? nullptr : keys.data(), sizeof(int32_t) * keys.size());
+         break;
+     }
+     default:
+diff --git a/source/MaaAgentServer/RemoteInstance/RemoteController.cpp b/source/MaaAgentServer/RemoteInstance/RemoteController.cpp
+index cdebe18..f023476 100644
+--- a/source/MaaAgentServer/RemoteInstance/RemoteController.cpp
++++ b/source/MaaAgentServer/RemoteInstance/RemoteController.cpp
+@@ -26,6 +26,7 @@ bool RemoteController::set_option(MaaCtrlOption key, MaaOptionValue value, MaaOp
+     case MaaCtrlOption_ScreenshotTargetLongSide:
+     case MaaCtrlOption_ScreenshotTargetShortSide:
+     case MaaCtrlOption_ScreenshotResizeMethod:
++    case MaaCtrlOption_ScreenshotViewportAlignment:
+         if (val_size != sizeof(int32_t)) {
+             LogError << "invalid val_size for int32_t option" << VAR(key) << VAR(val_size);
+             return false;
+diff --git a/source/MaaFramework/Controller/ControllerAgent.cpp b/source/MaaFramework/Controller/ControllerAgent.cpp
+index 7268d85..fd78fb3 100644
+--- a/source/MaaFramework/Controller/ControllerAgent.cpp
++++ b/source/MaaFramework/Controller/ControllerAgent.cpp
+@@ -1,5 +1,8 @@
+ #include "ControllerAgent.h"
+ 
++#include <algorithm>
++#include <cstdlib>
++
+ #include "Global/OptionMgr.h"
+ #include "Global/PluginMgr.h"
+ #include "MaaFramework/MaaMsg.h"
+@@ -23,6 +26,8 @@ ControllerAgent::ControllerAgent(std::shared_ptr<MAA_CTRL_UNIT_NS::ControlUnitAP
+ 
+     action_runner_ =
+         std::make_unique<AsyncRunner<Action>>(std::bind(&ControllerAgent::run_action, this, std::placeholders::_1, std::placeholders::_2));
++
++    configure_viewport_from_environment();
+ }
+ 
+ ControllerAgent::~ControllerAgent()
+@@ -47,6 +52,8 @@ bool ControllerAgent::set_option(MaaCtrlOption key, MaaOptionValue value, MaaOpt
+         return set_screenshot_resize_method(value, val_size);
+     case MaaCtrlOption_BackgroundManagedKeys:
+         return set_background_managed_keys_option(value, val_size);
++    case MaaCtrlOption_ScreenshotViewportAlignment:
++        return set_screenshot_viewport_alignment(value, val_size);
+ 
+     default:
+         LogError << "Unknown key" << VAR(key) << VAR(value);
+@@ -56,15 +63,13 @@ bool ControllerAgent::set_option(MaaCtrlOption key, MaaOptionValue value, MaaOpt
+ 
+ MaaCtrlId ControllerAgent::post_connection()
+ {
+-    auto id = post({ .type = Action::Type::connect });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::connect });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_click(int x, int y, int contact, int pressure)
+ {
+     ClickParam p { .point = { x, y }, .contact = contact, .pressure = pressure };
+-    auto id = post({ .type = Action::Type::click, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::click, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_swipe(int x1, int y1, int x2, int y2, int duration, int contact, int pressure)
+@@ -74,104 +79,89 @@ MaaCtrlId ControllerAgent::post_swipe(int x1, int y1, int x2, int y2, int durati
+                    .duration = { static_cast<uint>(duration) },
+                    .contact = contact,
+                    .pressure = pressure };
+-    auto id = post({ .type = Action::Type::swipe, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::swipe, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_click_key(int keycode)
+ {
+     ClickKeyParam p { .keycode = { keycode } };
+-    auto id = post({ .type = Action::Type::click_key, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::click_key, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_input_text(const std::string& text)
+ {
+     InputTextParam p { .text = text };
+-    auto id = post({ .type = Action::Type::input_text, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::input_text, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_start_app(const std::string& intent)
+ {
+     AppParam p { .package = intent };
+-    auto id = post({ .type = Action::Type::start_app, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::start_app, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_stop_app(const std::string& intent)
+ {
+     AppParam p { .package = intent };
+-    auto id = post({ .type = Action::Type::stop_app, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::stop_app, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_screencap()
+ {
+-    auto id = post({ .type = Action::Type::screencap });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::screencap });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_touch_down(int contact, int x, int y, int pressure)
+ {
+     TouchParam p { .contact = contact, .point = { x, y }, .pressure = pressure };
+-    auto id = post({ .type = Action::Type::touch_down, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::touch_down, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_touch_move(int contact, int x, int y, int pressure)
+ {
+     TouchParam p { .contact = contact, .point = { x, y }, .pressure = pressure };
+-    auto id = post({ .type = Action::Type::touch_move, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::touch_move, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_touch_up(int contact)
+ {
+     TouchParam p { .contact = contact };
+-    auto id = post({ .type = Action::Type::touch_up, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::touch_up, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_relative_move(int dx, int dy)
+ {
+     RelativeMoveParam p { .dx = dx, .dy = dy };
+-    auto id = post({ .type = Action::Type::relative_move, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::relative_move, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_key_down(int keycode)
+ {
+     ClickKeyParam p { .keycode = { keycode } };
+-    auto id = post({ .type = Action::Type::key_down, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::key_down, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_key_up(int keycode)
+ {
+     ClickKeyParam p { .keycode = { keycode } };
+-    auto id = post({ .type = Action::Type::key_up, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::key_up, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_scroll(int dx, int dy)
+ {
+     ScrollParam p { .dx = dx, .dy = dy };
+-    auto id = post({ .type = Action::Type::scroll, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::scroll, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_shell(const std::string& cmd, int64_t timeout)
+ {
+     ShellParam p { .cmd = cmd, .shell_timeout = timeout };
+-    auto id = post({ .type = Action::Type::shell, .param = std::move(p) });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::shell, .param = std::move(p) });
+ }
+ 
+ MaaCtrlId ControllerAgent::post_inactive()
+ {
+-    auto id = post({ .type = Action::Type::inactive });
+-    return focus_id(id);
++    return post_focused({ .type = Action::Type::inactive });
+ }
+ 
+ MaaStatus ControllerAgent::status(MaaCtrlId ctrl_id) const
+@@ -227,6 +217,7 @@ std::string ControllerAgent::get_uuid()
+ 
+ bool ControllerAgent::get_resolution(int32_t& width, int32_t& height) const
+ {
++    std::unique_lock lock(image_mutex_);
+     if (image_raw_width_ == 0 || image_raw_height_ == 0) {
+         return false;
+     }
+@@ -238,7 +229,148 @@ bool ControllerAgent::get_resolution(int32_t& width, int32_t& height) const
+ 
+ json::object ControllerAgent::get_info() const
+ {
+-    return control_unit_->get_info();
++    json::object info = control_unit_->get_info();
++    json::object viewport_info;
++    viewport_info["configured"] = viewport_config_.has_value();
++    viewport_info["source"] = "environment:MAA_SCREENSHOT_VIEWPORT";
++
++    std::unique_lock lock(image_mutex_);
++    const bool active = viewport_transform_ && viewport_transform_->active();
++    viewport_info["active"] = active;
++    viewport_info["raw_width"] = image_raw_width_;
++    viewport_info["raw_height"] = image_raw_height_;
++    viewport_info["frame_id"] = frame_id_;
++    viewport_info["alignment"] = std::string(ViewportTransform::alignment_name(viewport_alignment_));
++    viewport_info["cached_alignment"] = std::string(ViewportTransform::alignment_name(cached_viewport_alignment_));
++    viewport_info["alignment_value"] = static_cast<int32_t>(viewport_alignment_);
++    viewport_info["cached_alignment_value"] = static_cast<int32_t>(cached_viewport_alignment_);
++    viewport_info["raw"] = json::object {
++        { "x", 0 },
++        { "y", 0 },
++        { "width", image_raw_width_ },
++        { "height", image_raw_height_ },
++    };
++
++    json::array available_alignments;
++    available_alignments.emplace_back("center");
++    if (active && viewport_transform_->adaptive()) {
++        available_alignments.emplace_back("left");
++        available_alignments.emplace_back("right");
++    }
++    viewport_info["available_alignments"] = std::move(available_alignments);
++
++    if (viewport_config_) {
++        viewport_info["mode"] = std::string(ViewportTransform::mode_name(viewport_config_->mode));
++        viewport_info["logical_width"] = viewport_config_->logical_size.width;
++        viewport_info["logical_height"] = viewport_config_->logical_size.height;
++        viewport_info["logical"] = json::object {
++            { "x", 0 },
++            { "y", 0 },
++            { "width", viewport_config_->logical_size.width },
++            { "height", viewport_config_->logical_size.height },
++        };
++    }
++    if (active) {
++        const cv::Rect rect = viewport_transform_->viewport(viewport_alignment_);
++        viewport_info["x"] = rect.x;
++        viewport_info["y"] = rect.y;
++        viewport_info["width"] = rect.width;
++        viewport_info["height"] = rect.height;
++        viewport_info["adaptive"] = viewport_transform_->adaptive();
++        viewport_info["viewport"] = json::object {
++            { "x", rect.x },
++            { "y", rect.y },
++            { "width", rect.width },
++            { "height", rect.height },
++        };
++    }
++
++    json::array active_contacts;
++    {
++        std::unique_lock contact_lock(contact_mutex_);
++        for (const auto& [contact, alignment] : contact_alignments_) {
++            active_contacts.emplace_back(json::object {
++                { "contact", contact },
++                { "alignment", std::string(ViewportTransform::alignment_name(alignment)) },
++                { "alignment_value", static_cast<int32_t>(alignment) },
++            });
++        }
++    }
++    viewport_info["active_contacts"] = std::move(active_contacts);
++
++    info["screenshot_viewport"] = std::move(viewport_info);
++    return info;
++}
++
++bool ControllerAgent::adaptive_viewport() const
++{
++    std::unique_lock lock(image_mutex_);
++    return viewport_transform_ && viewport_transform_->adaptive();
++}
++
++ViewportAlignment ControllerAgent::viewport_alignment() const
++{
++    std::unique_lock lock(image_mutex_);
++    return viewport_alignment_;
++}
++
++bool ControllerAgent::select_viewport_alignment(ViewportAlignment alignment)
++{
++    if (alignment != ViewportAlignment::Center && alignment != ViewportAlignment::Left && alignment != ViewportAlignment::Right) {
++        return false;
++    }
++
++    std::unique_lock lock(image_mutex_);
++    if (!viewport_transform_ || !viewport_transform_->active()) {
++        return alignment == ViewportAlignment::Center;
++    }
++    if (!viewport_transform_->adaptive() && alignment != ViewportAlignment::Center) {
++        return false;
++    }
++    if (raw_image_.empty()) {
++        return false;
++    }
++
++    cv::Mat selected = render_viewport_image(raw_image_, alignment);
++    if (selected.empty()) {
++        return false;
++    }
++    viewport_alignment_ = alignment;
++    cached_viewport_alignment_ = alignment;
++    image_ = std::move(selected);
++    return true;
++}
++
++std::vector<ViewportImage> ControllerAgent::viewport_images() const
++{
++    std::unique_lock lock(image_mutex_);
++    if (!viewport_transform_ || !viewport_transform_->adaptive() || raw_image_.empty()) {
++        return { { .alignment = cached_viewport_alignment_, .frame_id = frame_id_, .image = image_.clone() } };
++    }
++
++    std::vector<ViewportImage> result;
++    const auto order = viewport_transform_->candidate_alignments();
++
++    std::vector<cv::Rect> seen;
++    for (const auto alignment : order) {
++        const cv::Rect rect = viewport_transform_->viewport(alignment);
++        if (std::ranges::find(seen, rect) != seen.end()) {
++            continue;
++        }
++        seen.emplace_back(rect);
++        result.emplace_back(
++            ViewportImage { .alignment = alignment, .frame_id = frame_id_, .image = render_viewport_image(raw_image_, alignment) });
++    }
++    return result;
++}
++
++ViewportAlignment ControllerAgent::preferred_viewport_alignment(int logical_x) const
++{
++    std::unique_lock lock(image_mutex_);
++    if (!viewport_transform_ || !viewport_transform_->adaptive()) {
++        return ViewportAlignment::Center;
++    }
++    return ViewportTransform::preferred_alignment_for_logical_x(logical_x, viewport_transform_->logical_size().width);
+ }
+ 
+ MaaSinkId ControllerAgent::add_sink(MaaEventCallback callback, void* trans_arg)
+@@ -354,7 +486,7 @@ cv::Mat ControllerAgent::screencap()
+ {
+     auto id = post({ .type = Action::Type::screencap });
+     if (wait(id) != MaaStatus_Succeeded) {
+-        return { };
++        return {};
+     }
+     return cached_image();
+ }
+@@ -411,16 +543,27 @@ MaaCtrlId ControllerAgent::post(Action action)
+     if (!action_runner_) {
+         return MaaInvalidId;
+     }
++
++    {
++        std::unique_lock lock(image_mutex_);
++        action.viewport_alignment = viewport_alignment_;
++        action.frame_id = frame_id_;
++        action.display_param = display_param_snapshot_locked(action.type, action.param, action.viewport_alignment);
++    }
+     return action_runner_->post(std::move(action));
+ }
+ 
+-MaaCtrlId ControllerAgent::focus_id(MaaCtrlId id)
++MaaCtrlId ControllerAgent::post_focused(Action action)
+ {
++    // run_action() takes the same mutex before deciding whether to publish
++    // Controller.Action callbacks. Keep the queue wake-up and focus insertion
++    // inside this critical section so a zero-duration action cannot finish in
++    // the gap between post() and focus registration.
++    std::unique_lock lock { focus_ids_mutex_ };
++    const MaaCtrlId id = post(std::move(action));
+     if (id == MaaInvalidId) {
+         return id;
+     }
+-
+-    std::unique_lock lock { focus_ids_mutex_ };
+     return *focus_ids_.emplace(id).first;
+ }
+ 
+@@ -438,14 +581,14 @@ bool ControllerAgent::handle_connect()
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_click(const ClickParam& param)
++bool ControllerAgent::handle_click(const ClickParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+         return false;
+     }
+ 
+-    cv::Point point = preproc_touch_point(param.point);
++    cv::Point point = preproc_touch_point(param.point, alignment);
+ 
+     bool ret = true;
+     if (control_unit_->get_features() & MaaControllerFeature_UseMouseDownAndUpInsteadOfClick) {
+@@ -460,14 +603,14 @@ bool ControllerAgent::handle_click(const ClickParam& param)
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_long_press(const LongPressParam& param)
++bool ControllerAgent::handle_long_press(const LongPressParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+         return false;
+     }
+ 
+-    cv::Point point = preproc_touch_point(param.point);
++    cv::Point point = preproc_touch_point(param.point, alignment);
+ 
+     bool ret = true;
+     if (control_unit_->get_features() & MaaControllerFeature_UseMouseDownAndUpInsteadOfClick) {
+@@ -483,7 +626,7 @@ bool ControllerAgent::handle_long_press(const LongPressParam& param)
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_swipe(const SwipeParam& param)
++bool ControllerAgent::handle_swipe(const SwipeParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+@@ -495,7 +638,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+         LogWarn << "touch not supported, use swipe instead. some features can not work";
+     }
+ 
+-    cv::Point begin = preproc_touch_point(param.begin);
++    cv::Point begin = preproc_touch_point(param.begin, alignment);
+     bool ret = !param.end.empty();
+ 
+     if (!param.only_hover && use_touch_down_up) {
+@@ -503,7 +646,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+     }
+ 
+     for (size_t i = 0; i < param.end.size(); ++i) {
+-        const cv::Point& end = preproc_touch_point(param.end.at(i));
++        const cv::Point end = preproc_touch_point(param.end.at(i), alignment);
+         const uint duration = param.duration.empty() ? 200 : (i < param.duration.size()) ? param.duration.at(i) : param.duration.back();
+         const uint end_hold = param.end_hold.empty() ? 0 : (i < param.end_hold.size()) ? param.end_hold.at(i) : param.end_hold.back();
+ 
+@@ -550,7 +693,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_multi_swipe(const MultiSwipeParam& param)
++bool ControllerAgent::handle_multi_swipe(const MultiSwipeParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+@@ -562,136 +705,169 @@ bool ControllerAgent::handle_multi_swipe(const MultiSwipeParam& param)
+         return false;
+     }
+ 
+-    constexpr double kInterval = 10; // ms
+-    const std::chrono::milliseconds delay(static_cast<int>(kInterval));
++    constexpr auto kInterval = std::chrono::milliseconds(10);
+ 
+     struct SegmentOperating
+     {
+-        cv::Point begin { };
+-        cv::Point end { };
+-        double total_step = 0;
+-        double x_step_len = 0;
+-        double y_step_len = 0;
+-        size_t step_index = 0;
++        cv::Point begin {};
++        cv::Point end {};
+         uint duration = 0;
+         uint end_hold = 0;
+     };
+ 
+-    struct CotactOperating
++    struct ContactOperating
+     {
+-        std::vector<SegmentOperating> seg;
+-        size_t seg_index = 0;
++        std::vector<SegmentOperating> segments;
++        size_t segment_index = 0;
++        int contact = 0;
++        bool started = false;
++        bool endpoint_sent = false;
++        bool completed = false;
++        std::chrono::steady_clock::time_point segment_started_at {};
++        std::chrono::steady_clock::time_point endpoint_sent_at {};
+     };
+ 
+-    // contact index < end index < op >>
+-    std::vector<CotactOperating> operating(param.swipes.size());
++    if (param.swipes.empty()) {
++        LogError << "multi swipe requires at least one contact";
++        return false;
++    }
++
++    std::vector<ContactOperating> operating(param.swipes.size());
++    std::vector<int> contacts;
++    contacts.reserve(param.swipes.size());
+ 
+     for (size_t s_i = 0; s_i < param.swipes.size(); ++s_i) {
+         const SwipeParam& s = param.swipes.at(s_i);
++        if (s.end.empty()) {
++            LogError << "multi swipe contact requires at least one endpoint" << VAR(s_i);
++            return false;
++        }
+ 
+-        cv::Point begin = preproc_touch_point(s.begin);
++        const int contact = s.contact != 0 ? s.contact : static_cast<int>(s_i);
++        if (std::ranges::find(contacts, contact) != contacts.end()) {
++            LogError << "multi swipe contact identifiers must be unique" << VAR(contact);
++            return false;
++        }
++        contacts.emplace_back(contact);
++        operating.at(s_i).contact = contact;
++
++        cv::Point begin = preproc_touch_point(s.begin, alignment);
+         for (size_t e_i = 0; e_i < s.end.size(); ++e_i) {
+-            const cv::Point& end = preproc_touch_point(s.end.at(e_i));
++            const cv::Point end = preproc_touch_point(s.end.at(e_i), alignment);
+             const uint duration = s.duration.empty() ? 200 : (e_i < s.duration.size()) ? s.duration.at(e_i) : s.duration.back();
+             const uint end_hold = s.end_hold.empty() ? 0 : (e_i < s.end_hold.size()) ? s.end_hold.at(e_i) : s.end_hold.back();
+ 
+-            SegmentOperating o;
+-            o.begin = begin;
+-            o.end = end;
+-            o.total_step = duration / kInterval;
+-            o.x_step_len = (end.x - begin.x) / o.total_step;
+-            o.y_step_len = (end.y - begin.y) / o.total_step;
+-            o.step_index = 0;
+-            o.duration = duration;
+-            o.end_hold = end_hold;
+-
+-            operating.at(s_i).seg.emplace_back(std::move(o));
+-            operating.at(s_i).seg_index = 0;
++            operating.at(s_i).segments.emplace_back(SegmentOperating {
++                .begin = begin,
++                .end = end,
++                .duration = duration,
++                .end_hold = end_hold,
++            });
+ 
+             begin = end;
+         }
+     }
+ 
+     const auto starting = std::chrono::steady_clock::now();
+-    auto now = starting;
+-
+-    bool ret = !param.swipes.empty();
+-    size_t over_count = 0;
+-    while (over_count < param.swipes.size()) {
+-        uint now_point = static_cast<uint>(std::chrono::duration_cast<std::chrono::milliseconds>(now - starting).count());
++    bool ret = true;
++    size_t completed_count = 0;
++    while (completed_count < param.swipes.size()) {
++        const auto now = std::chrono::steady_clock::now();
++        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - starting);
+ 
+         for (size_t i = 0; i < param.swipes.size(); ++i) {
+             const SwipeParam& s = param.swipes.at(i);
+-            if (now_point < s.starting) {
++            auto& contact_op = operating.at(i);
++            if (contact_op.completed || elapsed < std::chrono::milliseconds(s.starting)) {
+                 continue;
+             }
+ 
+-            int contact = s.contact != 0 ? s.contact : static_cast<int>(i);
++            if (!contact_op.started) {
++                if (!s.only_hover) {
++                    const auto& begin = contact_op.segments.front().begin;
++                    ret &= control_unit_->touch_down(contact_op.contact, begin.x, begin.y, s.pressure);
++                }
++                contact_op.started = true;
++                contact_op.segment_started_at = now;
++            }
+ 
+-            if (i >= operating.size()) {
+-                LogError << "Invalid contact index" << VAR(i) << VAR(operating.size());
++            auto& segment = contact_op.segments.at(contact_op.segment_index);
++            if (!contact_op.endpoint_sent) {
++                const auto segment_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - contact_op.segment_started_at);
++                if (segment.duration == 0 || segment_elapsed >= std::chrono::milliseconds(segment.duration)) {
++                    ret &= control_unit_->touch_move(contact_op.contact, segment.end.x, segment.end.y, s.pressure);
++                    contact_op.endpoint_sent = true;
++                    contact_op.endpoint_sent_at = now;
++                }
++                else if (segment_elapsed > std::chrono::milliseconds::zero()) {
++                    const double progress =
++                        std::clamp(static_cast<double>(segment_elapsed.count()) / static_cast<double>(segment.duration), 0.0, 1.0);
++                    const int x = static_cast<int>(std::round(segment.begin.x + (segment.end.x - segment.begin.x) * progress));
++                    const int y = static_cast<int>(std::round(segment.begin.y + (segment.end.y - segment.begin.y) * progress));
++                    ret &= control_unit_->touch_move(contact_op.contact, x, y, s.pressure);
++                }
+                 continue;
+             }
+-            auto& contact_op = operating.at(i);
+ 
+-            if (contact_op.seg_index >= contact_op.seg.size()) {
+-                continue; // all segments done
++            if (now - contact_op.endpoint_sent_at < std::chrono::milliseconds(segment.end_hold)) {
++                continue;
+             }
+-            auto& seg_op = contact_op.seg.at(contact_op.seg_index);
+ 
+-            if (seg_op.step_index == 0) {
+-                if (!s.only_hover) {
+-                    ret &= control_unit_->touch_down(contact, seg_op.begin.x, seg_op.begin.y, s.pressure);
+-                }
+-                ++seg_op.step_index;
++            ++contact_op.segment_index;
++            if (contact_op.segment_index < contact_op.segments.size()) {
++                contact_op.segment_started_at = now;
++                contact_op.endpoint_sent = false;
+             }
+-            else if (seg_op.step_index < seg_op.total_step) {
+-                int mx = static_cast<int>(seg_op.begin.x + seg_op.step_index * seg_op.x_step_len);
+-                int my = static_cast<int>(seg_op.begin.y + seg_op.step_index * seg_op.y_step_len);
+-                ret &= control_unit_->touch_move(contact, mx, my, s.pressure);
+-                ++seg_op.step_index;
+-            }
+-            else if (seg_op.step_index == seg_op.total_step) {
++            else {
+                 if (!s.only_hover) {
+-                    ret &= control_unit_->touch_up(contact);
++                    ret &= control_unit_->touch_up(contact_op.contact);
+                 }
+-                ++seg_op.step_index;
+-                ++over_count;
+-            }
+-            else { // step_index > total
+-                ++contact_op.seg_index;
+-                continue;
++                contact_op.completed = true;
++                ++completed_count;
+             }
+         }
+ 
+-        std::this_thread::sleep_until(now + delay);
+-        now = std::chrono::steady_clock::now();
++        if (completed_count < param.swipes.size()) {
++            std::this_thread::sleep_until(now + kInterval);
++        }
+     }
+ 
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_touch_down(const TouchParam& param)
++bool ControllerAgent::handle_touch_down(const TouchParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+         return false;
+     }
+ 
+-    cv::Point point = preproc_touch_point(param.point);
++    cv::Point point = preproc_touch_point(param.point, alignment);
+     bool ret = control_unit_->touch_down(param.contact, point.x, point.y, param.pressure);
+ 
++    if (ret) {
++        std::unique_lock lock(contact_mutex_);
++        contact_alignments_[param.contact] = alignment;
++    }
++
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_touch_move(const TouchParam& param)
++bool ControllerAgent::handle_touch_move(const TouchParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+         return false;
+     }
+ 
+-    cv::Point point = preproc_touch_point(param.point);
++    {
++        std::unique_lock lock(contact_mutex_);
++        if (const auto iter = contact_alignments_.find(param.contact); iter != contact_alignments_.end()) {
++            alignment = iter->second;
++        }
++    }
++
++    cv::Point point = preproc_touch_point(param.point, alignment);
+     bool ret = control_unit_->touch_move(param.contact, point.x, point.y, param.pressure);
+ 
+     return ret;
+@@ -706,6 +882,11 @@ bool ControllerAgent::handle_touch_up(const TouchParam& param)
+ 
+     bool ret = control_unit_->touch_up(param.contact);
+ 
++    {
++        std::unique_lock lock(contact_mutex_);
++        contact_alignments_.erase(param.contact);
++    }
++
+     return ret;
+ }
+ 
+@@ -862,14 +1043,14 @@ bool ControllerAgent::handle_key_up(const ClickKeyParam& param)
+     return ret;
+ }
+ 
+-bool ControllerAgent::handle_scroll(const ScrollParam& param)
++bool ControllerAgent::handle_scroll(const ScrollParam& param, ViewportAlignment alignment)
+ {
+     if (!control_unit_) {
+         LogError << "control_unit_ is nullptr";
+         return false;
+     }
+ 
+-    cv::Point point = preproc_touch_point(param.point);
++    cv::Point point = preproc_touch_point(param.point, alignment);
+     if (!control_unit_->touch_move(0, point.x, point.y, 0)) {
+         LogWarn << "Failed to move to scroll position" << VAR(point);
+     }
+@@ -938,6 +1119,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+         { "uuid", get_uuid() },
+         { "action", action.type },
+         { "param", action.param },
++        { "viewport", action_viewport_detail(action) },
+         { "info", control_unit_->get_info() },
+     };
+ 
+@@ -953,23 +1135,23 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+         break;
+ 
+     case Action::Type::click:
+-        ret = handle_click(std::get<ClickParam>(action.param));
++        ret = handle_click(std::get<ClickParam>(action.param), action.viewport_alignment);
+         break;
+     case Action::Type::long_press:
+-        ret = handle_long_press(std::get<LongPressParam>(action.param));
++        ret = handle_long_press(std::get<LongPressParam>(action.param), action.viewport_alignment);
+         break;
+     case Action::Type::swipe:
+-        ret = handle_swipe(std::get<SwipeParam>(action.param));
++        ret = handle_swipe(std::get<SwipeParam>(action.param), action.viewport_alignment);
+         break;
+     case Action::Type::multi_swipe:
+-        ret = handle_multi_swipe(std::get<MultiSwipeParam>(action.param));
++        ret = handle_multi_swipe(std::get<MultiSwipeParam>(action.param), action.viewport_alignment);
+         break;
+ 
+     case Action::Type::touch_down:
+-        ret = handle_touch_down(std::get<TouchParam>(action.param));
++        ret = handle_touch_down(std::get<TouchParam>(action.param), action.viewport_alignment);
+         break;
+     case Action::Type::touch_move:
+-        ret = handle_touch_move(std::get<TouchParam>(action.param));
++        ret = handle_touch_move(std::get<TouchParam>(action.param), action.viewport_alignment);
+         break;
+     case Action::Type::touch_up:
+         ret = handle_touch_up(std::get<TouchParam>(action.param));
+@@ -1005,7 +1187,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+         break;
+ 
+     case Action::Type::scroll:
+-        ret = handle_scroll(std::get<ScrollParam>(action.param));
++        ret = handle_scroll(std::get<ScrollParam>(action.param), action.viewport_alignment);
+         break;
+ 
+     case Action::Type::shell:
+@@ -1035,7 +1217,116 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+     return ret;
+ }
+ 
+-cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
++std::optional<Param>
++    ControllerAgent::display_param_snapshot_locked(Action::Type type, const Param& param, ViewportAlignment alignment) const
++{
++    const auto map_point = [&](const cv::Point& point) -> std::optional<cv::Point> {
++        if (control_unit_ && control_unit_->get_features() & MaaControllerFeature_NoScalingTouchPoints) {
++            return point;
++        }
++        if (viewport_transform_ && viewport_transform_->active() && !raw_image_.empty()) {
++            return viewport_transform_->logical_to_display(point, alignment);
++        }
++        if (image_target_width_ <= 0 || image_target_height_ <= 0 || image_raw_width_ <= 0 || image_raw_height_ <= 0) {
++            return std::nullopt;
++        }
++
++        const double scale_width = static_cast<double>(image_raw_width_) / image_target_width_;
++        const double scale_height = static_cast<double>(image_raw_height_) / image_target_height_;
++        return cv::Point {
++            static_cast<int>(std::round(point.x * scale_width)),
++            static_cast<int>(std::round(point.y * scale_height)),
++        };
++    };
++
++    Param display = param;
++    if (type == Action::Type::click) {
++        auto& value = std::get<ClickParam>(display);
++        const auto point = map_point(value.point);
++        if (!point) {
++            return std::nullopt;
++        }
++        value.point = *point;
++    }
++    else if (type == Action::Type::long_press) {
++        auto& value = std::get<LongPressParam>(display);
++        const auto point = map_point(value.point);
++        if (!point) {
++            return std::nullopt;
++        }
++        value.point = *point;
++    }
++    else if (type == Action::Type::swipe) {
++        auto& value = std::get<SwipeParam>(display);
++        const auto begin = map_point(value.begin);
++        if (!begin) {
++            return std::nullopt;
++        }
++        value.begin = *begin;
++        for (auto& end : value.end) {
++            const auto point = map_point(end);
++            if (!point) {
++                return std::nullopt;
++            }
++            end = *point;
++        }
++    }
++    else if (type == Action::Type::multi_swipe) {
++        auto& value = std::get<MultiSwipeParam>(display);
++        for (auto& swipe : value.swipes) {
++            const auto begin = map_point(swipe.begin);
++            if (!begin) {
++                return std::nullopt;
++            }
++            swipe.begin = *begin;
++            for (auto& end : swipe.end) {
++                const auto point = map_point(end);
++                if (!point) {
++                    return std::nullopt;
++                }
++                end = *point;
++            }
++        }
++    }
++    else if (type == Action::Type::touch_down || type == Action::Type::touch_move) {
++        auto& value = std::get<TouchParam>(display);
++        const auto point = map_point(value.point);
++        if (!point) {
++            return std::nullopt;
++        }
++        value.point = *point;
++    }
++    else if (type == Action::Type::scroll) {
++        auto& value = std::get<ScrollParam>(display);
++        const auto point = map_point(value.point);
++        if (!point) {
++            return std::nullopt;
++        }
++        value.point = *point;
++    }
++    else {
++        return std::nullopt;
++    }
++
++    return display;
++}
++
++json::object ControllerAgent::action_viewport_detail(const Action& action) const
++{
++    json::object detail {
++        { "alignment", std::string(ViewportTransform::alignment_name(action.viewport_alignment)) },
++        { "alignment_value", static_cast<int32_t>(action.viewport_alignment) },
++        { "frame_id", action.frame_id },
++        { "logical_param", action.param },
++        { "display_param_available", action.display_param.has_value() },
++    };
++    if (action.display_param) {
++        detail["display_param"] = *action.display_param;
++    }
++    return detail;
++}
++
++cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p, ViewportAlignment alignment)
+ {
+     if (control_unit_ && control_unit_->get_features() & MaaControllerFeature_NoScalingTouchPoints) {
+         return p;
+@@ -1045,12 +1336,17 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
+         LogWarn << "Invalid image target size" << VAR(image_target_width_) << VAR(image_target_height_);
+ 
+         if (!init_scale_info()) {
+-            return { };
++            return {};
+         }
+     }
+ 
+-    double scale_width = static_cast<double>(image_raw_width_) / image_target_width_;
+-    double scale_height = static_cast<double>(image_raw_height_) / image_target_height_;
++    std::unique_lock lock(image_mutex_);
++    if (viewport_transform_ && viewport_transform_->active()) {
++        return viewport_transform_->logical_to_display(p, alignment);
++    }
++
++    const double scale_width = static_cast<double>(image_raw_width_) / image_target_width_;
++    const double scale_height = static_cast<double>(image_raw_height_) / image_target_height_;
+ 
+     int proced_x = static_cast<int>(std::round(p.x * scale_width));
+     int proced_y = static_cast<int>(std::round(p.y * scale_height));
+@@ -1060,8 +1356,12 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
+ 
+ bool ControllerAgent::postproc_screenshot(const cv::Mat& raw)
+ {
++    std::unique_lock lock(image_mutex_);
++
+     if (raw.empty()) {
+         image_ = cv::Mat();
++        raw_image_ = cv::Mat();
++        cached_viewport_alignment_ = ViewportAlignment::Center;
+         LogError << "Empty screenshot";
+         return false;
+     }
+@@ -1074,13 +1374,29 @@ bool ControllerAgent::postproc_screenshot(const cv::Mat& raw)
+ 
+         if (!calc_target_image_size()) {
+             image_ = cv::Mat();
++            raw_image_ = cv::Mat();
++            cached_viewport_alignment_ = ViewportAlignment::Center;
+             LogError << "Invalid target image size";
+             return false;
+         }
+     }
+ 
+-    cv::resize(raw, image_, { image_target_width_, image_target_height_ }, 0, 0, image_resize_method_);
+-    return !image_.empty();
++    raw_image_ = raw.clone();
++    cv::Mat rendered;
++    if (viewport_transform_ && viewport_transform_->active()) {
++        rendered = render_viewport_image(raw_image_, viewport_alignment_);
++    }
++    else {
++        cv::resize(raw_image_, rendered, { image_target_width_, image_target_height_ }, 0, 0, image_resize_method_);
++    }
++    if (rendered.empty()) {
++        image_ = cv::Mat();
++        return false;
++    }
++    image_ = std::move(rendered);
++    cached_viewport_alignment_ = viewport_alignment_;
++    ++frame_id_;
++    return true;
+ }
+ 
+ bool ControllerAgent::calc_target_image_size()
+@@ -1090,6 +1406,28 @@ bool ControllerAgent::calc_target_image_size()
+         return false;
+     }
+ 
++    viewport_transform_.reset();
++    viewport_alignment_ = ViewportAlignment::Center;
++    cached_viewport_alignment_ = ViewportAlignment::Center;
++
++    if (viewport_config_) {
++        ViewportTransform candidate({ image_raw_width_, image_raw_height_ }, *viewport_config_);
++        if (candidate.active()) {
++            image_target_width_ = viewport_config_->logical_size.width;
++            image_target_height_ = viewport_config_->logical_size.height;
++            viewport_transform_ = std::move(candidate);
++            const cv::Rect rect = viewport_transform_->viewport();
++            LogInfo << "Adaptive screenshot viewport active" << VAR(image_raw_width_) << VAR(image_raw_height_) << VAR(image_target_width_)
++                    << VAR(image_target_height_) << VAR(rect.x) << VAR(rect.y) << VAR(rect.width) << VAR(rect.height)
++                    << VAR(ViewportTransform::mode_name(viewport_config_->mode));
++            return true;
++        }
++
++        LogInfo << "Adaptive screenshot viewport is configured but inactive for the current orientation or resolution"
++                << VAR(image_raw_width_) << VAR(image_raw_height_) << VAR(viewport_config_->logical_size.width)
++                << VAR(viewport_config_->logical_size.height);
++    }
++
+     if (image_use_raw_size_) {
+         LogDebug << "image_use_raw_size_" << VAR(image_raw_width_) << VAR(image_raw_height_);
+         image_target_width_ = image_raw_width_;
+@@ -1138,6 +1476,9 @@ void ControllerAgent::clear_target_image_size()
+ 
+     image_target_width_ = 0;
+     image_target_height_ = 0;
++    viewport_transform_.reset();
++    viewport_alignment_ = ViewportAlignment::Center;
++    cached_viewport_alignment_ = ViewportAlignment::Center;
+ }
+ 
+ bool ControllerAgent::request_uuid()
+@@ -1158,6 +1499,53 @@ bool ControllerAgent::init_scale_info()
+     return handle_screencap();
+ }
+ 
++cv::Mat ControllerAgent::render_viewport_image(const cv::Mat& raw, ViewportAlignment alignment) const
++{
++    if (raw.empty() || !viewport_transform_ || !viewport_transform_->active()) {
++        return {};
++    }
++
++    const cv::Rect viewport = viewport_transform_->viewport(alignment);
++    const cv::Rect bounds { 0, 0, raw.cols, raw.rows };
++    if (viewport.empty() || (viewport & bounds) != viewport) {
++        LogError << "Screenshot viewport is outside the raw image" << VAR(viewport.x) << VAR(viewport.y) << VAR(viewport.width)
++                 << VAR(viewport.height) << VAR(raw.cols) << VAR(raw.rows);
++        return {};
++    }
++
++    cv::Mat result;
++    cv::resize(raw(viewport), result, viewport_transform_->logical_size(), 0, 0, image_resize_method_);
++    return result;
++}
++
++void ControllerAgent::configure_viewport_from_environment()
++{
++#ifdef _MSC_VER
++    char* raw_value = nullptr;
++    size_t value_size = 0;
++    if (_dupenv_s(&raw_value, &value_size, "MAA_SCREENSHOT_VIEWPORT") != 0) {
++        return;
++    }
++    const std::unique_ptr<char, decltype(&std::free)> value_holder(raw_value, &std::free);
++    const std::string value = value_holder ? value_holder.get() : "";
++#else
++    const char* raw_value = std::getenv("MAA_SCREENSHOT_VIEWPORT");
++    const std::string value = raw_value ? raw_value : "";
++#endif
++    if (value.empty()) {
++        return;
++    }
++
++    viewport_config_ = ViewportTransform::parse(value);
++    if (!viewport_config_) {
++        LogError << "Invalid MAA_SCREENSHOT_VIEWPORT; expected WIDTHxHEIGHT:center or WIDTHxHEIGHT:adaptive" << VAR(value);
++        return;
++    }
++
++    LogInfo << "Configured screenshot viewport from environment" << VAR(viewport_config_->logical_size.width)
++            << VAR(viewport_config_->logical_size.height) << VAR(ViewportTransform::mode_name(viewport_config_->mode));
++}
++
+ bool ControllerAgent::set_image_target_long_side(MaaOptionValue value, MaaOptionValueSize val_size)
+ {
+     LogDebug;
+@@ -1278,4 +1666,63 @@ bool ControllerAgent::set_background_managed_keys_option(MaaOptionValue value, M
+     return win32_unit->set_background_managed_keys_option(keycodes, count);
+ }
+ 
++bool ControllerAgent::set_screenshot_viewport_alignment(MaaOptionValue value, MaaOptionValueSize val_size)
++{
++    LogDebug;
++
++    if (!value || val_size != sizeof(MaaViewportAlignment)) {
++        LogError << "invalid viewport alignment option" << VAR_VOIDP(value) << VAR(val_size);
++        return false;
++    }
++
++    const auto raw = *reinterpret_cast<const MaaViewportAlignment*>(value);
++    ViewportAlignment alignment;
++    switch (raw) {
++    case MaaViewportAlignment_Center:
++        alignment = ViewportAlignment::Center;
++        break;
++    case MaaViewportAlignment_Left:
++        alignment = ViewportAlignment::Left;
++        break;
++    case MaaViewportAlignment_Right:
++        alignment = ViewportAlignment::Right;
++        break;
++    default:
++        LogError << "unknown viewport alignment" << VAR(raw);
++        return false;
++    }
++
++    std::unique_lock lock(image_mutex_);
++    if (raw_image_.empty()) {
++        LogError << "viewport alignment requires a valid cached raw frame";
++        return false;
++    }
++
++    const bool active = viewport_transform_ && viewport_transform_->active();
++    if (!active) {
++        if (alignment != ViewportAlignment::Center || image_.empty()) {
++            LogError << "only center viewport alignment is available while adaptive viewport is inactive" << VAR(raw);
++            return false;
++        }
++        viewport_alignment_ = ViewportAlignment::Center;
++        cached_viewport_alignment_ = ViewportAlignment::Center;
++        return true;
++    }
++    if (!viewport_transform_->adaptive() && alignment != ViewportAlignment::Center) {
++        LogError << "left and right viewport alignments require adaptive viewport mode" << VAR(raw);
++        return false;
++    }
++
++    cv::Mat selected = render_viewport_image(raw_image_, alignment);
++    if (selected.empty()) {
++        return false;
++    }
++    viewport_alignment_ = alignment;
++    cached_viewport_alignment_ = alignment;
++    image_ = std::move(selected);
++    LogInfo << "selected screenshot viewport alignment without capturing a new frame" << VAR(ViewportTransform::alignment_name(alignment))
++            << VAR(frame_id_);
++    return true;
++}
++
+ MAA_CTRL_NS_END
+diff --git a/source/MaaFramework/Controller/ControllerAgent.h b/source/MaaFramework/Controller/ControllerAgent.h
+index b69d68e..12f7852 100644
+--- a/source/MaaFramework/Controller/ControllerAgent.h
++++ b/source/MaaFramework/Controller/ControllerAgent.h
+@@ -1,9 +1,12 @@
+ #pragma once
+ 
+ #include <memory>
++#include <map>
+ #include <mutex>
++#include <optional>
+ #include <set>
+ #include <variant>
++#include <vector>
+ 
+ #include "Base/AsyncRunner.hpp"
+ #include "Common/MaaTypes.h"
+@@ -13,6 +16,7 @@
+ #include "Utils/EventDispatcher.hpp"
+ 
+ #include "Common/Conf.h"
++#include "Controller/ViewportTransform.h"
+ 
+ MAA_RES_NS_BEGIN
+ class ResourceMgr;
+@@ -115,6 +119,13 @@ struct ScrollParam
+     MEO_TOJSON(point, dx, dy);
+ };
+ 
++struct ViewportImage
++{
++    ViewportAlignment alignment = ViewportAlignment::Center;
++    uint64_t frame_id = 0;
++    cv::Mat image;
++};
++
+ struct ShellParam
+ {
+     std::string cmd;
+@@ -166,6 +177,9 @@ struct Action
+     } type = Type::invalid;
+ 
+     Param param;
++    ViewportAlignment viewport_alignment = ViewportAlignment::Center;
++    uint64_t frame_id = 0;
++    std::optional<Param> display_param;
+ };
+ 
+ class ControllerAgent : public MaaController
+@@ -249,14 +263,20 @@ public: // for Actuator
+ 
+     std::shared_ptr<MAA_CTRL_UNIT_NS::ControlUnitAPI> control_unit() const { return control_unit_; }
+ 
++    bool adaptive_viewport() const;
++    ViewportAlignment viewport_alignment() const;
++    bool select_viewport_alignment(ViewportAlignment alignment);
++    std::vector<ViewportImage> viewport_images() const;
++    ViewportAlignment preferred_viewport_alignment(int logical_x) const;
++
+ private:
+     bool handle_connect();
+-    bool handle_click(const ClickParam& param);
+-    bool handle_long_press(const LongPressParam& param);
+-    bool handle_swipe(const SwipeParam& param);
+-    bool handle_multi_swipe(const MultiSwipeParam& param);
+-    bool handle_touch_down(const TouchParam& param);
+-    bool handle_touch_move(const TouchParam& param);
++    bool handle_click(const ClickParam& param, ViewportAlignment alignment);
++    bool handle_long_press(const LongPressParam& param, ViewportAlignment alignment);
++    bool handle_swipe(const SwipeParam& param, ViewportAlignment alignment);
++    bool handle_multi_swipe(const MultiSwipeParam& param, ViewportAlignment alignment);
++    bool handle_touch_down(const TouchParam& param, ViewportAlignment alignment);
++    bool handle_touch_move(const TouchParam& param, ViewportAlignment alignment);
+     bool handle_touch_up(const TouchParam& param);
+     bool handle_relative_move(const RelativeMoveParam& param);
+     bool handle_click_key(const ClickKeyParam& param);
+@@ -267,22 +287,27 @@ private:
+     bool handle_stop_app(const AppParam& param);
+     bool handle_key_down(const ClickKeyParam& param);
+     bool handle_key_up(const ClickKeyParam& param);
+-    bool handle_scroll(const ScrollParam& param);
++    bool handle_scroll(const ScrollParam& param, ViewportAlignment alignment);
+     bool handle_shell(const ShellParam& param);
+     bool handle_inactive();
+ 
+     MaaCtrlId post(Action action);
+-    MaaCtrlId focus_id(MaaCtrlId id);
++    MaaCtrlId post_focused(Action action);
+     bool check_stop();
+ 
+ private:
+     bool run_action(typename AsyncRunner<Action>::Id id, Action action);
+-    cv::Point preproc_touch_point(const cv::Point& p);
++    cv::Point preproc_touch_point(const cv::Point& p, ViewportAlignment alignment);
++    std::optional<Param>
++        display_param_snapshot_locked(Action::Type type, const Param& param, ViewportAlignment alignment) const;
++    json::object action_viewport_detail(const Action& action) const;
+     bool postproc_screenshot(const cv::Mat& raw);
+     bool calc_target_image_size();
+     void clear_target_image_size();
+     bool request_uuid();
+     bool init_scale_info();
++    cv::Mat render_viewport_image(const cv::Mat& raw, ViewportAlignment alignment) const;
++    void configure_viewport_from_environment();
+ 
+ private: // options
+     bool set_image_target_long_side(MaaOptionValue value, MaaOptionValueSize val_size);
+@@ -291,6 +316,7 @@ private: // options
+     bool set_mouse_lock_follow_option(MaaOptionValue value, MaaOptionValueSize val_size);
+     bool set_screenshot_resize_method(MaaOptionValue value, MaaOptionValueSize val_size);
+     bool set_background_managed_keys_option(MaaOptionValue value, MaaOptionValueSize val_size);
++    bool set_screenshot_viewport_alignment(MaaOptionValue value, MaaOptionValueSize val_size);
+ 
+ private:
+     bool need_to_stop_ = false;
+@@ -301,6 +327,7 @@ private:
+ 
+     mutable std::mutex image_mutex_;
+     cv::Mat image_;
++    cv::Mat raw_image_;
+     mutable std::mutex shell_output_mutex_;
+     std::string shell_output_;
+ 
+@@ -313,6 +340,15 @@ private:
+     int image_raw_height_ = 0;
+     int image_resize_method_ = 3; // cv::INTER_AREA
+ 
++    std::optional<ViewportConfig> viewport_config_;
++    std::optional<ViewportTransform> viewport_transform_;
++    ViewportAlignment viewport_alignment_ = ViewportAlignment::Center;
++    ViewportAlignment cached_viewport_alignment_ = ViewportAlignment::Center;
++    uint64_t frame_id_ = 0;
++
++    mutable std::mutex contact_mutex_;
++    std::map<int, ViewportAlignment> contact_alignments_;
++
+     std::string uuid_cache_;
+ 
+     std::set<AsyncRunner<Action>::Id> focus_ids_;
+diff --git a/source/MaaFramework/Task/PipelineTask.cpp b/source/MaaFramework/Task/PipelineTask.cpp
+index 693672d..b6018a9 100644
+--- a/source/MaaFramework/Task/PipelineTask.cpp
++++ b/source/MaaFramework/Task/PipelineTask.cpp
+@@ -1,7 +1,9 @@
+ #include "PipelineTask.h"
+ 
++#include <numeric>
+ #include <stack>
+ 
++#include "Component/ActionHelper.h"
+ #include "Component/Recognizer.h"
+ #include "Controller/ControllerAgent.h"
+ #include "Global/OptionMgr.h"
+@@ -206,6 +208,7 @@ NodeDetail PipelineTask::run_next(const std::vector<MAA_RES_NS::NodeAttr>& next,
+             return data_opt && data_opt->name == hit_name;
+         });
+ 
++        select_direct_hit_action_alignment(reco, *hit_opt);
+         auto act = run_action(reco, *hit_opt);
+ 
+         for (const auto& [anchor, target] : hit_opt->anchor) {
+@@ -272,8 +275,44 @@ RecoResult PipelineTask::recognize_list(const cv::Mat& image, const std::vector<
+     notify(MaaMsg_Node_NextList_Starting, reco_list_cb_detail);
+ 
+     auto batch_plan = prepare_batch_ocr(list);
+-    auto ocr_cache = batch_plan ? std::make_shared<MAA_VISION_NS::OCRCache>() : nullptr;
+-    bool batch_triggered = false;
++
++    struct CandidateState
++    {
++        MAA_CTRL_NS::ViewportAlignment alignment = MAA_CTRL_NS::ViewportAlignment::Center;
++        uint64_t frame_id = 0;
++        cv::Mat image;
++        std::shared_ptr<MAA_VISION_NS::OCRCache> ocr_cache;
++        bool batch_triggered = false;
++    };
++
++    auto* ctrl = controller();
++    const auto original_alignment = ctrl ? ctrl->viewport_alignment() : MAA_CTRL_NS::ViewportAlignment::Center;
++    std::vector<MAA_CTRL_NS::ViewportImage> viewport_images = ctrl ? ctrl->viewport_images() : std::vector<MAA_CTRL_NS::ViewportImage> {};
++    if (viewport_images.empty()) {
++        viewport_images.emplace_back(MAA_CTRL_NS::ViewportImage {
++            .alignment = original_alignment,
++            .frame_id = 0,
++            .image = image.clone(),
++        });
++    }
++
++    std::vector<CandidateState> candidates;
++    candidates.reserve(viewport_images.size());
++    for (auto& viewport_image : viewport_images) {
++        candidates.emplace_back(CandidateState {
++            .alignment = viewport_image.alignment,
++            .frame_id = viewport_image.frame_id,
++            .image = std::move(viewport_image.image),
++            .ocr_cache = batch_plan ? std::make_shared<MAA_VISION_NS::OCRCache>() : nullptr,
++        });
++    }
++
++    auto restore_original_alignment = [&]() {
++        if (ctrl && !ctrl->select_viewport_alignment(original_alignment)) {
++            LogError << "failed to restore screenshot viewport alignment"
++                     << VAR(MAA_CTRL_NS::ViewportTransform::alignment_name(original_alignment));
++        }
++    };
+ 
+     for (const auto& node : list) {
+         if (context_->need_to_stop()) {
+@@ -288,13 +327,6 @@ RecoResult PipelineTask::recognize_list(const cv::Mat& image, const std::vector<
+         }
+         const auto& pipeline_data = *node_opt;
+ 
+-        if (batch_plan && !batch_triggered && batch_plan->node_names.contains(pipeline_data.name)) {
+-            batch_triggered = true;
+-
+-            Recognizer recognizer(tasker_, *context_, image, ocr_cache);
+-            recognizer.prefetch_batch_ocr(batch_plan->entries);
+-        }
+-
+         if (!pipeline_data.enabled) {
+             LogDebug << "node disabled" << pipeline_data.name << VAR(pipeline_data.enabled);
+             continue;
+@@ -304,32 +336,160 @@ RecoResult PipelineTask::recognize_list(const cv::Mat& image, const std::vector<
+             continue;
+         }
+ 
+-        auto anchor_name = node.anchor ? std::optional { node.name } : std::nullopt;
+-        RecoResult result = run_recognition(image, pipeline_data, std::move(anchor_name), ocr_cache);
++        std::optional<RecoResult> inverse_result;
++        bool inverse_hit = pipeline_data.inverse;
++
++        for (auto& candidate : candidates) {
++            if (context_->need_to_stop()) {
++                LogWarn << "need_to_stop";
++                break;
++            }
++            if (candidate.image.empty()) {
++                continue;
++            }
++            if (ctrl && !ctrl->select_viewport_alignment(candidate.alignment)) {
++                LogError << "failed to select screenshot viewport alignment"
++                         << VAR(MAA_CTRL_NS::ViewportTransform::alignment_name(candidate.alignment));
++                continue;
++            }
++
++            if (batch_plan && !candidate.batch_triggered && batch_plan->node_names.contains(pipeline_data.name)) {
++                candidate.batch_triggered = true;
++                Recognizer recognizer(tasker_, *context_, candidate.image, candidate.ocr_cache);
++                recognizer.prefetch_batch_ocr(batch_plan->entries);
++            }
+ 
+-        if (result.box) {
+-            LogInfo << "reco hit" << VAR(result.name) << VAR(result.box);
++            auto anchor_name = node.anchor ? std::optional { node.name } : std::nullopt;
++            RecoResult result = run_recognition(candidate.image, pipeline_data, std::move(anchor_name), candidate.ocr_cache);
++            result.viewport_alignment = MAA_CTRL_NS::ViewportTransform::alignment_name(candidate.alignment);
++            result.frame_id = candidate.frame_id;
++
++            if (pipeline_data.inverse) {
++                if (!result.box) {
++                    inverse_hit = false;
++                    break;
++                }
++                if (!inverse_result) {
++                    inverse_result = std::move(result);
++                }
++                continue;
++            }
++
++            if (!result.box) {
++                continue;
++            }
++
++            LogInfo << "reco hit" << VAR(result.name) << VAR(result.box)
++                    << VAR(MAA_CTRL_NS::ViewportTransform::alignment_name(candidate.alignment));
+             context_->increment_hit_count(pipeline_data.name);
++            notify(MaaMsg_Node_NextList_Succeeded, reco_list_cb_detail);
++            return result;
+         }
+ 
+         if (context_->need_to_stop()) {
+-            LogWarn << "need_to_stop";
+             break;
+         }
+-        if (!result.box) {
++        if (!inverse_hit || !inverse_result) {
+             continue;
+         }
+ 
++        restore_original_alignment();
++        LogInfo << "inverse reco hit across all screenshot viewport candidates" << VAR(inverse_result->name) << VAR(inverse_result->box);
++        context_->increment_hit_count(pipeline_data.name);
+         notify(MaaMsg_Node_NextList_Succeeded, reco_list_cb_detail);
+-
+-        return result;
++        return std::move(*inverse_result);
+     }
+ 
++    restore_original_alignment();
+     notify(MaaMsg_Node_NextList_Failed, reco_list_cb_detail);
+ 
+     return { };
+ }
+ 
++void PipelineTask::select_direct_hit_action_alignment(const RecoResult& reco, const PipelineData& data)
++{
++    auto* ctrl = controller();
++    if (!ctrl || !ctrl->adaptive_viewport() || reco.algorithm != "DirectHit") {
++        return;
++    }
++
++    const auto logical_x = action_logical_x(reco, data);
++    if (!logical_x) {
++        return;
++    }
++
++    const auto alignment = ctrl->preferred_viewport_alignment(*logical_x);
++    if (!ctrl->select_viewport_alignment(alignment)) {
++        LogError << "failed to infer DirectHit action viewport alignment" << VAR(*logical_x)
++                 << VAR(MAA_CTRL_NS::ViewportTransform::alignment_name(alignment));
++        return;
++    }
++
++    LogInfo << "selected DirectHit action viewport alignment" << VAR(*logical_x)
++            << VAR(MAA_CTRL_NS::ViewportTransform::alignment_name(alignment));
++}
++
++std::optional<int> PipelineTask::action_logical_x(const RecoResult& reco, const PipelineData& data)
++{
++    if (!context_ || !reco.box) {
++        return std::nullopt;
++    }
++
++    ActionHelper helper(context_.get());
++    std::vector<int> centers;
++    auto append_target = [&](const MAA_RES_NS::Action::Target& target) {
++        const cv::Rect rect = helper.get_target_rect(target, *reco.box);
++        if (!rect.empty()) {
++            centers.emplace_back(rect.x + rect.width / 2);
++        }
++    };
++    auto append_swipe = [&](const MAA_RES_NS::Action::SwipeParam& swipe) {
++        append_target(swipe.begin);
++        for (size_t index = 0; index < swipe.end.size(); ++index) {
++            const auto& end = swipe.end[index];
++            const cv::Rect offset = swipe.end_offset.empty()          ? cv::Rect {}
++                                    : index < swipe.end_offset.size() ? swipe.end_offset[index]
++                                                                      : swipe.end_offset.back();
++            append_target(MAA_RES_NS::Action::Target { .type = end.type, .param = end.param, .offset = offset });
++        }
++    };
++
++    using namespace MAA_RES_NS::Action;
++    switch (data.action_type) {
++    case Type::Click:
++        append_target(std::get<ClickParam>(data.action_param).target);
++        break;
++    case Type::LongPress:
++        append_target(std::get<LongPressParam>(data.action_param).target);
++        break;
++    case Type::Swipe:
++        append_swipe(std::get<SwipeParam>(data.action_param));
++        break;
++    case Type::MultiSwipe:
++        for (const auto& swipe : std::get<MultiSwipeParam>(data.action_param).swipes) {
++            append_swipe(swipe);
++        }
++        break;
++    case Type::TouchDown:
++    case Type::TouchMove:
++        append_target(std::get<TouchParam>(data.action_param).target);
++        break;
++    case Type::Scroll:
++        append_target(std::get<ScrollParam>(data.action_param).target);
++        break;
++    case Type::Custom:
++        append_target(std::get<CustomParam>(data.action_param).target);
++        break;
++    default:
++        break;
++    }
++
++    if (centers.empty()) {
++        return std::nullopt;
++    }
++    return std::accumulate(centers.cbegin(), centers.cend(), 0) / static_cast<int>(centers.size());
++}
++
+ std::optional<PipelineTask::BatchOCRPlan> PipelineTask::prepare_batch_ocr(const std::vector<MAA_RES_NS::NodeAttr>& list)
+ {
+     using namespace MAA_RES_NS::Recognition;
+diff --git a/source/MaaFramework/Task/PipelineTask.h b/source/MaaFramework/Task/PipelineTask.h
+index 5d3d709..177d28f 100644
+--- a/source/MaaFramework/Task/PipelineTask.h
++++ b/source/MaaFramework/Task/PipelineTask.h
+@@ -50,6 +50,8 @@ private:
+     NodeDetail run_next(const std::vector<MAA_RES_NS::NodeAttr>& next, const PipelineData& pretask);
+     RecoResult recognize_list(const cv::Mat& image, const std::vector<MAA_RES_NS::NodeAttr>& list);
+     std::optional<BatchOCRPlan> prepare_batch_ocr(const std::vector<MAA_RES_NS::NodeAttr>& list);
++    void select_direct_hit_action_alignment(const RecoResult& reco, const PipelineData& data);
++    std::optional<int> action_logical_x(const RecoResult& reco, const PipelineData& data);
+ 
+     void try_add_ocr_node(OCRCollectContext& ctx, const std::string& name, const MAA_VISION_NS::OCRerParam& param);
+     void collect_ocr_from_reco(
+diff --git a/source/binding/NodeJS/src/apis/controller.cpp b/source/binding/NodeJS/src/apis/controller.cpp
+index 1ff0120..b9f6a24 100644
+--- a/source/binding/NodeJS/src/apis/controller.cpp
++++ b/source/binding/NodeJS/src/apis/controller.cpp
+@@ -139,6 +139,13 @@ void ControllerImpl::set_screenshot_resize_method(int32_t value)
+     }
+ }
+ 
++void ControllerImpl::set_screenshot_viewport_alignment(int32_t value)
++{
++    if (!MaaControllerSetOption(controller, MaaCtrlOption_ScreenshotViewportAlignment, &value, sizeof(value))) {
++        throw maajs::MaaError { "Controller set screenshot_viewport_alignment failed" };
++    }
++}
++
+ maajs::ValueType ControllerImpl::post_connection(maajs::ValueType self, maajs::EnvType)
+ {
+     auto id = MaaControllerPostConnection(controller);
+@@ -374,6 +381,7 @@ void ControllerImpl::init_proto(maajs::ObjectType proto, maajs::FunctionType)
+     MAA_BIND_SETTER(proto, "screenshot_target_short_side", ControllerImpl::set_screenshot_target_short_side);
+     MAA_BIND_SETTER(proto, "screenshot_use_raw_size", ControllerImpl::set_screenshot_use_raw_size);
+     MAA_BIND_SETTER(proto, "screenshot_resize_method", ControllerImpl::set_screenshot_resize_method);
++    MAA_BIND_SETTER(proto, "screenshot_viewport_alignment", ControllerImpl::set_screenshot_viewport_alignment);
+     MAA_BIND_FUNC(proto, "clear_sinks", ControllerImpl::clear_sinks);
+     MAA_BIND_FUNC(proto, "post_connection", ControllerImpl::post_connection);
+     MAA_BIND_FUNC(proto, "post_click", ControllerImpl::post_click);
+diff --git a/source/binding/NodeJS/src/apis/controller.d.ts b/source/binding/NodeJS/src/apis/controller.d.ts
+index 0b609b5..ead6db7 100644
+--- a/source/binding/NodeJS/src/apis/controller.d.ts
++++ b/source/binding/NodeJS/src/apis/controller.d.ts
+@@ -1,5 +1,7 @@
+ declare global {
+     namespace maa {
++        type ViewportAlignment = 0 | 1 | 2
++
+         type ClickParam = {
+             point: Point
+             contact: number
+@@ -49,6 +51,7 @@ declare global {
+         }
+ 
+         type ScrollParam = {
++            point: Point
+             dx: number
+             dy: number
+         }
+@@ -77,6 +80,14 @@ declare global {
+             ctrl_id: number // CtrlId
+             uuid: string
+             info: Record<string, unknown>
++            viewport: {
++                alignment: 'center' | 'left' | 'right'
++                alignment_value: ViewportAlignment
++                frame_id: number
++                logical_param: ActionParam
++                display_param_available: boolean
++                display_param?: ActionParam
++            }
+         } & (
+             | {
+                   action: 'connect'
+@@ -152,6 +163,7 @@ declare global {
+             set screenshot_target_short_side(value: number)
+             set screenshot_use_raw_size(value: boolean)
+             set screenshot_resize_method(value: number)
++            set screenshot_viewport_alignment(value: ViewportAlignment)
+ 
+             post_connection(): Job<CtrlId, Controller>
+             post_click(
+diff --git a/source/binding/NodeJS/src/apis/controller.h b/source/binding/NodeJS/src/apis/controller.h
+index 0a93ad9..d33dc98 100644
+--- a/source/binding/NodeJS/src/apis/controller.h
++++ b/source/binding/NodeJS/src/apis/controller.h
+@@ -37,6 +37,7 @@ struct ControllerImpl : public maajs::NativeClassBase
+     void set_screenshot_target_short_side(int32_t value);
+     void set_screenshot_use_raw_size(bool value);
+     void set_screenshot_resize_method(int32_t value);
++    void set_screenshot_viewport_alignment(int32_t value);
+     maajs::ValueType post_connection(maajs::ValueType self, maajs::EnvType env);
+     maajs::ValueType post_click(
+         maajs::ValueType self,
+diff --git a/source/binding/Python/maa/controller.py b/source/binding/Python/maa/controller.py
+index 635de29..b3a5612 100644
+--- a/source/binding/Python/maa/controller.py
++++ b/source/binding/Python/maa/controller.py
+@@ -539,6 +539,22 @@ class Controller:
+             )
+         )
+ 
++    def set_screenshot_viewport_alignment(self, alignment: MaaViewportAlignmentEnum) -> bool:
++        """Select a viewport from the current cached raw screenshot frame.
++
++        This does not capture a new frame. Left and Right require an active adaptive viewport;
++        all values require a valid cached raw frame.
++        """
++        value = MaaViewportAlignment(int(alignment))
++        return bool(
++            Library.framework().MaaControllerSetOption(
++                self._handle,
++                MaaOption(MaaCtrlOptionEnum.ScreenshotViewportAlignment),
++                ctypes.pointer(value),
++                ctypes.sizeof(MaaViewportAlignment),
++            )
++        )
++
+     _sink_holder: dict[int, "ControllerEventSink"] = {}
+ 
+     def add_sink(self, sink: "ControllerEventSink") -> Optional[int]:
+@@ -1821,6 +1837,7 @@ class ControllerEventSink(EventSink):
+         uuid: str
+         action: str
+         param: dict[str, Any]
++        viewport: dict[str, Any]
+         info: dict[str, Any]
+ 
+     def on_controller_action(
+@@ -1845,6 +1862,7 @@ class ControllerEventSink(EventSink):
+                 uuid=details["uuid"],
+                 action=details["action"],
+                 param=details["param"],
++                viewport=details.get("viewport", {}),
+                 info=details["info"],
+             )
+             self.on_controller_action(controller, noti_type, detail)
+diff --git a/source/binding/Python/maa/define.py b/source/binding/Python/maa/define.py
+index f19ae61..a4dd9d8 100644
+--- a/source/binding/Python/maa/define.py
++++ b/source/binding/Python/maa/define.py
+@@ -30,6 +30,7 @@ __all__ = [
+     "MaaOption",
+     "MaaGlobalOption",
+     "MaaCtrlOption",
++    "MaaViewportAlignment",
+     "MaaResOption",
+     # Handle aliases
+     "MaaStringBufferHandle",
+@@ -66,6 +67,7 @@ __all__ = [
+     "MaaStatusEnum",
+     "MaaGlobalOptionEnum",
+     "MaaCtrlOptionEnum",
++    "MaaViewportAlignmentEnum",
+     "MaaInferenceDeviceEnum",
+     "MaaInferenceExecutionProviderEnum",
+     "MaaResOptionEnum",
+@@ -171,6 +173,7 @@ MaaOptionValue = ctypes.c_void_p
+ MaaOption = ctypes.c_int32
+ MaaGlobalOption = MaaOption
+ MaaCtrlOption = MaaOption
++MaaViewportAlignment = ctypes.c_int32
+ MaaResOption = MaaOption
+ 
+ 
+@@ -274,6 +277,16 @@ class MaaCtrlOptionEnum(IntEnum):
+     # value: int32_t array of virtual key codes; val_size: sizeof(int32_t) * count
+     BackgroundManagedKeys = 7
+ 
++    # Select the logical viewport rendered from the current cached raw frame.
++    # value: MaaViewportAlignment; val_size: sizeof(MaaViewportAlignment)
++    ScreenshotViewportAlignment = 8
++
++
++class MaaViewportAlignmentEnum(IntEnum):
++    Center = 0
++    Left = 1
++    Right = 2
++
+ 
+ class MaaInferenceDeviceEnum(IntEnum):
+     CPU = -2
+diff --git a/source/include/Common/TaskResultTypes.h b/source/include/Common/TaskResultTypes.h
+index 98f3509..a81a4ee 100644
+--- a/source/include/Common/TaskResultTypes.h
++++ b/source/include/Common/TaskResultTypes.h
+@@ -18,11 +18,13 @@ struct RecoResult
+     std::string name;
+     std::string algorithm;
+     std::optional<cv::Rect> box = std::nullopt;
++    std::string viewport_alignment;
++    uint64_t frame_id = 0;
+     json::value detail;
+     ImageEncodedBuffer raw;
+     std::vector<ImageEncodedBuffer> draws;
+ 
+-    MEO_TOJSON(reco_id, name, algorithm, box, detail);
++    MEO_TOJSON(reco_id, name, algorithm, box, viewport_alignment, frame_id, detail);
+ };
+ 
+ struct ActionResult
+diff --git a/source/modules/MaaFramework.cppm b/source/modules/MaaFramework.cppm
+index 5e733de..9f4fff1 100644
+--- a/source/modules/MaaFramework.cppm
++++ b/source/modules/MaaFramework.cppm
+@@ -53,6 +53,8 @@ export using ::MaaInferenceExecutionProviderEnum;
+ 
+ export using ::MaaCtrlOption;
+ export using ::MaaCtrlOptionEnum;
++export using ::MaaViewportAlignment;
++export using ::MaaViewportAlignmentEnum;
+ 
+ export using ::MaaTaskerOption;
+ export using ::MaaTaskerOptionEnum;
+diff --git a/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp b/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp
+new file mode 100644
+index 0000000..442aed1
+--- /dev/null
++++ b/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp
+@@ -0,0 +1,71 @@
++#include "ScreencapFailoverPolicy.h"
++
++#include <algorithm>
++
++MAA_CTRL_UNIT_NS_BEGIN
++
++void ScreencapFailoverPolicy::reset(size_t candidate_count, size_t active_candidate)
++{
++    candidates_.assign(candidate_count, CandidateState {});
++    active_candidate_ = active_candidate < candidate_count ? std::optional<size_t>(active_candidate) : std::nullopt;
++    generation_ = 0;
++}
++
++void ScreencapFailoverPolicy::reset_backoff()
++{
++    for (auto& candidate : candidates_) {
++        candidate = CandidateState {};
++    }
++}
++
++std::vector<size_t> ScreencapFailoverPolicy::begin_attempt()
++{
++    ++generation_;
++    std::vector<size_t> order;
++    order.reserve(candidates_.size());
++
++    if (active_candidate_ && available(*active_candidate_)) {
++        order.emplace_back(*active_candidate_);
++    }
++    for (size_t candidate = 0; candidate < candidates_.size(); ++candidate) {
++        if (candidate == active_candidate_ || !available(candidate)) {
++            continue;
++        }
++        order.emplace_back(candidate);
++    }
++    return order;
++}
++
++void ScreencapFailoverPolicy::report_success(size_t candidate)
++{
++    if (candidate >= candidates_.size()) {
++        return;
++    }
++    candidates_[candidate] = CandidateState {};
++    active_candidate_ = candidate;
++}
++
++void ScreencapFailoverPolicy::report_failure(size_t candidate)
++{
++    if (candidate >= candidates_.size()) {
++        return;
++    }
++
++    auto& state = candidates_[candidate];
++    ++state.consecutive_failures;
++    const uint32_t exponent = std::min<uint32_t>(state.consecutive_failures - 1, 5);
++    const uint64_t skipped_generations = uint64_t { 1 } << exponent;
++    state.retry_generation = generation_ + skipped_generations + 1;
++}
++
++std::optional<size_t> ScreencapFailoverPolicy::active_candidate() const noexcept
++{
++    return active_candidate_;
++}
++
++bool ScreencapFailoverPolicy::available(size_t candidate) const noexcept
++{
++    return candidate < candidates_.size() && generation_ >= candidates_[candidate].retry_generation;
++}
++
++MAA_CTRL_UNIT_NS_END
+diff --git a/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.h b/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.h
+new file mode 100644
+index 0000000..156531d
+--- /dev/null
++++ b/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.h
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include "Common/Conf.h"
++
++MAA_CTRL_UNIT_NS_BEGIN
++
++class ScreencapFailoverPolicy
++{
++public:
++    void reset(size_t candidate_count, size_t active_candidate = 0);
++    void reset_backoff();
++
++    std::vector<size_t> begin_attempt();
++    void report_success(size_t candidate);
++    void report_failure(size_t candidate);
++
++    template <typename Attempt>
++    std::optional<size_t> try_candidates(Attempt&& attempt)
++    {
++        for (const size_t candidate : begin_attempt()) {
++            if (attempt(candidate)) {
++                report_success(candidate);
++                return candidate;
++            }
++            report_failure(candidate);
++        }
++        return std::nullopt;
++    }
++
++    std::optional<size_t> active_candidate() const noexcept;
++
++private:
++    struct CandidateState
++    {
++        uint32_t consecutive_failures = 0;
++        uint64_t retry_generation = 0;
++    };
++
++    bool available(size_t candidate) const noexcept;
++
++    std::vector<CandidateState> candidates_;
++    std::optional<size_t> active_candidate_;
++    uint64_t generation_ = 0;
++};
++
++MAA_CTRL_UNIT_NS_END
+diff --git a/source/MaaFramework/Controller/ViewportTransform.cpp b/source/MaaFramework/Controller/ViewportTransform.cpp
+new file mode 100644
+index 0000000..7605f1f
+--- /dev/null
++++ b/source/MaaFramework/Controller/ViewportTransform.cpp
+@@ -0,0 +1,226 @@
++#include "ViewportTransform.h"
++
++#include <algorithm>
++#include <cctype>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
++#include <string>
++
++MAA_CTRL_NS_BEGIN
++
++namespace
++{
++std::string trim_and_lower(std::string_view value)
++{
++    const auto first = value.find_first_not_of(" \t\r\n");
++    if (first == std::string_view::npos) {
++        return {};
++    }
++    const auto last = value.find_last_not_of(" \t\r\n");
++    std::string result(value.substr(first, last - first + 1));
++    std::ranges::transform(result, result.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
++    return result;
++}
++
++bool parse_positive_int(std::string_view value, int& output) noexcept
++{
++    if (value.empty()) {
++        return false;
++    }
++    const char* begin = value.data();
++    const char* end = begin + value.size();
++    const auto [ptr, error] = std::from_chars(begin, end, output);
++    return error == std::errc() && ptr == end && output > 0;
++}
++} // namespace
++
++ViewportTransform::ViewportTransform(cv::Size display_size, ViewportConfig config)
++    : display_size_(display_size)
++    , config_(config)
++{
++    if (display_size_.width <= 0 || display_size_.height <= 0 || config_.logical_size.width <= 0 || config_.logical_size.height <= 0) {
++        return;
++    }
++
++    const bool display_landscape = display_size_.width >= display_size_.height;
++    const bool logical_landscape = config_.logical_size.width >= config_.logical_size.height;
++    if (display_landscape != logical_landscape || display_size_.width < config_.logical_size.width
++        || display_size_.height < config_.logical_size.height) {
++        return;
++    }
++
++    const int64_t display_ratio = static_cast<int64_t>(display_size_.width) * config_.logical_size.height;
++    const int64_t logical_ratio = static_cast<int64_t>(display_size_.height) * config_.logical_size.width;
++    if (display_ratio >= logical_ratio) {
++        const int width =
++            static_cast<int>(static_cast<int64_t>(display_size_.height) * config_.logical_size.width / config_.logical_size.height);
++        center_viewport_ = { (display_size_.width - width) / 2, 0, width, display_size_.height };
++    }
++    else {
++        const int height =
++            static_cast<int>(static_cast<int64_t>(display_size_.width) * config_.logical_size.height / config_.logical_size.width);
++        center_viewport_ = { 0, (display_size_.height - height) / 2, display_size_.width, height };
++    }
++
++    active_ = center_viewport_.width >= config_.logical_size.width && center_viewport_.height >= config_.logical_size.height;
++}
++
++std::optional<ViewportConfig> ViewportTransform::parse(std::string_view value) noexcept
++{
++    const std::string normalized = trim_and_lower(value);
++    if (normalized.empty() || normalized == "off" || normalized == "disabled") {
++        return std::nullopt;
++    }
++
++    const size_t separator = normalized.find(':');
++    const std::string_view size_part(normalized.data(), separator == std::string::npos ? normalized.size() : separator);
++    const std::string_view mode_part =
++        separator == std::string::npos ? std::string_view("center") : std::string_view(normalized).substr(separator + 1);
++    const size_t cross = size_part.find('x');
++    if (cross == std::string_view::npos || size_part.find('x', cross + 1) != std::string_view::npos) {
++        return std::nullopt;
++    }
++
++    int width = 0;
++    int height = 0;
++    if (!parse_positive_int(size_part.substr(0, cross), width) || !parse_positive_int(size_part.substr(cross + 1), height)) {
++        return std::nullopt;
++    }
++
++    ViewportMode mode;
++    if (mode_part == "center" || mode_part == "centre") {
++        mode = ViewportMode::Center;
++    }
++    else if (mode_part == "adaptive") {
++        mode = ViewportMode::Adaptive;
++    }
++    else {
++        return std::nullopt;
++    }
++
++    return ViewportConfig { .logical_size = { width, height }, .mode = mode };
++}
++
++std::string_view ViewportTransform::mode_name(ViewportMode mode) noexcept
++{
++    switch (mode) {
++    case ViewportMode::Adaptive:
++        return "adaptive";
++    case ViewportMode::Center:
++    default:
++        return "center";
++    }
++}
++
++std::string_view ViewportTransform::alignment_name(ViewportAlignment alignment) noexcept
++{
++    switch (alignment) {
++    case ViewportAlignment::Left:
++        return "left";
++    case ViewportAlignment::Right:
++        return "right";
++    case ViewportAlignment::Center:
++    default:
++        return "center";
++    }
++}
++
++bool ViewportTransform::active() const noexcept
++{
++    return active_;
++}
++
++bool ViewportTransform::adaptive() const noexcept
++{
++    if (!active_ || config_.mode != ViewportMode::Adaptive) {
++        return false;
++    }
++    return center_viewport_.width != display_size_.width || center_viewport_.height != display_size_.height;
++}
++
++cv::Size ViewportTransform::display_size() const noexcept
++{
++    return display_size_;
++}
++
++cv::Size ViewportTransform::logical_size() const noexcept
++{
++    return config_.logical_size;
++}
++
++cv::Rect ViewportTransform::viewport(ViewportAlignment alignment) const noexcept
++{
++    if (!active_) {
++        return {};
++    }
++    if (!adaptive() || alignment == ViewportAlignment::Center) {
++        return center_viewport_;
++    }
++
++    if (center_viewport_.width < display_size_.width) {
++        const int x = alignment == ViewportAlignment::Left ? 0 : display_size_.width - center_viewport_.width;
++        return { x, center_viewport_.y, center_viewport_.width, center_viewport_.height };
++    }
++    if (center_viewport_.height < display_size_.height) {
++        const int y = alignment == ViewportAlignment::Left ? 0 : display_size_.height - center_viewport_.height;
++        return { center_viewport_.x, y, center_viewport_.width, center_viewport_.height };
++    }
++    return center_viewport_;
++}
++
++std::array<ViewportAlignment, 3> ViewportTransform::candidate_alignments() const noexcept
++{
++    return { ViewportAlignment::Center, ViewportAlignment::Left, ViewportAlignment::Right };
++}
++
++cv::Point ViewportTransform::logical_to_display(const cv::Point& point, ViewportAlignment alignment) const noexcept
++{
++    const cv::Rect target = viewport(alignment);
++    if (target.empty()) {
++        return point;
++    }
++    return {
++        scale_axis(point.x, config_.logical_size.width, target.x, target.width),
++        scale_axis(point.y, config_.logical_size.height, target.y, target.height),
++    };
++}
++
++cv::Point ViewportTransform::display_to_logical(const cv::Point& point, ViewportAlignment alignment) const noexcept
++{
++    const cv::Rect source = viewport(alignment);
++    if (source.empty()) {
++        return point;
++    }
++    return {
++        scale_axis(point.x - source.x, source.width, 0, config_.logical_size.width),
++        scale_axis(point.y - source.y, source.height, 0, config_.logical_size.height),
++    };
++}
++
++ViewportAlignment ViewportTransform::preferred_alignment_for_logical_x(int logical_x, int logical_width) noexcept
++{
++    if (logical_width <= 0) {
++        return ViewportAlignment::Center;
++    }
++    const int edge_band = logical_width * 5 / 16;
++    if (logical_x < edge_band) {
++        return ViewportAlignment::Left;
++    }
++    if (logical_x >= logical_width - edge_band) {
++        return ViewportAlignment::Right;
++    }
++    return ViewportAlignment::Center;
++}
++
++int ViewportTransform::scale_axis(int coordinate, int source_extent, int target_offset, int target_extent) noexcept
++{
++    if (source_extent <= 0 || target_extent <= 0) {
++        return target_offset;
++    }
++    const int bounded = std::clamp(coordinate, 0, source_extent - 1);
++    const int scaled = static_cast<int>(std::llround(static_cast<double>(bounded) * static_cast<double>(target_extent) / source_extent));
++    return target_offset + std::clamp(scaled, 0, target_extent - 1);
++}
++
++MAA_CTRL_NS_END
+diff --git a/source/MaaFramework/Controller/ViewportTransform.h b/source/MaaFramework/Controller/ViewportTransform.h
+new file mode 100644
+index 0000000..b0f2176
+--- /dev/null
++++ b/source/MaaFramework/Controller/ViewportTransform.h
+@@ -0,0 +1,62 @@
++#pragma once
++
++#include <array>
++#include <optional>
++#include <string_view>
++
++#include "Common/Conf.h"
++#include "MaaFramework/MaaDef.h"
++#include "MaaUtils/NoWarningCVMat.hpp"
++
++MAA_CTRL_NS_BEGIN
++
++enum class ViewportMode
++{
++    Center,
++    Adaptive,
++};
++
++enum class ViewportAlignment
++{
++    Center = MaaViewportAlignment_Center,
++    Left = MaaViewportAlignment_Left,
++    Right = MaaViewportAlignment_Right,
++};
++
++struct ViewportConfig
++{
++    cv::Size logical_size;
++    ViewportMode mode = ViewportMode::Center;
++};
++
++class ViewportTransform
++{
++public:
++    ViewportTransform(cv::Size display_size, ViewportConfig config);
++
++    static std::optional<ViewportConfig> parse(std::string_view value) noexcept;
++    static std::string_view mode_name(ViewportMode mode) noexcept;
++    static std::string_view alignment_name(ViewportAlignment alignment) noexcept;
++
++    bool active() const noexcept;
++    bool adaptive() const noexcept;
++    cv::Size display_size() const noexcept;
++    cv::Size logical_size() const noexcept;
++    cv::Rect viewport(ViewportAlignment alignment = ViewportAlignment::Center) const noexcept;
++    std::array<ViewportAlignment, 3> candidate_alignments() const noexcept;
++
++    cv::Point logical_to_display(const cv::Point& point, ViewportAlignment alignment) const noexcept;
++    cv::Point display_to_logical(const cv::Point& point, ViewportAlignment alignment) const noexcept;
++
++    static ViewportAlignment preferred_alignment_for_logical_x(int logical_x, int logical_width) noexcept;
++
++private:
++    static int scale_axis(int coordinate, int source_extent, int target_offset, int target_extent) noexcept;
++
++    cv::Size display_size_;
++    ViewportConfig config_;
++    cv::Rect center_viewport_;
++    bool active_ = false;
++};
++
++MAA_CTRL_NS_END
+diff --git a/test/screencap/CMakeLists.txt b/test/screencap/CMakeLists.txt
+new file mode 100644
+index 0000000..627db5d
+--- /dev/null
++++ b/test/screencap/CMakeLists.txt
+@@ -0,0 +1,14 @@
++add_executable(
++    ScreencapFailoverTesting
++    main.cpp
++    ${CMAKE_SOURCE_DIR}/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp)
++
++target_include_directories(
++    ScreencapFailoverTesting
++    PRIVATE
++    ${CMAKE_SOURCE_DIR}/source/MaaAdbControlUnit
++    ${MAA_PRIVATE_INC}
++    ${MAA_PUBLIC_INC})
++
++add_test(NAME screencap::failover COMMAND ScreencapFailoverTesting)
++set_target_properties(ScreencapFailoverTesting PROPERTIES FOLDER Testing)
+diff --git a/test/screencap/main.cpp b/test/screencap/main.cpp
+new file mode 100644
+index 0000000..4792583
+--- /dev/null
++++ b/test/screencap/main.cpp
+@@ -0,0 +1,109 @@
++#include <cstdlib>
++#include <iostream>
++#include <optional>
++#include <string_view>
++#include <vector>
++
++#include "Manager/ScreencapFailoverPolicy.h"
++
++namespace
++{
++using MAA_CTRL_UNIT_NS::ScreencapFailoverPolicy;
++
++int failures = 0;
++
++void check(bool condition, std::string_view message)
++{
++    if (condition) {
++        return;
++    }
++    ++failures;
++    std::cerr << "FAILED: " << message << '\n';
++}
++
++void check_order(const std::vector<size_t>& actual, const std::vector<size_t>& expected, std::string_view message)
++{
++    check(actual == expected, message);
++}
++
++void test_active_first_and_switch()
++{
++    ScreencapFailoverPolicy policy;
++    policy.reset(3);
++
++    check_order(policy.begin_attempt(), { 0, 1, 2 }, "initial attempt follows benchmark order");
++    policy.report_failure(0);
++    policy.report_success(1);
++    check(policy.active_candidate() == std::optional<size_t>(1), "successful fallback becomes active");
++
++    check_order(policy.begin_attempt(), { 1, 2 }, "failed method is skipped for the next frame");
++    check_order(policy.begin_attempt(), { 1, 0, 2 }, "backed-off method returns behind the active method");
++}
++
++void test_exponential_backoff()
++{
++    ScreencapFailoverPolicy policy;
++    policy.reset(1);
++
++    check_order(policy.begin_attempt(), { 0 }, "single candidate starts available");
++    policy.report_failure(0);
++    check(policy.begin_attempt().empty(), "first failure skips one frame");
++    check_order(policy.begin_attempt(), { 0 }, "first failure retries after one skipped frame");
++
++    policy.report_failure(0);
++    check(policy.begin_attempt().empty(), "second failure begins longer backoff");
++    check(policy.begin_attempt().empty(), "second failure skips two frames");
++    check_order(policy.begin_attempt(), { 0 }, "second failure retries after two skipped frames");
++}
++
++void test_lifecycle_reset()
++{
++    ScreencapFailoverPolicy policy;
++    policy.reset(2);
++
++    check_order(policy.begin_attempt(), { 0, 1 }, "candidates initially available");
++    policy.report_failure(0);
++    policy.report_failure(1);
++    policy.reset_backoff();
++
++    check_order(policy.begin_attempt(), { 0, 1 }, "resolution or app lifecycle change clears backoff");
++}
++
++void test_runtime_attempt_sequence()
++{
++    ScreencapFailoverPolicy policy;
++    policy.reset(3);
++    std::vector<size_t> calls;
++
++    const auto selected = policy.try_candidates([&](size_t candidate) {
++        calls.emplace_back(candidate);
++        return candidate == 2;
++    });
++
++    check_order(calls, { 0, 1, 2 }, "runtime failure immediately tries ranked fallback methods");
++    check(selected == std::optional<size_t>(2), "runtime attempt reports the successful fallback");
++    check(policy.active_candidate() == std::optional<size_t>(2), "runtime attempt switches the active candidate");
++
++    calls.clear();
++    policy.try_candidates([&](size_t candidate) {
++        calls.emplace_back(candidate);
++        return true;
++    });
++    check_order(calls, { 2 }, "next frame uses the successful fallback first");
++}
++} // namespace
++
++int main()
++{
++    test_active_first_and_switch();
++    test_exponential_backoff();
++    test_lifecycle_reset();
++    test_runtime_attempt_sequence();
++
++    if (failures != 0) {
++        std::cerr << failures << " screencap failover checks failed\n";
++        return EXIT_FAILURE;
++    }
++    std::cout << "screencap failover checks passed\n";
++    return EXIT_SUCCESS;
++}
+diff --git a/test/viewport/CMakeLists.txt b/test/viewport/CMakeLists.txt
+new file mode 100644
+index 0000000..57048bf
+--- /dev/null
++++ b/test/viewport/CMakeLists.txt
+@@ -0,0 +1,24 @@
++add_executable(
++    ViewportTransformTesting
++    main.cpp
++    ${CMAKE_SOURCE_DIR}/source/MaaFramework/Controller/ViewportTransform.cpp)
++
++target_include_directories(
++    ViewportTransformTesting
++    PRIVATE
++    ${CMAKE_SOURCE_DIR}/source/MaaFramework
++    ${MAA_PRIVATE_INC}
++    ${MAA_PUBLIC_INC})
++
++target_link_libraries(ViewportTransformTesting PRIVATE MaaUtils ${OpenCV_LIBS})
++
++add_test(NAME viewport::transform COMMAND ViewportTransformTesting)
++set_target_properties(ViewportTransformTesting PROPERTIES FOLDER Testing)
++
++if(WITH_CUSTOM_CONTROLLER)
++    add_executable(ViewportControllerTesting controller.cpp)
++    target_link_libraries(ViewportControllerTesting PRIVATE MaaFramework ${OpenCV_LIBS})
++    add_dependencies(ViewportControllerTesting MaaCustomControlUnit)
++    add_test(NAME viewport::controller COMMAND ViewportControllerTesting)
++    set_target_properties(ViewportControllerTesting PROPERTIES FOLDER Testing)
++endif()
+diff --git a/test/viewport/controller.cpp b/test/viewport/controller.cpp
+new file mode 100644
+index 0000000..bbf86a5
+--- /dev/null
++++ b/test/viewport/controller.cpp
+@@ -0,0 +1,437 @@
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <iostream>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <opencv2/core.hpp>
++
++#include <MaaFramework/MaaAPI.h>
++
++namespace
++{
++struct InputEvent
++{
++    std::string type;
++    int contact = 0;
++    int x = 0;
++    int y = 0;
++    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
++};
++
++struct FakeController
++{
++    int width = 2800;
++    int height = 1260;
++    std::vector<uint8_t> pixels = std::vector<uint8_t>(static_cast<size_t>(width) * height * 3, 0);
++    std::vector<InputEvent> events;
++    std::vector<std::string> controller_callbacks;
++    MaaControllerFeature features = 0;
++    std::mutex mutex;
++    std::condition_variable condition;
++    bool block_start = false;
++    bool start_entered = false;
++    bool release_start = false;
++};
++
++int failures = 0;
++
++void check(bool condition, std::string_view message)
++{
++    if (condition) {
++        return;
++    }
++    ++failures;
++    std::cerr << "FAILED: " << message << '\n';
++}
++
++MaaBool request_uuid(void*, MaaStringBuffer* buffer)
++{
++    return MaaStringBufferSet(buffer, "viewport-controller-test");
++}
++
++void controller_event(void*, const char* message, const char* details_json, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.controller_callbacks.emplace_back(
++        std::string(message ? message : "") + " " + std::string(details_json ? details_json : ""));
++}
++
++MaaBool connect(void*)
++{
++    return true;
++}
++
++MaaBool connected(void*)
++{
++    return true;
++}
++
++MaaControllerFeature get_features(void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    return state.features;
++}
++
++MaaBool screencap(void* trans_arg, MaaImageBuffer* buffer)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    return MaaImageBufferSetRawData(buffer, state.pixels.data(), state.width, state.height, CV_8UC3);
++}
++
++MaaBool start_app(const char*, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    if (!state.block_start) {
++        return true;
++    }
++    state.start_entered = true;
++    state.condition.notify_all();
++    state.condition.wait(lock, [&]() { return state.release_start; });
++    return true;
++}
++
++MaaBool click(int32_t x, int32_t y, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "click", .x = x, .y = y });
++    return true;
++}
++
++MaaBool swipe(int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "swipe_begin", .x = x1, .y = y1 });
++    state.events.emplace_back(InputEvent { .type = "swipe_end", .x = x2, .y = y2 });
++    return true;
++}
++
++MaaBool touch_down(int32_t contact, int32_t x, int32_t y, int32_t, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "down", .contact = contact, .x = x, .y = y });
++    return true;
++}
++
++MaaBool touch_move(int32_t contact, int32_t x, int32_t y, int32_t, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "move", .contact = contact, .x = x, .y = y });
++    return true;
++}
++
++MaaBool touch_up(int32_t contact, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "up", .contact = contact });
++    return true;
++}
++
++MaaBool scroll(int32_t dx, int32_t dy, void* trans_arg)
++{
++    auto& state = *static_cast<FakeController*>(trans_arg);
++    std::unique_lock lock(state.mutex);
++    state.events.emplace_back(InputEvent { .type = "scroll", .x = dx, .y = dy });
++    return true;
++}
++
++MaaBool get_info(void*, MaaStringBuffer* buffer)
++{
++    return MaaStringBufferSet(buffer, "{}");
++}
++
++MaaCustomControllerCallbacks callbacks()
++{
++    MaaCustomControllerCallbacks value {};
++    value.connect = connect;
++    value.connected = connected;
++    value.request_uuid = request_uuid;
++    value.get_features = get_features;
++    value.start_app = start_app;
++    value.screencap = screencap;
++    value.click = click;
++    value.swipe = swipe;
++    value.touch_down = touch_down;
++    value.touch_move = touch_move;
++    value.touch_up = touch_up;
++    value.scroll = scroll;
++    value.get_info = get_info;
++    return value;
++}
++
++bool set_alignment(MaaController* controller, MaaViewportAlignment alignment)
++{
++    return MaaControllerSetOption(controller, MaaCtrlOption_ScreenshotViewportAlignment, &alignment, sizeof(alignment));
++}
++
++std::string controller_info(MaaController* controller)
++{
++    MaaStringBuffer* buffer = MaaStringBufferCreate();
++    if (!buffer || !MaaControllerGetInfo(controller, buffer)) {
++        if (buffer) {
++            MaaStringBufferDestroy(buffer);
++        }
++        return {};
++    }
++    std::string result = MaaStringBufferGet(buffer);
++    MaaStringBufferDestroy(buffer);
++    return result;
++}
++
++bool has_json_integer(const std::string& value, std::string_view key, int expected)
++{
++    const std::string compact = std::string("\"") + std::string(key) + "\":" + std::to_string(expected);
++    const std::string spaced = std::string("\"") + std::string(key) + "\": " + std::to_string(expected);
++    return value.find(compact) != std::string::npos || value.find(spaced) != std::string::npos;
++}
++
++InputEvent last_event(FakeController& state)
++{
++    std::unique_lock lock(state.mutex);
++    return state.events.empty() ? InputEvent {} : state.events.back();
++}
++
++std::vector<InputEvent> events_since(FakeController& state, size_t offset)
++{
++    std::unique_lock lock(state.mutex);
++    if (offset >= state.events.size()) {
++        return {};
++    }
++    return { state.events.begin() + static_cast<std::ptrdiff_t>(offset), state.events.end() };
++}
++
++size_t event_count(FakeController& state)
++{
++    std::unique_lock lock(state.mutex);
++    return state.events.size();
++}
++
++size_t succeeded_touch_callback_count(FakeController& state, size_t offset)
++{
++    std::unique_lock lock(state.mutex);
++    if (offset >= state.controller_callbacks.size()) {
++        return 0;
++    }
++    size_t count = 0;
++    for (auto iter = state.controller_callbacks.begin() + static_cast<std::ptrdiff_t>(offset);
++         iter != state.controller_callbacks.end(); ++iter) {
++        if (iter->find("Controller.Action.Succeeded") != std::string::npos
++            && (iter->find("\"action\":\"touch_down\"") != std::string::npos
++                || iter->find("\"action\":\"touch_up\"") != std::string::npos)) {
++            ++count;
++        }
++    }
++    return count;
++}
++
++void set_resolution(FakeController& state, int width, int height)
++{
++    std::unique_lock lock(state.mutex);
++    state.width = width;
++    state.height = height;
++    state.pixels.assign(static_cast<size_t>(width) * height * 3, 0);
++}
++
++std::pair<int, int> cached_image_size(MaaController* controller)
++{
++    MaaImageBuffer* buffer = MaaImageBufferCreate();
++    if (!buffer || !MaaControllerCachedImage(controller, buffer)) {
++        if (buffer) {
++            MaaImageBufferDestroy(buffer);
++        }
++        return {};
++    }
++    const std::pair result { MaaImageBufferWidth(buffer), MaaImageBufferHeight(buffer) };
++    MaaImageBufferDestroy(buffer);
++    return result;
++}
++
++void test_controller_contract()
++{
++#ifdef _WIN32
++    _putenv_s("MAA_SCREENSHOT_VIEWPORT", "1280x720:adaptive");
++#else
++    setenv("MAA_SCREENSHOT_VIEWPORT", "1280x720:adaptive", 1);
++#endif
++
++    FakeController state;
++    auto callback_table = callbacks();
++    MaaController* controller = MaaCustomControllerCreate(&callback_table, &state);
++    check(controller != nullptr, "create custom controller");
++    if (!controller) {
++        return;
++    }
++    const MaaSinkId controller_sink = MaaControllerAddSink(controller, controller_event, &state);
++    check(controller_sink != MaaInvalidId, "add controller event sink");
++
++    check(MaaControllerWait(controller, MaaControllerPostConnection(controller)) == MaaStatus_Succeeded, "connect custom controller");
++
++    MaaViewportAlignment invalid = 99;
++    check(!set_alignment(controller, MaaViewportAlignment_Center), "alignment requires a raw frame");
++    check(!set_alignment(controller, invalid), "unknown alignment is rejected");
++    check(
++        !MaaControllerSetOption(controller, MaaCtrlOption_ScreenshotViewportAlignment, &invalid, sizeof(int16_t)),
++        "invalid alignment option size is rejected");
++
++    check(MaaControllerWait(controller, MaaControllerPostScreencap(controller)) == MaaStatus_Succeeded, "initial screencap");
++    const std::string first_info = controller_info(controller);
++    check(has_json_integer(first_info, "frame_id", 1), "first raw frame has frame id 1");
++    check(first_info.find("available_alignments") != std::string::npos, "controller info exposes available alignments");
++
++    check(set_alignment(controller, MaaViewportAlignment_Left), "select left viewport");
++    check(has_json_integer(controller_info(controller), "frame_id", 1), "alignment switch does not increment frame id");
++
++    {
++        std::unique_lock lock(state.mutex);
++        state.block_start = true;
++    }
++    const MaaCtrlId blocker = MaaControllerPostStartApp(controller, "viewport-test-blocker");
++    {
++        std::unique_lock lock(state.mutex);
++        state.condition.wait(lock, [&]() { return state.start_entered; });
++    }
++    const MaaCtrlId queued_click = MaaControllerPostClick(controller, 0, 0);
++    check(set_alignment(controller, MaaViewportAlignment_Right), "switch to right while click is queued");
++    {
++        std::unique_lock lock(state.mutex);
++        state.release_start = true;
++        state.condition.notify_all();
++    }
++    check(MaaControllerWait(controller, blocker) == MaaStatus_Succeeded, "blocking action completes");
++    check(MaaControllerWait(controller, queued_click) == MaaStatus_Succeeded, "queued click completes");
++    check(last_event(state).type == "click" && last_event(state).x == 0, "queued click keeps left alignment snapshot");
++
++    check(set_alignment(controller, MaaViewportAlignment_Left), "select left for contact 1");
++    check(MaaControllerWait(controller, MaaControllerPostTouchDown(controller, 1, 0, 100, 1)) == MaaStatus_Succeeded, "contact 1 down");
++    check(set_alignment(controller, MaaViewportAlignment_Right), "select right after contact 1 down");
++    check(MaaControllerWait(controller, MaaControllerPostTouchMove(controller, 1, 0, 100, 1)) == MaaStatus_Succeeded, "contact 1 move");
++    check(last_event(state).type == "move" && last_event(state).x == 0, "touch move keeps contact alignment");
++    check(MaaControllerWait(controller, MaaControllerPostTouchUp(controller, 1)) == MaaStatus_Succeeded, "contact 1 up");
++    check(
++        MaaControllerWait(controller, MaaControllerPostTouchMove(controller, 1, 0, 100, 1)) == MaaStatus_Succeeded,
++        "hover move after touch up");
++    check(last_event(state).type == "move" && last_event(state).x == 560, "touch up clears contact alignment");
++
++    size_t callback_offset = 0;
++    {
++        std::unique_lock lock(state.mutex);
++        callback_offset = state.controller_callbacks.size();
++    }
++    constexpr int FastTouchIterations = 64;
++    for (int index = 0; index != FastTouchIterations; ++index) {
++        check(
++            MaaControllerWait(controller, MaaControllerPostTouchDown(controller, 3, 640, 360, 1))
++                == MaaStatus_Succeeded,
++            "fast contact down succeeds");
++        check(
++            MaaControllerWait(controller, MaaControllerPostTouchUp(controller, 3)) == MaaStatus_Succeeded,
++            "fast contact up succeeds");
++    }
++    check(
++        succeeded_touch_callback_count(state, callback_offset) == FastTouchIterations * 2,
++        "zero-duration focused actions never outrun callback registration");
++
++    check(
++        MaaControllerWait(controller, MaaControllerPostSwipe(controller, 0, 0, 1279, 719, 200)) == MaaStatus_Succeeded,
++        "right-aligned swipe");
++    check(last_event(state).type == "swipe_end" && last_event(state).x == 2798, "swipe end uses right alignment");
++
++    {
++        std::unique_lock lock(state.mutex);
++        state.features = MaaControllerFeature_UseMouseDownAndUpInsteadOfClick;
++    }
++    MaaResource* resource = MaaResourceCreate();
++    MaaTasker* tasker = MaaTaskerCreate();
++    check(resource != nullptr && MaaResourceClear(resource), "create an empty valid resource for direct action tests");
++    check(
++        tasker != nullptr && MaaTaskerBindResource(tasker, resource) && MaaTaskerBindController(tasker, controller),
++        "bind direct action tasker");
++    if (tasker && MaaTaskerInited(tasker)) {
++        const size_t multi_swipe_offset = event_count(state);
++        const MaaRect reco_box {};
++        const char* action_param = R"({
++            "swipes": [{
++                "begin": [0, 100],
++                "end": [[100, 100], [200, 100]],
++                "end_hold": [30, 0],
++                "duration": [1, 1],
++                "contact": 2,
++                "pressure": 1
++            }]
++        })";
++        const MaaTaskId action_id = MaaTaskerPostAction(tasker, "MultiSwipe", action_param, &reco_box, "{}");
++        check(action_id != MaaInvalidId && MaaTaskerWait(tasker, action_id) == MaaStatus_Succeeded, "segmented multi swipe succeeds");
++        const auto multi_swipe_events = events_since(state, multi_swipe_offset);
++        check(multi_swipe_events.size() == 4, "segmented swipe emits one down, exact endpoints, and one up");
++        if (multi_swipe_events.size() == 4) {
++            check(
++                multi_swipe_events[0].type == "down" && multi_swipe_events[0].contact == 2 && multi_swipe_events[0].x == 560,
++                "segmented swipe starts at the selected right viewport");
++            check(
++                multi_swipe_events[1].type == "move" && multi_swipe_events[1].x == 735 && multi_swipe_events[2].type == "move"
++                    && multi_swipe_events[2].x == 910,
++                "short segments still emit both exact endpoints without lifting between them");
++            check(
++                multi_swipe_events[2].at - multi_swipe_events[1].at >= std::chrono::milliseconds(25),
++                "segment end_hold delays the following segment");
++            check(multi_swipe_events[3].type == "up" && multi_swipe_events[3].contact == 2, "touch lifts only after the final segment");
++        }
++    }
++    if (tasker) {
++        MaaTaskerDestroy(tasker);
++    }
++    if (resource) {
++        MaaResourceDestroy(resource);
++    }
++
++    const size_t scroll_offset = event_count(state);
++    check(MaaControllerWait(controller, MaaControllerPostScroll(controller, 120, -240)) == MaaStatus_Succeeded, "right-aligned scroll");
++    const auto scroll_events = events_since(state, scroll_offset);
++    check(
++        scroll_events.size() == 2 && scroll_events[0].type == "move" && scroll_events[0].x == 560 && scroll_events[1].type == "scroll"
++            && scroll_events[1].x == 120 && scroll_events[1].y == -240,
++        "scroll cursor position uses queued alignment while deltas stay unscaled");
++
++    check(MaaControllerWait(controller, MaaControllerPostScreencap(controller)) == MaaStatus_Succeeded, "second screencap");
++    check(has_json_integer(controller_info(controller), "frame_id", 2), "new raw frame increments frame id");
++
++    set_resolution(state, 1260, 2800);
++    check(MaaControllerWait(controller, MaaControllerPostScreencap(controller)) == MaaStatus_Succeeded, "portrait screencap");
++    check(!set_alignment(controller, MaaViewportAlignment_Left), "portrait frame rejects left alignment");
++    check(set_alignment(controller, MaaViewportAlignment_Center), "portrait frame accepts center alignment");
++    check(cached_image_size(controller) != std::pair { 1280, 720 }, "portrait frame is not reported as a landscape viewport");
++
++    set_resolution(state, 2400, 1080);
++    check(
++        MaaControllerWait(controller, MaaControllerPostScreencap(controller)) == MaaStatus_Succeeded,
++        "landscape screencap after portrait");
++    check(cached_image_size(controller) == std::pair { 1280, 720 }, "landscape transition restores logical viewport");
++    check(set_alignment(controller, MaaViewportAlignment_Right), "landscape transition restores adaptive alignments");
++    check(has_json_integer(controller_info(controller), "frame_id", 4), "orientation transitions preserve monotonic frame ids");
++
++    MaaControllerDestroy(controller);
++}
++} // namespace
++
++int main()
++{
++    test_controller_contract();
++    if (failures != 0) {
++        std::cerr << failures << " viewport controller checks failed\n";
++        return EXIT_FAILURE;
++    }
++    std::cout << "viewport controller checks passed\n";
++    return EXIT_SUCCESS;
++}
+diff --git a/test/viewport/main.cpp b/test/viewport/main.cpp
+new file mode 100644
+index 0000000..8a80a0c
+--- /dev/null
++++ b/test/viewport/main.cpp
+@@ -0,0 +1,201 @@
++#include <array>
++#include <cstdlib>
++#include <iostream>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "Controller/ViewportTransform.h"
++#include "Common/TaskResultTypes.h"
++
++namespace
++{
++using MAA_CTRL_NS::ViewportAlignment;
++using MAA_CTRL_NS::ViewportMode;
++using MAA_CTRL_NS::ViewportTransform;
++
++int failures = 0;
++
++void check(bool condition, std::string_view message)
++{
++    if (condition) {
++        return;
++    }
++    ++failures;
++    std::cerr << "FAILED: " << message << '\n';
++}
++
++void check_point(const cv::Point& actual, const cv::Point& expected, std::string_view message)
++{
++    check(actual == expected, message);
++}
++
++void check_rect(const cv::Rect& actual, const cv::Rect& expected, std::string_view message)
++{
++    check(actual == expected, message);
++}
++
++void test_parse()
++{
++    const auto adaptive = ViewportTransform::parse(" 1280X720:Adaptive ");
++    check(adaptive.has_value(), "parse adaptive viewport");
++    if (adaptive) {
++        check(adaptive->logical_size == cv::Size(1280, 720), "parse logical size");
++        check(adaptive->mode == ViewportMode::Adaptive, "parse adaptive mode");
++    }
++
++    const auto center = ViewportTransform::parse("1920x1080");
++    check(center.has_value() && center->mode == ViewportMode::Center, "default to center mode");
++    check(!ViewportTransform::parse("1280x0:adaptive"), "reject zero height");
++    check(!ViewportTransform::parse("1280x720:unknown"), "reject unknown mode");
++    check(!ViewportTransform::parse("1280x720:adaptive:extra"), "reject extra separator");
++}
++
++void test_identity_and_scaled_16x9()
++{
++    const MAA_CTRL_NS::ViewportConfig config { .logical_size = { 1280, 720 }, .mode = ViewportMode::Adaptive };
++
++    const ViewportTransform identity({ 1280, 720 }, config);
++    check(identity.active(), "1280x720 viewport active");
++    check(!identity.adaptive(), "1280x720 does not need candidates");
++    check_rect(identity.viewport(), { 0, 0, 1280, 720 }, "1280x720 viewport bounds");
++    check_point(identity.logical_to_display({ 1279, 719 }, ViewportAlignment::Center), { 1279, 719 }, "identity edge mapping");
++
++    const ViewportTransform scaled({ 1920, 1080 }, config);
++    check(scaled.active(), "1920x1080 viewport active");
++    check(!scaled.adaptive(), "1920x1080 does not need candidates");
++    check_rect(scaled.viewport(), { 0, 0, 1920, 1080 }, "1920x1080 viewport bounds");
++    check_point(scaled.logical_to_display({ 640, 360 }, ViewportAlignment::Center), { 960, 540 }, "1920x1080 center mapping");
++    check_point(scaled.display_to_logical({ 960, 540 }, ViewportAlignment::Center), { 640, 360 }, "1920x1080 inverse center mapping");
++}
++
++void test_ultrawide_candidates_and_mapping()
++{
++    const MAA_CTRL_NS::ViewportConfig config { .logical_size = { 1280, 720 }, .mode = ViewportMode::Adaptive };
++
++    struct MatrixCase
++    {
++        cv::Size display;
++        int viewport_width = 0;
++        int center_offset = 0;
++        int right_offset = 0;
++    };
++    const std::array matrix {
++        MatrixCase { .display = { 2800, 1260 }, .viewport_width = 2240, .center_offset = 280, .right_offset = 560 },
++        MatrixCase { .display = { 2400, 1080 }, .viewport_width = 1920, .center_offset = 240, .right_offset = 480 },
++        MatrixCase { .display = { 2340, 1080 }, .viewport_width = 1920, .center_offset = 210, .right_offset = 420 },
++    };
++
++    for (const auto& item : matrix) {
++        const ViewportTransform transform(item.display, config);
++        const std::string prefix = std::to_string(item.display.width) + "x" + std::to_string(item.display.height) + " ";
++
++        check(transform.active(), prefix + "viewport active");
++        check(transform.adaptive(), prefix + "viewport adaptive");
++        check_rect(
++            transform.viewport(ViewportAlignment::Left),
++            { 0, 0, item.viewport_width, item.display.height },
++            prefix + "left viewport");
++        check_rect(
++            transform.viewport(ViewportAlignment::Center),
++            { item.center_offset, 0, item.viewport_width, item.display.height },
++            prefix + "center viewport");
++        check_rect(
++            transform.viewport(ViewportAlignment::Right),
++            { item.right_offset, 0, item.viewport_width, item.display.height },
++            prefix + "right viewport");
++
++        check_point(transform.logical_to_display({ 0, 0 }, ViewportAlignment::Left), { 0, 0 }, prefix + "left origin mapping");
++        check_point(
++            transform.logical_to_display({ 0, 0 }, ViewportAlignment::Center),
++            { item.center_offset, 0 },
++            prefix + "center origin mapping");
++        check_point(
++            transform.logical_to_display({ 0, 0 }, ViewportAlignment::Right),
++            { item.right_offset, 0 },
++            prefix + "right origin mapping");
++        check_point(
++            transform.logical_to_display({ 640, 360 }, ViewportAlignment::Center),
++            { item.center_offset + item.viewport_width / 2, item.display.height / 2 },
++            prefix + "center mapping");
++        check_point(
++            transform.display_to_logical(
++                { item.center_offset + item.viewport_width / 2, item.display.height / 2 },
++                ViewportAlignment::Center),
++            { 640, 360 },
++            prefix + "inverse center mapping");
++    }
++
++    const ViewportTransform transform({ 2800, 1260 }, config);
++
++    const std::vector<cv::Point> logical_swipe { { 100, 600 }, { 640, 360 }, { 1180, 120 } };
++    const std::vector<cv::Point> expected_swipe { { 735, 1050 }, { 1680, 630 }, { 2625, 210 } };
++    for (size_t index = 0; index < logical_swipe.size(); ++index) {
++        check_point(
++            transform.logical_to_display(logical_swipe[index], ViewportAlignment::Right),
++            expected_swipe[index],
++            "swipe and multi-touch points use the same transform");
++    }
++
++    const auto candidates = transform.candidate_alignments();
++    check(candidates == std::array { ViewportAlignment::Center, ViewportAlignment::Left, ViewportAlignment::Right }, "candidate order");
++}
++
++void test_orientation_and_boundaries()
++{
++    const MAA_CTRL_NS::ViewportConfig config { .logical_size = { 1280, 720 }, .mode = ViewportMode::Adaptive };
++    const ViewportTransform portrait({ 1260, 2800 }, config);
++    check(!portrait.active(), "portrait screenshot leaves landscape viewport inactive");
++
++    const ViewportTransform landscape_after_portrait({ 2400, 1080 }, config);
++    check(landscape_after_portrait.active(), "landscape viewport reactivates after portrait frame");
++    check_rect(
++        landscape_after_portrait.viewport(ViewportAlignment::Right),
++        { 480, 0, 1920, 1080 },
++        "orientation transition recomputes right viewport");
++
++    const ViewportTransform too_small({ 1000, 500 }, config);
++    check(!too_small.active(), "undersized screenshot leaves viewport inactive");
++
++    const ViewportTransform transform({ 2800, 1260 }, config);
++    const cv::Point mapped = transform.logical_to_display({ 9999, -10 }, ViewportAlignment::Right);
++    check(mapped.x >= 560 && mapped.x < 2800 && mapped.y >= 0 && mapped.y < 1260, "out-of-range logical point is clamped");
++
++    check(ViewportTransform::preferred_alignment_for_logical_x(399, 1280) == ViewportAlignment::Left, "left edge band");
++    check(ViewportTransform::preferred_alignment_for_logical_x(400, 1280) == ViewportAlignment::Center, "center band start");
++    check(ViewportTransform::preferred_alignment_for_logical_x(879, 1280) == ViewportAlignment::Center, "center band end");
++    check(ViewportTransform::preferred_alignment_for_logical_x(880, 1280) == ViewportAlignment::Right, "right edge band");
++}
++
++void test_recognition_evidence_serialization()
++{
++    MAA_TASK_NS::RecoResult result {
++        .reco_id = 7,
++        .name = "InWorld",
++        .algorithm = "Or",
++        .box = cv::Rect { 10, 20, 30, 40 },
++        .viewport_alignment = "left",
++        .frame_id = 42,
++    };
++    const json::value serialized = result;
++    const auto& object = serialized.as_object();
++    check(object.at("viewport_alignment").as_string() == "left", "recognition callback carries viewport alignment");
++    check(object.at("frame_id").as_integer() == 42, "recognition callback carries raw frame id");
++}
++} // namespace
++
++int main()
++{
++    test_parse();
++    test_identity_and_scaled_16x9();
++    test_ultrawide_candidates_and_mapping();
++    test_orientation_and_boundaries();
++    test_recognition_evidence_serialization();
++
++    if (failures != 0) {
++        std::cerr << failures << " viewport transform checks failed\n";
++        return EXIT_FAILURE;
++    }
++    std::cout << "viewport transform checks passed\n";
++    return EXIT_SUCCESS;
++}

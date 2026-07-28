@@ -259,27 +259,52 @@ for the mechanism mapping and safety boundary.
 ### Open source automation hub
 
 The **Open Source Automation** view (`#opensource`) is a data-driven catalog for
-selecting multiple open-source projects and the automation features provided by
-each project. The simulated-universe feature uses the existing external Star Rail
-adapter. MaaEnd is also available through an official, user-installed Windows
-release and an MXU instance that has already been configured for the selected ADB
-device. MaaAssistantArknights remains the next planned integration.
+selecting one open-source project and its automation entry. MaaAssistantArknights
+is now the default and the first project marked end-to-end verified: the patched
+v6.14.2 MaaCore has completed physical-device `StartUp`, `Depot`, `OperBox`, the
+explicitly authorized `Award` path, and one guarded JieGarden roguelike run through
+natural settlement on a 2800×1260 phone. Its runtime panel performs a read-only
+adaptive viewport preflight before enabling Start, retains all evidence locally,
+and never persists Award consent. The core and release directories default from
+the current research checkout and Downloads folder, or can be supplied with
+`MOBILE_PROFILER_MAA_CORE_ROOT` and `MOBILE_PROFILER_MAA_RUNTIME_ROOT`.
+The smoke probe, feature runner, guarded roguelike runner, and default guard policy
+are packaged inside `mobile_profiler`; the scripts under `tools/` are compatibility
+entry points, so wheel and portable installs do not depend on a repository checkout.
 
-For MaaEnd, extract the official release, create a uniquely named ADB instance in
-MaaEnd, enable only tasks whose Project Interface declares ADB support, then enter
-the release directory and instance name in the runtime panel. The adapter validates
-the AGPL release, MaaFramework/agent files, controller, resource, device binding,
-and enabled tasks. Profiles with enabled external pre-actions are rejected. A
-successful preflight permits only this fixed one-shot launch:
+The Star Rail adapter now launches a separate
+[StarRailCopilot](https://github.com/LmeSzinc/StarRailCopilot) checkout instead of
+the former M7A/Auto_Simulated_Universe compatibility layer. It uses SRC's native
+ADB/scrcpy screenshot and MaaTouch/minitouch control stack, with a read-only host
+ADB preflight and no pyautogui/win32 emulation. The checkout defaults to
+`open-source-runtimes/StarRailCopilot` and can be supplied through
+`MOBILE_PROFILER_STAR_RAIL_COPILOT_ROOT`. Upstream SRC still rejects captures and
+devices outside `1280×720`; the replacement therefore reports those phones as
+`unsupported_resolution` instead of claiming mobile compatibility. Architecture
+and the new phone-resolution work plan are documented in
+[`integrations/starrailcopilot/README.md`](integrations/starrailcopilot/README.md)
+and
+[`integrations/starrailcopilot/RESOLUTION-PLAN.md`](integrations/starrailcopilot/RESOLUTION-PLAN.md).
 
-```text
-MaaEnd.exe --autostart --instance "<instance name>" --quit-after-run
-```
-
-The values can alternatively default from `MOBILE_PROFILER_MAAEND_ROOT` and
-`MOBILE_PROFILER_MAAEND_INSTANCE`. MaaEnd and its agents remain separate upstream
-processes; Mobile Profiler does not load their native DLLs or redistribute their
-Pipeline/image resources.
+The StarRailCopilot and MaaEnd adapters remain visible as restructuring inputs,
+but are explicitly marked **end-to-end unverified** and cannot be preflighted or
+started from this page or through the controller API. Verification is fail-closed:
+an adapter is runnable only when it explicitly reports `end_to_end_verified=true`;
+a missing flag is treated as unverified. They must first adopt the contract proven by
+MAA: separate physical/viewport/logical coordinates, route every coordinate-bearing
+input through one transform, audit analyzers that bypass the common recognition
+path, guard destructive fallbacks before execution, and turn every failure into an
+environment/callback/screenshot incident plus a reproducible regression. The MAA
+patch, issue ledger, fixture promotion, source/resource/patch drift checks, and
+maintenance workflow are documented in
+[`integrations/maa/README.md`](integrations/maa/README.md) and
+[`integrations/maa/ITERATION-RUNBOOK.md`](integrations/maa/ITERATION-RUNBOOK.md).
+MaaEnd 的迁移实验现已具备独立的 MaaFramework viewport、截图后端故障转移、
+竖屏 `AndroidOpenGame` 门禁、可回滚十文件部署、自动更新恢复和运行时完整性锁，但
+完整真机流程仍未验收，
+因此继续保持不可运行状态。实现与当前证据见
+[`integrations/maaend/README.md`](integrations/maaend/README.md) 和
+[`integrations/maaend/ITERATION-RUNBOOK.md`](integrations/maaend/ITERATION-RUNBOOK.md)。
 
 The earlier deterministic visual spike is retained under the collapsed adapter
 diagnostics section. Install the optional image runtime only when using that

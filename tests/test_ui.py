@@ -2058,8 +2058,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-63', html)
-            self.assertIn('/app.js?v=platform-ui-63', html)
+            self.assertIn('/app.css?v=platform-ui-65', html)
+            self.assertIn('/app.js?v=platform-ui-65', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2408,7 +2408,10 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("开源自动化", html)
             self.assertIn("选择项目", html)
             self.assertIn("当前项目", html)
-            self.assertIn("全部 ADB 任务、选项和预设", html)
+            self.assertIn("adaptive MaaCore", html)
+            self.assertIn("端到端真机验收", html)
+            self.assertIn("MAA 是当前唯一跑通", html)
+            self.assertIn("禁止预检和启动", html)
             self.assertIn("适配能力对齐", html)
             self.assertIn("第三方游戏自动化可能违反游戏规则", html)
             self.assertIn("约 160 MiB", html)
@@ -2525,6 +2528,9 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("function renderOpenSourceFeatures", javascript)
             self.assertIn("function saveOpenSourceAutomationSelection", javascript)
             self.assertIn("function renderOpenSourceRuntimeConsole", javascript)
+            self.assertIn("endToEndVerified", javascript)
+            self.assertIn("adapter?.end_to_end_verified === true", javascript)
+            self.assertIn("MAA Core 正在执行", javascript)
             self.assertIn("function runOpenSourceFeatureAction", javascript)
             self.assertIn("function renderOpenSourceAlignment", javascript)
             self.assertIn("function runOpenSourceAutomationDemo", javascript)
@@ -2747,8 +2753,8 @@ class UiServerTests(unittest.TestCase):
             manager.update_open_source_automation_selection = Mock(
                 return_value={
                     "selection": {
-                        "project_ids": ["march7th-assistant"],
-                        "feature_ids": ["m7a-universe"],
+                        "project_ids": ["star-rail-copilot"],
+                        "feature_ids": ["src-rogue"],
                     },
                     "execution": {"status": "adapter_pending"},
                 }
@@ -2782,8 +2788,8 @@ class UiServerTests(unittest.TestCase):
                 with urlopen(request, timeout=5) as response:
                     result = json.loads(response.read().decode("utf-8"))
                 selection_payload = {
-                    "project_ids": ["march7th-assistant"],
-                    "feature_ids": ["m7a-universe"],
+                    "project_ids": ["star-rail-copilot"],
+                    "feature_ids": ["src-rogue"],
                 }
                 selection_request = Request(
                     base + "/api/open-source-automation/selection",
@@ -2794,8 +2800,8 @@ class UiServerTests(unittest.TestCase):
                 with urlopen(selection_request, timeout=5) as response:
                     selection = json.loads(response.read().decode("utf-8"))
                 runtime_payload = {
-                    "project_id": "march7th-assistant",
-                    "feature_id": "m7a-universe",
+                    "project_id": "star-rail-copilot",
+                    "feature_id": "src-rogue",
                     "device": "USB-DEVICE",
                 }
                 runtime_results = {}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "stop_after_settlement": true,
+  "destructive_tasks": [
+    {
+      "resource_task": "Roguelike@ExitThenAbandon",
+      "callback_suffix": "ExitThenAbandon",
+      "reason": "识别链耗尽后准备退出并放弃当前探索；诊断运行必须先停机留证。"
+    }
+  ],
+  "watchdogs": {
+    "no_progress_seconds": 240,
+    "same_task_start_limit": 12,
+    "static_snapshot_limit": 5,
+    "slow_screenshot_seconds": 2.5,
+    "stop_on_slow_screenshot": false
+  }
+}

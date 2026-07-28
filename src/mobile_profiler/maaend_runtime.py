@@ -19,10 +19,28 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+from .maa_iteration import (
+    IncidentSignal,
+    record_incident_bundle,
+    triage_run_incidents,
+)
+from .maaend_guard import (
+    MaaEndGuardError,
+    build_maaend_probe_request,
+    canonical_sha256,
+    evaluate_maaend_guard,
+    evaluate_terminal_contracts,
+    fingerprint_maaend_resources,
+    load_maaend_guard_policy,
+    requested_maaend_internal_probe,
+    validate_maaend_guard_policy,
+)
+from .maaend_monitor import MaaEndRunMonitor
 
 
 MAAEND_REPOSITORY = "https://github.com/MaaEnd/MaaEnd"
@@ -33,6 +51,7 @@ MAAEND_MANAGED_INSTANCE_ID = "mobile-profiler-adb"
 MAAEND_MANAGED_INSTANCE_NAME = "Mobile Profiler · ADB 日常"
 MAAEND_GAME_PACKAGE = "com.hypergryph.endfield"
 MAAEND_STANDARD_VERSION = "v2.20.0"
+MAAEND_SCREENSHOT_VIEWPORT = "1280x720:adaptive"
 
 _MXU_API_PORTS = tuple(range(12701, 12711))
 _MXU_API_STARTUP_TIMEOUT_SECONDS = 30.0
@@ -122,15 +141,19 @@ _MXU_API_HOST_FILENAME = "MaaEnd.mobile-profiler-api-v2.20.exe"
 
 _MAX_JSON_BYTES = 32 * 1024 * 1024
 _MAX_IMPORT_FILES = 128
-_REQUIRED_FILES = (
+_RUNTIME_INTEGRITY_FILES = (
     "MaaEnd.exe",
     "interface.json",
-    "LICENSE",
     "maafw/MaaFramework.dll",
+    "maafw/MaaAdbControlUnit.dll",
+    "maafw/MaaUtils.dll",
+    "maafw/MaaToolkit.dll",
     "maafw/MaaAgentClient.dll",
+    "maafw/MaaAgentServer.dll",
     "agent/go-service.exe",
     "agent/cpp-algo.exe",
 )
+_REQUIRED_FILES = (*_RUNTIME_INTEGRITY_FILES, "LICENSE")
 _REQUIRED_DIRECTORIES = (
     "resource",
     "resource_adb",
@@ -451,6 +474,11 @@ def validate_maaend_runtime(path: Path | str) -> dict[str, object]:
     repository = str(interface.get("github") or "").strip().rstrip("/")
     if repository.lower() != MAAEND_REPOSITORY.lower():
         raise RuntimeError("interface.json 的上游仓库不是官方 MaaEnd/MaaEnd")
+    if str(interface.get("mirrorchyan_rid") or "").strip():
+        raise RuntimeError(
+            "受管 MaaEnd v2.20.0 运行目录未禁用自动更新；"
+            "必须先清空 interface.json 的 mirrorchyan_rid，避免运行中资源漂移"
+        )
 
     controllers = interface.get("controller")
     if not isinstance(controllers, list) or not any(
@@ -1659,6 +1687,7 @@ def configure_maaend_managed_profile(
     tasks: object = None,
     preset_name: str = "",
     resource_name: str = "",
+    allow_empty_tasks: bool = False,
 ) -> dict[str, object]:
     """Atomically create/update the one Mobile Profiler-owned MXU ADB instance.
 
@@ -1762,7 +1791,7 @@ def configure_maaend_managed_profile(
                         "option_values": values,
                     }
                 )
-    if not requested_rows:
+    if not requested_rows and not allow_empty_tasks:
         raise ValueError("请至少配置一项 MaaEnd ADB 任务")
 
     seen_tasks: set[str] = set()
@@ -1792,7 +1821,10 @@ def configure_maaend_managed_profile(
                 ),
             }
         )
-    if not any(row["enabled"] is True for row in normalized_rows):
+    if (
+        not allow_empty_tasks
+        and not any(row["enabled"] is True for row in normalized_rows)
+    ):
         raise ValueError("请至少启用一项 MaaEnd ADB 任务")
 
     config_path = runtime_root / "config" / MAAEND_CONFIG_FILENAME
@@ -1937,14 +1969,153 @@ def _adb_text_command(adb: str, device: str, *arguments: str) -> str:
     return stdout
 
 
-def _probe_maaend_device_state(
-    adb: str,
-    device: str,
-    screenshot_path: Optional[Path] = None,
-    *,
-    allow_game_launch: bool = False,
-) -> dict[str, object]:
+def _read_maaend_interaction_state(adb: str, device: str) -> dict[str, object]:
     power = _adb_text_command(adb, device, "shell", "dumpsys", "power")
+    policy = _adb_text_command(
+        adb,
+        device,
+        "shell",
+        "dumpsys",
+        "window",
+        "policy",
+    )
+    wakefulness_match = re.search(
+        r"mWakefulness(?:Raw)?\s*=\s*(Awake|Asleep|Dozing|Dreaming)",
+        power,
+        flags=re.IGNORECASE,
+    )
+    showing_match = re.search(
+        r"^\s+showing=(true|false)\s*$",
+        policy,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    secure_match = re.search(
+        r"^\s+secure=(true|false)\s*$",
+        policy,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    wakefulness = (
+        wakefulness_match.group(1).title() if wakefulness_match else "Unknown"
+    )
+    return {
+        "wakefulness": wakefulness,
+        "awake": None if wakefulness == "Unknown" else wakefulness == "Awake",
+        "keyguard_showing": (
+            None
+            if showing_match is None
+            else showing_match.group(1).casefold() == "true"
+        ),
+        "keyguard_secure": (
+            None
+            if secure_match is None
+            else secure_match.group(1).casefold() == "true"
+        ),
+    }
+
+
+def _maaend_display_size_for_swipe(adb: str, device: str) -> tuple[int, int]:
+    displays = _adb_text_command(
+        adb,
+        device,
+        "shell",
+        "dumpsys",
+        "window",
+        "displays",
+    )
+    match = re.search(r"\binit=(\d+)x(\d+)\b", displays)
+    if match is None:
+        raise RuntimeError("ADB display state did not expose an initial display size")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise RuntimeError("ADB display state returned an invalid display size")
+    return width, height
+
+
+def _ensure_maaend_device_interactive(adb: str, device: str) -> dict[str, object]:
+    """Wake and dismiss only an explicitly non-secure Android keyguard."""
+
+    before = _read_maaend_interaction_state(adb, device)
+    current = dict(before)
+    actions: list[str] = []
+    if current.get("awake") is False:
+        _adb_text_command(adb, device, "shell", "input", "keyevent", "224")
+        actions.append("wake")
+        time.sleep(0.5)
+        current = _read_maaend_interaction_state(adb, device)
+
+    if current.get("awake") is not True:
+        evidence = {"before": before, "after": current, "actions": actions}
+        raise _DeviceStateError(
+            "device_asleep",
+            f"Android 真机未能自动唤醒（{current.get('wakefulness') or 'Unknown'}）",
+            evidence,
+        )
+
+    if current.get("keyguard_showing") is True:
+        if current.get("keyguard_secure") is True:
+            evidence = {"before": before, "after": current, "actions": actions}
+            raise _DeviceStateError(
+                "secure_keyguard",
+                "Android 真机存在安全锁屏，拒绝通过 ADB 绕过",
+                evidence,
+            )
+        if current.get("keyguard_secure") is not False:
+            evidence = {"before": before, "after": current, "actions": actions}
+            raise _DeviceStateError(
+                "keyguard_state_unknown",
+                "无法确认 Android 锁屏是否安全，拒绝注入解锁动作",
+                evidence,
+            )
+
+        _adb_text_command(adb, device, "shell", "wm", "dismiss-keyguard")
+        actions.append("dismiss_insecure_keyguard")
+        time.sleep(0.3)
+        current = _read_maaend_interaction_state(adb, device)
+
+        if current.get("keyguard_showing") is True:
+            _adb_text_command(adb, device, "shell", "input", "keyevent", "82")
+            actions.append("menu_key")
+            time.sleep(0.3)
+            current = _read_maaend_interaction_state(adb, device)
+
+        if current.get("keyguard_showing") is True:
+            width, height = _maaend_display_size_for_swipe(adb, device)
+            portrait_width = min(width, height)
+            portrait_height = max(width, height)
+            _adb_text_command(
+                adb,
+                device,
+                "shell",
+                "input",
+                "swipe",
+                str(portrait_width // 2),
+                str(round(portrait_height * 0.86)),
+                str(portrait_width // 2),
+                str(round(portrait_height * 0.24)),
+                "450",
+            )
+            actions.append("swipe_up")
+            time.sleep(0.8)
+            current = _read_maaend_interaction_state(adb, device)
+
+    if current.get("keyguard_showing") is not False:
+        evidence = {"before": before, "after": current, "actions": actions}
+        raise _DeviceStateError(
+            "keyguard_not_dismissed",
+            "Android 非安全锁屏未能通过 ADB 自动解除",
+            evidence,
+        )
+    return {
+        "succeeded": True,
+        "before": before,
+        "after": current,
+        "actions": actions,
+    }
+
+
+def _probe_maaend_foreground_state(adb: str, device: str) -> dict[str, object]:
+    """Read the resumed package without injecting input or changing device state."""
+
     activity = _adb_text_command(
         adb,
         device,
@@ -1953,6 +2124,30 @@ def _probe_maaend_device_state(
         "activity",
         "activities",
     )
+    component_match = re.search(
+        r"(?:topResumedActivity|mResumedActivity|ResumedActivity)[^\r\n]*?"
+        r"\s([A-Za-z0-9_.]+)/(?:[A-Za-z0-9_.$]+)",
+        activity,
+    )
+    foreground_package = component_match.group(1) if component_match else ""
+    return {
+        "available": bool(foreground_package),
+        "foreground_package": foreground_package,
+        "target_package": MAAEND_GAME_PACKAGE,
+        "game_foreground": foreground_package == MAAEND_GAME_PACKAGE,
+    }
+
+
+def _probe_maaend_device_state(
+    adb: str,
+    device: str,
+    screenshot_path: Optional[Path] = None,
+    *,
+    allow_game_launch: bool = False,
+) -> dict[str, object]:
+    interaction = _ensure_maaend_device_interactive(adb, device)
+    power = _adb_text_command(adb, device, "shell", "dumpsys", "power")
+    foreground = _probe_maaend_foreground_state(adb, device)
     awake_match = re.search(
         r"mWakefulness(?:Raw)?\s*=\s*(Awake|Asleep|Dozing|Dreaming)",
         power,
@@ -1960,12 +2155,7 @@ def _probe_maaend_device_state(
     )
     wakefulness = awake_match.group(1).title() if awake_match else "Unknown"
     awake = wakefulness == "Awake"
-    component_match = re.search(
-        r"(?:topResumedActivity|mResumedActivity|ResumedActivity)[^\r\n]*?"
-        r"\s([A-Za-z0-9_.]+)/(?:[A-Za-z0-9_.$]+)",
-        activity,
-    )
-    foreground_package = component_match.group(1) if component_match else ""
+    foreground_package = str(foreground.get("foreground_package") or "")
 
     creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
@@ -2001,6 +2191,7 @@ def _probe_maaend_device_state(
         "game_launch_required": (
             allow_game_launch and foreground_package != MAAEND_GAME_PACKAGE
         ),
+        "interaction": interaction,
         "screenshot_available": screenshot_valid,
         "screenshot": {
             "width": width,
@@ -2093,6 +2284,8 @@ def _validate_profile(
     config: dict[str, object],
     instance_name: str,
     device: str,
+    *,
+    internal_probe: str = "",
 ) -> dict[str, object]:
     instances = config.get("instances")
     if not isinstance(instances, list):
@@ -2158,7 +2351,12 @@ def _validate_profile(
     enabled_tasks = [
         task for task in tasks if isinstance(task, dict) and _enabled_for_adb(task)
     ]
-    if not enabled_tasks:
+    if internal_probe and enabled_tasks:
+        raise _ProfileValidationError(
+            "unsafe_profile",
+            "MaaEnd 内部探针只能使用没有启用任务的专用 ADB Profile",
+        )
+    if not internal_probe and not enabled_tasks:
         raise _ProfileValidationError(
             "profile_incompatible",
             f"MaaEnd 实例“{instance_name}”没有启用的 ADB 任务",
@@ -2237,6 +2435,8 @@ def _validate_profile(
         "task_names": task_names,
         "task_count": len(task_names),
         "task_configurations": task_configurations,
+        "internal_probe": internal_probe,
+        "probe_only": bool(internal_probe),
         "managed": (
             str(instance.get("id") or "") == MAAEND_MANAGED_INSTANCE_ID
             or instance_name == MAAEND_MANAGED_INSTANCE_NAME
@@ -2246,6 +2446,36 @@ def _validate_profile(
 
 class MaaEndRuntimeController:
     """Validate and run one configured MaaEnd MXU instance in a subprocess."""
+
+    @staticmethod
+    def _empty_verification() -> dict[str, object]:
+        return {
+            "launch_verified": False,
+            "pipeline_verified": False,
+            "custom_agent_verified": False,
+            "input_verified": False,
+            "guarded_flow_verified": False,
+            "end_to_end_verified": False,
+            "reason": "尚未取得本轮 MaaEnd 业务终点证据",
+        }
+
+    @staticmethod
+    def _empty_runtime_integrity() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "status": "pending",
+            "verified": False,
+            "baseline_sha256": "",
+            "started_at": None,
+            "checked_at": None,
+            "check_count": 0,
+            "stage": "",
+            "full_resource_rehash": False,
+            "files": {},
+            "resource_fingerprint_expected": {},
+            "resource_fingerprint_observed": {},
+            "drift": [],
+        }
 
     def __init__(
         self,
@@ -2258,6 +2488,8 @@ class MaaEndRuntimeController:
         http_json: Callable[..., object] = _mxu_http_json,
         http_bytes: Callable[..., bytes] = _mxu_http_bytes,
         api_host_preparer: Callable[[Path], Path] = _prepare_mxu_v220_api_host,
+        guard_policy: Optional[Mapping[str, object]] = None,
+        guard_policy_path: Optional[Path] = None,
     ) -> None:
         runtime_root = output_root.resolve()
         self.output_root = (
@@ -2288,6 +2520,17 @@ class MaaEndRuntimeController:
         self._http_json = http_json
         self._http_bytes = http_bytes
         self._api_host_preparer = api_host_preparer
+        if guard_policy is None:
+            self._guard_policy = load_maaend_guard_policy(guard_policy_path)
+        else:
+            policy_errors = validate_maaend_guard_policy(guard_policy)
+            if policy_errors:
+                raise ValueError(
+                    "invalid MaaEnd guard policy: " + "; ".join(policy_errors)
+                )
+            self._guard_policy = json.loads(json.dumps(dict(guard_policy)))
+        self._guard_policy_path = str(guard_policy_path.resolve()) if guard_policy_path else ""
+        self._resource_hash_cache: dict[str, tuple[int, int, str]] = {}
         self._lock = threading.RLock()
         self._status = "not_installed"
         self._running = False
@@ -2298,8 +2541,17 @@ class MaaEndRuntimeController:
         self._device = ""
         self._last_error = ""
         self._last_preflight: Optional[dict[str, object]] = None
-        self._last_preflight_context: Optional[dict[str, str]] = None
+        self._last_preflight_context: Optional[dict[str, object]] = None
         self._last_profile: Optional[dict[str, object]] = None
+        self._last_guard: Optional[dict[str, object]] = None
+        self._guard_checks: list[dict[str, object]] = []
+        self._terminal_contract: Optional[dict[str, object]] = None
+        self._verification = self._empty_verification()
+        self._runtime_integrity = self._empty_runtime_integrity()
+        self._last_request: dict[str, object] = {}
+        self._run_monitor: Optional[MaaEndRunMonitor] = None
+        self._incident_records: list[dict[str, object]] = []
+        self._local_issue_ledger = self.output_root / "issues.json"
         self._last_run_dir = ""
         self._last_exit_code: Optional[int] = None
         self._started_at: Optional[float] = None
@@ -2325,10 +2577,688 @@ class MaaEndRuntimeController:
         self._api_tasks: list[dict[str, object]] = []
         self._api_task_ids: list[int] = []
         self._api_resource_paths: list[str] = []
+        self._api_screenshots: list[dict[str, object]] = []
         self._api_updated_at: Optional[float] = None
         self._logs: deque[dict[str, object]] = deque(maxlen=30)
         self._refresh_install_status()
         self._log(self._status, "MaaEnd 外部运行时适配器已加载")
+
+    def _reset_run_evidence(self) -> None:
+        with self._lock:
+            self._last_guard = None
+            self._guard_checks = []
+            self._terminal_contract = None
+            self._verification = self._empty_verification()
+            self._runtime_integrity = self._empty_runtime_integrity()
+            self._last_request = {}
+            self._run_monitor = None
+            self._incident_records = []
+
+    def _guard_watchdogs(self) -> dict[str, object]:
+        value = self._guard_policy.get("watchdogs")
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    @staticmethod
+    def _runtime_integrity_file_entry(
+        root: Path,
+        relative: str,
+    ) -> dict[str, object]:
+        candidate = root / relative
+        if candidate.is_symlink():
+            raise RuntimeError(f"MaaEnd 运行时关键文件不得为符号链接: {relative}")
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            raise RuntimeError(f"MaaEnd 运行时关键文件越出发布目录: {relative}")
+        if not resolved.is_file():
+            raise RuntimeError(f"MaaEnd 运行时关键文件缺失: {relative}")
+        before = resolved.stat()
+        digest = _sha256_file(resolved)
+        after = resolved.stat()
+        if (
+            before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise RuntimeError(f"MaaEnd 运行时关键文件在哈希期间发生变化: {relative}")
+        return {
+            "path": relative,
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "sha256": digest,
+        }
+
+    @staticmethod
+    def _runtime_integrity_identity(
+        files: Mapping[str, object],
+        resource_fingerprint: Mapping[str, object],
+        *,
+        observed: bool = False,
+    ) -> str:
+        rows = []
+        for relative in sorted(files):
+            raw = files.get(relative)
+            entry = raw if isinstance(raw, Mapping) else {}
+            rows.append(
+                {
+                    "path": relative,
+                    "size": entry.get(
+                        "observed_size" if observed else "expected_size",
+                        entry.get("size"),
+                    ),
+                    "sha256": entry.get(
+                        "observed_sha256" if observed else "expected_sha256",
+                        entry.get("sha256"),
+                    ),
+                }
+            )
+        return canonical_sha256(
+            {
+                "files": rows,
+                "resource_fingerprint": {
+                    "algorithm": resource_fingerprint.get("algorithm"),
+                    "sha256": resource_fingerprint.get("sha256"),
+                    "file_count": resource_fingerprint.get("file_count"),
+                    "total_bytes": resource_fingerprint.get("total_bytes"),
+                    "paths": resource_fingerprint.get("paths"),
+                },
+            }
+        )
+
+    def _persist_runtime_integrity(
+        self,
+        state: Mapping[str, object],
+        *,
+        label: str,
+        run_dir: Optional[Path] = None,
+        strict: bool = False,
+    ) -> None:
+        selected_dir = run_dir or (
+            Path(self._last_run_dir) if self._last_run_dir else None
+        )
+        if selected_dir is None:
+            return
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-.")
+        safe_label = safe_label or "state"
+        try:
+            _atomic_write(
+                selected_dir / f"runtime-integrity-{safe_label}.json",
+                (
+                    json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+                ).encode("utf-8"),
+            )
+        except OSError as exc:
+            if strict:
+                raise RuntimeError(f"无法保存 MaaEnd 运行时完整性证据: {exc}") from exc
+            self._log(
+                "evidence_warning",
+                f"MaaEnd 运行时完整性证据保存失败: {exc}",
+            )
+
+    def _begin_runtime_integrity(
+        self,
+        root: Path,
+        resource_fingerprint: Mapping[str, object],
+        run_dir: Path,
+    ) -> dict[str, object]:
+        resolved_root = root.resolve()
+        files: dict[str, object] = {}
+        for relative in _RUNTIME_INTEGRITY_FILES:
+            observed = self._runtime_integrity_file_entry(
+                resolved_root,
+                relative,
+            )
+            files[relative] = {
+                "expected_size": observed["size"],
+                "expected_mtime_ns": observed["mtime_ns"],
+                "expected_sha256": observed["sha256"],
+                "observed_size": observed["size"],
+                "observed_mtime_ns": observed["mtime_ns"],
+                "observed_sha256": observed["sha256"],
+            }
+
+        # Do not reuse the guard cache here. A fresh full hash closes the
+        # preflight-to-launch window, including edits that preserve metadata.
+        observed_resource = fingerprint_maaend_resources(
+            resolved_root,
+            self._guard_policy,
+        )
+        expected_sha256 = str(resource_fingerprint.get("sha256") or "").lower()
+        observed_sha256 = str(observed_resource.get("sha256") or "").lower()
+        if not expected_sha256 or observed_sha256 != expected_sha256:
+            raise RuntimeError(
+                "MaaEnd 资源树在风险门禁与进程启动之间发生变化"
+            )
+
+        started_at = time.time()
+        state: dict[str, object] = {
+            "schema_version": 1,
+            "status": "active",
+            "verified": True,
+            "baseline_sha256": self._runtime_integrity_identity(
+                files,
+                observed_resource,
+            ),
+            "root": str(resolved_root),
+            "started_at": started_at,
+            "checked_at": started_at,
+            "check_count": 1,
+            "stage": "launch_baseline",
+            "full_resource_rehash": True,
+            "files": files,
+            "resource_fingerprint_expected": dict(resource_fingerprint),
+            "resource_fingerprint_observed": observed_resource,
+            "current_manifest_sha256": self._runtime_integrity_identity(
+                files,
+                observed_resource,
+                observed=True,
+            ),
+            "drift": [],
+        }
+        with self._lock:
+            self._runtime_integrity = json.loads(json.dumps(state))
+        self._persist_runtime_integrity(
+            state,
+            label="baseline",
+            run_dir=run_dir,
+            strict=True,
+        )
+        return state
+
+    def _check_runtime_integrity(
+        self,
+        *,
+        stage: str,
+        full_resource_rehash: bool,
+    ) -> dict[str, object]:
+        with self._lock:
+            state = json.loads(json.dumps(self._runtime_integrity))
+        if state.get("status") == "pending" or not state.get("baseline_sha256"):
+            raise RuntimeError("MaaEnd 运行时完整性基线尚未建立")
+
+        root = Path(str(state.get("root") or "")).resolve()
+        raw_files = state.get("files")
+        files = raw_files if isinstance(raw_files, dict) else {}
+        previous_drift_raw = state.get("drift")
+        previous_drift = (
+            [dict(row) for row in previous_drift_raw if isinstance(row, Mapping)]
+            if isinstance(previous_drift_raw, list)
+            else []
+        )
+        drift_was_latched = state.get("status") == "drifted"
+        drift: list[dict[str, object]] = []
+        for relative in _RUNTIME_INTEGRITY_FILES:
+            raw_expected = files.get(relative)
+            expected = raw_expected if isinstance(raw_expected, dict) else {}
+            candidate = root / relative
+            if candidate.is_symlink():
+                drift.append(
+                    {"path": relative, "reason": "symbolic_link"}
+                )
+                continue
+            try:
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(root):
+                    drift.append(
+                        {"path": relative, "reason": "path_escape"}
+                    )
+                    continue
+                stat = resolved.stat()
+                if not resolved.is_file():
+                    raise FileNotFoundError(relative)
+            except OSError as exc:
+                drift.append(
+                    {
+                        "path": relative,
+                        "reason": "missing_or_unreadable",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            metadata_changed = (
+                stat.st_size != expected.get("observed_size")
+                or stat.st_mtime_ns != expected.get("observed_mtime_ns")
+            )
+            observed_sha256 = str(expected.get("observed_sha256") or "")
+            if full_resource_rehash or metadata_changed or not observed_sha256:
+                try:
+                    observed = self._runtime_integrity_file_entry(root, relative)
+                except Exception as exc:
+                    drift.append(
+                        {
+                            "path": relative,
+                            "reason": "hash_failed",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                stat_size = int(observed["size"])
+                stat_mtime_ns = int(observed["mtime_ns"])
+                observed_sha256 = str(observed["sha256"])
+            else:
+                stat_size = stat.st_size
+                stat_mtime_ns = stat.st_mtime_ns
+
+            expected["observed_size"] = stat_size
+            expected["observed_mtime_ns"] = stat_mtime_ns
+            expected["observed_sha256"] = observed_sha256
+            files[relative] = expected
+            if observed_sha256 != str(expected.get("expected_sha256") or ""):
+                drift.append(
+                    {
+                        "path": relative,
+                        "reason": "sha256_changed",
+                        "expected_sha256": expected.get("expected_sha256"),
+                        "observed_sha256": observed_sha256,
+                        "expected_size": expected.get("expected_size"),
+                        "observed_size": stat_size,
+                    }
+                )
+
+        expected_resource_raw = state.get("resource_fingerprint_expected")
+        expected_resource = (
+            expected_resource_raw
+            if isinstance(expected_resource_raw, dict)
+            else {}
+        )
+        try:
+            observed_resource = fingerprint_maaend_resources(
+                root,
+                self._guard_policy,
+                file_hash_cache=(
+                    None
+                    if full_resource_rehash
+                    else self._resource_hash_cache
+                ),
+            )
+        except Exception as exc:
+            observed_resource = {
+                "available": False,
+                "error": str(exc),
+            }
+            drift.append(
+                {
+                    "path": "<resource_tree>",
+                    "reason": "fingerprint_failed",
+                    "error": str(exc),
+                }
+            )
+        else:
+            expected_resource_sha256 = str(
+                expected_resource.get("sha256") or ""
+            ).lower()
+            observed_resource_sha256 = str(
+                observed_resource.get("sha256") or ""
+            ).lower()
+            if observed_resource_sha256 != expected_resource_sha256:
+                drift.append(
+                    {
+                        "path": "<resource_tree>",
+                        "reason": "sha256_changed",
+                        "expected_sha256": expected_resource_sha256,
+                        "observed_sha256": observed_resource_sha256,
+                        "expected_file_count": expected_resource.get("file_count"),
+                        "observed_file_count": observed_resource.get("file_count"),
+                    }
+                )
+
+        if drift_was_latched:
+            seen_drift = {
+                canonical_sha256(row)
+                for row in drift
+            }
+            for row in previous_drift:
+                fingerprint = canonical_sha256(row)
+                if fingerprint not in seen_drift:
+                    drift.append(row)
+                    seen_drift.add(fingerprint)
+        drift_latched = drift_was_latched or bool(drift)
+        state.update(
+            {
+                "status": (
+                    "drifted"
+                    if drift_latched
+                    else "verified"
+                    if stage == "terminal"
+                    else "active"
+                ),
+                "verified": not drift_latched,
+                "checked_at": time.time(),
+                "first_drift_at": (
+                    state.get("first_drift_at")
+                    or (time.time() if drift else None)
+                ),
+                "check_count": int(state.get("check_count") or 0) + 1,
+                "stage": stage,
+                "full_resource_rehash": full_resource_rehash,
+                "files": files,
+                "resource_fingerprint_observed": observed_resource,
+                "current_manifest_sha256": self._runtime_integrity_identity(
+                    files,
+                    observed_resource,
+                    observed=True,
+                ),
+                "drift": drift,
+            }
+        )
+        with self._lock:
+            self._runtime_integrity = json.loads(json.dumps(state))
+        if drift or full_resource_rehash:
+            self._persist_runtime_integrity(
+                state,
+                label=stage,
+            )
+        return state
+
+    def _runtime_integrity_failure(
+        self,
+        *,
+        stage: str,
+        full_resource_rehash: bool,
+    ) -> str:
+        try:
+            state = self._check_runtime_integrity(
+                stage=stage,
+                full_resource_rehash=full_resource_rehash,
+            )
+        except Exception as exc:
+            with self._lock:
+                state = json.loads(json.dumps(self._runtime_integrity))
+                state.update(
+                    {
+                        "status": "drifted",
+                        "verified": False,
+                        "checked_at": time.time(),
+                        "stage": stage,
+                        "full_resource_rehash": full_resource_rehash,
+                        "drift": [
+                            {
+                                "path": "<integrity_check>",
+                                "reason": "check_failed",
+                                "error": str(exc),
+                            }
+                        ],
+                    }
+                )
+                self._runtime_integrity = json.loads(json.dumps(state))
+            self._persist_runtime_integrity(state, label=stage)
+        if state.get("verified") is True:
+            return ""
+
+        reason = f"MaaEnd 运行时在 {stage} 完整性检查中发生漂移"
+        verification = self._empty_verification()
+        verification["reason"] = reason
+        with self._lock:
+            self._verification = verification
+        raw_drift = state.get("drift")
+        drift = raw_drift if isinstance(raw_drift, list) else []
+        self._emit_runtime_incident(
+            "maaend_runtime_drift",
+            reason,
+            {
+                "stage": stage,
+                "baseline_sha256": state.get("baseline_sha256"),
+                "current_manifest_sha256": state.get(
+                    "current_manifest_sha256"
+                ),
+                "drift": drift,
+            },
+        )
+        return reason
+
+    def _prepare_guard(
+        self,
+        root: Path,
+        interface: dict[str, object],
+        config: dict[str, object],
+        profile: dict[str, object],
+        payload: Mapping[str, object],
+        *,
+        stage: str,
+    ) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+        probe_name = requested_maaend_internal_probe(payload)
+        if probe_name:
+            probe_request = build_maaend_probe_request(
+                self._guard_policy,
+                probe_name,
+            )
+            task_requests = [probe_request]
+            task_metadata = [
+                {
+                    "id": str(probe_request["selected_task_id"]),
+                    "name": probe_name,
+                    "entry": str(probe_request["entry"]),
+                    "status": "pending",
+                    "maa_task_id": None,
+                    "internal_probe": True,
+                }
+            ]
+        else:
+            task_requests, task_metadata = _mxu_task_requests(
+                interface,
+                config,
+                profile,
+            )
+        resource_fingerprint = fingerprint_maaend_resources(
+            root,
+            self._guard_policy,
+            file_hash_cache=self._resource_hash_cache,
+        )
+        decision = evaluate_maaend_guard(
+            self._guard_policy,
+            profile,
+            payload,
+            resource_fingerprint=resource_fingerprint,
+            task_requests=task_requests,
+        )
+        decision["stage"] = stage
+        decision["checked_at"] = time.time()
+        decision["policy_path"] = self._guard_policy_path
+        with self._lock:
+            self._guard_checks.append(json.loads(json.dumps(decision)))
+        return decision, task_requests, task_metadata
+
+    def _ensure_local_issue_ledger(self) -> None:
+        if self._local_issue_ledger.is_file():
+            return
+        _atomic_write(
+            self._local_issue_ledger,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project": "MaaEnd",
+                    "updated_at": None,
+                    "issues": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _file_evidence(path: Path) -> dict[str, object]:
+        if not path.is_file():
+            return {"path": str(path), "available": False}
+        try:
+            return {
+                "path": str(path),
+                "available": True,
+                "size": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        except (OSError, RuntimeError) as exc:
+            return {"path": str(path), "available": False, "error": str(exc)}
+
+    def _incident_environment(self) -> dict[str, object]:
+        binaries = {}
+        for relative in _REQUIRED_FILES:
+            if relative in {"interface.json", "LICENSE"}:
+                continue
+            binaries[relative] = self._file_evidence(self.runtime_path / relative)
+        preflight_screen = self.output_root / "preflight-screen.png"
+        launch_screen = self.output_root / "launch-screen.png"
+        with self._lock:
+            monitor = self._run_monitor.state() if self._run_monitor else {}
+            return {
+                "schema_version": 1,
+                "captured_at": time.time(),
+                "runtime": {
+                    "path": str(self.runtime_path),
+                    "version": MAAEND_STANDARD_VERSION,
+                },
+                "device": {"serial": self._device},
+                "viewport": MAAEND_SCREENSHOT_VIEWPORT,
+                "policy_sha256": canonical_sha256(self._guard_policy),
+                "guard_checks": json.loads(json.dumps(self._guard_checks)),
+                "request": json.loads(json.dumps(self._last_request)),
+                "binaries": binaries,
+                "resource_fingerprint": (
+                    dict(self._last_guard.get("resource_fingerprint", {}))
+                    if isinstance(self._last_guard, dict)
+                    else {}
+                ),
+                "mxu_state": json.loads(json.dumps(self._api_instance_state)),
+                "mxu_tasks": json.loads(json.dumps(self._api_tasks)),
+                "terminal_contract": json.loads(
+                    json.dumps(self._terminal_contract)
+                ) if self._terminal_contract is not None else None,
+                "verification": json.loads(json.dumps(self._verification)),
+                "runtime_integrity": json.loads(
+                    json.dumps(self._runtime_integrity)
+                ),
+                "screenshots": {
+                    "preflight_raw": self._file_evidence(preflight_screen),
+                    "launch_raw": self._file_evidence(launch_screen),
+                    "controller": json.loads(json.dumps(self._api_screenshots)),
+                },
+                "monitor": monitor,
+            }
+
+    def _monitor_log_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        if self._last_run_dir:
+            paths.append(Path(self._last_run_dir) / "runtime.log")
+        debug_root = self.runtime_path / "debug"
+        if debug_root.is_dir():
+            try:
+                paths.extend(sorted(debug_root.glob("*.log")))
+            except OSError:
+                pass
+        return paths
+
+    def _incident_artifacts(
+        self,
+    ) -> tuple[
+        dict[str, Path],
+        dict[str, object],
+        dict[str, Path],
+    ]:
+        """Snapshot the complete MaaEnd evidence set for one occurrence."""
+
+        files: dict[str, Path] = {}
+        for key, path in (
+            ("raw-preflight", self.output_root / "preflight-screen.png"),
+            ("raw-launch", self.output_root / "launch-screen.png"),
+        ):
+            if path.is_file():
+                files[key] = path
+
+        with self._lock:
+            request = json.loads(json.dumps(self._last_request))
+            mxu_state = json.loads(json.dumps(self._api_instance_state))
+            mxu_tasks = json.loads(json.dumps(self._api_tasks))
+            task_ids = list(self._api_task_ids)
+            api_phase = self._api_phase
+            screenshots = json.loads(json.dumps(self._api_screenshots))
+            guard_checks = json.loads(json.dumps(self._guard_checks))
+            terminal_contract = (
+                json.loads(json.dumps(self._terminal_contract))
+                if self._terminal_contract is not None
+                else None
+            )
+            verification = json.loads(json.dumps(self._verification))
+            runtime_integrity = json.loads(
+                json.dumps(self._runtime_integrity)
+            )
+            monitor_state = self._run_monitor.state() if self._run_monitor else {}
+
+        for row in screenshots:
+            if not isinstance(row, dict):
+                continue
+            label = re.sub(
+                r"[^A-Za-z0-9_.-]+",
+                "-",
+                str(row.get("label") or "controller"),
+            ).strip("-.")
+            path = Path(str(row.get("path") or ""))
+            if label and path.is_file():
+                files[f"logical-{label}"] = path
+
+        json_artifacts: dict[str, object] = {
+            "request": request,
+            "mxu-state": {
+                "phase": api_phase,
+                "task_ids": task_ids,
+                "instance_state": mxu_state,
+                "tasks": mxu_tasks,
+            },
+            "controller-screenshots": screenshots,
+            "guard-decisions": guard_checks,
+            "alignment-trace": monitor_state.get("alignment_trace", []),
+            "structured-events": monitor_state.get("events", []),
+            "terminal-contract": terminal_contract,
+            "verification": verification,
+            "runtime-integrity": runtime_integrity,
+        }
+
+        logs: dict[str, Path] = {}
+        for index, path in enumerate(self._monitor_log_paths()):
+            key = "runtime" if index == 0 and path.name == "runtime.log" else (
+                f"upstream-{index:02d}-{path.stem}"
+            )
+            if path.is_file():
+                logs[key] = path
+        return files, json_artifacts, logs
+
+    def _record_monitor_signals(
+        self,
+        signals: list[IncidentSignal],
+        *,
+        screenshot: bytes | None = None,
+    ) -> None:
+        if not signals or not self._last_run_dir:
+            return
+        run_dir = Path(self._last_run_dir)
+        with self._lock:
+            monitor = self._run_monitor
+        events = list(monitor.events) if monitor else []
+        environment = self._incident_environment()
+        upstream_log = self.runtime_path / "debug" / "maafw.log"
+        artifact_files, artifact_json, log_files = self._incident_artifacts()
+        for signal in signals:
+            incident = record_incident_bundle(
+                run_dir,
+                signal,
+                events_tail=events,
+                screenshot=screenshot,
+                environment=environment,
+                asst_log=upstream_log if upstream_log.is_file() else None,
+                artifact_files=artifact_files,
+                artifact_json=artifact_json,
+                log_files=log_files,
+            )
+            with self._lock:
+                self._incident_records.append(
+                    {
+                        "fingerprint": incident.get("fingerprint"),
+                        "kind": incident.get("kind"),
+                        "occurrence_count": incident.get("occurrence_count"),
+                    }
+                )
+        try:
+            self._ensure_local_issue_ledger()
+            triage_run_incidents(run_dir, self._local_issue_ledger)
+        except Exception as exc:
+            self._log("evidence_warning", f"MaaEnd incident 账本更新失败: {exc}")
 
     def _load_settings(self) -> dict[str, object]:
         if not self._settings_path.is_file():
@@ -2437,6 +3367,7 @@ class MaaEndRuntimeController:
         if not path_text:
             raise ValueError("MaaEnd 发布目录不能为空")
         root = Path(path_text).expanduser().resolve()
+        self._reset_run_evidence()
         with self._lock:
             if self._running:
                 raise RuntimeError("MaaEnd 运行中，不能改写任务配置")
@@ -2455,6 +3386,7 @@ class MaaEndRuntimeController:
             self._api_tasks = []
             self._api_task_ids = []
             self._api_resource_paths = []
+            self._api_screenshots = []
             self._api_updated_at = None
             self._last_install_check_path = ""
             self._last_install_check_at = 0.0
@@ -2644,6 +3576,7 @@ class MaaEndRuntimeController:
         screen_state: str,
         error: Exception,
         device_state: Optional[dict[str, object]] = None,
+        guard_evidence: Optional[dict[str, object]] = None,
     ) -> None:
         message = str(error)
         summary: dict[str, object] = {
@@ -2658,6 +3591,7 @@ class MaaEndRuntimeController:
                 "name": self.instance_name,
                 "task_names": [],
             },
+            "guard": guard_evidence,
         }
         with self._lock:
             self._status = "error"
@@ -2674,8 +3608,10 @@ class MaaEndRuntimeController:
         with self._lock:
             if self._running:
                 raise RuntimeError("MaaEnd 已在运行")
+        self._reset_run_evidence()
         try:
             root, instance_name = self._configuration_from_payload(payload)
+            internal_probe = requested_maaend_internal_probe(payload)
         except Exception as exc:
             self._preflight_failure(device, "profile_missing", exc)
             raise
@@ -2711,13 +3647,40 @@ class MaaEndRuntimeController:
         try:
             interface = _load_interface_bundle(root)
             config = load_maaend_profile_config(root)
-            profile = _validate_profile(interface, config, instance_name, device)
+            profile = _validate_profile(
+                interface,
+                config,
+                instance_name,
+                device,
+                internal_probe=internal_probe,
+            )
         except _ProfileValidationError as exc:
             self._preflight_failure(device, exc.screen_state, exc)
             raise RuntimeError(str(exc)) from exc
         except Exception as exc:
             self._preflight_failure(device, "profile_missing", exc)
             raise RuntimeError(str(exc)) from exc
+
+        try:
+            guard, _, _ = self._prepare_guard(
+                root,
+                interface,
+                config,
+                profile,
+                payload,
+                stage="preflight",
+            )
+        except MaaEndGuardError as exc:
+            self._preflight_failure(
+                device,
+                "guard_denied",
+                exc,
+                guard_evidence=exc.evidence,
+            )
+            raise RuntimeError(str(exc)) from exc
+        except Exception as exc:
+            self._preflight_failure(device, "guard_error", exc)
+            raise RuntimeError(f"MaaEnd 风险策略预检失败: {exc}") from exc
 
         device_state: dict[str, object] = {}
         if self.adb:
@@ -2754,6 +3717,7 @@ class MaaEndRuntimeController:
                 **device_state,
             },
             "profile": profile,
+            "guard": guard,
         }
         with self._lock:
             self._last_preflight = summary
@@ -2761,8 +3725,10 @@ class MaaEndRuntimeController:
                 "runtime_path": str(root),
                 "instance_name": instance_name,
                 "device": device,
+                "internal_probe": internal_probe,
             }
             self._last_profile = profile
+            self._last_guard = guard
             self._status = "ready"
             self._last_error = ""
         _atomic_write(
@@ -2771,7 +3737,11 @@ class MaaEndRuntimeController:
         )
         self._log(
             "ready",
-            f"MaaEnd 实例“{instance_name}”已通过 ADB 配置预检（{len(profile['task_names'])} 项任务）",
+            (
+                f"MaaEnd 实例“{instance_name}”已通过内部探针 {internal_probe} 预检"
+                if internal_probe
+                else f"MaaEnd 实例“{instance_name}”已通过 ADB 配置预检（{len(profile['task_names'])} 项任务）"
+            ),
         )
         return self.snapshot()
 
@@ -2809,24 +3779,78 @@ class MaaEndRuntimeController:
             timeout=timeout,
         )
 
-    def _verify_api_controller_screenshot(self) -> dict[str, int]:
+    def _capture_api_controller_screenshot(self, label: str) -> dict[str, object]:
+        if label not in {"connection", "terminal"} and not re.fullmatch(
+            r"watchdog-\d{4}", label
+        ):
+            raise ValueError(f"不支持的 MaaEnd 控制器截图标签: {label}")
         with self._lock:
             base_url = self._api_base_url
+            run_dir = self._last_run_dir
         if not base_url:
             raise RuntimeError("MaaEnd MXU API 尚未就绪")
+        started = time.monotonic()
         screenshot = self._http_bytes(
             base_url,
             "GET",
             self._instance_api_path("/screenshot"),
             timeout=_MXU_SCREENSHOT_TIMEOUT_SECONDS,
         )
+        duration_seconds = time.monotonic() - started
         if len(screenshot) < 24 or not screenshot.startswith(b"\x89PNG\r\n\x1a\n"):
             raise RuntimeError("MXU ADB 控制器未返回有效 PNG 截图")
         width, height = struct.unpack(">II", screenshot[16:24])
         if width <= 0 or height <= 0:
             raise RuntimeError("MXU ADB 控制器返回的截图尺寸无效")
-        _atomic_write(self.output_root / "mxu-connection-screen.png", screenshot)
-        return {"width": width, "height": height}
+        evidence_root = Path(run_dir) if run_dir else self.output_root
+        path = evidence_root / f"controller-{label}.png"
+        _atomic_write(path, screenshot)
+        captured = {
+            "label": label,
+            "width": width,
+            "height": height,
+            "path": str(path),
+            "captured_at": time.time(),
+            "sha256": hashlib.sha256(screenshot).hexdigest(),
+            "duration_seconds": round(duration_seconds, 4),
+        }
+        with self._lock:
+            self._api_screenshots = [
+                row
+                for row in self._api_screenshots
+                if str(row.get("label") or "") != label
+            ]
+            self._api_screenshots.append(captured)
+            if len(self._api_screenshots) > 32:
+                self._api_screenshots = self._api_screenshots[-32:]
+            self._api_updated_at = captured["captured_at"]
+            monitor = self._run_monitor
+        if monitor is not None:
+            signals = monitor.observe_screenshot(
+                screenshot,
+                duration_seconds,
+                label=label,
+            )
+            self._record_monitor_signals(signals, screenshot=screenshot)
+        return dict(captured)
+
+    def _verify_api_controller_screenshot(self) -> dict[str, object]:
+        return self._capture_api_controller_screenshot("connection")
+
+    def _capture_terminal_controller_screenshot(self) -> dict[str, object]:
+        try:
+            screenshot = self._capture_api_controller_screenshot("terminal")
+        except Exception as exc:
+            self._log("evidence_warning", f"MaaEnd 终态控制器截图失败: {exc}")
+            return {"captured": False, "error": str(exc)}
+        self._log(
+            "evidence",
+            (
+                "MaaEnd 终态控制器截图已保存"
+                f"（{screenshot['width']}x{screenshot['height']}）"
+            ),
+        )
+        return {"captured": True, **screenshot}
 
     def _instance_api_path(self, suffix: str = "") -> str:
         with self._lock:
@@ -3200,16 +4224,244 @@ class MaaEndRuntimeController:
             except Exception as exc:
                 self._log("stopping", f"MXU API {suffix} 未完成: {exc}")
 
+    def _poll_monitor_logs(self) -> list[IncidentSignal]:
+        with self._lock:
+            monitor = self._run_monitor
+        if monitor is None:
+            return []
+        lines = monitor.read_new_log_lines(self._monitor_log_paths())
+        signals = monitor.ingest_log_lines(lines)
+        self._record_monitor_signals(signals)
+        return signals
+
+    def _emit_runtime_incident(
+        self,
+        kind: str,
+        reason: str,
+        basis: Mapping[str, object],
+        *,
+        stop: bool = True,
+    ) -> IncidentSignal:
+        signal = IncidentSignal.create(kind, reason, basis, stop=stop)
+        with self._lock:
+            monitor = self._run_monitor
+        if monitor is not None:
+            unique = monitor.emit_signal(signal)
+            if unique is not None:
+                self._record_monitor_signals([unique])
+                return unique
+        self._record_monitor_signals([signal])
+        return signal
+
+    def _terminal_device_state(
+        self,
+        task_rows: list[dict[str, object]],
+    ) -> dict[str, object]:
+        if not any(str(row.get("name") or "") == "CloseGame" for row in task_rows):
+            return {}
+        with self._lock:
+            device = self._device
+        if not self.adb or not device:
+            return {
+                "available": False,
+                "error": "CloseGame 终态缺少只读 ADB 前台应用探针",
+            }
+        try:
+            return _probe_maaend_foreground_state(self.adb, device)
+        except Exception as exc:
+            self._log("evidence_warning", f"CloseGame 前台应用终态探针失败: {exc}")
+            return {"available": False, "error": str(exc)}
+
+    def _evaluate_business_terminal(
+        self,
+        terminal_capture: Mapping[str, object],
+    ) -> dict[str, object]:
+        self._poll_monitor_logs()
+        with self._lock:
+            monitor = self._run_monitor
+            task_rows = json.loads(json.dumps(self._api_tasks))
+            guard_checks = json.loads(json.dumps(self._guard_checks))
+            runtime_integrity = json.loads(
+                json.dumps(self._runtime_integrity)
+            )
+        if monitor is None:
+            monitor_state: dict[str, object] = {}
+            terminal_signals: list[IncidentSignal] = []
+        else:
+            terminal_signals = monitor.terminal_signals()
+            self._record_monitor_signals(terminal_signals)
+            monitor_state = monitor.state()
+        incidents = monitor_state.get("incidents")
+        incident_rows = incidents if isinstance(incidents, list) else []
+        blocking_incidents = [
+            row
+            for row in incident_rows
+            if isinstance(row, dict) and row.get("stop") is True
+        ]
+        screenshot = (
+            dict(terminal_capture)
+            if terminal_capture.get("captured") is True
+            else {}
+        )
+        terminal = evaluate_terminal_contracts(
+            self._guard_policy,
+            task_rows,
+            terminal_screenshot=screenshot,
+            viewport_evidence=(
+                monitor_state.get("viewport_evidence")
+                if isinstance(monitor_state.get("viewport_evidence"), dict)
+                else {}
+            ),
+            structured_events=(
+                monitor_state.get("events")
+                if isinstance(monitor_state.get("events"), list)
+                else []
+            ),
+            active_contacts=(
+                monitor_state.get("active_contacts")
+                if isinstance(monitor_state.get("active_contacts"), list)
+                else []
+            ),
+            blocking_incidents=blocking_incidents,
+            device_state=self._terminal_device_state(task_rows),
+        )
+        terminal["runtime_integrity"] = {
+            "verified": runtime_integrity.get("verified") is True,
+            "status": runtime_integrity.get("status"),
+            "baseline_sha256": runtime_integrity.get("baseline_sha256"),
+            "current_manifest_sha256": runtime_integrity.get(
+                "current_manifest_sha256"
+            ),
+        }
+        task_contracts = terminal.get("tasks")
+        contract_rows = task_contracts if isinstance(task_contracts, list) else []
+        launch_rows = [
+            row
+            for row in contract_rows
+            if isinstance(row, dict) and row.get("name") == "AndroidOpenGame"
+        ]
+        events = monitor_state.get("events")
+        event_rows = events if isinstance(events, list) else []
+        alignments = monitor_state.get("alignment_trace")
+        alignment_rows = alignments if isinstance(alignments, list) else []
+        guarded = (
+            len(guard_checks) >= 2
+            and all(row.get("allowed") is True for row in guard_checks[-2:])
+            and guard_checks[-1].get("decision_sha256")
+            == guard_checks[-2].get("decision_sha256")
+            and terminal.get("verified") is True
+            and runtime_integrity.get("status") == "verified"
+            and runtime_integrity.get("verified") is True
+        )
+        input_verified = any(
+            isinstance(row, dict)
+            and row.get("alignment") in {"left", "center", "right"}
+            and row.get("logical_param") is not None
+            and row.get("display_param") is not None
+            for row in alignment_rows
+        )
+        custom_agent_verified = any(
+            isinstance(row, dict)
+            and (
+                row.get("kind") == "viewport_activated"
+                or (
+                    row.get("kind") == "agent_log"
+                    and bool(row.get("component") or row.get("task_id"))
+                )
+            )
+            for row in event_rows
+        )
+        verification = {
+            "launch_verified": bool(launch_rows)
+            and all(row.get("passed") is True for row in launch_rows),
+            "pipeline_verified": terminal.get("verified") is True,
+            "custom_agent_verified": custom_agent_verified,
+            "input_verified": input_verified,
+            "guarded_flow_verified": guarded,
+            "end_to_end_verified": False,
+            "reason": (
+                "本轮任务达到已定义业务终点；完整受保护组合仍未人工验收"
+                if terminal.get("verified") is True
+                else "MXU 执行状态已保留，但业务终点证据不完整"
+            ),
+        }
+        with self._lock:
+            self._terminal_contract = terminal
+            self._verification = verification
+        if terminal.get("verified") is not True:
+            failed = []
+            for row in contract_rows:
+                if not isinstance(row, dict) or row.get("passed") is True:
+                    continue
+                checks = row.get("checks")
+                missing = [
+                    str(key)
+                    for key, value in checks.items()
+                    if value is not True
+                ] if isinstance(checks, dict) else []
+                failed.append(
+                    f"{row.get('name')}: {', '.join(missing) or 'contract failed'}"
+                )
+            reason = "MaaEnd MXU 任务成功，但业务终点契约未满足: " + "; ".join(failed)
+            self._emit_runtime_incident(
+                "maaend_terminal_contract_failed",
+                reason,
+                {
+                    "tasks": [str(row.get("name") or "") for row in contract_rows if isinstance(row, dict)],
+                    "failed_checks": failed,
+                },
+            )
+        return terminal
+
     def _watch_api_run(
         self,
         process: subprocess.Popen[bytes],
         log_handle,
     ) -> None:
+        watchdogs = self._guard_watchdogs()
+        poll_interval = max(0.05, float(watchdogs.get("poll_interval_seconds") or 0.5))
+        api_error_limit = max(1, int(watchdogs.get("api_error_limit") or 10))
+        idle_grace = float(watchdogs.get("tasker_idle_grace_seconds") or 15.0)
+        screenshot_interval = float(
+            watchdogs.get("screenshot_interval_seconds") or 0
+        )
+        integrity_interval = max(
+            poll_interval,
+            float(
+                watchdogs.get("runtime_integrity_interval_seconds") or 2.0
+            ),
+        )
+        next_screenshot_at = (
+            time.monotonic() + screenshot_interval
+            if screenshot_interval > 0
+            else float("inf")
+        )
+        next_integrity_at = time.monotonic() + integrity_interval
+        watchdog_screenshot_index = 0
+        consecutive_screenshot_errors = 0
         idle_since: Optional[float] = None
         consecutive_api_errors = 0
         terminal_status = ""
         terminal_error = ""
-        while not self._stop_event.wait(0.5):
+        terminal_integrity_checked = False
+        while not self._stop_event.wait(poll_interval):
+            log_signals = self._poll_monitor_logs()
+            stopping_signal = next((row for row in log_signals if row.stop), None)
+            if stopping_signal is not None:
+                terminal_status = "error"
+                terminal_error = stopping_signal.reason
+                break
+            now = time.monotonic()
+            if now >= next_integrity_at:
+                integrity_error = self._runtime_integrity_failure(
+                    stage="watchdog",
+                    full_resource_rehash=False,
+                )
+                next_integrity_at = now + integrity_interval
+                if integrity_error:
+                    terminal_status = "error"
+                    terminal_error = integrity_error
+                    break
             try:
                 state = self._read_instance_state()
                 consecutive_api_errors = 0
@@ -3220,12 +4472,65 @@ class MaaEndRuntimeController:
                     terminal_error = (
                         f"MaaEnd 进程在任务取得终态前退出（退出码 {process.poll()}）"
                     )
+                    self._emit_runtime_incident(
+                        "maaend_process_exited_early",
+                        terminal_error,
+                        {"exit_code": process.poll()},
+                    )
                     break
-                if consecutive_api_errors >= 10:
+                if consecutive_api_errors >= api_error_limit:
                     terminal_status = "error"
                     terminal_error = f"连续无法读取 MXU API 任务状态: {exc}"
+                    self._emit_runtime_incident(
+                        "maaend_api_unavailable",
+                        terminal_error,
+                        {"consecutive_errors": consecutive_api_errors},
+                    )
                     break
                 continue
+
+            with self._lock:
+                monitor = self._run_monitor
+                monitor_tasks = json.loads(json.dumps(self._api_tasks))
+            if monitor is not None:
+                state_signals = monitor.observe_state(state, monitor_tasks)
+                self._record_monitor_signals(state_signals)
+                stopping_signal = next(
+                    (row for row in state_signals if row.stop),
+                    None,
+                )
+                if stopping_signal is not None:
+                    terminal_status = "error"
+                    terminal_error = stopping_signal.reason
+                    break
+
+            now = time.monotonic()
+            if now >= next_screenshot_at:
+                watchdog_screenshot_index += 1
+                try:
+                    self._capture_api_controller_screenshot(
+                        f"watchdog-{watchdog_screenshot_index:04d}"
+                    )
+                    consecutive_screenshot_errors = 0
+                except Exception as exc:
+                    consecutive_screenshot_errors += 1
+                    self._log(
+                        "evidence_warning",
+                        f"MaaEnd watchdog 截图失败: {exc}",
+                    )
+                    if consecutive_screenshot_errors >= 3:
+                        terminal_status = "error"
+                        terminal_error = "MaaEnd watchdog 连续无法取得控制器截图"
+                        self._emit_runtime_incident(
+                            "maaend_screenshot_unavailable",
+                            terminal_error,
+                            {
+                                "consecutive_errors": consecutive_screenshot_errors,
+                                "last_error": str(exc),
+                            },
+                        )
+                        break
+                next_screenshot_at = now + screenshot_interval
 
             run_state = state.get("task_run_state")
             statuses = run_state.get("statuses") if isinstance(run_state, dict) else None
@@ -3242,12 +4547,34 @@ class MaaEndRuntimeController:
                 ]
             expected_statuses = [str(status_map.get(item) or "") for item in expected_ids]
             if expected_ids and all(status == "succeeded" for status in expected_statuses):
-                terminal_status = "completed"
+                terminal_capture = self._capture_terminal_controller_screenshot()
+                terminal_error = self._runtime_integrity_failure(
+                    stage="terminal",
+                    full_resource_rehash=True,
+                )
+                terminal_integrity_checked = True
+                if terminal_error:
+                    terminal_status = "error"
+                    break
+                terminal = self._evaluate_business_terminal(terminal_capture)
+                if terminal.get("verified") is True:
+                    terminal_status = "completed"
+                else:
+                    terminal_status = "error"
+                    terminal_error = (
+                        "MaaEnd 逐任务状态均为 succeeded，但业务终点契约未满足"
+                    )
                 break
             if failed_names or overall == "Failed":
+                self._capture_terminal_controller_screenshot()
                 terminal_status = "error"
                 terminal_error = "MaaEnd 任务失败: " + (
                     ", ".join(failed_names) if failed_names else "MXU 整体状态为 Failed"
+                )
+                self._emit_runtime_incident(
+                    "maaend_task_failed",
+                    terminal_error,
+                    {"failed_tasks": failed_names, "overall_status": overall},
                 )
                 break
             if overall == "Succeeded":
@@ -3261,19 +4588,59 @@ class MaaEndRuntimeController:
                     "MXU 整体状态为 Succeeded，但并非全部任务状态为 succeeded: "
                     + ", ".join(missing)
                 )
+                self._emit_runtime_incident(
+                    "maaend_incomplete_task_truth",
+                    terminal_error,
+                    {"missing_task_ids": missing},
+                )
                 break
 
             if state.get("is_running") is True:
                 idle_since = None
             elif idle_since is None:
                 idle_since = time.monotonic()
-            elif time.monotonic() - idle_since >= 15.0:
+            elif time.monotonic() - idle_since >= idle_grace:
                 terminal_status = "error"
                 terminal_error = "MXU Tasker 已停止，但逐任务状态没有形成完整终态"
+                self._emit_runtime_incident(
+                    "maaend_tasker_stopped_without_terminal",
+                    terminal_error,
+                    {
+                        "idle_grace_seconds": idle_grace,
+                        "overall_status": overall,
+                        "statuses": expected_statuses,
+                    },
+                )
                 break
 
         if self._stop_event.is_set():
             return
+        if not terminal_integrity_checked:
+            with self._lock:
+                integrity_already_failed = (
+                    self._runtime_integrity.get("status") == "drifted"
+                )
+            if integrity_already_failed:
+                # Preserve one incident fingerprint while still producing the
+                # required terminal, cache-independent full-tree evidence.
+                try:
+                    self._check_runtime_integrity(
+                        stage="terminal",
+                        full_resource_rehash=True,
+                    )
+                except Exception as exc:
+                    self._log(
+                        "evidence_warning",
+                        f"MaaEnd 终态完整性复核失败: {exc}",
+                    )
+            else:
+                integrity_error = self._runtime_integrity_failure(
+                    stage="terminal",
+                    full_resource_rehash=True,
+                )
+                if integrity_error:
+                    terminal_status = "error"
+                    terminal_error = integrity_error
         self._stop_api_instance()
         with self._lock:
             owned = self._process_owned
@@ -3291,6 +4658,7 @@ class MaaEndRuntimeController:
         if not device:
             raise ValueError("MaaEnd 启动需要 Android 设备")
         root, instance_name = self._configuration_from_payload(payload)
+        internal_probe = requested_maaend_internal_probe(payload)
         with self._lock:
             if self._running:
                 raise RuntimeError("MaaEnd 已在运行")
@@ -3300,6 +4668,7 @@ class MaaEndRuntimeController:
             "runtime_path": str(root),
             "instance_name": instance_name,
             "device": device,
+            "internal_probe": internal_probe,
         }
         if expected != requested:
             raise RuntimeError("请先为当前 MaaEnd 目录、实例和设备运行成功预检")
@@ -3310,7 +4679,13 @@ class MaaEndRuntimeController:
             validate_maaend_runtime(root)
             interface = _load_interface_bundle(root)
             config = load_maaend_profile_config(root)
-            profile = _validate_profile(interface, config, instance_name, device)
+            profile = _validate_profile(
+                interface,
+                config,
+                instance_name,
+                device,
+                internal_probe=internal_probe,
+            )
         except Exception as exc:
             with self._lock:
                 self._last_preflight_context = None
@@ -3329,6 +4704,41 @@ class MaaEndRuntimeController:
                 self._last_error = "MaaEnd 实例在预检后发生变化，请重新预检"
             self._log("error", self._last_error)
             raise RuntimeError(self._last_error)
+
+        try:
+            guard, task_requests, task_metadata = self._prepare_guard(
+                root,
+                interface,
+                config,
+                profile,
+                payload,
+                stage="start",
+            )
+        except Exception as exc:
+            evidence = exc.evidence if isinstance(exc, MaaEndGuardError) else None
+            with self._lock:
+                self._last_preflight_context = None
+                self._last_profile = None
+                self._status = "error"
+                self._last_error = f"MaaEnd 启动前风险复检失败: {exc}"
+                if evidence is not None:
+                    self._last_guard = dict(evidence)
+            self._log("error", self._last_error)
+            raise RuntimeError(self._last_error) from exc
+        expected_guard_sha256 = str(expected_profile and (self._last_guard or {}).get("decision_sha256") or "")
+        if not expected_guard_sha256 or guard.get("decision_sha256") != expected_guard_sha256:
+            with self._lock:
+                self._last_preflight_context = None
+                self._last_profile = None
+                self._status = "error"
+                self._last_error = (
+                    "MaaEnd 任务、选项、授权或 Pipeline override 在预检后发生变化，"
+                    "请重新预检"
+                )
+            self._log("error", self._last_error)
+            raise RuntimeError(self._last_error)
+        with self._lock:
+            self._last_guard = guard
 
         if self.adb:
             try:
@@ -3353,7 +4763,6 @@ class MaaEndRuntimeController:
             controller_name="ADB",
             resource_name=str(profile.get("resource") or ""),
         )
-        task_requests, task_metadata = _mxu_task_requests(interface, config, profile)
         instance_id = str(profile.get("id") or "").strip()
         if not instance_id:
             raise RuntimeError("MaaEnd 实例缺少稳定 ID，无法通过 MXU API 执行")
@@ -3362,9 +4771,38 @@ class MaaEndRuntimeController:
         run_dir = self.output_root / "runs" / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_handle = (run_dir / "runtime.log").open("wb")
+        monitor = MaaEndRunMonitor(self._guard_watchdogs())
+        baseline_logs = [run_dir / "runtime.log"]
+        debug_root = root / "debug"
+        if debug_root.is_dir():
+            try:
+                baseline_logs.extend(sorted(debug_root.glob("*.log")))
+            except OSError:
+                pass
+        monitor.mark_log_baseline(baseline_logs)
         command = self._command(root)
+        guarded_resource = guard.get("resource_fingerprint")
+        if not isinstance(guarded_resource, Mapping):
+            log_handle.close()
+            raise RuntimeError("MaaEnd 风险门禁没有提供资源树指纹")
+        try:
+            integrity = self._begin_runtime_integrity(
+                root,
+                guarded_resource,
+                run_dir,
+            )
+        except Exception as exc:
+            log_handle.close()
+            with self._lock:
+                self._last_run_dir = str(run_dir)
+                self._status = "error"
+                self._last_error = f"MaaEnd 启动完整性基线建立失败: {exc}"
+            self._log("error", self._last_error)
+            raise RuntimeError(self._last_error) from exc
         creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
         creationflags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        process_env = os.environ.copy()
+        process_env["MAA_SCREENSHOT_VIEWPORT"] = MAAEND_SCREENSHOT_VIEWPORT
         try:
             process = self._popen_factory(
                 command,
@@ -3372,6 +4810,7 @@ class MaaEndRuntimeController:
                 stderr=subprocess.STDOUT,
                 cwd=str(root),
                 creationflags=creationflags,
+                env=process_env,
             )
         except Exception as exc:
             log_handle.close()
@@ -3401,7 +4840,41 @@ class MaaEndRuntimeController:
             self._api_tasks = task_metadata
             self._api_task_ids = []
             self._api_resource_paths = resource_paths
+            self._api_screenshots = []
             self._api_updated_at = self._started_at
+            self._terminal_contract = None
+            self._verification = self._empty_verification()
+            self._last_request = {
+                "device": device,
+                "runtime_path": str(root),
+                "instance_name": instance_name,
+                "internal_probe": internal_probe,
+                "authorized_tasks": sorted(
+                    str(item).strip()
+                    for item in payload.get("authorized_tasks", [])
+                    if str(item).strip()
+                ) if isinstance(payload.get("authorized_tasks"), list) else [],
+                "allow_baker_entry": payload.get("allow_baker_entry") is True,
+                "authorized_probes": sorted(
+                    str(item).strip()
+                    for item in payload.get("authorized_probes", [])
+                    if str(item).strip()
+                ) if isinstance(payload.get("authorized_probes"), list) else [],
+                "allow_viewport_input_probe": payload.get(
+                    "allow_viewport_input_probe"
+                ) is True,
+                "policy_sha256": guard.get("policy_sha256"),
+                "resource_fingerprint": guard.get("resource_fingerprint"),
+                "runtime_integrity_baseline_sha256": integrity.get(
+                    "baseline_sha256"
+                ),
+                "guard_decision_sha256": guard.get("decision_sha256"),
+                "request_set_sha256": guard.get("request_set_sha256"),
+                "tasks": json.loads(json.dumps(task_requests)),
+                "task_metadata": json.loads(json.dumps(task_metadata)),
+            }
+            self._run_monitor = monitor
+            self._incident_records = []
         self._log("starting_service", "正在启动 MaaEnd v2.20 本地 MXU API")
         try:
             base_url, maafw_version, owned = self._discover_api(root, process)
@@ -3539,8 +5012,27 @@ class MaaEndRuntimeController:
                         "label": f"{self.instance_name} · 未找到",
                     },
                 )
+            verification = json.loads(json.dumps(self._verification))
+            runtime_integrity = json.loads(
+                json.dumps(self._runtime_integrity)
+            )
+            monitor_state = self._run_monitor.state() if self._run_monitor else {}
             return {
                 "adapter_id": MAAEND_ADAPTER_ID,
+                "end_to_end_verified": False,
+                "launch_verified": verification.get("launch_verified") is True,
+                "pipeline_verified": verification.get("pipeline_verified") is True,
+                "custom_agent_verified": verification.get("custom_agent_verified") is True,
+                "input_verified": verification.get("input_verified") is True,
+                "guarded_flow_verified": verification.get("guarded_flow_verified") is True,
+                "verification": {
+                    **verification,
+                    "status": (
+                        "run_contract_verified"
+                        if verification.get("guarded_flow_verified") is True
+                        else "pending"
+                    ),
+                },
                 "standard_version": MAAEND_STANDARD_VERSION,
                 "status": status,
                 "running": running,
@@ -3554,6 +5046,17 @@ class MaaEndRuntimeController:
                     else 0,
                 },
                 "preflight": self._last_preflight,
+                "guard": {
+                    "mode": "fail_closed",
+                    "policy_sha256": canonical_sha256(self._guard_policy),
+                    "policy_path": self._guard_policy_path,
+                    "last_decision": json.loads(json.dumps(self._last_guard)),
+                    "checks": json.loads(json.dumps(self._guard_checks)),
+                },
+                "terminal_contract": json.loads(
+                    json.dumps(self._terminal_contract)
+                ) if self._terminal_contract is not None else None,
+                "runtime_integrity": runtime_integrity,
                 "profile": profile,
                 "configured_profile": configured_profile,
                 "profiles": profiles,
@@ -3610,6 +5113,7 @@ class MaaEndRuntimeController:
                     "instance_id": self._api_instance_id,
                     "maafw_version": self._api_maafw_version,
                     "resource_paths": list(self._api_resource_paths),
+                    "screenshots": json.loads(json.dumps(self._api_screenshots)),
                     "task_ids": list(self._api_task_ids),
                     "tasks": json.loads(json.dumps(self._api_tasks)),
                     "instance_state": json.loads(
@@ -3618,6 +5122,9 @@ class MaaEndRuntimeController:
                     "updated_at": self._api_updated_at,
                     "truth_source": "GET /api/maa/state",
                 },
+                "watchdog": monitor_state,
+                "incidents": json.loads(json.dumps(self._incident_records)),
+                "issue_ledger": str(self._local_issue_ledger),
                 "runtime_output": self._runtime_output_snapshot(),
                 "upstream_debug": self._upstream_debug_snapshot()
                 if available

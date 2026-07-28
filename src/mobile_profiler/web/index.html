@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-63">
-  <script src="/app.js?v=platform-ui-63" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-65">
+  <script src="/app.js?v=platform-ui-65" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -374,7 +374,7 @@
 
         <section class="view" data-panel="opensource" hidden>
           <div class="view-header opensource-view-header">
-            <div><small>OPEN SOURCE AUTOMATION HUB</small><h2>开源自动化</h2><p>下拉选择一个已接入项目。MaaEnd 页面动态读取用户安装包中的全部 ADB 任务、选项和预设，并只改写本项目专用实例，不复制上游 Pipeline 与图片资源。</p></div>
+            <div><small>OPEN SOURCE AUTOMATION HUB</small><h2>开源自动化</h2><p>明日方舟 MAA 是当前唯一跑通的端到端真机验收流程，可通过 adaptive MaaCore 运行受控任务，也是后续项目的重构基准。崩铁底层已从 M7A 更换为 StarRailCopilot，并直接使用其 Android 设备栈；多分辨率与完整模拟宇宙尚未验收。终末地仍保留独立重构入口；各流程按 MAA 验收契约闭环前禁止预检和启动。</p></div>
             <span class="agent-status-badge opensource-status-badge idle" id="opensource-status-badge"><i></i><span><strong id="opensource-status-label">读取项目目录</strong><small id="opensource-status-detail">等待服务端状态</small></span></span>
           </div>
 
@@ -410,7 +410,7 @@
                   <span><small>SELECTED FEATURE RUNTIME</small><strong id="opensource-runtime-title">功能运行控制</strong></span>
                   <em id="opensource-runtime-status">WAITING</em>
                 </div>
-                <p id="opensource-runtime-detail">选择并保存一个已接入功能后，可对顶部当前 Android 真机运行预检。</p>
+                <p id="opensource-runtime-detail">选择并保存一个适配器入口；只有端到端已验收流程才允许真机预检。</p>
                 <div class="opensource-runtime-facts">
                   <span><small>DEVICE</small><strong id="opensource-runtime-device">未选择</strong></span>
                   <span><small>SCREEN</small><strong id="opensource-runtime-screen">未预检</strong></span>
@@ -436,7 +436,7 @@
               </summary>
               <div class="opensource-diagnostics-grid">
                 <section class="opensource-overview-panel opensource-diagnostic-section">
-                  <div class="panel-heading"><div><small>OPEN SOURCE RUNTIME</small><h2>独立运行时与边界</h2></div><a class="data-source opensource-upstream-link" href="https://github.com/moesnow/March7thAssistant" target="_blank" rel="noreferrer">上游项目 ↗</a></div>
+                  <div class="panel-heading"><div><small>OPEN SOURCE RUNTIME</small><h2>独立运行时与边界</h2></div><a class="data-source opensource-upstream-link" href="https://github.com/LmeSzinc/StarRailCopilot" target="_blank" rel="noreferrer">SRC 上游 ↗</a></div>
                   <div class="opensource-runtime-grid">
                     <article><small>IMAGE ENGINE</small><strong id="opensource-dependency-value">检查中</strong><span id="opensource-dependency-detail">OpenCV / NumPy 为可选依赖</span></article>
                     <article><small>DISK COST</small><strong id="opensource-disk-value">约 160 MiB</strong><span id="opensource-disk-detail">核心项目仍保持轻量</span></article>

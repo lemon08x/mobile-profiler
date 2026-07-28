@@ -26,16 +26,25 @@ from .automation import (
     TemplateSpec,
     template_matching_dependency_status,
 )
+from .maa_arknights_runtime import MaaArknightsRuntimeController
 from .maaend_runtime import MaaEndRuntimeController
-from .star_rail_runtime import StarRailAsuRuntimeController
+from .star_rail_runtime import StarRailCopilotRuntimeController
 
 
 IMAGE_EXTRA_ESTIMATED_BYTES = 167_348_599
 DEFAULT_DEMO_ITERATIONS = 50
 MAX_DEMO_ITERATIONS = 100
-DEFAULT_PROJECT_IDS = ("maaend",)
-DEFAULT_FEATURE_IDS: tuple[str, ...] = ("maaend-profile",)
-STAR_RAIL_UNIVERSE_FEATURE_ID = "m7a-universe"
+DEFAULT_PROJECT_IDS = ("maa-arknights",)
+DEFAULT_FEATURE_IDS: tuple[str, ...] = ("maa-arknights-adaptive",)
+STAR_RAIL_COPILOT_PROJECT_ID = "star-rail-copilot"
+STAR_RAIL_ROGUE_FEATURE_ID = "src-rogue"
+LEGACY_PROJECT_ID_MIGRATIONS = {
+    "march7th-assistant": STAR_RAIL_COPILOT_PROJECT_ID,
+}
+LEGACY_FEATURE_ID_MIGRATIONS = {
+    "m7a-universe": STAR_RAIL_ROGUE_FEATURE_ID,
+}
+MAA_ARKNIGHTS_FEATURE_ID = "maa-arknights-adaptive"
 MAAEND_PROFILE_FEATURE_ID = "maaend-profile"
 
 
@@ -270,7 +279,11 @@ class OpenSourceAutomationController:
         self._logs: deque[Dict[str, object]] = deque(maxlen=16)
         self._feature_adapters: Dict[str, object] = (
             {
-                STAR_RAIL_UNIVERSE_FEATURE_ID: StarRailAsuRuntimeController(
+                STAR_RAIL_ROGUE_FEATURE_ID: StarRailCopilotRuntimeController(
+                    adb,
+                    runtime_root,
+                ),
+                MAA_ARKNIGHTS_FEATURE_ID: MaaArknightsRuntimeController(
                     adb,
                     runtime_root,
                 ),
@@ -289,26 +302,63 @@ class OpenSourceAutomationController:
     def _projects() -> List[Dict[str, object]]:
         return [
             {
-                "id": "march7th-assistant",
-                "name": "March7thAssistant",
-                "short_name": "M7A",
-                "game": "崩坏：星穹铁道",
-                "summary": "覆盖日常、周常与工具箱任务的开源自动化项目。",
-                "source_url": "https://github.com/moesnow/March7thAssistant",
+                "id": "maa-arknights",
+                "name": "MaaAssistantArknights",
+                "short_name": "MAA",
+                "game": "明日方舟",
+                "summary": "首个完成非 16:9 真机端到端验收的开源自动化流程。",
+                "source_url": (
+                    "https://github.com/MaaAssistantArknights/"
+                    "MaaAssistantArknights"
+                ),
                 "selectable": True,
-                "status": "configurable",
-                "status_label": "功能可配置",
+                "role": "reference_implementation",
+                "role_label": "唯一跑通 · 重构基准",
+                "status": "verified",
+                "status_label": "端到端已验收",
                 "adapter_status": "pending",
-                "adapter_label": "执行适配器待接入",
+                "adapter_label": "等待 adaptive MaaCore 与官方资源",
                 "features": [
                     {
-                        "id": "m7a-universe",
+                        "id": "maa-arknights-adaptive",
+                        "name": "运行 MAA 真机任务",
+                        "category": "daily",
+                        "category_label": "自适应真机",
+                        "description": (
+                            "已跑通仓库、干员箱、启动、受控领奖，以及带危险退出"
+                            "护栏的界园肉鸽完整单轮。"
+                        ),
+                        "featured": True,
+                    },
+                ],
+            },
+            {
+                "id": "star-rail-copilot",
+                "name": "StarRailCopilot",
+                "short_name": "SRC",
+                "game": "崩坏：星穹铁道",
+                "summary": "已替换为原生 Android 设备栈；多分辨率与完整流程待验收。",
+                "source_url": "https://github.com/LmeSzinc/StarRailCopilot",
+                "selectable": True,
+                "role": "restructuring_candidate",
+                "role_label": "未跑通 · 重构对象",
+                "reference_project_id": "maa-arknights",
+                "status": "verification_pending",
+                "status_label": "端到端未验收",
+                "adapter_status": "pending",
+                "adapter_label": "禁止启动，等待按 MAA 经验重构",
+                "features": [
+                    {
+                        "id": "src-rogue",
                         "name": "自动模拟宇宙",
                         "category": "battle",
                         "category_label": "战斗",
-                        "description": "编排模拟宇宙 / 差分宇宙的自动化流程。",
-                        "featured": True,
-                    },
+                        "description": (
+                            "直接使用 SRC 的 ADB/scrcpy 与 MaaTouch/minitouch；当前仍受"
+                            "原生 1280×720 门禁限制。"
+                        ),
+                        "featured": False,
+                    }
                 ],
             },
             {
@@ -316,13 +366,16 @@ class OpenSourceAutomationController:
                 "name": "MaaEnd",
                 "short_name": "END",
                 "game": "明日方舟：终末地",
-                "summary": "使用官方 MaaEnd 发布包运行已配置的 ADB 自动化实例。",
+                "summary": "保留官方运行时目录与配置适配；完整任务流程尚未跑通。",
                 "source_url": "https://github.com/MaaEnd/MaaEnd",
                 "selectable": True,
-                "status": "configurable",
-                "status_label": "功能可配置",
+                "role": "restructuring_candidate",
+                "role_label": "未跑通 · 重构对象",
+                "reference_project_id": "maa-arknights",
+                "status": "verification_pending",
+                "status_label": "端到端未验收",
                 "adapter_status": "pending",
-                "adapter_label": "等待 MaaEnd 发布目录",
+                "adapter_label": "禁止启动，等待按 MAA 经验重构",
                 "features": [
                     {
                         "id": "maaend-profile",
@@ -330,10 +383,9 @@ class OpenSourceAutomationController:
                         "category": "daily",
                         "category_label": "实例任务",
                         "description": (
-                            "运行 MaaEnd 中已保存的 ADB 实例；任务与选项继续由 "
-                            "MaaEnd 管理。"
+                            "可读取 MaaEnd ADB 实例和任务配置；端到端验收前不可启动。"
                         ),
-                        "featured": True,
+                        "featured": False,
                     }
                 ],
             },
@@ -380,6 +432,22 @@ class OpenSourceAutomationController:
         else:
             requested_project_ids = cls._selection_ids(payload, "project_ids")
             requested_feature_ids = cls._selection_ids(payload, "feature_ids")
+
+        # Catalog v6 replaces the former M7A/ASU adapter.  Normalize both the
+        # persisted flat schema and the current nested schema so existing user
+        # selections move to SRC without presenting the retired project again.
+        requested_project_ids = list(
+            dict.fromkeys(
+                LEGACY_PROJECT_ID_MIGRATIONS.get(project_id, project_id)
+                for project_id in requested_project_ids
+            )
+        )
+        requested_feature_ids = list(
+            dict.fromkeys(
+                LEGACY_FEATURE_ID_MIGRATIONS.get(feature_id, feature_id)
+                for feature_id in requested_feature_ids
+            )
+        )
 
         if len(requested_project_ids) > 1:
             raise ValueError("only one open-source automation project may be selected")
@@ -575,40 +643,40 @@ class OpenSourceAutomationController:
     def _alignment() -> List[Dict[str, str]]:
         return [
             {
-                "feature": "点击图片 / 查找图片",
-                "upstream": "模板、阈值、检测区域、重试",
+                "feature": "截图与坐标空间",
+                "upstream": "物理 display → active viewport → 1280×720 logical",
                 "status": "ready",
-                "current": "OpenCV 多尺度模板匹配、阈值、归一化 ROI 与证据框",
+                "current": "MAA adaptive Left/Center/Right 已在 2800×1260 真机闭环",
             },
             {
-                "feature": "流程编排",
-                "upstream": "顺序步骤与 if / for / while",
+                "feature": "输入统一入口",
+                "upstream": "click / swipe / DOWN / MOVE 统一经过坐标代理",
+                "status": "ready",
+                "current": "ControlScaleProxy 覆盖普通输入与多点触控，源码审计防回归",
+            },
+            {
+                "feature": "直接 analyzer 审计",
+                "upstream": "绕过通用识别器的战斗、编队、仓库等路径",
                 "status": "partial",
-                "current": "强类型状态图、最短路径与 transition 上限；通用循环编辑器待接入",
+                "current": "MAA 已显式声明各页面 alignment；其它项目仍需逐路径清点",
             },
             {
-                "feature": "点击坐标 / 按键",
-                "upstream": "直接执行桌面输入",
-                "status": "partial",
-                "current": "JSON 动作已强类型化；真机 ADB Gateway 与审批策略待接入",
+                "feature": "危险动作权限",
+                "upstream": "资源层护栏优先于 callback 后抢停",
+                "status": "ready",
+                "current": "肉鸽 ExitThenAbandon 默认 Stop；Award 要求单次账号变更确认",
             },
             {
-                "feature": "点击文字 / 查找文字",
-                "upstream": "OCR 文字识别",
-                "status": "planned",
-                "current": "当前未引入 OCR 模型，优先保持安装体积可控",
+                "feature": "证据与问题闭环",
+                "upstream": "运行 manifest、callbacks、截图、incident、fingerprint",
+                "status": "ready",
+                "current": "问题账本、fixture promotion、资源/补丁漂移门禁已落地",
             },
             {
-                "feature": "模板采集 / 导入导出",
-                "upstream": "截图框选、流程素材目录与 ZIP",
-                "status": "planned",
-                "current": "已定义独立资源包格式；采集器与资源包管理前端待实现",
-            },
-            {
-                "feature": "运行与调试",
-                "upstream": "完整流程、选中步骤、停止与日志",
-                "status": "demo",
-                "current": "本页可运行合成验证、查看耗时/坐标/证据与日志",
+                "feature": "端到端验收门",
+                "upstream": "预检 → 完整流程 → 自然终点 → 可重复回归",
+                "status": "ready",
+                "current": "当前只有明日方舟 MAA 通过；崩铁和终末地保持禁用",
             },
         ]
 
@@ -650,6 +718,7 @@ class OpenSourceAutomationController:
         for project in projects:
             available_count = 0
             planned_count = 0
+            unverified_count = 0
             project_selectable = project.get("selectable") is True
             features = project.get("features", [])
             for feature in features:
@@ -672,7 +741,12 @@ class OpenSourceAutomationController:
                     )
                     planned_count += 1
                     continue
-                available = adapter.get("available") is True
+                runtime_available = adapter.get("available") is True
+                # Verification is deliberately fail-closed.  A newly added adapter
+                # must opt in only after a complete physical-device flow reaches its
+                # natural endpoint; merely exposing snapshot()/start() is not enough.
+                verified = adapter.get("end_to_end_verified") is True
+                available = runtime_available and verified
                 running = adapter.get("running") is True
                 feature.update(
                     {
@@ -680,12 +754,25 @@ class OpenSourceAutomationController:
                             adapter.get("adapter_id") or "external-runtime"
                         ),
                         "implementation_status": (
-                            "running" if running else "ready" if available else "runtime_missing"
+                            "running"
+                            if running
+                            else "ready"
+                            if available
+                            else "unverified"
+                            if not verified
+                            else "runtime_missing"
                         ),
                         "implementation_label": (
-                            "运行中" if running else "已接入" if available else "运行时未安装"
+                            "运行中"
+                            if running
+                            else "端到端已验收"
+                            if available
+                            else "端到端未验收"
+                            if not verified
+                            else "运行时未安装"
                         ),
                         "can_execute": available,
+                        "end_to_end_verified": verified,
                         "runtime_status": str(adapter.get("status") or "unknown"),
                     }
                 )
@@ -693,15 +780,24 @@ class OpenSourceAutomationController:
                     available_count += 1
                 else:
                     planned_count += 1
+                if not verified:
+                    unverified_count += 1
             project["available_feature_count"] = available_count
             project["planned_feature_count"] = planned_count
+            project["unverified_feature_count"] = unverified_count
             if project_selectable:
                 project["adapter_status"] = (
-                    "ready" if available_count else "runtime_missing"
+                    "ready"
+                    if available_count
+                    else "unverified"
+                    if unverified_count
+                    else "runtime_missing"
                 )
                 project["adapter_label"] = (
                     f"{available_count} 项功能可运行"
                     if available_count
+                    else f"{unverified_count} 项端到端未验收"
+                    if unverified_count
                     else "功能可配置，运行时待安装"
                 )
                 project["status_label"] = project["adapter_label"]
@@ -717,11 +813,14 @@ class OpenSourceAutomationController:
             feature_id
             for feature_id in selected_feature_ids
             if adapter_snapshots.get(feature_id, {}).get("available") is True
+            and adapter_snapshots.get(feature_id, {}).get("end_to_end_verified")
+            is True
         ]
         preflightable = [
             feature_id
             for feature_id in selected_feature_ids
             if feature_id in adapter_snapshots
+            and adapter_snapshots[feature_id].get("end_to_end_verified") is True
             and (
                 adapter_snapshots[feature_id].get("available") is True
                 or (
@@ -740,6 +839,12 @@ class OpenSourceAutomationController:
             feature_id
             for feature_id in selected_feature_ids
             if feature_id not in runnable
+        ]
+        unverified = [
+            feature_id
+            for feature_id in selected_feature_ids
+            if feature_id in adapter_snapshots
+            and adapter_snapshots[feature_id].get("end_to_end_verified") is not True
         ]
         running = [
             feature_id
@@ -774,6 +879,10 @@ class OpenSourceAutomationController:
             status = "preflight_required"
             label = "需要运行真机预检"
             detail = "填写运行时配置并完成预检后，才允许启动所选功能。"
+        elif unverified:
+            status = "verification_pending"
+            label = "端到端尚未验收"
+            detail = "该适配器保留用于重构与诊断；完整真机流程跑通前禁止启动。"
         else:
             status = "runtime_pending"
             label = "外部运行时尚未就绪"
@@ -790,6 +899,7 @@ class OpenSourceAutomationController:
             "runnable_feature_ids": runnable,
             "preflight_feature_ids": preflightable,
             "pending_feature_ids": pending,
+            "unverified_feature_ids": unverified,
             "ready_feature_ids": ready,
             "running_feature_ids": running,
         }
@@ -830,6 +940,14 @@ class OpenSourceAutomationController:
 
     def preflight(self, payload: Dict[str, object]) -> Dict[str, object]:
         feature_id, adapter = self._resolve_feature_adapter(payload)
+        adapter_state = getattr(adapter, "snapshot", lambda: {})()
+        if (
+            not isinstance(adapter_state, dict)
+            or adapter_state.get("end_to_end_verified") is not True
+        ):
+            raise RuntimeError(
+                f"feature has not passed end-to-end physical-device verification: {feature_id}"
+            )
         method = getattr(adapter, "preflight", None)
         if not callable(method):
             raise RuntimeError(f"feature does not support preflight: {feature_id}")
@@ -850,6 +968,14 @@ class OpenSourceAutomationController:
 
     def start(self, payload: Dict[str, object]) -> Dict[str, object]:
         feature_id, adapter = self._resolve_feature_adapter(payload)
+        adapter_state = getattr(adapter, "snapshot", lambda: {})()
+        if (
+            not isinstance(adapter_state, dict)
+            or adapter_state.get("end_to_end_verified") is not True
+        ):
+            raise RuntimeError(
+                f"feature has not passed end-to-end physical-device verification: {feature_id}"
+            )
         method = getattr(adapter, "start", None)
         if not callable(method):
             raise RuntimeError(f"feature does not support start: {feature_id}")
@@ -904,7 +1030,7 @@ class OpenSourceAutomationController:
         return {
             "status": status,
             "running": running,
-            "catalog_version": 3,
+            "catalog_version": 6,
             "projects": projects,
             "selection": {
                 "schema_version": 2,
@@ -929,6 +1055,18 @@ class OpenSourceAutomationController:
             },
             "bundle": self._bundle_summary(),
             "alignment": self._alignment(),
+            "verification_policy": {
+                "mode": "fail_closed",
+                "reference_project_id": "maa-arknights",
+                "reference_feature_id": MAA_ARKNIGHTS_FEATURE_ID,
+                "required_adapter_flag": "end_to_end_verified=true",
+                "acceptance_path": [
+                    "physical-device preflight",
+                    "complete task flow",
+                    "natural endpoint",
+                    "reproducible regression",
+                ],
+            },
             "demo": {
                 "default_iterations": DEFAULT_DEMO_ITERATIONS,
                 "max_iterations": MAX_DEMO_ITERATIONS,
@@ -947,15 +1085,17 @@ class OpenSourceAutomationController:
                 "external_runtime_policy": "upstream_process_permissions",
                 "device_gateway": any(
                     adapter.get("available") is True
+                    and adapter.get("end_to_end_verified") is True
                     for adapter in adapters.values()
                 ),
                 "device_gateway_detail": (
                     "已接入受验证的外部运行时；第三方原生代码按其自身权限运行"
                     if any(
                         adapter.get("available") is True
+                        and adapter.get("end_to_end_verified") is True
                         for adapter in adapters.values()
                     )
-                    else "外部项目运行时尚未安装"
+                    else "当前没有已通过端到端验收且可用的外部运行时"
                 ),
             },
         }

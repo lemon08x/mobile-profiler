@@ -6829,7 +6829,8 @@
     target.innerHTML = integratedProjects.length
       ? integratedProjects.map(project => {
         const projectId = String(project?.id || "");
-        return `<option value="${escapeHtml(projectId)}" ${project === active ? "selected" : ""}>${escapeHtml(project?.game || project?.name || projectId)}</option>`;
+        const maturity = project?.role === "reference_implementation" ? "唯一已验收" : "未跑通";
+        return `<option value="${escapeHtml(projectId)}" ${project === active ? "selected" : ""}>${escapeHtml(project?.game || project?.name || projectId)} · ${maturity}</option>`;
       }).join("")
       : '<option value="">暂无已接入项目</option>';
     target.disabled = app.openSourceSelectionSaving || !integratedProjects.length;
@@ -6839,7 +6840,7 @@
     $("#opensource-project-summary").textContent = active?.summary || "等待项目说明";
     $("#opensource-project-count").textContent = active?.adapter_label
       || active?.status_label
-      || "适配器已接入";
+      || "适配器入口已登记";
     const source = $("#opensource-project-source");
     if (active?.source_url) {
       source.href = active.source_url;
@@ -7148,7 +7149,7 @@
                 <label class="opensource-feature-card ${selected ? "selected" : ""} ${feature?.featured ? "featured" : ""} status-${escapeHtml(implementationStatus)}">
                   <input class="opensource-feature-checkbox" type="checkbox" data-open-source-feature="${escapeHtml(featureId)}" data-open-source-project="${escapeHtml(project?.id || "")}" ${selected ? "checked" : ""}>
                   <i aria-hidden="true"></i>
-                  <span><span class="opensource-feature-meta"><small>${feature?.featured ? "推荐功能" : escapeHtml(label)}</small><em class="${escapeHtml(implementationStatus)}">${escapeHtml(implementationLabel)}</em></span><strong>${escapeHtml(feature?.name || featureId)}</strong><p>${escapeHtml(feature?.description || "等待功能说明")}</p></span>
+                  <span><span class="opensource-feature-meta"><small>${project?.role === "reference_implementation" ? "重构基准" : "重构诊断"}</small><em class="${escapeHtml(implementationStatus)}">${escapeHtml(implementationLabel)}</em></span><strong>${escapeHtml(feature?.name || featureId)}</strong><p>${escapeHtml(feature?.description || "等待功能说明")}</p></span>
                 </label>`;
             }).join("")}</div>
           </section>`;
@@ -7197,10 +7198,10 @@
       ? "保存后应用本次修改"
       : hasFeatures ? (execution.label || (runnableCount ? "功能可预检" : "等待运行时配置")) : "等待选择功能";
     $("#opensource-execution-detail").textContent = app.openSourceSelectionDirty
-      ? `当前草稿包含 ${selectedFeatures.length} 项功能，其中 ${runnableCount} 项已接入。`
+      ? `当前草稿包含 ${selectedFeatures.length} 项功能，其中 ${runnableCount} 项通过端到端验收。`
       : hasFeatures
-        ? (execution.detail || `当前 ${runnableCount} 项功能已接入执行适配器。`)
-        : "至少选择一项已接入功能，保存后形成当前项目的执行方案。";
+        ? (execution.detail || `当前 ${runnableCount} 项功能通过端到端验收。`)
+        : "至少选择一个适配器入口，保存后形成当前项目的执行方案。";
   }
 
   function renderOpenSourceCatalog(moduleState = {}) {
@@ -7645,10 +7646,15 @@
       universe_ui: "模拟宇宙界面",
       wrong_app: "目标游戏未在前台",
       device_asleep: "真机未亮屏",
+      device_offline: "ADB 设备不可用",
+      package_missing: "目标游戏未安装",
       wrong_orientation: "游戏不是横屏",
+      unsupported_resolution: "当前分辨率尚未适配",
+      screenshot_error: "ADB 截图失败",
       vision_error: "识别失败",
       maaend_profile_ready: "MaaEnd 实例就绪",
       maaend_launch_ready: "可由 MaaEnd 启动游戏",
+      account_mutation_not_confirmed: "尚未确认账号变更",
       profile_missing: "MaaEnd 实例不存在",
       profile_incompatible: "实例不兼容 ADB",
       unsafe_profile: "实例含前置程序",
@@ -7746,6 +7752,8 @@
     );
     const available = adapter?.available === true;
     const running = adapter?.running === true;
+    const adapterId = String(adapter?.adapter_id || "");
+    const endToEndVerified = adapter?.end_to_end_verified === true;
     const mxuApi = adapter?.mxu_api && typeof adapter.mxu_api === "object"
       ? adapter.mxu_api
       : {};
@@ -7806,9 +7814,11 @@
       ? String(upstream.version)
       : profile.name
         ? String(profile.name)
-        : upstream.map_count
-          ? `${Number(upstream.map_count)} 张地图`
-          : available ? "已安装" : "未安装";
+        : upstream.route_count
+          ? `${Number(upstream.route_count)} 条路线`
+          : upstream.map_count
+            ? `${Number(upstream.map_count)} 张地图`
+            : available ? "已安装" : "未安装";
     $("#opensource-runtime-upstream").title = upstream.repository || upstream.path || "";
     $("#opensource-runtime-disk").textContent = finite(upstream.disk_mib)
       ? `${Number(upstream.disk_mib).toFixed(1)} MiB`
@@ -7820,8 +7830,11 @@
     const errorSummary = String(errorLines[errorLines.length - 1] || "").slice(-320);
     if (!featureId) {
       $("#opensource-runtime-detail").textContent = selection.featureIds.length
-        ? "当前所选功能尚待适配；请选择一个标记为“已接入”的功能。"
-        : "选择并保存一个已接入功能后，可对顶部当前 Android 真机运行预检。";
+        ? "当前所选功能没有适配器入口。"
+        : "选择并保存一个适配器入口；只有端到端已验收流程才允许真机预检。";
+    } else if (!endToEndVerified) {
+      $("#opensource-runtime-detail").textContent = adapter?.verification?.reason
+        || "该流程尚未通过完整真机端到端验收，当前只保留诊断信息并禁止启动。";
     } else if (!available || status === "error") {
       $("#opensource-runtime-detail").textContent = errorSummary
         || (available
@@ -7829,10 +7842,20 @@
           : canConfigureMissing
             ? "填写外部运行时目录与实例名，然后运行预检。"
             : "外部运行时尚未安装，功能方案仍可保存。");
+    } else if (running && adapterId === "maa-arknights") {
+      const progress = adapter?.progress && typeof adapter.progress === "object"
+        ? adapter.progress
+        : {};
+      $("#opensource-runtime-detail").textContent = `MAA Core 正在执行 ${progress.task_label || progress.task || "真机任务"}；识别与输入固定使用 ${progress.viewport || "adaptive"} viewport，运行证据仅保存在本机。`;
     } else if (running) {
       const phase = mxuPhaseLabels[String(mxuApi?.phase || "")] || String(mxuApi?.phase || "运行中");
       const progress = mxuTasks.length ? `；逐任务成功 ${mxuSucceeded}/${mxuTasks.length}` : "";
       $("#opensource-runtime-detail").textContent = `MXU API：${phase}${progress}；状态仅来自 /api/maa/state。`;
+    } else if (status === "completed" && adapterId === "maa-arknights") {
+      const result = adapter?.result && typeof adapter.result === "object" ? adapter.result : {};
+      $("#opensource-runtime-detail").textContent = result?.one_round_completed === true
+        ? `MAA 界园单轮已自然闭环；game_pass=${String(result?.game_pass)}。`
+        : `MAA ${adapter?.progress?.task_label || adapter?.progress?.task || "任务"} 已完成，证据目录已保留。`;
     } else if (status === "completed" && mxuTasks.length) {
       $("#opensource-runtime-detail").textContent = `MXU API 已确认 ${mxuSucceeded}/${mxuTasks.length} 项任务全部 succeeded。`;
     } else if (gameReady) {
@@ -7857,8 +7880,8 @@
       : (Array.isArray(adapter?.game_catalog?.tasks) && adapter.game_catalog.tasks.length
         ? "保存 MaaEnd 任务"
         : "载入目录 / 保存任务");
-    preflightButton.disabled = busy || running || (!available && !canConfigureMissing) || !saved || !(isMaaEnd ? usbReady : androidReady) || app.openSourceSelectionDirty || maaEndDirty;
-    startButton.disabled = busy || running || !available || !saved || !gameReady || app.openSourceSelectionDirty || maaEndDirty;
+    preflightButton.disabled = busy || running || !endToEndVerified || (!available && !canConfigureMissing) || !saved || !(isMaaEnd ? usbReady : androidReady) || app.openSourceSelectionDirty || maaEndDirty;
+    startButton.disabled = busy || running || !endToEndVerified || !available || !saved || !gameReady || app.openSourceSelectionDirty || maaEndDirty;
     stopButton.disabled = busy || !running;
     preflightButton.textContent = app.openSourceRuntimeAction === "preflight" ? "正在预检..." : "运行预检";
     startButton.textContent = app.openSourceRuntimeAction === "start" ? "正在启动..." : "启动所选功能";

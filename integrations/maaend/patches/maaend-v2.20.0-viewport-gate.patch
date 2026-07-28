@@ -1,0 +1,4973 @@
+diff --git a/agent/cpp-algo/CMakeLists.txt b/agent/cpp-algo/CMakeLists.txt
+index 20b9804..0d6d271 100644
+--- a/agent/cpp-algo/CMakeLists.txt
++++ b/agent/cpp-algo/CMakeLists.txt
+@@ -5,17 +5,23 @@ project(maaend-cpp-agent)
+ include(MaaUtils/MaaUtils.cmake)
+ add_library(HeaderOnlyLibraries INTERFACE)
+ 
+-set(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../deps)
++set(
++    DEPS_DIR
++    "${CMAKE_CURRENT_SOURCE_DIR}/../../deps"
++    CACHE PATH
++    "Pinned MaaFramework installation used by the C++ agent")
+ 
+-if(NOT EXISTS ${DEPS_DIR})
++if(NOT EXISTS "${DEPS_DIR}")
+     message(FATAL_ERROR "Dependencies directory not found: ${DEPS_DIR}")
+ endif()
+ 
+-# MaaFramework only ships RelWithDebInfo config, map all other configs to it
+-set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO RelWithDebInfo)
+-set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL RelWithDebInfo)
+-set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE RelWithDebInfo)
+-set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG RelWithDebInfo)
++# The pinned MaaFramework install exports a single Release configuration.
++# Map every consumer configuration to that explicit import so single- and
++# multi-config generators resolve the same DLL/import-library pair.
++set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
++set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
++set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE Release)
++set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
+ 
+ set(MaaFramework_DIR ${DEPS_DIR}/share/cmake/MaaFramework)
+ find_package(MaaFramework REQUIRED)
+diff --git a/agent/cpp-algo/cmake/WebView2.cmake b/agent/cpp-algo/cmake/WebView2.cmake
+index 3c0d67a..276e237 100644
+--- a/agent/cpp-algo/cmake/WebView2.cmake
++++ b/agent/cpp-algo/cmake/WebView2.cmake
+@@ -116,15 +116,15 @@ if(NOT EXISTS "${_webview2_loader_implib}")
+ endif()
+ 
+ add_library(WebView2::WebView2 SHARED IMPORTED GLOBAL)
+-# 顶层 CMakeLists 通过 CMAKE_MAP_IMPORTED_CONFIG_* 把所有 config 都映射到 RELWITHDEBINFO，
+-# 因此必须为 RELWITHDEBINFO 后缀显式设置 IMPORTED_LOCATION/IMPLIB；
+-# 同时保留无后缀属性作为兜底，覆盖未启用 config-mapping 的调用方（例如直接 ninja 单 config）。
++# Keep this target on the same Release import contract as the pinned
++# MaaFramework package. The unsuffixed properties remain as a fallback for
++# consumers that do not configure CMAKE_MAP_IMPORTED_CONFIG_*.
+ set_target_properties(WebView2::WebView2 PROPERTIES
+-    IMPORTED_CONFIGURATIONS "RELWITHDEBINFO"
++    IMPORTED_CONFIGURATIONS "RELEASE"
+     IMPORTED_LOCATION "${_webview2_loader_dll}"
+     IMPORTED_IMPLIB "${_webview2_loader_implib}"
+-    IMPORTED_LOCATION_RELWITHDEBINFO "${_webview2_loader_dll}"
+-    IMPORTED_IMPLIB_RELWITHDEBINFO "${_webview2_loader_implib}"
++    IMPORTED_LOCATION_RELEASE "${_webview2_loader_dll}"
++    IMPORTED_IMPLIB_RELEASE "${_webview2_loader_implib}"
+     INTERFACE_INCLUDE_DIRECTORIES "${_webview2_include_dir}")
+ 
+ message(STATUS "WebView2 SDK enabled (arch=${_webview2_arch}, dynamic): ${WEBVIEW2_SDK_DIR}")
+diff --git a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
+index 48f2ed5..ab88be9 100644
+--- a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
++++ b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
+@@ -17,6 +17,7 @@
+ #include <unistd.h>
+ #endif
+ #include "../utils.h"
++#include "../Viewport/ViewportSession.h"
+ 
+ #include "MapLocateAction.h"
+ #include "MapLocator.h"
+@@ -46,8 +47,20 @@ struct LocateOutput
+     double rot = 0.0;
+     double locConf = 0.0;
+     int latencyMs = 0;
++    std::string viewportAlignment;
++    std::uint64_t frameId = 0;
+ 
+-    MEO_JSONIZATION(status, message, MEO_OPT mapName, MEO_OPT x, MEO_OPT y, MEO_OPT rot, MEO_OPT locConf, MEO_OPT latencyMs)
++    MEO_JSONIZATION(
++        status,
++        message,
++        MEO_OPT mapName,
++        MEO_OPT x,
++        MEO_OPT y,
++        MEO_OPT rot,
++        MEO_OPT locConf,
++        MEO_OPT latencyMs,
++        MEO_OPT viewportAlignment,
++        MEO_OPT frameId)
+ };
+ 
+ struct MapLocateAssertLocationParam
+@@ -74,6 +87,8 @@ struct MapLocateAssertLocationOutput
+     double locConf = 0.0;
+     int latencyMs = 0;
+     std::vector<double> target;
++    std::string viewportAlignment;
++    std::uint64_t frameId = 0;
+ 
+     MEO_JSONIZATION(
+         status,
+@@ -86,7 +101,9 @@ struct MapLocateAssertLocationOutput
+         MEO_OPT rot,
+         MEO_OPT locConf,
+         MEO_OPT latencyMs,
+-        MEO_OPT target)
++        MEO_OPT target,
++        MEO_OPT viewportAlignment,
++        MEO_OPT frameId)
+ };
+ 
+ fs::path getExeDir()
+@@ -116,11 +133,13 @@ void WriteJsonDetail(MaaStringBuffer* out_detail, const T& payload)
+     MaaStringBufferSet(out_detail, json_text.c_str());
+ }
+ 
+-LocateOutput BuildLocateOutput(const LocateResult& result)
++LocateOutput BuildLocateOutput(const LocateResult& result, const maaend::viewport::ViewportFrame& frame)
+ {
+     LocateOutput output;
+     output.status = static_cast<int>(result.status);
+     output.message = result.debugMessage;
++    output.viewportAlignment = "center";
++    output.frameId = frame.frame_id;
+     if (!result.position.has_value()) {
+         return output;
+     }
+@@ -135,7 +154,11 @@ LocateOutput BuildLocateOutput(const LocateResult& result)
+     return output;
+ }
+ 
+-MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& result, const MapLocateAssertLocationParam& param, bool matched)
++MapLocateAssertLocationOutput BuildAssertLocationOutput(
++    const LocateResult& result,
++    const MapLocateAssertLocationParam& param,
++    bool matched,
++    const maaend::viewport::ViewportFrame& frame)
+ {
+     MapLocateAssertLocationOutput output;
+     output.status = static_cast<int>(result.status);
+@@ -144,6 +167,8 @@ MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& resu
+     output.message = result.debugMessage;
+     output.zoneId = param.zone_id;
+     output.target = param.target;
++    output.viewportAlignment = "center";
++    output.frameId = frame.frame_id;
+     if (!result.position.has_value()) {
+         return output;
+     }
+@@ -282,28 +307,26 @@ bool UsesAdbMinimapRoi(std::string_view controller_type)
+     return equals_ignore_case("adb") || equals_ignore_case("playcover") || equals_ignore_case("play_cover");
+ }
+ 
+-bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const LocateOptions& options, LocateResult* out_result)
++bool TryLocateOnMinimap(
++	MaaContext* context,
++	const MaaImageBuffer* image,
++	const LocateOptions& options,
++	LocateResult* out_result,
++	maaend::viewport::ViewportFrame* out_frame)
+ {
+-    if (out_result == nullptr) {
++    if (out_result == nullptr || out_frame == nullptr) {
+         return false;
+     }
+ 
+-    const MaaImageBuffer* actual_image = image;
+-    ScopedImageBuffer captured_image;
+-    if (actual_image == nullptr || MaaImageBufferIsEmpty(actual_image)) {
+-        auto controller = MaaTaskerGetController(MaaContextGetTasker(context));
+-        const MaaCtrlId screencap_id = MaaControllerPostScreencap(controller);
+-        MaaControllerWait(controller, screencap_id);
+-        if (!MaaControllerCachedImage(controller, captured_image.Get()) || MaaImageBufferIsEmpty(captured_image.Get())) {
+-            LogError << "MapLocateRecognition: Image buffer is empty";
+-            return false;
+-        }
+-        actual_image = captured_image.Get();
+-    }
+-
+-    if (actual_image == nullptr || MaaImageBufferIsEmpty(actual_image)) {
+-        LogError << "MapLocateRecognition: Image buffer is empty";
+-        return false;
++	MaaController* controller = MaaTaskerGetController(MaaContextGetTasker(context));
++	maaend::viewport::ViewportSession viewport(controller);
++	auto frame = viewport.Adopt(image, MaaViewportAlignment_Center);
++	if (!frame.has_value()) {
++		frame = viewport.Capture(MaaViewportAlignment_Center, true);
++	}
++	if (!frame.has_value() || frame->image.empty()) {
++		LogError << "MapLocateRecognition: Image buffer is empty";
++		return false;
+     }
+ 
+     auto locator = getOrInitLocator();
+@@ -313,13 +336,13 @@ bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const
+     }
+ 
+     cv::Mat minimap;
+-    const cv::Mat image_mat = to_mat(actual_image);
+-    if (!TryExtractMinimap(image_mat, UsesAdbMinimapRoi(DetectControllerType(context)), &minimap)) {
++	if (!TryExtractMinimap(frame->image, UsesAdbMinimapRoi(DetectControllerType(context)), &minimap)) {
+         LogError << "MapLocateRecognition: ROI empty";
+         return false;
+     }
+ 
+     *out_result = locator->locate(minimap, options);
++	*out_frame = std::move(frame.value());
+     return true;
+ }
+ 
+@@ -371,11 +394,12 @@ MaaBool MAA_CALL MapLocateRecognitionRun(
+     const LocateOptions options = ParseCustomRecognitionParam<LocateOptions>(custom_recognition_param);
+ 
+     LocateResult result;
+-    if (!TryLocateOnMinimap(context, image, options, &result)) {
++	maaend::viewport::ViewportFrame frame;
++	if (!TryLocateOnMinimap(context, image, options, &result, &frame)) {
+         return MAA_FALSE;
+     }
+ 
+-    WriteJsonDetail(out_detail, BuildLocateOutput(result));
++	WriteJsonDetail(out_detail, BuildLocateOutput(result, frame));
+ 
+     if (result.status == LocateStatus::Success && result.position.has_value()) {
+         if (out_box != nullptr) {
+@@ -430,10 +454,11 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+     LocateResult result;
+     bool settled = false;
+     MapPosition stable_pos {};
++	maaend::viewport::ViewportFrame viewport_frame;
+ 
+     for (int frame = 0; frame < kAssertSettleMaxFrames; ++frame) {
+         const MaaImageBuffer* frame_image = frame == 0 ? image : nullptr;
+-        if (!TryLocateOnMinimap(context, frame_image, options, &result)) {
++		if (!TryLocateOnMinimap(context, frame_image, options, &result, &viewport_frame)) {
+             return MAA_FALSE;
+         }
+ 
+@@ -466,7 +491,7 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+         result.position->x = stable_pos.x;
+         result.position->y = stable_pos.y;
+     }
+-    WriteJsonDetail(out_detail, BuildAssertLocationOutput(result, param, matched));
++	WriteJsonDetail(out_detail, BuildAssertLocationOutput(result, param, matched, viewport_frame));
+ 
+     if (!matched) {
+         if (settled) {
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
+index df4534b..dff27a2 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
+@@ -26,8 +26,12 @@ cv::Point ClampPoint(const cv::Point& point, const cv::Size& resolution)
+ 
+ } // namespace
+ 
+-AdbCameraSwipeDriver::AdbCameraSwipeDriver(MaaController* controller, AdbCameraSwipeDriverConfig config)
++AdbCameraSwipeDriver::AdbCameraSwipeDriver(
++    MaaController* controller,
++    std::shared_ptr<maaend::viewport::ViewportSession> viewport,
++    AdbCameraSwipeDriverConfig config)
+     : controller_(controller)
++    , viewport_(std::move(viewport))
+     , config_(std::move(config))
+ {
+ }
+@@ -86,10 +90,18 @@ bool AdbCameraSwipeDriver::ExecuteSwipe(const ScreenGeometry& geometry, int swip
+ 
+ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int swipe_dx) const
+ {
++	if (viewport_ == nullptr) {
++		return false;
++	}
++	const auto frame = viewport_->PreferredLabel(MaaViewportAlignment_Right);
++	if (!frame.has_value()) {
++		return false;
++	}
++
+     const cv::Point start = geometry.center;
+     const cv::Point end = ClampPoint({ geometry.center.x + swipe_dx, geometry.center.y }, geometry.resolution);
+ 
+-    if (!PostTouchDown(start)) {
++    if (!PostTouchDown(frame.value(), start)) {
+         return false;
+     }
+ 
+@@ -101,7 +113,7 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
+         const int next_x = static_cast<int>(std::lround(start.x + static_cast<double>(end.x - start.x) * ratio));
+         const int next_y = static_cast<int>(std::lround(start.y + static_cast<double>(end.y - start.y) * ratio));
+ 
+-        if (!PostTouchMove({ next_x, next_y })) {
++        if (!PostTouchMove(frame.value(), { next_x, next_y })) {
+             const bool ignored = PostTouchUp();
+             (void)ignored;
+             return false;
+@@ -122,59 +134,28 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
+     return true;
+ }
+ 
+-bool AdbCameraSwipeDriver::PostTouchDown(const cv::Point& point) const
++bool AdbCameraSwipeDriver::PostTouchDown(const maaend::viewport::ViewportFrame& frame, const cv::Point& point) const
+ {
+-    if (controller_ == nullptr) {
++    if (viewport_ == nullptr) {
+         return false;
+     }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchDown(controller_, config_.contact_id, point.x, point.y, config_.pressure);
+-    return WaitForControllerAction(ctrl_id, "touch_down");
++	return viewport_->TouchDown(frame, config_.contact_id, point, config_.pressure);
+ }
+ 
+-bool AdbCameraSwipeDriver::PostTouchMove(const cv::Point& point) const
++bool AdbCameraSwipeDriver::PostTouchMove(const maaend::viewport::ViewportFrame& frame, const cv::Point& point) const
+ {
+-    if (controller_ == nullptr) {
++    if (viewport_ == nullptr) {
+         return false;
+     }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchMove(controller_, config_.contact_id, point.x, point.y, config_.pressure);
+-    return WaitForControllerAction(ctrl_id, "touch_move");
++	return viewport_->TouchMove(frame, config_.contact_id, point, config_.pressure);
+ }
+ 
+ bool AdbCameraSwipeDriver::PostTouchUp() const
+ {
+-    if (controller_ == nullptr) {
+-        return false;
+-    }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchUp(controller_, config_.contact_id);
+-    return WaitForControllerAction(ctrl_id, "touch_up");
+-}
+-
+-bool AdbCameraSwipeDriver::EnsureControllerActionPosted(MaaCtrlId ctrl_id, const char* action_name) const
+-{
+-    if (ctrl_id != MaaInvalidId) {
+-        return true;
+-    }
+-
+-    LogWarn << "AdbCameraSwipeDriver: failed to post controller action." << VAR(action_name);
+-    return false;
+-}
+-
+-bool AdbCameraSwipeDriver::WaitForControllerAction(MaaCtrlId ctrl_id, const char* action_name) const
+-{
+-    if (!EnsureControllerActionPosted(ctrl_id, action_name)) {
++    if (viewport_ == nullptr) {
+         return false;
+     }
+-
+-    const MaaStatus status = MaaControllerWait(controller_, ctrl_id);
+-    if (status == MaaStatus_Succeeded) {
+-        return true;
+-    }
+-
+-    LogWarn << "AdbCameraSwipeDriver: controller action did not succeed." << VAR(action_name) << VAR(ctrl_id) << VAR(status);
+-    return false;
++	return viewport_->TouchUp(config_.contact_id);
+ }
+ 
+ void AdbCameraSwipeDriver::SleepIfNeeded(int delay_millis)
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.h b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.h
+index b360002..5138b84 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.h
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.h
+@@ -1,11 +1,13 @@
+ #pragma once
+ 
++#include <memory>
+ #include <optional>
+ 
+ #include <MaaFramework/MaaAPI.h>
+ #include <MaaUtils/NoWarningCV.hpp>
+ 
+ #include "../../navi_config.h"
++#include "../../../Viewport/ViewportSession.h"
+ 
+ namespace mapnavigator::backend::adb
+ {
+@@ -34,7 +36,10 @@ struct AdbCameraSwipeDriverConfig
+ class AdbCameraSwipeDriver
+ {
+ public:
+-    AdbCameraSwipeDriver(MaaController* controller, AdbCameraSwipeDriverConfig config = {});
++    AdbCameraSwipeDriver(
++        MaaController* controller,
++        std::shared_ptr<maaend::viewport::ViewportSession> viewport,
++        AdbCameraSwipeDriverConfig config = {});
+ 
+     bool SwipeByPixels(int dx, int dy) const;
+ 
+@@ -52,14 +57,13 @@ private:
+     std::optional<ScreenGeometry> GetScreenGeometry() const;
+     bool ExecuteSwipe(const ScreenGeometry& geometry, int swipe_dx) const;
+     bool ExecuteStableDrag(const ScreenGeometry& geometry, int swipe_dx) const;
+-    bool PostTouchDown(const cv::Point& point) const;
+-    bool PostTouchMove(const cv::Point& point) const;
++    bool PostTouchDown(const maaend::viewport::ViewportFrame& frame, const cv::Point& point) const;
++    bool PostTouchMove(const maaend::viewport::ViewportFrame& frame, const cv::Point& point) const;
+     bool PostTouchUp() const;
+-    bool EnsureControllerActionPosted(MaaCtrlId ctrl_id, const char* action_name) const;
+-    bool WaitForControllerAction(MaaCtrlId ctrl_id, const char* action_name) const;
+     static void SleepIfNeeded(int delay_millis);
+ 
+     MaaController* controller_ = nullptr;
++	std::shared_ptr<maaend::viewport::ViewportSession> viewport_;
+     AdbCameraSwipeDriverConfig config_;
+ };
+ 
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
+index 61e9e35..95faf47 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
+@@ -18,25 +18,6 @@ namespace
+ 
+ constexpr int32_t kReferenceFrameHeight = 720;
+ 
+-class ScopedImageBuffer
+-{
+-public:
+-    ScopedImageBuffer()
+-        : buffer_(MaaImageBufferCreate())
+-    {
+-    }
+-
+-    ~ScopedImageBuffer() { MaaImageBufferDestroy(buffer_); }
+-
+-    ScopedImageBuffer(const ScopedImageBuffer&) = delete;
+-    ScopedImageBuffer& operator=(const ScopedImageBuffer&) = delete;
+-
+-    MaaImageBuffer* Get() const { return buffer_; }
+-
+-private:
+-    MaaImageBuffer* buffer_ = nullptr;
+-};
+-
+ AdbCameraSwipeDriverConfig MakeDefaultCameraSwipeDriverConfig(std::string_view controller_type)
+ {
+     AdbCameraSwipeDriverConfig config;
+@@ -92,12 +73,13 @@ bool HasUsableBlindActionZoneGate(const maplocator::YoloCoarseResult& coarse)
+ 
+ AdbInputBackend::AdbInputBackend(MaaController* ctrl, std::string controller_type, std::shared_ptr<maplocator::MapLocator> locator)
+     : ctrl_(ctrl)
++    , viewport_(std::make_shared<maaend::viewport::ViewportSession>(ctrl))
+     , controller_type_(std::move(controller_type))
+     , default_turn_units_per_degree_(ComputeDefaultTurnUnitsPerDegree(ctrl))
+     , has_locator_(locator != nullptr)
+-    , camera_swipe_driver_(ctrl, MakeDefaultCameraSwipeDriverConfig(controller_type_))
++    , camera_swipe_driver_(ctrl, viewport_, MakeDefaultCameraSwipeDriverConfig(controller_type_))
+     , zone_guard_(locator)
+-    , joystick_driver_(ctrl, locator, MakeDefaultJoystickDriverConfig(controller_type_))
++    , joystick_driver_(ctrl, locator, viewport_, MakeDefaultJoystickDriverConfig(controller_type_))
+     , action_buttons_(MakeDefaultActionButtonLayout(controller_type_))
+ {
+     if (ctrl_ == nullptr) {
+@@ -113,6 +95,14 @@ AdbInputBackend::AdbInputBackend(MaaController* ctrl, std::string controller_typ
+             << VAR(kAdbTouchTurnProfile.post_swipe_settle_ms);
+ }
+ 
++AdbInputBackend::~AdbInputBackend()
++{
++	const bool joystick_released = joystick_driver_.Release(0);
++	const bool contacts_released = viewport_ == nullptr || viewport_->ReleaseTouches();
++	(void)joystick_released;
++	(void)contacts_released;
++}
++
+ MaaController* AdbInputBackend::GetCtrl() const
+ {
+     return ctrl_;
+@@ -285,23 +275,16 @@ void AdbInputBackend::ApplyMovementState(int delay_millis)
+ 
+ bool AdbInputBackend::CaptureFrame(cv::Mat* out_image) const
+ {
+-    if (out_image == nullptr || ctrl_ == nullptr) {
++    if (out_image == nullptr || viewport_ == nullptr) {
+         return false;
+     }
+ 
+-    ScopedImageBuffer buffer;
+-    const MaaCtrlId screencap_id = MaaControllerPostScreencap(ctrl_);
+-    MaaControllerWait(ctrl_, screencap_id);
+-    if (!MaaControllerCachedImage(ctrl_, buffer.Get()) || MaaImageBufferIsEmpty(buffer.Get())) {
++	const auto frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++	if (!frame.has_value() || frame->image.empty()) {
+         return false;
+     }
+ 
+-    *out_image = cv::Mat(
+-                     MaaImageBufferHeight(buffer.Get()),
+-                     MaaImageBufferWidth(buffer.Get()),
+-                     MaaImageBufferType(buffer.Get()),
+-                     MaaImageBufferGetRawData(buffer.Get()))
+-                     .clone();
++	*out_image = frame->image;
+     return !out_image->empty();
+ }
+ 
+@@ -344,8 +327,7 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
+ 
+     SleepIfNeeded(hold_millis);
+ 
+-    const MaaCtrlId up_id = MaaControllerPostTouchUp(ctrl_, target.contact_id);
+-    if (!WaitForControllerAction(up_id, "touch_up")) {
++	if (viewport_ == nullptr || !viewport_->TouchUp(target.contact_id)) {
+         return false;
+     }
+ 
+@@ -355,14 +337,16 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
+ 
+ bool AdbInputBackend::TouchDownTargetSync(const AdbTapTarget& target) const
+ {
++	if (viewport_ == nullptr) {
++		return false;
++	}
+     const cv::Point point(std::clamp(target.point.x, 0, kWorkWidth - 1), std::clamp(target.point.y, 0, kReferenceFrameHeight - 1));
+-    const MaaCtrlId move_id = MaaControllerPostTouchMove(ctrl_, target.contact_id, point.x, point.y, 0);
+-    if (!WaitForControllerAction(move_id, "touch_move")) {
++	const auto frame = viewport_->PreferredLabel(MaaViewportAlignment_Right);
++	if (!frame.has_value() || !viewport_->TouchMove(frame.value(), target.contact_id, point, 0)) {
+         return false;
+     }
+ 
+-    const MaaCtrlId down_id = MaaControllerPostTouchDown(ctrl_, target.contact_id, point.x, point.y, 0);
+-    if (!WaitForControllerAction(down_id, "touch_down")) {
++	if (!viewport_->TouchDown(frame.value(), target.contact_id, point, 0)) {
+         return false;
+     }
+ 
+@@ -394,29 +378,12 @@ void AdbInputBackend::MouseRightUpOnTargetSync(int contact_id, int delay_millis)
+         return;
+     }
+ 
+-    const MaaCtrlId up_id = MaaControllerPostTouchUp(ctrl_, contact_id);
+-    if (WaitForControllerAction(up_id, "touch_up")) {
++	if (viewport_ != nullptr && viewport_->TouchUp(contact_id)) {
+         sprint_button_down_ = false;
+     }
+     SleepIfNeeded(delay_millis);
+ }
+ 
+-bool AdbInputBackend::WaitForControllerAction(MaaCtrlId ctrl_id, const char* action_name) const
+-{
+-    if (ctrl_id == MaaInvalidId) {
+-        LogWarn << "AdbInputBackend: failed to post controller action." << VAR(action_name);
+-        return false;
+-    }
+-
+-    const MaaStatus status = MaaControllerWait(ctrl_, ctrl_id);
+-    if (status == MaaStatus_Succeeded) {
+-        return true;
+-    }
+-
+-    LogWarn << "AdbInputBackend: controller action did not succeed." << VAR(action_name) << VAR(ctrl_id) << VAR(status);
+-    return false;
+-}
+-
+ void AdbInputBackend::SleepIfNeeded(int delay_millis)
+ {
+     if (delay_millis <= 0) {
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
+index d30c153..af41108 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
+@@ -9,6 +9,7 @@
+ #include "adb_camera_swipe_driver.h"
+ #include "adb_virtual_joystick_driver.h"
+ #include "adb_zone_guard.h"
++#include "../../../Viewport/ViewportSession.h"
+ 
+ namespace maplocator
+ {
+@@ -40,6 +41,7 @@ class AdbInputBackend final : public IInputBackend
+ {
+ public:
+     AdbInputBackend(MaaController* ctrl, std::string controller_type, std::shared_ptr<maplocator::MapLocator> locator);
++	~AdbInputBackend() override;
+ 
+     MaaController* GetCtrl() const override;
+     const std::string& controller_type() const override;
+@@ -70,10 +72,10 @@ private:
+     bool TouchDownTargetSync(const AdbTapTarget& target) const;
+     void MouseRightDownOnTargetSync(const AdbTapTarget& target, int delay_millis);
+     void MouseRightUpOnTargetSync(int contact_id, int delay_millis);
+-    bool WaitForControllerAction(MaaCtrlId ctrl_id, const char* action_name) const;
+     static void SleepIfNeeded(int delay_millis);
+ 
+     MaaController* ctrl_ = nullptr;
++	std::shared_ptr<maaend::viewport::ViewportSession> viewport_;
+     std::string controller_type_;
+     std::string unsupported_reason_;
+     double default_turn_units_per_degree_ = 0.0;
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
+index cb258f1..bba8aa0 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
+@@ -21,8 +21,10 @@ constexpr int32_t kAdbDefaultTouchPressure = 0;
+ AdbVirtualJoystickDriver::AdbVirtualJoystickDriver(
+     MaaController* controller,
+     std::shared_ptr<maplocator::MapLocator> locator,
++	std::shared_ptr<maaend::viewport::ViewportSession> viewport,
+     AdbVirtualJoystickDriverConfig config)
+     : controller_(controller)
++    , viewport_(std::move(viewport))
+     , config_(std::move(config))
+ {
+     (void)locator;
+@@ -73,6 +75,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+     if (!touch_active_) {
+         active_direction_ = Direction::kNone;
+         active_geometry_.reset();
++		active_frame_.reset();
+         active_touch_point_ = {};
+         SleepIfNeeded(delay_millis);
+         return true;
+@@ -83,6 +86,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+         touch_active_ = false;
+         active_direction_ = Direction::kNone;
+         active_geometry_.reset();
++		active_frame_.reset();
+         active_touch_point_ = {};
+         SleepIfNeeded(delay_millis);
+         return false;
+@@ -91,6 +95,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+     touch_active_ = false;
+     active_direction_ = Direction::kNone;
+     active_geometry_.reset();
++	active_frame_.reset();
+     active_touch_point_ = {};
+     SleepIfNeeded(std::max(delay_millis, config_.release_settle_ms));
+     return true;
+@@ -138,15 +143,24 @@ std::optional<AdbVirtualJoystickDriver::ControlGeometry> AdbVirtualJoystickDrive
+ 
+ bool AdbVirtualJoystickDriver::BeginDirectionalDrag(Direction direction)
+ {
++	if (viewport_ == nullptr) {
++		return false;
++	}
++	active_frame_ = viewport_->PreferredLabel(MaaViewportAlignment_Left);
++	if (!active_frame_.has_value()) {
++		return false;
++	}
+     active_geometry_ = AcquireControlGeometry();
+     if (!active_geometry_.has_value()) {
+         active_direction_ = Direction::kNone;
++		active_frame_.reset();
+         return false;
+     }
+ 
+     const cv::Point start = ClampPoint(active_geometry_->control_origin, active_geometry_->frame_size);
+     if (!PostTouchDown(start)) {
+         active_geometry_.reset();
++		active_frame_.reset();
+         active_direction_ = Direction::kNone;
+         return false;
+     }
+@@ -193,35 +207,26 @@ bool AdbVirtualJoystickDriver::UpdateDirectionalDrag(Direction direction)
+ 
+ bool AdbVirtualJoystickDriver::PostTouchDown(const cv::Point& point) const
+ {
+-    if (controller_ == nullptr) {
++    if (viewport_ == nullptr || !active_frame_.has_value()) {
+         return false;
+     }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchDown(controller_, config_.contact_id, point.x, point.y, kAdbDefaultTouchPressure);
+-    MaaControllerWait(controller_, ctrl_id);
+-    return true;
++	return viewport_->TouchDown(active_frame_.value(), config_.contact_id, point, kAdbDefaultTouchPressure);
+ }
+ 
+ bool AdbVirtualJoystickDriver::PostTouchMove(const cv::Point& point) const
+ {
+-    if (controller_ == nullptr) {
++    if (viewport_ == nullptr || !active_frame_.has_value()) {
+         return false;
+     }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchMove(controller_, config_.contact_id, point.x, point.y, kAdbDefaultTouchPressure);
+-    MaaControllerWait(controller_, ctrl_id);
+-    return true;
++	return viewport_->TouchMove(active_frame_.value(), config_.contact_id, point, kAdbDefaultTouchPressure);
+ }
+ 
+ bool AdbVirtualJoystickDriver::PostTouchUp() const
+ {
+-    if (controller_ == nullptr) {
++    if (viewport_ == nullptr) {
+         return false;
+     }
+-
+-    const MaaCtrlId ctrl_id = MaaControllerPostTouchUp(controller_, config_.contact_id);
+-    MaaControllerWait(controller_, ctrl_id);
+-    return true;
++	return viewport_->TouchUp(config_.contact_id);
+ }
+ 
+ cv::Point AdbVirtualJoystickDriver::ComputeTargetPoint(Direction direction) const
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.h b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.h
+index 74ba0eb..6fb0f74 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.h
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.h
+@@ -6,6 +6,8 @@
+ #include <MaaFramework/MaaAPI.h>
+ #include <MaaUtils/NoWarningCV.hpp>
+ 
++#include "../../../Viewport/ViewportSession.h"
++
+ namespace maplocator
+ {
+ 
+@@ -36,6 +38,7 @@ public:
+     AdbVirtualJoystickDriver(
+         MaaController* controller,
+         std::shared_ptr<maplocator::MapLocator> locator,
++		std::shared_ptr<maaend::viewport::ViewportSession> viewport,
+         AdbVirtualJoystickDriverConfig config = {});
+     ~AdbVirtualJoystickDriver();
+ 
+@@ -78,10 +81,12 @@ private:
+     static void SleepIfNeeded(int delay_millis);
+ 
+     MaaController* controller_ = nullptr;
++	std::shared_ptr<maaend::viewport::ViewportSession> viewport_;
+     AdbVirtualJoystickDriverConfig config_;
+     Direction active_direction_ = Direction::kNone;
+     bool touch_active_ = false;
+     std::optional<ControlGeometry> active_geometry_;
++	std::optional<maaend::viewport::ViewportFrame> active_frame_;
+     cv::Point active_touch_point_ {};
+ };
+ 
+diff --git a/agent/cpp-algo/source/MapNavigator/position_provider.cpp b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
+index 4a4d5a5..40a7abd 100644
+--- a/agent/cpp-algo/source/MapNavigator/position_provider.cpp
++++ b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
+@@ -46,6 +46,7 @@ bool IsBlackScreen(const cv::Mat& image)
+ 
+ PositionProvider::PositionProvider(MaaController* controller, std::shared_ptr<maplocator::MapLocator> locator)
+     : controller_(controller)
++    , viewport_(std::make_shared<maaend::viewport::ViewportSession>(controller))
+     , locator_(std::move(locator))
+     , uses_adb_minimap_roi_(IsAdbLikeControllerType(DetectControllerType(controller_)))
+ {
+@@ -65,15 +66,12 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
+     last_capture_was_black_screen_ = false;
+     const auto capture_started_at = std::chrono::steady_clock::now();
+ 
+-    const MaaCtrlId screencap_id = MaaControllerPostScreencap(controller_);
+-    MaaControllerWait(controller_, screencap_id);
+-    ScopedImageBuffer buffer;
+-
+-    if (!MaaControllerCachedImage(controller_, buffer.Get()) || MaaImageBufferIsEmpty(buffer.Get())) {
++	const auto frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++	if (!frame.has_value() || frame->image.empty()) {
+         return false;
+     }
+ 
+-    cv::Mat image = to_mat(buffer.Get());
++	const cv::Mat& image = frame->image;
+     last_capture_was_black_screen_ = IsBlackScreen(image);
+     if (frame_observer_) {
+         frame_observer_(image);
+diff --git a/agent/cpp-algo/source/MapNavigator/position_provider.h b/agent/cpp-algo/source/MapNavigator/position_provider.h
+index 90bcd8f..ba2bf06 100644
+--- a/agent/cpp-algo/source/MapNavigator/position_provider.h
++++ b/agent/cpp-algo/source/MapNavigator/position_provider.h
+@@ -7,6 +7,7 @@
+ #include <MaaFramework/MaaAPI.h>
+ 
+ #include "../MapLocator/MapLocator.h"
++#include "../Viewport/ViewportSession.h"
+ #include "navi_domain_types.h"
+ 
+ namespace mapnavigator
+@@ -42,6 +43,7 @@ public:
+ 
+ private:
+     MaaController* controller_;
++	std::shared_ptr<maaend::viewport::ViewportSession> viewport_;
+     std::shared_ptr<maplocator::MapLocator> locator_;
+     std::function<void(NaviPosition&)> position_normalizer_;
+     std::function<void(const cv::Mat&)> frame_observer_;
+diff --git a/agent/go-service/accountswitch/action_windows.go b/agent/go-service/accountswitch/action_windows.go
+index 91500ab..8d73aee 100644
+--- a/agent/go-service/accountswitch/action_windows.go
++++ b/agent/go-service/accountswitch/action_windows.go
+@@ -3,12 +3,14 @@
+ package accountswitch
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"strings"
+ 	"time"
+ 	"unsafe"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ 	"golang.org/x/sys/windows"
+@@ -272,8 +274,8 @@ func sourceImageSize(ctx *maa.Context) (int, int, error) {
+ 		return 0, 0, fmt.Errorf("nil controller")
+ 	}
+ 	ctrl := ctx.GetTasker().GetController()
+-	if img, err := ctrl.CacheImage(); err == nil && img != nil {
+-		bounds := img.Bounds()
++	if frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, false); err == nil && frame.Image != nil {
++		bounds := frame.Image.Bounds()
+ 		if bounds.Dx() > 0 && bounds.Dy() > 0 {
+ 			return bounds.Dx(), bounds.Dy(), nil
+ 		}
+diff --git a/agent/go-service/autofight/autofight.go b/agent/go-service/autofight/autofight.go
+index d803c0a..80af7c9 100644
+--- a/agent/go-service/autofight/autofight.go
++++ b/agent/go-service/autofight/autofight.go
+@@ -1,6 +1,7 @@
+ package autofight
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -13,6 +14,7 @@ import (
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/i18n"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -96,12 +98,18 @@ func captureAndUpdateScreenDetail(ctx *maa.Context) (image.Image, bool) {
+ 		}
+ 	}()
+ 
+-	ctx.GetTasker().GetController().PostScreencap().Wait()
+-	img, err := ctx.GetTasker().GetController().CacheImage()
++	controller := ctx.GetTasker().GetController()
++	session, err := viewport.New(controller)
++	if err != nil {
++		log.Error().Err(err).Str("component", "AutoFight").Msg("failed to create viewport session")
++		return nil, false
++	}
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		log.Error().Err(err).Str("component", "AutoFight").Msg("failed to cache image")
+ 		return nil, false
+ 	}
++	img := frame.Image
+ 	if !screenAnalyzer.UpdateScreenDetail(ctx, img) {
+ 		log.Error().Str("component", "AutoFight").Msg("failed to update screen detail")
+ 		return nil, false
+diff --git a/agent/go-service/autostockstaple/action.go b/agent/go-service/autostockstaple/action.go
+index 413d52b..2f96b5c 100644
+--- a/agent/go-service/autostockstaple/action.go
++++ b/agent/go-service/autostockstaple/action.go
+@@ -1,6 +1,7 @@
+ package autostockstaple
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -8,6 +9,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -346,14 +348,17 @@ func captureCurrentImage(ctx *maa.Context) (image.Image, error) {
+ 		return nil, fmt.Errorf("controller is nil")
+ 	}
+ 
+-	controller.PostScreencap().Wait()
+-	img, err := controller.CacheImage()
++	session, err := viewport.New(controller)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if img == nil {
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil {
++		return nil, err
++	}
++	if frame.Image == nil {
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
+ 
+-	return img, nil
++	return frame.Image, nil
+ }
+diff --git a/agent/go-service/captureuid/capture.go b/agent/go-service/captureuid/capture.go
+index 0ff8ce2..e707859 100644
+--- a/agent/go-service/captureuid/capture.go
++++ b/agent/go-service/captureuid/capture.go
+@@ -1,6 +1,7 @@
+ package captureuid
+ 
+ import (
++	"context"
+ 	"crypto/rand"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+@@ -11,6 +12,7 @@ import (
+ 	"strings"
+ 	"sync"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -23,9 +25,16 @@ var (
+ 	capturedUid   string
+ 	capturedUidMu sync.Mutex
+ 
+-	uidDigitRe = regexp.MustCompile(`\d+`)
++	uidLabelRe = regexp.MustCompile(`(?i)u\s*[i1l|]\s*d\s*[:：]?\s*([0-9]{8,12})`)
++	uidDigitRe = regexp.MustCompile(`[0-9]{8,12}`)
+ )
+ 
++type uidMatch struct {
++	digits   string
++	frame    viewport.Frame
++	labelled bool
++}
++
+ // Capture captures and hashes the player UID.
+ //   - useCache: if true and cache has a UID, return cached UID immediately
+ //   - stayOnCurrentScreen: if false, navigate to SceneEnterMenuOperationalManual before OCR
+@@ -40,36 +49,62 @@ func Capture(ctx *maa.Context, ctrl *maa.Controller, useCache, stayOnCurrentScre
+ 
+ 	if !stayOnCurrentScreen {
+ 		if _, err := ctx.RunTask("SceneEnterMenuOperationalManual"); err != nil {
+-			return captureErr(allowUnknown, "failed to navigate to SceneEnterMenuOperationalManual: %w", err)
++			return captureErr(allowUnknown, "failed to navigate to SceneEnterMenuOperationalManual: %v", err)
+ 		}
+ 	}
+ 
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
+-	if err != nil || img == nil {
+-		return captureErr(allowUnknown, "screenshot failed: %w", err)
++	session, err := viewport.New(ctrl)
++	if err != nil {
++		return captureErr(allowUnknown, "viewport session failed: %v", err)
+ 	}
+-
+-	param := maa.OCRParam{
+-		ROI:      targetRect(maa.Rect{60, 690, 155, 25}),
+-		Expected: []string{".*"},
+-		OnlyRec:  true,
+-		OrderBy:  maa.OCROrderByLength,
++	frames, err := session.CaptureCandidates(context.Background(), true)
++	if err != nil || len(frames) == 0 {
++		return captureErr(allowUnknown, "screenshot failed: %v", err)
+ 	}
+-	detail, err := ctx.RunRecognitionDirect(maa.RecognitionTypeOCR, &param, img)
+-	if err != nil || detail == nil || !detail.Hit {
+-		return captureErr(allowUnknown, "uid OCR miss")
++
++	matches := make([]uidMatch, 0, len(frames))
++	for _, frame := range frames {
++		if frame.Image == nil {
++			continue
++		}
++		// UID is anchored to the game's configurable safe-area margin, not
++		// necessarily to the physical display edge. The wider strip covers the
++		// stock 16:9 position and custom phone margins without reading the rest
++		// of the account UI.
++		param := maa.OCRParam{
++			ROI:      targetRect(maa.Rect{0, 660, 420, 60}),
++			Expected: []string{".*"},
++			OnlyRec:  true,
++			OrderBy:  maa.OCROrderByLength,
++		}
++		detail, recoErr := ctx.RunRecognitionDirect(maa.RecognitionTypeOCR, &param, frame.Image)
++		if recoErr != nil || detail == nil || !detail.Hit {
++			continue
++		}
++		labelled, fallback := uidCandidates(ocrTexts(detail))
++		if len(labelled) == 1 {
++			matches = append(matches, uidMatch{digits: labelled[0], frame: frame, labelled: true})
++			continue
++		}
++		if len(labelled) == 0 && len(fallback) == 1 {
++			matches = append(matches, uidMatch{digits: fallback[0], frame: frame})
++		}
+ 	}
+ 
+-	text := bestOCRText(detail)
+-	digits := extractAllDigits(text)
+-	if len(digits) < 8 || len(digits) > 12 {
+-		return captureErr(allowUnknown, "uid digit count %d not in [8,12], text=%q", len(digits), text)
++	selected, ok := selectUIDMatch(matches)
++	if !ok {
++		return captureErr(
++			allowUnknown,
++			"uid OCR did not produce one unambiguous 8-12 digit candidate across %d viewport(s)",
++			len(frames),
++		)
+ 	}
++	digits := selected.digits
++	frame := selected.frame
+ 
+ 	salt, err := loadOrCreateSalt()
+ 	if err != nil {
+-		return captureErr(allowUnknown, "salt load/create failed: %w", err)
++		return captureErr(allowUnknown, "salt load/create failed: %v", err)
+ 	}
+ 
+ 	hash := sha256.Sum256([]byte(digits + salt))
+@@ -79,10 +114,26 @@ func Capture(ctx *maa.Context, ctrl *maa.Controller, useCache, stayOnCurrentScre
+ 	capturedUid = uid
+ 	capturedUidMu.Unlock()
+ 
+-	log.Info().Str("component", component).Str("uid", uid).Msg("captured uid")
++	log.Info().
++		Str("component", component).
++		Str("uid", uid).
++		Str("alignment", viewportAlignmentName(frame.Alignment)).
++		Uint64("frame_id", frame.FrameID).
++		Msg("captured uid")
+ 	return uid, nil
+ }
+ 
++func viewportAlignmentName(alignment maa.ViewportAlignment) string {
++	switch alignment {
++	case maa.ViewportAlignmentLeft:
++		return "left"
++	case maa.ViewportAlignmentRight:
++		return "right"
++	default:
++		return "center"
++	}
++}
++
+ // ClearCache clears the cached UID (thread-safe).
+ func ClearCache() {
+ 	capturedUidMu.Lock()
+@@ -98,33 +149,96 @@ func GetCachedUID() string {
+ 	return capturedUid
+ }
+ 
+-func bestOCRText(detail *maa.RecognitionDetail) string {
++func ocrTexts(detail *maa.RecognitionDetail) []string {
+ 	if detail == nil || detail.Results == nil {
+-		return ""
++		return nil
++	}
++	seen := make(map[string]struct{})
++	texts := make([]string, 0)
++	appendResult := func(result *maa.RecognitionResult) {
++		if result == nil {
++			return
++		}
++		o, ok := result.AsOCR()
++		if !ok {
++			return
++		}
++		text := strings.TrimSpace(o.Text)
++		if text == "" {
++			return
++		}
++		if _, exists := seen[text]; exists {
++			return
++		}
++		seen[text] = struct{}{}
++		texts = append(texts, text)
+ 	}
+-	if detail.Results.Best != nil {
+-		if o, ok := detail.Results.Best.AsOCR(); ok {
+-			return strings.TrimSpace(o.Text)
++	appendResult(detail.Results.Best)
++	for _, group := range [][]*maa.RecognitionResult{
++		detail.Results.Filtered,
++		detail.Results.All,
++	} {
++		for _, result := range group {
++			appendResult(result)
+ 		}
+ 	}
+-	for _, r := range detail.Results.Filtered {
+-		if r == nil {
+-			continue
++	if len(texts) > 1 {
++		joined := strings.Join(texts, " ")
++		if _, exists := seen[joined]; !exists {
++			texts = append(texts, joined)
++		}
++	}
++	return texts
++}
++
++func uidCandidates(texts []string) (labelled, fallback []string) {
++	labelledSet := make(map[string]struct{})
++	fallbackSet := make(map[string]struct{})
++	for _, text := range texts {
++		for _, match := range uidLabelRe.FindAllStringSubmatch(text, -1) {
++			if len(match) > 1 {
++				labelledSet[match[1]] = struct{}{}
++			}
+ 		}
+-		if o, ok := r.AsOCR(); ok {
+-			return strings.TrimSpace(o.Text)
++		for _, digits := range uidDigitRe.FindAllString(text, -1) {
++			fallbackSet[digits] = struct{}{}
+ 		}
+ 	}
+-	return ""
++	for digits := range labelledSet {
++		labelled = append(labelled, digits)
++		delete(fallbackSet, digits)
++	}
++	for digits := range fallbackSet {
++		fallback = append(fallback, digits)
++	}
++	return labelled, fallback
+ }
+ 
+-func extractAllDigits(s string) string {
+-	parts := uidDigitRe.FindAllString(s, -1)
+-	var b strings.Builder
+-	for _, p := range parts {
+-		b.WriteString(p)
++func selectUIDMatch(matches []uidMatch) (uidMatch, bool) {
++	if len(matches) == 0 {
++		return uidMatch{}, false
++	}
++	labelled := make(map[string]uidMatch)
++	fallback := make(map[string]uidMatch)
++	for _, match := range matches {
++		if match.labelled {
++			labelled[match.digits] = match
++		} else {
++			fallback[match.digits] = match
++		}
++	}
++	if len(labelled) == 1 {
++		for _, match := range labelled {
++			return match, true
++		}
++	}
++	if len(labelled) > 1 || len(fallback) != 1 {
++		return uidMatch{}, false
++	}
++	for _, match := range fallback {
++		return match, true
+ 	}
+-	return b.String()
++	return uidMatch{}, false
+ }
+ 
+ func targetRect(r maa.Rect) maa.Target {
+diff --git a/agent/go-service/creditshopping/adb_shelf.go b/agent/go-service/creditshopping/adb_shelf.go
+index 34681fc..65de680 100644
+--- a/agent/go-service/creditshopping/adb_shelf.go
++++ b/agent/go-service/creditshopping/adb_shelf.go
+@@ -1,10 +1,12 @@
+ package creditshopping
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"image"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -30,6 +32,7 @@ func swipeShelfForADB(ctx *maa.Context, ctrl *maa.Controller, beginY, endY int)
+ 		log.Warn().Err(err).Str("component", component).Msg("record shelf adb: swipe adaptor failed")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
+ 	dy := endY - beginY
+ 	ca.Swipe(0, adbShelfSwipeBeginX, beginY, 0, dy, adbShelfSwipeDurMs, adbShelfSwipeWaitMs)
+ 	return true
+@@ -67,13 +70,16 @@ func scanShelfSlotsADB(ctx *maa.Context, ctrl *maa.Controller, first image.Image
+ }
+ 
+ func screencap(ctrl *maa.Controller) (image.Image, error) {
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	session, err := viewport.New(ctrl)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if img == nil {
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil {
++		return nil, err
++	}
++	if frame.Image == nil {
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
+-	return img, nil
++	return frame.Image, nil
+ }
+diff --git a/agent/go-service/itemtransfer/action.go b/agent/go-service/itemtransfer/action.go
+index 89483cc..64d4dac 100644
+--- a/agent/go-service/itemtransfer/action.go
++++ b/agent/go-service/itemtransfer/action.go
+@@ -1,6 +1,7 @@
+ package itemtransfer
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"image"
+ 	"sort"
+@@ -9,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/levenshtein"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -75,19 +77,24 @@ func (a *ItemTransferFallbackAction) Run(ctx *maa.Context, arg *maa.CustomAction
+ 
+ 	tasker := ctx.GetTasker()
+ 	ctrl := tasker.GetController()
++	session, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Str("component", componentName).Msg("failed to create viewport session")
++		return false
++	}
+ 
+ 	if tasker.Stopping() {
+ 		return false
+ 	}
+ 
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
+-	if err != nil {
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil || frame.Image == nil {
+ 		log.Error().Err(err).Str("component", componentName).Msg("failed to cache image")
+ 		return false
+ 	}
++	inputLabel := frame.CoordinateLabel()
+ 
+-	rawItems := detectAllItems(ctx, img, nndNode)
++	rawItems := detectAllItems(ctx, frame.Image, nndNode)
+ 	if len(rawItems) == 0 {
+ 		log.Warn().Str("component", componentName).Msg("no items detected on current page")
+ 		return false
+@@ -108,10 +115,10 @@ func (a *ItemTransferFallbackAction) Run(ctx *maa.Context, arg *maa.CustomAction
+ 			Int("grid_x", gx).Int("grid_y", gy).
+ 			Msg("target class found with low score, verifying via OCR")
+ 
+-		names := hoverAndOCR(ctx, tasker, ctrl, gx, gy)
++		names := hoverAndOCR(ctx, tasker, session, inputLabel, gx, gy)
+ 		if matchesAnyTarget(names, itemInfo.Name) {
+ 			log.Info().Str("component", componentName).Strs("ocr_names", names).Msg("OCR verified target")
+-			return ctrlClick(ctrl, gx, gy)
++			return ctrlClick(ctrl, session, inputLabel, gx, gy)
+ 		}
+ 		log.Info().
+ 			Str("component", componentName).
+@@ -122,23 +129,23 @@ func (a *ItemTransferFallbackAction) Run(ctx *maa.Context, arg *maa.CustomAction
+ 
+ 	// Case 2.2 + Step 3: binary search among visible grid cells
+ 	if targetIdx >= 0 && len(categoryOrder) > 0 {
+-		result := binarySearchOnPage(ctx, tasker, ctrl, items, categoryOrder, targetIdx, itemInfo.Name, params.MaxDistance)
++		result := binarySearchOnPage(ctx, tasker, session, inputLabel, items, categoryOrder, targetIdx, itemInfo.Name, params.MaxDistance)
+ 		if result != nil {
+-			return ctrlClick(ctrl, result.CenterX, result.CenterY)
++			return ctrlClick(ctrl, session, inputLabel, result.CenterX, result.CenterY)
+ 		}
+ 		log.Info().Str("component", componentName).Msg("binary search exhausted all grid cells, item not found")
+-		moveMouseSafe(ctrl)
++		moveMouseSafe(session, inputLabel)
+ 		return false
+ 	}
+ 
+ 	// No category_order data: linear scan
+-	result := linearScanOnPage(ctx, tasker, ctrl, items, itemInfo.Name)
++	result := linearScanOnPage(ctx, tasker, session, inputLabel, items, itemInfo.Name)
+ 	if result != nil {
+-		return ctrlClick(ctrl, result.CenterX, result.CenterY)
++		return ctrlClick(ctrl, session, inputLabel, result.CenterX, result.CenterY)
+ 	}
+ 
+ 	log.Info().Str("component", componentName).Msg("linear scan found nothing, item not found")
+-	moveMouseSafe(ctrl)
++	moveMouseSafe(session, inputLabel)
+ 	return false
+ }
+ 
+@@ -229,21 +236,23 @@ func findByLowScoreTarget(items []gridItem, targetClass int) *gridItem {
+ 	return best
+ }
+ 
+-func hoverAndOCR(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controller, x, y int) []string {
++func hoverAndOCR(ctx *maa.Context, tasker *maa.Tasker, session *viewport.Session, label viewport.Frame, x, y int) []string {
+ 	if tasker.Stopping() {
+ 		return nil
+ 	}
+ 
+-	ctrl.PostTouchMove(0, int32(x), int32(y), 0).Wait()
++	if err := session.TouchMove(context.Background(), label, 0, int32(x), int32(y), 0); err != nil {
++		log.Error().Err(err).Str("component", componentName).Msg("failed to move hover pointer")
++		return nil
++	}
+ 	time.Sleep(1500 * time.Millisecond)
+ 
+ 	if tasker.Stopping() {
+ 		return nil
+ 	}
+ 
+-	ctrl.PostScreencap().Wait()
+-	newImg, err := ctrl.CacheImage()
+-	if err != nil {
++	frame, err := session.Capture(context.Background(), label.Alignment, true)
++	if err != nil || frame.Image == nil {
+ 		log.Error().Err(err).Str("component", componentName).Msg("failed to cache image after hover")
+ 		return nil
+ 	}
+@@ -255,7 +264,7 @@ func hoverAndOCR(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controller, x,
+ 		},
+ 	}
+ 
+-	detail, err := ctx.RunRecognition(tooltipOCRNode, newImg, override)
++	detail, err := ctx.RunRecognition(tooltipOCRNode, frame.Image, override)
+ 	if err != nil || detail == nil || !detail.Hit {
+ 		log.Warn().
+ 			Str("component", componentName).
+@@ -385,7 +394,7 @@ func cleanOCRNoise(s string) string {
+ // Always starts from cell 0 (top-left) to establish a baseline, then
+ // converges forward via binary search on the remaining range.
+ // Returns the target item if found, or nil when the range is exhausted.
+-func binarySearchOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controller, items []gridItem, categoryOrder []string, targetIdx int, targetName string, maxDistance int) *gridItem {
++func binarySearchOnPage(ctx *maa.Context, tasker *maa.Tasker, session *viewport.Session, label viewport.Frame, items []gridItem, categoryOrder []string, targetIdx int, targetName string, maxDistance int) *gridItem {
+ 	if len(items) == 0 {
+ 		return nil
+ 	}
+@@ -398,7 +407,7 @@ func binarySearchOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controll
+ 	consecutiveMisses := 0
+ 
+ 	first := &items[0]
+-	names := hoverAndOCR(ctx, tasker, ctrl, first.CenterX, first.CenterY)
++	names := hoverAndOCR(ctx, tasker, session, label, first.CenterX, first.CenterY)
+ 
+ 	if matchesAnyTarget(names, targetName) {
+ 		log.Info().Str("component", componentName).Strs("ocr_names", names).Int("grid_idx", 0).Msg("found target at first cell")
+@@ -428,7 +437,7 @@ func binarySearchOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controll
+ 		mid := (lo + hi) / 2
+ 		item := &items[mid]
+ 
+-		names = hoverAndOCR(ctx, tasker, ctrl, item.CenterX, item.CenterY)
++		names = hoverAndOCR(ctx, tasker, session, label, item.CenterX, item.CenterY)
+ 		if len(names) == 0 {
+ 			lo = mid + 1
+ 			continue
+@@ -477,12 +486,12 @@ func binarySearchOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controll
+ 	return nil
+ }
+ 
+-func linearScanOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controller, items []gridItem, targetName string) *gridItem {
++func linearScanOnPage(ctx *maa.Context, tasker *maa.Tasker, session *viewport.Session, label viewport.Frame, items []gridItem, targetName string) *gridItem {
+ 	for i := range items {
+ 		if tasker.Stopping() {
+ 			return nil
+ 		}
+-		names := hoverAndOCR(ctx, tasker, ctrl, items[i].CenterX, items[i].CenterY)
++		names := hoverAndOCR(ctx, tasker, session, label, items[i].CenterX, items[i].CenterY)
+ 		if matchesAnyTarget(names, targetName) {
+ 			return &items[i]
+ 		}
+@@ -490,14 +499,17 @@ func linearScanOnPage(ctx *maa.Context, tasker *maa.Tasker, ctrl *maa.Controller
+ 	return nil
+ }
+ 
+-func ctrlClick(ctrl *maa.Controller, x, y int) bool {
++func ctrlClick(ctrl *maa.Controller, session *viewport.Session, label viewport.Frame, x, y int) bool {
+ 	ctrl.PostKeyDown(17).Wait()
++	defer func() { ctrl.PostKeyUp(17).Wait() }()
+ 	time.Sleep(50 * time.Millisecond)
+ 
+-	ctrl.PostClick(int32(x), int32(y)).Wait()
++	if err := session.Click(context.Background(), label, int32(x), int32(y)); err != nil {
++		log.Error().Err(err).Str("component", componentName).Int("x", x).Int("y", y).Msg("Ctrl+Click failed")
++		return false
++	}
+ 
+ 	time.Sleep(50 * time.Millisecond)
+-	ctrl.PostKeyUp(17).Wait()
+ 
+ 	log.Info().
+ 		Str("component", componentName).
+@@ -505,7 +517,7 @@ func ctrlClick(ctrl *maa.Controller, x, y int) bool {
+ 		Int("y", y).
+ 		Msg("Ctrl+Click performed")
+ 
+-	moveMouseSafe(ctrl)
++	moveMouseSafe(session, label)
+ 	return true
+ }
+ 
+@@ -524,8 +536,10 @@ func snapToGrid(x, y int, grid []gridItem) (int, int) {
+ 	return bestX, bestY
+ }
+ 
+-func moveMouseSafe(ctrl *maa.Controller) {
+-	ctrl.PostTouchMove(0, 10, 10, 0).Wait()
++func moveMouseSafe(session *viewport.Session, label viewport.Frame) {
++	if err := session.TouchMove(context.Background(), label, 0, 10, 10, 0); err != nil {
++		log.Warn().Err(err).Str("component", componentName).Msg("failed to move pointer to safe position")
++	}
+ 	time.Sleep(50 * time.Millisecond)
+ }
+ 
+diff --git a/agent/go-service/itemtransfer/ocr_action.go b/agent/go-service/itemtransfer/ocr_action.go
+index c3bc8a5..cb0968b 100644
+--- a/agent/go-service/itemtransfer/ocr_action.go
++++ b/agent/go-service/itemtransfer/ocr_action.go
+@@ -1,9 +1,11 @@
+ package itemtransfer
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"sort"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -91,19 +93,24 @@ func (a *ItemTransferOCRAction) Run(ctx *maa.Context, arg *maa.CustomActionArg)
+ 
+ 	tasker := ctx.GetTasker()
+ 	ctrl := tasker.GetController()
++	session, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Str("component", componentName).Msg("failed to create viewport session")
++		return false
++	}
+ 
+ 	if tasker.Stopping() {
+ 		return false
+ 	}
+ 
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
+-	if err != nil {
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil || frame.Image == nil {
+ 		log.Error().Err(err).Str("component", componentName).Msg("failed to cache image")
+ 		return false
+ 	}
++	inputLabel := frame.CoordinateLabel()
+ 
+-	items := detectAllItems(ctx, img, nndNode)
++	items := detectAllItems(ctx, frame.Image, nndNode)
+ 
+ 	cols := repoCols
+ 	if side == "bag" {
+@@ -121,18 +128,18 @@ func (a *ItemTransferOCRAction) Run(ctx *maa.Context, arg *maa.CustomActionArg)
+ 		items = buildSyntheticGrid(side, cols)
+ 	}
+ 
+-	result := binarySearchOnPage(ctx, tasker, ctrl, items, categoryOrder, targetIdx, params.ItemName, params.MaxDistance)
++	result := binarySearchOnPage(ctx, tasker, session, inputLabel, items, categoryOrder, targetIdx, params.ItemName, params.MaxDistance)
+ 	if result != nil {
+-		return ctrlClick(ctrl, result.CenterX, result.CenterY)
++		return ctrlClick(ctrl, session, inputLabel, result.CenterX, result.CenterY)
+ 	}
+ 
+-	result = linearScanOnPage(ctx, tasker, ctrl, items, params.ItemName)
++	result = linearScanOnPage(ctx, tasker, session, inputLabel, items, params.ItemName)
+ 	if result != nil {
+-		return ctrlClick(ctrl, result.CenterX, result.CenterY)
++		return ctrlClick(ctrl, session, inputLabel, result.CenterX, result.CenterY)
+ 	}
+ 
+ 	log.Info().Str("component", componentName).Str("item_name", params.ItemName).Msg("OCR search found nothing")
+-	moveMouseSafe(ctrl)
++	moveMouseSafe(session, inputLabel)
+ 	return false
+ }
+ 
+diff --git a/agent/go-service/maptracker/bigmap/find_image.go b/agent/go-service/maptracker/bigmap/find_image.go
+index afad914..c9c16e7 100644
+--- a/agent/go-service/maptracker/bigmap/find_image.go
++++ b/agent/go-service/maptracker/bigmap/find_image.go
+@@ -2,6 +2,7 @@
+ package maptrackerbigmap
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -15,6 +16,7 @@ import (
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/resource"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -280,6 +282,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+ 		log.Error().Err(err).Msg("Failed to create control adaptor for multi-viewport search")
+ 		return nil, false
+ 	}
++	defer ca.ReleaseTouches()
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Msg("Failed to create viewport session for multi-viewport search")
++		return nil, false
++	}
+ 
+ 	panFactor := BIG_MAP_PAN_FACTOR_NUMERATOR / control.GetScreenDiagonalSize(ctrl)
+ 
+@@ -291,12 +299,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+ 	pickAttempt := 0
+ 
+ 	// Initial screenshot, infer, and match.
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	frame, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		log.Error().Err(err).Msg("Failed to get cached image in multi-viewport search")
+ 		return nil, false
+ 	}
++	img := frame.Image
+ 	inferRes, err = r.inferResultWithImg(ctx, arg, img, &param.MapTrackerBigMapInferParam)
+ 	if err != nil {
+ 		log.Error().Err(err).Msg("Failed to infer viewport in multi-viewport search")
+@@ -336,12 +344,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+ 
+ 		// Fresh screenshot + infer after drag.
+ 		ca.TouchMove(0, 1, 1, 0)
+-		ctrl.PostScreencap().Wait()
+-		img, err = ctrl.CacheImage()
++		frame, err = view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 		if err != nil {
+ 			log.Error().Err(err).Msg("Failed to get cached image in multi-viewport search")
+ 			return nil, false
+ 		}
++		img = frame.Image
+ 		inferRes, err = r.inferResultWithImg(ctx, arg, img, &param.MapTrackerBigMapInferParam)
+ 		if err != nil {
+ 			log.Error().Err(err).Msg("Failed to infer viewport in multi-viewport search")
+diff --git a/agent/go-service/maptracker/bigmap/pick.go b/agent/go-service/maptracker/bigmap/pick.go
+index 731849c..fbea01d 100644
+--- a/agent/go-service/maptracker/bigmap/pick.go
++++ b/agent/go-service/maptracker/bigmap/pick.go
+@@ -2,6 +2,7 @@
+ package maptrackerbigmap
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"math"
+@@ -13,6 +14,7 @@ import (
+ 	internal "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/internal"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/resource"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -92,10 +94,16 @@ func (a *MapTrackerBigMapPick) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 		log.Error().Err(err).Msg("Failed to create control adaptor")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Msg("Failed to create viewport session")
++		return false
++	}
+ 
+ 	zoomValue := *param.ZoomValue // Not nil verified by parseParam
+ 	if zoomValue != 0 {
+-		if err := doBigMapZoom(ctrl, ca, zoomValue); err != nil {
++		if err := doBigMapZoom(view, ca, zoomValue); err != nil {
+ 			log.Warn().Err(err).Float64("zoomValue", zoomValue).Msg("Failed to auto adjust big-map zoom")
+ 		}
+ 	}
+@@ -246,14 +254,14 @@ func runBigMapTeleportNode(ctx *maa.Context, ca control.ControlAdaptor, targetIn
+ }
+ 
+ func doBigMapInferForMap(ctx *maa.Context, ctrl *maa.Controller, mapName string) (*MapTrackerBigMapInferResult, error) {
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get cached image: %w", err)
+ 	}
+-	if img == nil {
++	if frame.Image == nil {
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
++	img := frame.Image
+ 
+ 	inferConfig := map[string]any{
+ 		"map_name_regex": "^" + regexp.QuoteMeta(mapName) + "$",
+diff --git a/agent/go-service/maptracker/bigmap/zoom.go b/agent/go-service/maptracker/bigmap/zoom.go
+index 263a1e3..cbfeec7 100644
+--- a/agent/go-service/maptracker/bigmap/zoom.go
++++ b/agent/go-service/maptracker/bigmap/zoom.go
+@@ -2,6 +2,7 @@
+ package maptrackerbigmap
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -10,6 +11,7 @@ import (
+ 	internal "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/internal"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -52,8 +54,14 @@ func (a *MapTrackerBigMapZoom) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 		log.Error().Err(err).Msg("Failed to create control adaptor")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
+ 
+-	if err := doBigMapZoom(ctrl, ca, param.ZoomValue); err != nil {
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Msg("Failed to create viewport session")
++		return false
++	}
++	if err := doBigMapZoom(view, ca, param.ZoomValue); err != nil {
+ 		log.Error().Err(err).Float64("zoomValue", param.ZoomValue).Msg("Failed to adjust big-map zoom")
+ 		return false
+ 	}
+@@ -77,7 +85,7 @@ func (a *MapTrackerBigMapZoom) parseParam(paramStr string) (*MapTrackerBigMapZoo
+ 	return &param, nil
+ }
+ 
+-func doBigMapZoom(ctrl *maa.Controller, ca control.ControlAdaptor, position float64) error {
++func doBigMapZoom(view *viewport.Session, ca control.ControlAdaptor, position float64) error {
+ 	// Zoom-in (+) button template
+ 	zoomInTemplate, err := internal.Resource.ZoomInTemplate.Get()
+ 	if err != nil {
+@@ -92,16 +100,15 @@ func doBigMapZoom(ctrl *maa.Controller, ca control.ControlAdaptor, position floa
+ 
+ 	triedAgain := false
+ 	for {
+-		ctrl.PostScreencap().Wait()
+-		img, err := ctrl.CacheImage()
++		frame, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to get cached image for auto zoom: %w", err)
+ 		}
+-		if img == nil {
++		if frame.Image == nil {
+ 			return fmt.Errorf("cached image is nil for auto zoom")
+ 		}
+ 
+-		screen := minicv.ImageConvertRGBA(img)
++		screen := minicv.ImageConvertRGBA(frame.Image)
+ 		searchArea := [4]int{
+ 			int(math.Round(ZOOM_BUTTON_AREA_X)),
+ 			int(math.Round(ZOOM_BUTTON_AREA_Y)),
+diff --git a/agent/go-service/maptracker/default/goal.go b/agent/go-service/maptracker/default/goal.go
+index 596eb17..76da3f0 100644
+--- a/agent/go-service/maptracker/default/goal.go
++++ b/agent/go-service/maptracker/default/goal.go
+@@ -2,6 +2,7 @@
+ package maptrackerdefault
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image/color"
+@@ -12,6 +13,7 @@ import (
+ 	internal "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/internal"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -533,6 +535,7 @@ func (a *MapTrackerGoal) loadRuntimeZiplines(goalCtx *goalContext, mustSeePoints
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create control adaptor: %w", err)
+ 	}
++	defer ca.ReleaseTouches()
+ 	closeBigMap := func() {
+ 		ca.KeyType(27, 1000)
+ 	}
+@@ -568,14 +571,14 @@ func (a *MapTrackerGoal) loadRuntimeZiplines(goalCtx *goalContext, mustSeePoints
+ }
+ 
+ func (a *MapTrackerGoal) findBigMapZiplines(goalCtx *goalContext, mustSeePoints [][2]int) ([]maptrackerbigmap.MapTrackerBigMapFindImageMatch, error) {
+-	goalCtx.ctrl.PostScreencap().Wait()
+-	img, err := goalCtx.ctrl.CacheImage()
++	frame, err := viewport.CaptureController(context.Background(), goalCtx.ctrl, maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if img == nil {
++	if frame.Image == nil {
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
++	img := frame.Image
+ 	param := struct {
+ 		Template      string   `json:"template"`
+ 		Expected      bool     `json:"expected"`
+diff --git a/agent/go-service/maptracker/default/move.go b/agent/go-service/maptracker/default/move.go
+index 8df4df1..0ec208d 100644
+--- a/agent/go-service/maptracker/default/move.go
++++ b/agent/go-service/maptracker/default/move.go
+@@ -2,6 +2,7 @@
+ package maptrackerdefault
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -23,6 +24,7 @@ import (
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/resource"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -122,6 +124,7 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
+ 		log.Error().Err(err).Msg("Failed to create control adaptor")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
+ 
+ 	loopInterval := time.Duration(INFER_INTERVAL_MS) * time.Millisecond
+ 
+@@ -523,16 +526,16 @@ func doEmergencyStop(ca control.ControlAdaptor, noPrint bool) {
+ 
+ func doInfer(ctx *maa.Context, ctrl *maa.Controller, param *MapTrackerMoveParam) (*MapTrackerInferResult, error) {
+ 	// Capture screen
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		log.Error().Err(err).Msg("Failed to get cached image")
+ 		return nil, err
+ 	}
+-	if img == nil {
++	if frame.Image == nil {
+ 		log.Error().Msg("Cached image is nil")
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
++	img := frame.Image
+ 
+ 	// Run recognition
+ 	mapNameRegex := buildMapNameRegex(param.MapNameMatchRule, param.MapName)
+diff --git a/agent/go-service/maptracker/default/toward.go b/agent/go-service/maptracker/default/toward.go
+index 11666b3..6899a98 100644
+--- a/agent/go-service/maptracker/default/toward.go
++++ b/agent/go-service/maptracker/default/toward.go
+@@ -66,6 +66,7 @@ func (a *MapTrackerToward) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool
+ 		log.Error().Err(err).Msg("Failed to create control adaptor for MapTrackerToward")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
+ 
+ 	loopInterval := time.Duration(INFER_INTERVAL_MS) * time.Millisecond
+ 	deadline := time.Now().Add(time.Duration(TOWARD_TIMEOUT) * time.Millisecond)
+diff --git a/agent/go-service/maptracker/default/zipline.go b/agent/go-service/maptracker/default/zipline.go
+index cc01696..5057e0d 100644
+--- a/agent/go-service/maptracker/default/zipline.go
++++ b/agent/go-service/maptracker/default/zipline.go
+@@ -2,6 +2,7 @@
+ package maptrackerdefault
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -12,6 +13,7 @@ import (
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -67,6 +69,7 @@ func (a *MapTrackerZipline) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool
+ 		log.Error().Err(err).Msg("Failed to create control adaptor for MapTrackerZipline")
+ 		return false
+ 	}
++	defer ca.ReleaseTouches()
+ 	ca.SetPlayerMovement(control.MovementStop, control.PolicyLazy)
+ 
+ 	deadline := time.Now().Add(time.Duration(param.Timeout) * time.Millisecond)
+@@ -226,13 +229,12 @@ func captureMiniMapImage(ctrl *maa.Controller) (*image.RGBA, error) {
+ }
+ 
+ func captureFullScreen(ctrl *maa.Controller) (*image.RGBA, error) {
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if img == nil {
++	if frame.Image == nil {
+ 		return nil, fmt.Errorf("cached image is nil")
+ 	}
+-	return minicv.ImageConvertRGBA(img), nil
++	return minicv.ImageConvertRGBA(frame.Image), nil
+ }
+diff --git a/agent/go-service/pkg/control/adaptor.go b/agent/go-service/pkg/control/adaptor.go
+index 823f375..8603534 100644
+--- a/agent/go-service/pkg/control/adaptor.go
++++ b/agent/go-service/pkg/control/adaptor.go
+@@ -72,6 +72,10 @@ type ControlAdaptor interface {
+ 	// AggressivelyResetPlayerMovement provides an aggressive way to reset player movement for initialization purpose.
+ 	// Different implementations may have different ways to achieve this.
+ 	AggressivelyResetPlayerMovement()
++
++	// ReleaseTouches releases contacts owned by this adaptor. Long-running callers must defer
++	// it so cancellation and panic paths cannot leave a joystick or camera contact active.
++	ReleaseTouches()
+ }
+ 
+ // NewControlAdaptor creates a new ControlAdaptor instance.
+@@ -88,7 +92,7 @@ func NewControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (Contro
+ 	case CONTROL_TYPE_WLROOTS:
+ 		return newWlrootsControlAdaptor(ctx, ctrl, w, h), nil
+ 	case CONTROL_TYPE_ADB:
+-		return newADBControlAdaptor(ctx, ctrl, w, h), nil
++		return newADBControlAdaptor(ctx, ctrl, w, h)
+ 	default:
+ 		return nil, fmt.Errorf("unsupported control type: %s", controlType)
+ 	}
+diff --git a/agent/go-service/pkg/control/adaptor_adb.go b/agent/go-service/pkg/control/adaptor_adb.go
+index ff78dae..1b34d1f 100644
+--- a/agent/go-service/pkg/control/adaptor_adb.go
++++ b/agent/go-service/pkg/control/adaptor_adb.go
+@@ -2,14 +2,20 @@
+ package control
+ 
+ import (
++	"context"
++	"fmt"
++	"image"
+ 	"time"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
++	"github.com/rs/zerolog/log"
+ )
+ 
+ type ADBControlAdaptor struct {
+ 	ctx  *maa.Context
+ 	ctrl *maa.Controller
++	view *viewport.Session
+ 	w    int
+ 	h    int
+ 
+@@ -18,8 +24,12 @@ type ADBControlAdaptor struct {
+ 	lastMotionIsWalk bool
+ }
+ 
+-func newADBControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) *ADBControlAdaptor {
+-	return &ADBControlAdaptor{ctx: ctx, ctrl: ctrl, w: w, h: h, pm: MovementStop, lastDirection: DirectionF, lastMotionIsWalk: false}
++func newADBControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (*ADBControlAdaptor, error) {
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		return nil, fmt.Errorf("create viewport session: %w", err)
++	}
++	return &ADBControlAdaptor{ctx: ctx, ctrl: ctrl, view: view, w: w, h: h, pm: MovementStop, lastDirection: DirectionF, lastMotionIsWalk: false}, nil
+ }
+ 
+ func (aca *ADBControlAdaptor) Ctx() *maa.Context {
+@@ -27,36 +37,36 @@ func (aca *ADBControlAdaptor) Ctx() *maa.Context {
+ }
+ 
+ func (aca *ADBControlAdaptor) TouchDown(contact, x, y int, delayMillis int) {
+-	aca.ctrl.PostTouchMove(int32(contact), int32(x), int32(y), 1).Wait()
+-	aca.ctrl.PostTouchDown(int32(contact), int32(x), int32(y), 1).Wait()
++	alignment := aca.alignmentForSpan(x, y, x, y)
++	aca.touchDownAligned(alignment, contact, x, y, 1)
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ func (aca *ADBControlAdaptor) TouchUp(contact int, delayMillis int) {
+-	aca.ctrl.PostTouchUp(int32(contact)).Wait()
++	aca.report("touch_up", aca.view.TouchUp(context.Background(), int32(contact)))
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ func (aca *ADBControlAdaptor) TouchClick(contact, x, y int, durationMillis, delayMillis int) {
+-	aca.ctrl.PostTouchMove(int32(contact), int32(x), int32(y), 1).Wait()
+-	aca.ctrl.PostTouchDown(int32(contact), int32(x), int32(y), 1).Wait()
++	alignment := aca.alignmentForSpan(x, y, x, y)
++	aca.touchDownAligned(alignment, contact, x, y, 1)
+ 	time.Sleep(time.Duration(durationMillis) * time.Millisecond)
+-	aca.ctrl.PostTouchUp(int32(contact)).Wait()
++	aca.report("touch_up", aca.view.TouchUp(context.Background(), int32(contact)))
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ func (aca *ADBControlAdaptor) TouchMove(contact, x, y int, delayMillis int) {
+-	aca.ctrl.PostTouchMove(int32(contact), int32(x), int32(y), 1).Wait()
++	aca.touchMoveAligned(aca.alignmentForSpan(x, y, x, y), contact, x, y, 1)
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ func (aca *ADBControlAdaptor) Swipe(contact, x, y, dx, dy int, durationMillis, delayMillis int) {
+-	aca.ctrl.PostSwipeV2(int32(x), int32(y), int32(x+dx), int32(y+dy), time.Duration(durationMillis)*time.Millisecond, int32(contact), 1).Wait()
++	aca.swipeAligned(aca.alignmentForSpan(x, y, x+dx, y+dy), contact, x, y, dx, dy, durationMillis, 1)
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ func (aca *ADBControlAdaptor) SwipeHover(contact, x, y, dx, dy int, durationMillis, delayMillis int) {
+-	aca.ctrl.PostSwipeV2(int32(x), int32(y), int32(x+dx), int32(y+dy), time.Duration(durationMillis)*time.Millisecond, int32(contact), 0).Wait()
++	aca.swipeAligned(aca.alignmentForSpan(x, y, x+dx, y+dy), contact, x, y, dx, dy, durationMillis, 0)
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+@@ -77,7 +87,7 @@ func (aca *ADBControlAdaptor) KeyType(keyCode int, delayMillis int) {
+ 
+ func (aca *ADBControlAdaptor) RotateCamera(dx, dy int) {
+ 	cx, cy := aca.w/4*3, aca.h/2
+-	aca.Swipe(cameraContact, cx, cy, dx, dy, defaultTouchActionDelayMillis*5/2, 0)
++	aca.swipeAligned(maa.ViewportAlignmentRight, cameraContact, cx, cy, dx, dy, defaultTouchActionDelayMillis*5/2, 0)
+ }
+ 
+ func (aca *ADBControlAdaptor) GetPlayerMovement() PlayerMovement {
+@@ -87,11 +97,11 @@ func (aca *ADBControlAdaptor) GetPlayerMovement() PlayerMovement {
+ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy PlayerMovementPolicy) {
+ 	joystickRunForward := func() {
+ 		dx, dy := joystickOffset(aca.lastDirection, -JOYSTICK_RUN_DY)
+-		aca.TouchDown(joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 0)
++		aca.touchDownAligned(maa.ViewportAlignmentLeft, joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 1)
+ 	}
+ 	joystickWalkForward := func() {
+ 		dx, dy := joystickOffset(aca.lastDirection, -JOYSTICK_WALK_DY)
+-		aca.TouchDown(joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 0)
++		aca.touchDownAligned(maa.ViewportAlignmentLeft, joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 1)
+ 	}
+ 	joystickStopForward := func() {
+ 		aca.TouchUp(joystickContact, defaultTouchActionDelayMillis)
+@@ -123,7 +133,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
+ 		if aca.lastMotionIsWalk {
+ 			if movement.speed >= MovementSprint.speed {
+ 				// Set to "sprint"
+-				aca.TouchClick(sprintButtonContact, SPRINT_BUTTON_X, SPRINT_BUTTON_Y, defaultTouchActionDelayMillis, 0)
++				aca.touchClickAligned(maa.ViewportAlignmentRight, sprintButtonContact, SPRINT_BUTTON_X, SPRINT_BUTTON_Y, defaultTouchActionDelayMillis)
+ 				aca.lastMotionIsWalk = false
+ 			} else if movement.speed >= MovementRun.speed {
+ 				// Set to "run"
+@@ -151,7 +161,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
+ 				}
+ 			} else {
+ 				// Set to "sprint"
+-				aca.TouchClick(sprintButtonContact, SPRINT_BUTTON_X, SPRINT_BUTTON_Y, defaultTouchActionDelayMillis, 0)
++				aca.touchClickAligned(maa.ViewportAlignmentRight, sprintButtonContact, SPRINT_BUTTON_X, SPRINT_BUTTON_Y, defaultTouchActionDelayMillis)
+ 				if policy >= PolicyDefault {
+ 					joystickRunForward()
+ 				}
+@@ -169,16 +179,16 @@ func (aca *ADBControlAdaptor) SetPlayerDirection(direction PlayerDirection) {
+ 	if aca.pm.speed > MovementStop.speed {
+ 		if aca.pm.speed >= MovementRun.speed {
+ 			dx, dy := joystickOffset(direction, -JOYSTICK_RUN_DY)
+-			aca.TouchDown(joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 0)
++			aca.touchDownAligned(maa.ViewportAlignmentLeft, joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 1)
+ 		} else {
+ 			dx, dy := joystickOffset(direction, -JOYSTICK_WALK_DY)
+-			aca.TouchDown(joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 0)
++			aca.touchDownAligned(maa.ViewportAlignmentLeft, joystickContact, JOYSTICK_CENTER_X+dx, JOYSTICK_CENTER_Y+dy, 1)
+ 		}
+ 	}
+ }
+ 
+ func (aca *ADBControlAdaptor) PlayerJump() {
+-	aca.TouchClick(jumpButtonContact, JUMP_BUTTON_X, JUMP_BUTTON_Y, defaultTouchActionDelayMillis*4, 0)
++	aca.touchClickAligned(maa.ViewportAlignmentRight, jumpButtonContact, JUMP_BUTTON_X, JUMP_BUTTON_Y, defaultTouchActionDelayMillis*4)
+ }
+ 
+ func (aca *ADBControlAdaptor) ResetCursor(_ CursorResetPolicy) {
+@@ -189,6 +199,65 @@ func (aca *ADBControlAdaptor) AggressivelyResetPlayerMovement() {
+ 	// ADB has no need to reset player movement aggressively
+ }
+ 
++func (aca *ADBControlAdaptor) ReleaseTouches() {
++	aca.report("release_touches", aca.view.ReleaseTouches(context.Background()))
++}
++
++func (aca *ADBControlAdaptor) alignmentForSpan(x1, y1, x2, y2 int) maa.ViewportAlignment {
++	minX, maxX := min(x1, x2), max(x1, x2)
++	minY, maxY := min(y1, y2), max(y1, y2)
++	return viewport.PreferredAlignmentForROI(image.Rect(minX, minY, maxX+1, maxY+1), aca.w)
++}
++
++func (aca *ADBControlAdaptor) label(alignment maa.ViewportAlignment) (viewport.Frame, error) {
++	return aca.view.PreferredLabel(context.Background(), alignment)
++}
++
++func (aca *ADBControlAdaptor) touchDownAligned(alignment maa.ViewportAlignment, contact, x, y, pressure int) {
++	label, err := aca.label(alignment)
++	if err == nil {
++		err = aca.view.TouchMove(context.Background(), label, int32(contact), int32(x), int32(y), int32(pressure))
++	}
++	if err == nil {
++		err = aca.view.TouchDown(context.Background(), label, int32(contact), int32(x), int32(y), int32(pressure))
++	}
++	aca.report("touch_down", err)
++}
++
++func (aca *ADBControlAdaptor) touchMoveAligned(alignment maa.ViewportAlignment, contact, x, y, pressure int) {
++	label, err := aca.label(alignment)
++	if err == nil {
++		err = aca.view.TouchMove(context.Background(), label, int32(contact), int32(x), int32(y), int32(pressure))
++	}
++	aca.report("touch_move", err)
++}
++
++func (aca *ADBControlAdaptor) touchClickAligned(alignment maa.ViewportAlignment, contact, x, y, durationMillis int) {
++	aca.touchDownAligned(alignment, contact, x, y, 1)
++	time.Sleep(time.Duration(durationMillis) * time.Millisecond)
++	aca.report("touch_up", aca.view.TouchUp(context.Background(), int32(contact)))
++}
++
++func (aca *ADBControlAdaptor) swipeAligned(alignment maa.ViewportAlignment, contact, x, y, dx, dy, durationMillis, pressure int) {
++	label, err := aca.label(alignment)
++	if err == nil {
++		err = aca.view.Swipe(
++			context.Background(),
++			label,
++			int32(x), int32(y), int32(x+dx), int32(y+dy),
++			time.Duration(durationMillis)*time.Millisecond,
++			int32(contact), int32(pressure),
++		)
++	}
++	aca.report("swipe", err)
++}
++
++func (aca *ADBControlAdaptor) report(action string, err error) {
++	if err != nil {
++		log.Error().Err(err).Str("component", "ADBControlAdaptor").Str("action", action).Msg("viewport input rejected")
++	}
++}
++
+ func joystickOffset(direction PlayerDirection, magnitude int) (dx, dy int) {
+ 	switch direction {
+ 	case DirectionB: // Backward ↓
+diff --git a/agent/go-service/pkg/control/adaptor_desktop.go b/agent/go-service/pkg/control/adaptor_desktop.go
+index 7d2d6c9..e81211d 100644
+--- a/agent/go-service/pkg/control/adaptor_desktop.go
++++ b/agent/go-service/pkg/control/adaptor_desktop.go
+@@ -227,6 +227,10 @@ func (dca *desktopControlAdaptor) AggressivelyResetPlayerMovement() {
+ 	dca.lastMotionIsWalk = false
+ }
+ 
++func (dca *desktopControlAdaptor) ReleaseTouches() {
++	// Desktop input paths do not retain Maa touch contacts between high-level actions.
++}
++
+ const defaultDesktopKeyActionDelayMillis = 30
+ 
+ // cursorResetMaxInterval is the maximum time a lazy cursor reset may be deferred.
+diff --git a/agent/go-service/puzzle-solver/action.go b/agent/go-service/puzzle-solver/action.go
+index 6dfcf02..d012b15 100644
+--- a/agent/go-service/puzzle-solver/action.go
++++ b/agent/go-service/puzzle-solver/action.go
+@@ -14,7 +14,7 @@ type Action struct{}
+ var _ maa.CustomActionRunner = &Action{}
+ 
+ // doPlace performs the interaction to place a single puzzle piece
+-func doPlace(ctx *maa.Context, bd *BoardDesc, p Placement, isDryRun bool) {
++func doPlace(aw *ActionWrapper, bd *BoardDesc, p Placement, isDryRun bool) {
+ 	log.Debug().
+ 		Int("PuzzleIndex", p.PuzzleIndex).
+ 		Int("MachineX", p.MachineX).
+@@ -48,7 +48,6 @@ func doPlace(ctx *maa.Context, bd *BoardDesc, p Placement, isDryRun bool) {
+ 	endY := int(targetY)
+ 
+ 	// 3. Execution sequence
+-	aw := NewActionWrapper(ctx.GetTasker().GetController())
+ 	aw.TouchUpSync(100)
+ 	aw.TouchDownSync(0, startX, startY, 100)
+ 	aw.TouchMoveSync(0, endX, endY, 250)
+@@ -70,8 +69,7 @@ func doPlace(ctx *maa.Context, bd *BoardDesc, p Placement, isDryRun bool) {
+ 	aw.TouchUpSync(100)
+ }
+ 
+-func doResetCursor(ctx *maa.Context) {
+-	aw := NewActionWrapper(ctx.GetTasker().GetController())
++func doResetCursor(aw *ActionWrapper) {
+ 	aw.TouchUpSync(100)
+ 	aw.TouchDownSync(0, 640, 620, 100)
+ 	aw.TouchUpSync(100)
+@@ -98,6 +96,13 @@ func (a *Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
+ 		log.Info().Msg("Dry run mode enabled: actions will be logged but not executed")
+ 	}
+ 
++	aw, err := NewActionWrapper(ctx.GetTasker().GetController())
++	if err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("failed to create viewport action wrapper")
++		return false
++	}
++	defer aw.ReleaseTouches()
++
+ 	// Get the recognition result (boardDesc JSON)
+ 	recData := arg.RecognitionDetail.DetailJson
+ 	if recData == "" {
+@@ -136,10 +141,10 @@ func (a *Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
+ 
+ 	// Execute the solution steps (placements)
+ 	for _, p := range placements {
+-		doPlace(ctx, &boardDesc, p, isDryRun)
++		doPlace(aw, &boardDesc, p, isDryRun)
+ 		time.Sleep(250 * time.Millisecond)
+ 	}
+-	doResetCursor(ctx)
++	doResetCursor(aw)
+ 	log.Info().Msg("Finished PuzzleSolver action")
+ 
+ 	return true
+diff --git a/agent/go-service/puzzle-solver/recognition.go b/agent/go-service/puzzle-solver/recognition.go
+index 7ccc130..10b0a09 100644
+--- a/agent/go-service/puzzle-solver/recognition.go
++++ b/agent/go-service/puzzle-solver/recognition.go
+@@ -2,11 +2,13 @@
+ package puzzle
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"image"
+ 	"math"
+ 	"time"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -311,19 +313,18 @@ func doEnsureTab(ctx *maa.Context, img image.Image) image.Image {
+ 	}
+ 
+ 	// Then refresh screenshot
+-	ctrl.PostScreencap().Wait()
+-	newImg, err := ctrl.CacheImage()
++	frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		log.Error().
+ 			Err(err).
+ 			Msg("Failed to capture image")
+ 		return nil
+ 	}
+-	if newImg == nil {
++	if frame.Image == nil {
+ 		log.Error().Msg("Failed to capture image")
+ 		return nil
+ 	}
+-	return newImg
++	return frame.Image
+ }
+ 
+ func getPuzzleDesc(img image.Image) *PuzzleDesc {
+@@ -420,14 +421,18 @@ func doPreviewPuzzle(ctx *maa.Context, thumbX, thumbY int) *PuzzleDesc {
+ 	endX := int(PUZZLE_PREVIEW_MV_CENTER_X)
+ 	endY := int(PUZZLE_PREVIEW_MV_CENTER_Y)
+ 
+-	aw := NewActionWrapper(ctrl)
++	aw, err := NewActionWrapper(ctrl)
++	if err != nil {
++		log.Error().Err(err).Msg("Failed to create viewport action wrapper")
++		return nil
++	}
++	defer aw.ReleaseTouches()
+ 	aw.TouchUpSync(100)
+ 	aw.TouchDownSync(0, startX, startY, 100)
+ 	aw.TouchMoveSync(0, endX, endY, 500)
+ 
+ 	// 2. Screenshot
+-	ctrl.PostScreencap().Wait()
+-	previewImg, err := ctrl.CacheImage()
++	previewImg, err := aw.CaptureSync()
+ 	if err != nil {
+ 		log.Error().
+ 			Err(err).
+diff --git a/agent/go-service/puzzle-solver/utils.go b/agent/go-service/puzzle-solver/utils.go
+index 2251019..d5ea514 100644
+--- a/agent/go-service/puzzle-solver/utils.go
++++ b/agent/go-service/puzzle-solver/utils.go
+@@ -2,13 +2,16 @@
+ package puzzle
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"image"
+ 	"image/color"
+ 	"math"
+ 	"sort"
+ 	"time"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -302,32 +305,53 @@ func convertBoardCoordToLTCoord(bx, by int, totalW, totalH int) (int, int) {
+ 
+ // ActionWrapper provides synchronized touch/key operations with built-in delays
+ type ActionWrapper struct {
+-	ctrl *maa.Controller
++	ctrl  *maa.Controller
++	view  *viewport.Session
++	label viewport.Frame
+ }
+ 
+ // NewActionWrapper creates a new ActionWrapper from a context
+-func NewActionWrapper(ctrl *maa.Controller) *ActionWrapper {
+-	return &ActionWrapper{ctrl}
++func NewActionWrapper(ctrl *maa.Controller) (*ActionWrapper, error) {
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		return nil, err
++	}
++	label, err := view.Label(context.Background(), maa.ViewportAlignmentCenter)
++	if err != nil {
++		return nil, fmt.Errorf("create puzzle coordinate label: %w", err)
++	}
++	return &ActionWrapper{ctrl: ctrl, view: view, label: label}, nil
+ }
+ 
+ // TouchUpSync releases touch contact and waits
+ func (aw *ActionWrapper) TouchUpSync(delayMillis int) {
+-	aw.ctrl.PostTouchUp(0).Wait()
++	if err := aw.view.TouchUp(context.Background(), 0); err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("viewport touch up failed")
++	}
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+ // TouchDownSync moves to position then touches down
+ func (aw *ActionWrapper) TouchDownSync(contact, x, y int, delayMillis int) {
+ 	halfDelay := delayMillis / 2
+-	aw.ctrl.PostTouchMove(int32(contact), int32(x), int32(y), 1).Wait()
++	if err := aw.view.TouchMove(context.Background(), aw.label, int32(contact), int32(x), int32(y), 1); err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("viewport pre-down move failed")
++		return
++	}
+ 	time.Sleep(time.Duration(halfDelay) * time.Millisecond)
+-	aw.ctrl.PostTouchDown(int32(contact), int32(x), int32(y), 1).Wait()
++	if err := aw.view.TouchDown(context.Background(), aw.label, int32(contact), int32(x), int32(y), 1); err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("viewport touch down failed")
++		return
++	}
+ 	time.Sleep(time.Duration(delayMillis-halfDelay) * time.Millisecond)
+ }
+ 
+ // TouchMoveSync moves touch contact to position and waits
+ func (aw *ActionWrapper) TouchMoveSync(contact, x, y int, delayMillis int) {
+-	aw.ctrl.PostTouchMove(int32(contact), int32(x), int32(y), 1).Wait()
++	if err := aw.view.TouchMove(context.Background(), aw.label, int32(contact), int32(x), int32(y), 1); err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("viewport touch move failed")
++		return
++	}
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
+ 
+@@ -336,3 +360,20 @@ func (aw *ActionWrapper) TypeKeySync(keyCode int, delayMillis int) {
+ 	aw.ctrl.PostClickKey(int32(keyCode)).Wait()
+ 	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+ }
++
++func (aw *ActionWrapper) CaptureSync() (image.Image, error) {
++	frame, err := aw.view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil {
++		return nil, err
++	}
++	if frame.Image == nil {
++		return nil, fmt.Errorf("cached image is nil")
++	}
++	return frame.Image, nil
++}
++
++func (aw *ActionWrapper) ReleaseTouches() {
++	if err := aw.view.ReleaseTouches(context.Background()); err != nil {
++		log.Error().Err(err).Str("component", "PuzzleSolver").Msg("failed to release viewport contacts")
++	}
++}
+diff --git a/agent/go-service/register.go b/agent/go-service/register.go
+index 6f76b1d..9e9bd85 100644
+--- a/agent/go-service/register.go
++++ b/agent/go-service/register.go
+@@ -40,6 +40,7 @@ import (
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/taskersink/processcheck"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/taskersink/taskfail"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/trialofswordmancy"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/viewportprobe"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/visitfriends"
+ 	webevent202605 "github.com/MaaXYZ/MaaEnd/agent/go-service/webevent/202605"
+ 	"github.com/rs/zerolog/log"
+@@ -94,6 +95,7 @@ func registerAll() {
+ 	webevent202605.Register()
+ 	pullcount.Register()
+ 	trialofswordmancy.Register()
++	viewportprobe.Register()
+ 	log.Info().
+ 		Msg("All custom components and sinks registered successfully")
+ }
+diff --git a/agent/go-service/seizedeliveryjobs/departure.go b/agent/go-service/seizedeliveryjobs/departure.go
+index e2dcc0d..5a4772d 100644
+--- a/agent/go-service/seizedeliveryjobs/departure.go
++++ b/agent/go-service/seizedeliveryjobs/departure.go
+@@ -1,6 +1,7 @@
+ package seizedeliveryjobs
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -9,6 +10,7 @@ import (
+ 
+ 	maptrackerbigmap "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/bigmap"
+ 	maptrackerdefault "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/default"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -183,8 +185,12 @@ func (a *SeizeDeliveryJobsDepartureAction) loadCachedDestination() (seizeDeliver
+ 
+ func (a *SeizeDeliveryJobsDepartureAction) findTarget(ctx *maa.Context, arg *maa.CustomActionArg, mapNameRegex string) (string, [2]float64, [2]int, bool) {
+ 	ctrl := ctx.GetTasker().GetController()
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
++	session, err := viewport.New(ctrl)
++	if err != nil {
++		log.Error().Err(err).Str("component", seizeDeliveryJobsDepartureComponent).Msg("failed to create viewport session")
++		return "", [2]float64{}, [2]int{}, false
++	}
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+ 		log.Error().
+ 			Err(err).
+@@ -192,6 +198,7 @@ func (a *SeizeDeliveryJobsDepartureAction) findTarget(ctx *maa.Context, arg *maa
+ 			Msg("failed to get cached image")
+ 		return "", [2]float64{}, [2]int{}, false
+ 	}
++	img := frame.Image
+ 	if img == nil {
+ 		log.Error().
+ 			Str("component", seizeDeliveryJobsDepartureComponent).
+diff --git a/agent/go-service/taskersink/aspectratio/checker.go b/agent/go-service/taskersink/aspectratio/checker.go
+index fb48d74..79cc994 100644
+--- a/agent/go-service/taskersink/aspectratio/checker.go
++++ b/agent/go-service/taskersink/aspectratio/checker.go
+@@ -1,10 +1,12 @@
+ package aspectratio
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"math"
+ 	"runtime"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
+@@ -23,17 +25,61 @@ const (
+ 	tolerance    = 0.02
+ 	targetWidth  = 1280
+ 	targetHeight = 720
++
++	androidOpenGameEntry    = "AndroidOpenGame"
++	androidOpenGameGateNode = "OpenGame"
++	portraitTransitionWait  = 20 * time.Second
++	portraitTransitionPoll  = 250 * time.Millisecond
+ )
+ 
+ // AspectRatioChecker checks if the device resolution is 16:9 before task execution
+-type AspectRatioChecker struct{}
++type AspectRatioChecker struct {
++	transitionMu sync.Mutex
++	transitions  map[uint64]portraitTransition
++}
++
++type portraitTransition struct {
++	launchNode        string
++	controllerDisplay string
++	width             int
++	height            int
++	chainValidated    bool
++}
++
++var androidOpenGameLaunchPackages = map[string]string{
++	"AndroidOpenGame_CN":       "com.hypergryph.endfield",
++	"AndroidOpenGame_Bilibili": "com.hypergryph.endfield.bilibili",
++	"AndroidOpenGame_Global":   "com.gryphline.endfield.gp",
++	"AndroidOpenGame_VN":       "com.gryphline.endfield.gp.vn",
++}
+ 
+ type resolutionReader func() (int32, int32, error)
+ 
++type screenshotViewportInfo struct {
++	Configured    bool   `json:"configured"`
++	Active        bool   `json:"active"`
++	Mode          string `json:"mode"`
++	Adaptive      bool   `json:"adaptive"`
++	RawWidth      int    `json:"raw_width"`
++	RawHeight     int    `json:"raw_height"`
++	LogicalWidth  int    `json:"logical_width"`
++	LogicalHeight int    `json:"logical_height"`
++	X             int    `json:"x"`
++	Y             int    `json:"y"`
++	Width         int    `json:"width"`
++	Height        int    `json:"height"`
++}
++
++type controllerViewportInfo struct {
++	ScreenshotViewport *screenshotViewportInfo `json:"screenshot_viewport"`
++}
++
+ // OnTaskerTask handles tasker task events
+ func (c *AspectRatioChecker) OnTaskerTask(tasker *maa.Tasker, event maa.EventStatus, detail maa.TaskerTaskDetail) {
+-	// Only check on task starting
+ 	if event != maa.EventStatusStarting {
++		if event == maa.EventStatusSucceeded || event == maa.EventStatusFailed {
++			c.clearPortraitTransition(detail.TaskID)
++		}
+ 		return
+ 	}
+ 
+@@ -127,7 +173,57 @@ func (c *AspectRatioChecker) OnTaskerTask(tasker *maa.Tasker, event maa.EventSta
+ 			return
+ 		}
+ 
++		viewport, viewportErr := readCompatibleScreenshotViewport(controller, width, height)
++		if viewportErr == nil {
++			log.Info().
++				Uint64("task_id", detail.TaskID).
++				Str("entry", detail.Entry).
++				Str("controller_name", pienv.ControllerName()).
++				Str("controller_type", controlType).
++				Str("requirement", "active_screenshot_viewport").
++				Str("mode", "adb_screenshot_viewport").
++				Int32("width", width).
++				Int32("height", height).
++				Int("logical_width", viewport.LogicalWidth).
++				Int("logical_height", viewport.LogicalHeight).
++				Int("viewport_x", viewport.X).
++				Int("viewport_y", viewport.Y).
++				Int("viewport_width", viewport.Width).
++				Int("viewport_height", viewport.Height).
++				Str("viewport_mode", viewport.Mode).
++				Bool("adaptive", viewport.Adaptive).
++				Msg("resolution check passed with active screenshot viewport")
++			return
++		}
++
++		if isPortraitLaunchTransitionEntry(detail.Entry) {
++			portraitViewport, transitionErr := readCompatiblePortraitLaunchViewport(controller, width, height)
++			if transitionErr == nil {
++				c.beginPortraitTransition(detail.TaskID, portraitTransition{
++					controllerDisplay: controllerDisplay,
++					width:             int(width),
++					height:            int(height),
++				})
++				log.Info().
++					Uint64("task_id", detail.TaskID).
++					Str("entry", detail.Entry).
++					Str("controller_name", pienv.ControllerName()).
++					Str("controller_type", controlType).
++					Str("requirement", "portrait_start_app_transition").
++					Str("mode", "adb_portrait_start_app_transition").
++					Int32("width", width).
++					Int32("height", height).
++					Int("logical_width", portraitViewport.LogicalWidth).
++					Int("logical_height", portraitViewport.LogicalHeight).
++					Str("viewport_mode", portraitViewport.Mode).
++					Msg("temporarily allowing the verified Android launch chain before landscape viewport activation")
++				return
++			}
++			viewportErr = fmt.Errorf("active viewport: %v; portrait launch transition: %w", viewportErr, transitionErr)
++		}
++
+ 		log.Error().
++			Err(viewportErr).
+ 			Uint64("task_id", detail.TaskID).
+ 			Str("entry", detail.Entry).
+ 			Str("controller_name", pienv.ControllerName()).
+@@ -223,6 +319,335 @@ func (c *AspectRatioChecker) OnTaskerTask(tasker *maa.Tasker, event maa.EventSta
+ 		Msg("resolution check passed")
+ }
+ 
++func readCompatibleScreenshotViewport(controller *maa.Controller, width, height int32) (screenshotViewportInfo, error) {
++	info, err := controller.GetInfo()
++	if err != nil {
++		return screenshotViewportInfo{}, fmt.Errorf("read controller info: %w", err)
++	}
++	return parseCompatibleScreenshotViewport(info, width, height)
++}
++
++func readCompatiblePortraitLaunchViewport(controller *maa.Controller, width, height int32) (screenshotViewportInfo, error) {
++	info, err := controller.GetInfo()
++	if err != nil {
++		return screenshotViewportInfo{}, fmt.Errorf("read controller info: %w", err)
++	}
++	return parseCompatiblePortraitLaunchViewport(info, width, height)
++}
++
++func parseCompatibleScreenshotViewport(info string, width, height int32) (screenshotViewportInfo, error) {
++	viewport, err := parseScreenshotViewport(info)
++	if err != nil {
++		return screenshotViewportInfo{}, err
++	}
++
++	if !viewport.Configured || !viewport.Active {
++		return screenshotViewportInfo{}, fmt.Errorf("screenshot viewport is not configured and active")
++	}
++	if err := validateScreenshotViewportIdentity(viewport, width, height); err != nil {
++		return screenshotViewportInfo{}, err
++	}
++	if viewport.X < 0 || viewport.Y < 0 || viewport.Width <= 0 || viewport.Height <= 0 ||
++		viewport.X+viewport.Width > viewport.RawWidth || viewport.Y+viewport.Height > viewport.RawHeight {
++		return screenshotViewportInfo{}, fmt.Errorf("screenshot viewport is outside the raw image")
++	}
++	if width < height || viewport.Width < targetWidth || viewport.Height < targetHeight {
++		return screenshotViewportInfo{}, fmt.Errorf("active screenshot viewport does not provide a landscape 1280x720 source")
++	}
++	if !isAspectRatio16x9(viewport.Width, viewport.Height) {
++		return screenshotViewportInfo{}, fmt.Errorf(
++			"screenshot viewport size %dx%d is not 16:9",
++			viewport.Width,
++			viewport.Height,
++		)
++	}
++	if !isAspectRatio16x9(int(width), int(height)) && (viewport.Mode != "adaptive" || !viewport.Adaptive) {
++		return screenshotViewportInfo{}, fmt.Errorf("non-16:9 ADB resolution requires an adaptive screenshot viewport")
++	}
++
++	return viewport, nil
++}
++
++func parseCompatiblePortraitLaunchViewport(info string, width, height int32) (screenshotViewportInfo, error) {
++	viewport, err := parseScreenshotViewport(info)
++	if err != nil {
++		return screenshotViewportInfo{}, err
++	}
++	if !viewport.Configured || viewport.Active {
++		return screenshotViewportInfo{}, fmt.Errorf("portrait launch requires a configured but inactive screenshot viewport")
++	}
++	if err := validateScreenshotViewportIdentity(viewport, width, height); err != nil {
++		return screenshotViewportInfo{}, err
++	}
++	if viewport.Mode != "adaptive" {
++		return screenshotViewportInfo{}, fmt.Errorf("portrait launch requires adaptive screenshot viewport mode")
++	}
++	if width >= height {
++		return screenshotViewportInfo{}, fmt.Errorf("portrait launch requires portrait controller resolution")
++	}
++	if int(height) < targetWidth || int(width) < targetHeight {
++		return screenshotViewportInfo{}, fmt.Errorf(
++			"rotated controller resolution %dx%d is smaller than %dx%d",
++			height,
++			width,
++			targetWidth,
++			targetHeight,
++		)
++	}
++
++	return viewport, nil
++}
++
++func isPortraitLaunchTransitionEntry(entry string) bool {
++	return entry == androidOpenGameEntry
++}
++
++func parseScreenshotViewport(info string) (screenshotViewportInfo, error) {
++	if strings.TrimSpace(info) == "" {
++		return screenshotViewportInfo{}, fmt.Errorf("controller info is empty")
++	}
++
++	var parsed controllerViewportInfo
++	if err := json.Unmarshal([]byte(info), &parsed); err != nil {
++		return screenshotViewportInfo{}, fmt.Errorf("parse controller info: %w", err)
++	}
++	if parsed.ScreenshotViewport == nil {
++		return screenshotViewportInfo{}, fmt.Errorf("controller does not report screenshot_viewport capability")
++	}
++	return *parsed.ScreenshotViewport, nil
++}
++
++func validateScreenshotViewportIdentity(viewport screenshotViewportInfo, width, height int32) error {
++	if viewport.LogicalWidth != targetWidth || viewport.LogicalHeight != targetHeight {
++		return fmt.Errorf(
++			"screenshot viewport logical size is %dx%d, want %dx%d",
++			viewport.LogicalWidth,
++			viewport.LogicalHeight,
++			targetWidth,
++			targetHeight,
++		)
++	}
++	if viewport.RawWidth != int(width) || viewport.RawHeight != int(height) {
++		return fmt.Errorf(
++			"screenshot viewport raw size is %dx%d, controller resolution is %dx%d",
++			viewport.RawWidth,
++			viewport.RawHeight,
++			width,
++			height,
++		)
++	}
++	return nil
++}
++
++func (c *AspectRatioChecker) OnNodePipelineNode(ctx *maa.Context, event maa.EventStatus, detail maa.NodePipelineNodeDetail) {
++	if event != maa.EventStatusStarting {
++		return
++	}
++
++	transition, ok := c.getPortraitTransition(detail.TaskID)
++	if !ok {
++		return
++	}
++
++	if !transition.chainValidated {
++		if detail.Name != androidOpenGameEntry {
++			c.failPortraitTransition(ctx, detail, fmt.Errorf("first pipeline node is %q, want %q", detail.Name, androidOpenGameEntry))
++			return
++		}
++
++		launchNode, err := validateAndroidOpenGameLaunchChain(ctx)
++		if err != nil {
++			c.failPortraitTransition(ctx, detail, err)
++			return
++		}
++		c.markPortraitTransitionValidated(detail.TaskID, launchNode)
++		log.Info().
++			Uint64("task_id", detail.TaskID).
++			Str("entry", androidOpenGameEntry).
++			Str("launch_node", launchNode).
++			Msg("validated coordinate-free Android launch chain")
++		return
++	}
++
++	if detail.Name == androidOpenGameEntry || detail.Name == transition.launchNode {
++		return
++	}
++	if detail.Name != androidOpenGameGateNode {
++		c.failPortraitTransition(ctx, detail, fmt.Errorf("pipeline reached %q before the landscape viewport gate", detail.Name))
++		return
++	}
++
++	controller := ctx.GetTasker().GetController()
++	viewport, err := waitForCompatibleScreenshotViewport(controller)
++	if err != nil {
++		c.failPortraitTransition(ctx, detail, err)
++		return
++	}
++
++	c.clearPortraitTransition(detail.TaskID)
++	log.Info().
++		Uint64("task_id", detail.TaskID).
++		Str("entry", androidOpenGameEntry).
++		Str("gate_node", detail.Name).
++		Int("raw_width", viewport.RawWidth).
++		Int("raw_height", viewport.RawHeight).
++		Int("viewport_x", viewport.X).
++		Int("viewport_y", viewport.Y).
++		Int("viewport_width", viewport.Width).
++		Int("viewport_height", viewport.Height).
++		Msg("landscape screenshot viewport activated; continuing AndroidOpenGame")
++}
++
++func (c *AspectRatioChecker) OnNodeRecognitionNode(*maa.Context, maa.EventStatus, maa.NodeRecognitionNodeDetail) {
++}
++
++func (c *AspectRatioChecker) OnNodeActionNode(*maa.Context, maa.EventStatus, maa.NodeActionNodeDetail) {
++}
++
++func (c *AspectRatioChecker) OnNodeNextList(*maa.Context, maa.EventStatus, maa.NodeNextListDetail) {
++}
++
++func (c *AspectRatioChecker) OnNodeRecognition(*maa.Context, maa.EventStatus, maa.NodeRecognitionDetail) {
++}
++
++func (c *AspectRatioChecker) OnNodeAction(*maa.Context, maa.EventStatus, maa.NodeActionDetail) {
++}
++
++func validateAndroidOpenGameLaunchChain(ctx *maa.Context) (string, error) {
++	entry, err := ctx.GetNode(androidOpenGameEntry)
++	if err != nil {
++		return "", fmt.Errorf("read %s node: %w", androidOpenGameEntry, err)
++	}
++	if err := validateCoordinateFreeNode(entry, maa.ActionTypeDoNothing); err != nil {
++		return "", fmt.Errorf("validate %s node: %w", androidOpenGameEntry, err)
++	}
++	if len(entry.Next) != 1 || entry.Next[0].JumpBack || entry.Next[0].Anchor {
++		return "", fmt.Errorf("%s must select exactly one unannotated launch node", androidOpenGameEntry)
++	}
++
++	launchNode := entry.Next[0].Name
++	expectedPackage, ok := androidOpenGameLaunchPackages[launchNode]
++	if !ok {
++		return "", fmt.Errorf("%s selects unsupported launch node %q", androidOpenGameEntry, launchNode)
++	}
++	launch, err := ctx.GetNode(launchNode)
++	if err != nil {
++		return "", fmt.Errorf("read %s node: %w", launchNode, err)
++	}
++	if err := validateCoordinateFreeNode(launch, maa.ActionTypeStartApp); err != nil {
++		return "", fmt.Errorf("validate %s node: %w", launchNode, err)
++	}
++	startParam, ok := launch.Action.Param.(*maa.StartAppParam)
++	if !ok || startParam.Package != expectedPackage {
++		return "", fmt.Errorf("%s does not start its expected package", launchNode)
++	}
++	if len(launch.Next) != 1 || launch.Next[0].Name != androidOpenGameGateNode || launch.Next[0].JumpBack || launch.Next[0].Anchor {
++		return "", fmt.Errorf("%s must continue directly to %s", launchNode, androidOpenGameGateNode)
++	}
++
++	gate, err := ctx.GetNode(androidOpenGameGateNode)
++	if err != nil {
++		return "", fmt.Errorf("read %s node: %w", androidOpenGameGateNode, err)
++	}
++	if err := validateCoordinateFreeNode(gate, maa.ActionTypeDoNothing); err != nil {
++		return "", fmt.Errorf("validate %s gate node: %w", androidOpenGameGateNode, err)
++	}
++
++	return launchNode, nil
++}
++
++func validateCoordinateFreeNode(node *maa.Node, actionType maa.ActionType) error {
++	if node == nil || node.Recognition == nil || node.Recognition.Type != maa.RecognitionTypeDirectHit {
++		return fmt.Errorf("recognition must be DirectHit")
++	}
++	if node.Action == nil || node.Action.Type != actionType {
++		return fmt.Errorf("action must be %s", actionType)
++	}
++	return nil
++}
++
++func waitForCompatibleScreenshotViewport(controller *maa.Controller) (screenshotViewportInfo, error) {
++	if controller == nil {
++		return screenshotViewportInfo{}, fmt.Errorf("controller is unavailable at landscape viewport gate")
++	}
++
++	deadline := time.Now().Add(portraitTransitionWait)
++	var lastErr error
++	for {
++		width, height, resolutionErr := controller.GetResolution()
++		if resolutionErr == nil {
++			viewport, viewportErr := readCompatibleScreenshotViewport(controller, width, height)
++			if viewportErr == nil {
++				return viewport, nil
++			}
++			lastErr = viewportErr
++		} else {
++			lastErr = fmt.Errorf("read controller resolution: %w", resolutionErr)
++		}
++
++		if time.Now().After(deadline) {
++			return screenshotViewportInfo{}, fmt.Errorf("landscape screenshot viewport did not activate within %s: %w", portraitTransitionWait, lastErr)
++		}
++		if job := controller.PostScreencap().Wait(); !job.Success() {
++			lastErr = fmt.Errorf("screencap failed while waiting for landscape orientation")
++		}
++		time.Sleep(portraitTransitionPoll)
++	}
++}
++
++func (c *AspectRatioChecker) beginPortraitTransition(taskID uint64, transition portraitTransition) {
++	c.transitionMu.Lock()
++	defer c.transitionMu.Unlock()
++	if c.transitions == nil {
++		c.transitions = make(map[uint64]portraitTransition)
++	}
++	c.transitions[taskID] = transition
++}
++
++func (c *AspectRatioChecker) getPortraitTransition(taskID uint64) (portraitTransition, bool) {
++	c.transitionMu.Lock()
++	defer c.transitionMu.Unlock()
++	transition, ok := c.transitions[taskID]
++	return transition, ok
++}
++
++func (c *AspectRatioChecker) markPortraitTransitionValidated(taskID uint64, launchNode string) {
++	c.transitionMu.Lock()
++	defer c.transitionMu.Unlock()
++	transition, ok := c.transitions[taskID]
++	if !ok {
++		return
++	}
++	transition.launchNode = launchNode
++	transition.chainValidated = true
++	c.transitions[taskID] = transition
++}
++
++func (c *AspectRatioChecker) clearPortraitTransition(taskID uint64) {
++	c.transitionMu.Lock()
++	defer c.transitionMu.Unlock()
++	delete(c.transitions, taskID)
++}
++
++func (c *AspectRatioChecker) failPortraitTransition(ctx *maa.Context, detail maa.NodePipelineNodeDetail, err error) {
++	transition, _ := c.getPortraitTransition(detail.TaskID)
++	c.clearPortraitTransition(detail.TaskID)
++	log.Error().
++		Err(err).
++		Uint64("task_id", detail.TaskID).
++		Str("entry", androidOpenGameEntry).
++		Str("node", detail.Name).
++		Bool("stop_task", true).
++		Msg("portrait Android launch transition failed closed")
++	c.stopWithWarning(
++		ctx.GetTasker(),
++		transition.controllerDisplay,
++		transition.width,
++		transition.height,
++		i18n.T("tasker.aspect_ratio_warning.requirement_exact", targetWidth, targetHeight),
++	)
++}
++
+ func readResolutionWithRetry(controller *maa.Controller) (int32, int32, bool) {
+ 	const maxRetries = 20
+ 	var width, height int32
+diff --git a/agent/go-service/taskersink/aspectratio/register.go b/agent/go-service/taskersink/aspectratio/register.go
+index db935ad..28808db 100644
+--- a/agent/go-service/taskersink/aspectratio/register.go
++++ b/agent/go-service/taskersink/aspectratio/register.go
+@@ -3,10 +3,13 @@ package aspectratio
+ import "github.com/MaaXYZ/maa-framework-go/v4"
+ 
+ var (
+-	_ maa.TaskerEventSink = &AspectRatioChecker{}
++	_ maa.TaskerEventSink  = &AspectRatioChecker{}
++	_ maa.ContextEventSink = &AspectRatioChecker{}
+ )
+ 
+ // Register registers the aspect ratio checker as a tasker sink
+ func Register() {
+-	maa.AgentServerAddTaskerSink(&AspectRatioChecker{})
++	checker := &AspectRatioChecker{}
++	maa.AgentServerAddTaskerSink(checker)
++	maa.AgentServerAddContextSink(checker)
+ }
+diff --git a/agent/go-service/taskersink/cursormove/sink.go b/agent/go-service/taskersink/cursormove/sink.go
+index d900034..9761f66 100644
+--- a/agent/go-service/taskersink/cursormove/sink.go
++++ b/agent/go-service/taskersink/cursormove/sink.go
+@@ -1,6 +1,9 @@
+ package cursormove
+ 
+ import (
++	"context"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -20,7 +23,20 @@ type CursorMoveSink struct {
+ }
+ 
+ func (s *CursorMoveSink) moveCursor(ctrl *maa.Controller) {
+-	ctrl.PostTouchMove(0, s.imgW, s.imgH, 0).Wait()
++	view, err := viewport.New(ctrl)
++	if err != nil {
++		log.Warn().Err(err).Str("component", "cursormove").Msg("failed to create viewport session")
++		return
++	}
++	label, err := view.PreferredLabel(context.Background(), maa.ViewportAlignmentRight)
++	if err != nil {
++		log.Warn().Err(err).Str("component", "cursormove").Msg("failed to label cursor viewport")
++		return
++	}
++	x, y := max(s.imgW-1, 0), max(s.imgH-1, 0)
++	if err := view.TouchMove(context.Background(), label, 0, x, y, 0); err != nil {
++		log.Warn().Err(err).Str("component", "cursormove").Msg("failed to move cursor")
++	}
+ }
+ 
+ func (s *CursorMoveSink) OnTaskerTask(tasker *maa.Tasker, event maa.EventStatus, _ maa.TaskerTaskDetail) {
+@@ -34,13 +50,13 @@ func (s *CursorMoveSink) OnTaskerTask(tasker *maa.Tasker, event maa.EventStatus,
+ 		return
+ 	}
+ 
+-	img, err := ctrl.CacheImage()
+-	if err != nil || img == nil {
++	frame, err := viewport.CaptureController(context.Background(), ctrl, maa.ViewportAlignmentCenter, false)
++	if err != nil || frame.Image == nil {
+ 		log.Warn().Err(err).Str("component", "cursormove").Msg("failed to get cached image for size")
+ 		return
+ 	}
+ 
+-	bounds := img.Bounds()
++	bounds := frame.Image.Bounds()
+ 	s.imgW = int32(bounds.Dx())
+ 	s.imgH = int32(bounds.Dy())
+ 	log.Info().
+diff --git a/agent/go-service/trialofswordmancy/recognition.go b/agent/go-service/trialofswordmancy/recognition.go
+index ca7f3e9..7ea9022 100644
+--- a/agent/go-service/trialofswordmancy/recognition.go
++++ b/agent/go-service/trialofswordmancy/recognition.go
+@@ -1,6 +1,7 @@
+ package trialofswordmancy
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -8,6 +9,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/trialofswordmancy/solver"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+@@ -206,13 +208,17 @@ func (r *Recognition) probeAband(ctx *maa.Context) int {
+ 		log.Warn().Str("component", component).Msg("probeAband: controller 为空")
+ 		return -1
+ 	}
+-	ctrl.PostScreencap().Wait()
+-	img, err := ctrl.CacheImage()
+-	if err != nil || img == nil {
++	session, err := viewport.New(ctrl)
++	if err != nil {
++		log.Warn().Err(err).Str("component", component).Msg("probeAband: viewport session 创建失败")
++		return -1
++	}
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++	if err != nil || frame.Image == nil {
+ 		log.Warn().Err(err).Str("component", component).Msg("probeAband: 截屏失败")
+ 		return -1
+ 	}
+-	text, _ := ocrNodeText(ctx, img, nodeAbandPopup)
++	text, _ := ocrNodeText(ctx, frame.Image, nodeAbandPopup)
+ 	count := parseAbandCount(text)
+ 
+ 	// ② 点取消 → 等回抽牌页 → freeze。失败只记日志（次数已读到，界面若残留由上游兜底）。
+diff --git a/agent/go-service/webevent/202605/action.go b/agent/go-service/webevent/202605/action.go
+index a6ff887..674b7b7 100644
+--- a/agent/go-service/webevent/202605/action.go
++++ b/agent/go-service/webevent/202605/action.go
+@@ -2,6 +2,7 @@
+ package webevent202605
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"image"
+@@ -9,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -33,6 +35,16 @@ func (a *WebEvent202605Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 		log.Error().Str("component", "WebEvent202605").Msg("controller is nil")
+ 		return false
+ 	}
++	view, err := viewport.New(controller)
++	if err != nil {
++		log.Error().Err(err).Str("component", "WebEvent202605").Msg("failed to create viewport session")
++		return false
++	}
++	defer func() {
++		if err := view.ReleaseTouches(context.Background()); err != nil {
++			log.Error().Err(err).Str("component", "WebEvent202605").Msg("failed to release active contacts")
++		}
++	}()
+ 
+ 	const (
+ 		latencySamples   = 10
+@@ -61,24 +73,19 @@ func (a *WebEvent202605Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	// Estimate screen operations latency
+ 	for i := 0; i < latencySamples; i++ {
+ 		if tasker.Stopping() {
+-			controller.PostTouchUp(0).Wait()
++			_ = view.TouchUp(context.Background(), 0)
+ 			log.Warn().Str("component", "WebEvent202605").Msg("task stopping, exiting")
+ 			return false
+ 		}
+ 
+ 		start := time.Now()
+-		controller.PostScreencap().Wait()
+-		img, err := controller.CacheImage()
+-		if err != nil {
++		frame, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++		if err != nil || frame.Image == nil {
+ 			log.Error().Err(err).Str("component", "WebEvent202605").Int("index", i).Msg("failed to cache image")
+ 			return false
+ 		}
+-		if img == nil {
+-			log.Error().Str("component", "WebEvent202605").Int("index", i).Msg("cached image is nil")
+-			return false
+-		}
+-		_, _ = getPosition(img)
+-		controller.PostTouchUp(0).Wait()
++		_, _ = getPosition(frame.Image)
++		_ = view.TouchUp(context.Background(), 0)
+ 		total += time.Since(start)
+ 		time.Sleep(time.Duration(100) * time.Millisecond)
+ 	}
+@@ -91,7 +98,7 @@ func (a *WebEvent202605Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	maafocus.Print(ctx, fmt.Sprintf("- 截图与响应延迟：%.2fms", avgLatencySeconds*1000))
+ 
+ 	// Estimate object speed
+-	speed, err := getSpeed(ctx, time.Duration(speedObserveSec)*time.Second)
++	speed, err := getSpeed(ctx, view, time.Duration(speedObserveSec)*time.Second)
+ 	if err != nil {
+ 		log.Error().Err(err).Str("component", "WebEvent202605").Msg("failed to estimate object speed")
+ 		return false
+@@ -109,7 +116,7 @@ func (a *WebEvent202605Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	shots := 0
+ 	for shots < maxShot {
+ 		if tasker.Stopping() {
+-			controller.PostTouchUp(0).Wait()
++			_ = view.TouchUp(context.Background(), 0)
+ 			log.Warn().Str("component", "WebEvent202605").Msg("task stopping, exiting")
+ 			return false
+ 		}
+@@ -129,26 +136,24 @@ func (a *WebEvent202605Action) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 			return false
+ 		}
+ 
+-		hit, err := predict(ctx, avgLatencySeconds, speed, predictTolerance)
++		hit, clickFrame, err := predict(ctx, view, avgLatencySeconds, speed, predictTolerance)
+ 		if err != nil {
+ 			hit = false
+ 		} else {
+ 			lastEffectivePredictAt = time.Now()
+ 		}
+ 		if hit {
+-			img, err := controller.CacheImage()
+-			if err != nil {
+-				log.Error().Err(err).Str("component", "WebEvent202605").Msg("failed to cache image for click")
+-				return false
+-			}
+-			if img == nil {
++			if clickFrame.Image == nil {
+ 				log.Error().Str("component", "WebEvent202605").Msg("cached image is nil for click")
+ 				return false
+ 			}
+-			bounds := img.Bounds()
++			bounds := clickFrame.Image.Bounds()
+ 			centerX := bounds.Min.X + bounds.Dx()/2
+ 			centerY := bounds.Min.Y + bounds.Dy()/2
+-			controller.PostClick(int32(centerX), int32(centerY)).Wait()
++			if err := view.Click(context.Background(), clickFrame, int32(centerX), int32(centerY)); err != nil {
++				log.Error().Err(err).Str("component", "WebEvent202605").Msg("viewport click failed")
++				return false
++			}
+ 			lastHitAt = time.Now()
+ 			shots++
+ 			log.Info().
+@@ -233,7 +238,7 @@ func getPosition(img image.Image) (float64, error) {
+ 	return position, nil
+ }
+ 
+-func getSpeed(ctx *maa.Context, duration time.Duration) (float64, error) {
++func getSpeed(ctx *maa.Context, view *viewport.Session, duration time.Duration) (float64, error) {
+ 	if ctx == nil {
+ 		return 0, fmt.Errorf("context is nil")
+ 	}
+@@ -246,9 +251,8 @@ func getSpeed(ctx *maa.Context, duration time.Duration) (float64, error) {
+ 		return 0, fmt.Errorf("tasker is nil")
+ 	}
+ 
+-	controller := tasker.GetController()
+-	if controller == nil {
+-		return 0, fmt.Errorf("controller is nil")
++	if view == nil {
++		return 0, fmt.Errorf("viewport session is nil")
+ 	}
+ 
+ 	deadline := time.Now().Add(duration)
+@@ -259,13 +263,12 @@ func getSpeed(ctx *maa.Context, duration time.Duration) (float64, error) {
+ 	computed := false
+ 
+ 	for time.Now().Before(deadline) {
+-		controller.PostScreencap().Wait()
+-		img, err := controller.CacheImage()
+-		if err != nil || img == nil {
++		frame, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
++		if err != nil || frame.Image == nil {
+ 			continue
+ 		}
+ 
+-		pos, err := getPosition(img)
++		pos, err := getPosition(frame.Image)
+ 		if err != nil {
+ 			continue
+ 		}
+@@ -297,53 +300,50 @@ func getSpeed(ctx *maa.Context, duration time.Duration) (float64, error) {
+ 	return maxSpeed, nil
+ }
+ 
+-func predict(ctx *maa.Context, screenLatency float64, speed float64, tolerance float64) (bool, error) {
++func predict(ctx *maa.Context, view *viewport.Session, screenLatency float64, speed float64, tolerance float64) (bool, viewport.Frame, error) {
+ 	if ctx == nil {
+-		return false, fmt.Errorf("context is nil")
++		return false, viewport.Frame{}, fmt.Errorf("context is nil")
+ 	}
+ 	if screenLatency <= 0 {
+-		return false, fmt.Errorf("screenLatency must be positive")
++		return false, viewport.Frame{}, fmt.Errorf("screenLatency must be positive")
+ 	}
+ 	if tolerance < 0 {
+-		return false, fmt.Errorf("tolerance must be non-negative")
++		return false, viewport.Frame{}, fmt.Errorf("tolerance must be non-negative")
+ 	}
+ 
+ 	tasker := ctx.GetTasker()
+ 	if tasker == nil {
+-		return false, fmt.Errorf("tasker is nil")
++		return false, viewport.Frame{}, fmt.Errorf("tasker is nil")
+ 	}
+ 
+-	controller := tasker.GetController()
+-	if controller == nil {
+-		return false, fmt.Errorf("controller is nil")
++	if view == nil {
++		return false, viewport.Frame{}, fmt.Errorf("viewport session is nil")
+ 	}
+ 
+-	controller.PostScreencap().Wait()
+-	img, err := controller.CacheImage()
++	frame1, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+-		return false, err
++		return false, viewport.Frame{}, err
+ 	}
+-	if img == nil {
+-		return false, fmt.Errorf("cached image is nil")
++	if frame1.Image == nil {
++		return false, viewport.Frame{}, fmt.Errorf("cached image is nil")
+ 	}
+ 
+-	pos1, err := getPosition(img)
++	pos1, err := getPosition(frame1.Image)
+ 	if err != nil {
+-		return false, err
++		return false, viewport.Frame{}, err
+ 	}
+ 
+-	controller.PostScreencap().Wait()
+-	img, err = controller.CacheImage()
++	frame2, err := view.Capture(context.Background(), maa.ViewportAlignmentCenter, true)
+ 	if err != nil {
+-		return false, err
++		return false, viewport.Frame{}, err
+ 	}
+-	if img == nil {
+-		return false, fmt.Errorf("cached image is nil")
++	if frame2.Image == nil {
++		return false, viewport.Frame{}, fmt.Errorf("cached image is nil")
+ 	}
+ 
+-	pos2, err := getPosition(img)
++	pos2, err := getPosition(frame2.Image)
+ 	if err != nil {
+-		return false, err
++		return false, viewport.Frame{}, err
+ 	}
+ 
+ 	delta := pos2 - pos1
+@@ -352,15 +352,15 @@ func predict(ctx *maa.Context, screenLatency float64, speed float64, tolerance f
+ 		dir = 1
+ 	} else if delta < 0 {
+ 		// dir = -1
+-		return false, nil // Only one direction is valid
++		return false, frame2, nil // Only one direction is valid
+ 	}
+ 
+ 	predicted := pos2 + dir*math.Abs(speed)*screenLatency
+ 	min := 0.5 - tolerance
+ 	max := 0.5 + tolerance
+ 	if predicted >= min && predicted <= max {
+-		return true, nil
++		return true, frame2, nil
+ 	}
+ 
+-	return false, nil
++	return false, frame2, nil
+ }
+diff --git a/assets/interface.json b/assets/interface.json
+index 95af0bf..1674d9a 100644
+--- a/assets/interface.json
++++ b/assets/interface.json
+@@ -8,7 +8,7 @@
+     "welcome": "https://end.maafw.com/anno.md",
+     "icon": "locales/MaaEnd-Tiny.png",
+     "github": "https://github.com/MaaEnd/MaaEnd",
+-    "mirrorchyan_rid": "MaaEnd",
++    "mirrorchyan_rid": "",
+     "mirrorchyan_multiplatform": true,
+     "languages": {
+         "zh_cn": "locales/interface/zh_cn.json",
+diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.cpp b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
+new file mode 100644
+index 0000000..dcd91c2
+--- /dev/null
++++ b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
+@@ -0,0 +1,363 @@
++#include "ViewportSession.h"
++
++#include <algorithm>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <MaaFramework/Utility/MaaBuffer.h>
++#include <MaaUtils/Logger.h>
++#include <meojson/json.hpp>
++
++#include "../utils.h"
++
++namespace maaend::viewport
++{
++
++namespace
++{
++
++std::recursive_mutex& ControllerMutex()
++{
++    static std::recursive_mutex mutex;
++    return mutex;
++}
++
++std::optional<MaaViewportAlignment> ParseAlignment(std::string_view value)
++{
++    if (value == "center") {
++        return MaaViewportAlignment_Center;
++    }
++    if (value == "left") {
++        return MaaViewportAlignment_Left;
++    }
++    if (value == "right") {
++        return MaaViewportAlignment_Right;
++    }
++    return std::nullopt;
++}
++
++bool IsValidAlignment(MaaViewportAlignment alignment)
++{
++    return alignment == MaaViewportAlignment_Center || alignment == MaaViewportAlignment_Left || alignment == MaaViewportAlignment_Right;
++}
++
++} // namespace
++
++bool ViewportFrame::Valid() const
++{
++    return IsValidAlignment(alignment) && frame_id != 0;
++}
++
++ViewportFrame ViewportFrame::CoordinateLabel() const
++{
++    ViewportFrame label = *this;
++    label.image.release();
++    label.strict = false;
++    return label;
++}
++
++ViewportSession::ViewportSession(MaaController* controller)
++    : controller_(controller)
++{
++}
++
++ViewportSession::~ViewportSession()
++{
++    const bool released = ReleaseTouches();
++    (void)released;
++}
++
++std::optional<ViewportFrame> ViewportSession::Capture(MaaViewportAlignment alignment, bool refresh) const
++{
++    if (controller_ == nullptr || !IsValidAlignment(alignment)) {
++        return std::nullopt;
++    }
++
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo before;
++    if (!ReadInfo(&before) || !IsAlignmentAvailable(before, alignment)) {
++        return std::nullopt;
++    }
++
++    if (refresh) {
++        const MaaCtrlId id = MaaControllerPostScreencap(controller_);
++        if (!WaitForAction(id, "screencap")) {
++            return std::nullopt;
++        }
++    }
++
++    if (!SetAlignment(alignment)) {
++        return std::nullopt;
++    }
++
++    ScopedImageBuffer buffer;
++    const bool cached = MaaControllerCachedImage(controller_, buffer.Get()) && !MaaImageBufferIsEmpty(buffer.Get());
++    ViewportInfo selected;
++    const bool info_ok = ReadInfo(&selected);
++    const bool restored = RestoreAlignment(before.alignment);
++    if (!cached || !info_ok || !restored || selected.frame_id == 0 || selected.alignment != alignment
++        || selected.cached_alignment != alignment) {
++        LogWarn << "ViewportSession: screenshot contract validation failed." << VAR(cached) << VAR(info_ok) << VAR(restored)
++                << VAR(selected.frame_id);
++        return std::nullopt;
++    }
++
++    const cv::Mat borrowed = to_mat(buffer.Get());
++    if (borrowed.empty()) {
++        return std::nullopt;
++    }
++
++    return ViewportFrame {
++        .image = borrowed.clone(),
++        .alignment = alignment,
++        .frame_id = selected.frame_id,
++        .strict = true,
++    };
++}
++
++std::optional<ViewportFrame> ViewportSession::PreferredLabel(MaaViewportAlignment preferred) const
++{
++    if (controller_ == nullptr || !IsValidAlignment(preferred)) {
++        return std::nullopt;
++    }
++
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo info;
++    if (!ReadInfo(&info) || info.frame_id == 0) {
++        return std::nullopt;
++    }
++
++    MaaViewportAlignment alignment = preferred;
++    if (!IsAlignmentAvailable(info, alignment)) {
++        if (info.adaptive || !IsAlignmentAvailable(info, MaaViewportAlignment_Center)) {
++            return std::nullopt;
++        }
++        alignment = MaaViewportAlignment_Center;
++    }
++
++    return ViewportFrame {
++        .alignment = alignment,
++        .frame_id = info.frame_id,
++        .strict = false,
++    };
++}
++
++std::optional<ViewportFrame> ViewportSession::Adopt(const MaaImageBuffer* image, MaaViewportAlignment alignment) const
++{
++    if (image == nullptr || MaaImageBufferIsEmpty(image) || !IsValidAlignment(alignment)) {
++        return std::nullopt;
++    }
++
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo info;
++    if (!ReadInfo(&info) || info.frame_id == 0 || info.alignment != alignment || info.cached_alignment != alignment
++        || !IsAlignmentAvailable(info, alignment)) {
++        return std::nullopt;
++    }
++
++    const cv::Mat borrowed = to_mat(image);
++    if (borrowed.empty()) {
++        return std::nullopt;
++    }
++    return ViewportFrame {
++        .image = borrowed.clone(),
++        .alignment = alignment,
++        .frame_id = info.frame_id,
++        .strict = true,
++    };
++}
++
++bool ViewportSession::Click(const ViewportFrame& frame, const cv::Point& point) const
++{
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo before;
++    if (!PrepareFrame(frame, &before)) {
++        return false;
++    }
++
++    const bool succeeded = WaitForAction(MaaControllerPostClick(controller_, point.x, point.y), "click");
++    return RestoreAlignment(before.alignment) && succeeded;
++}
++
++bool ViewportSession::TouchDown(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const
++{
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo before;
++    if (!PrepareFrame(frame, &before)) {
++        return false;
++    }
++
++    const bool succeeded = WaitForAction(MaaControllerPostTouchDown(controller_, contact, point.x, point.y, pressure), "touch_down");
++    const bool restored = RestoreAlignment(before.alignment);
++    if (succeeded) {
++        active_contacts_[contact] = frame.CoordinateLabel();
++    }
++    return restored && succeeded;
++}
++
++bool ViewportSession::TouchMove(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const
++{
++    std::scoped_lock lock(ControllerMutex());
++    const auto active = active_contacts_.find(contact);
++    const ViewportFrame& effective = active == active_contacts_.end() ? frame : active->second;
++
++    ViewportInfo before;
++    if (!PrepareFrame(effective, &before)) {
++        return false;
++    }
++
++    const bool succeeded = WaitForAction(MaaControllerPostTouchMove(controller_, contact, point.x, point.y, pressure), "touch_move");
++    return RestoreAlignment(before.alignment) && succeeded;
++}
++
++bool ViewportSession::TouchUp(int contact) const
++{
++    if (controller_ == nullptr) {
++        return false;
++    }
++
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo before;
++    const bool has_info = ReadInfo(&before);
++    const auto active = active_contacts_.find(contact);
++    const bool selected = active == active_contacts_.end() || SetAlignment(active->second.alignment);
++
++    const bool succeeded = WaitForAction(MaaControllerPostTouchUp(controller_, contact), "touch_up");
++    active_contacts_.erase(contact);
++    const bool restored = !has_info || RestoreAlignment(before.alignment);
++    return selected && restored && succeeded;
++}
++
++bool ViewportSession::ReleaseTouches() const
++{
++    std::vector<int> contacts;
++    {
++        std::scoped_lock lock(ControllerMutex());
++        contacts.reserve(active_contacts_.size());
++        for (const auto& [contact, frame] : active_contacts_) {
++            (void)frame;
++            contacts.push_back(contact);
++        }
++    }
++
++    bool succeeded = true;
++    for (const int contact : contacts) {
++        succeeded = TouchUp(contact) && succeeded;
++    }
++    return succeeded;
++}
++
++bool ViewportSession::ReadInfo(ViewportInfo* out_info) const
++{
++    if (out_info == nullptr || controller_ == nullptr) {
++        return false;
++    }
++
++    ScopedStringBuffer buffer;
++    if (!MaaControllerGetInfo(controller_, buffer.Get()) || MaaStringBufferIsEmpty(buffer.Get())) {
++        return false;
++    }
++
++    const char* raw = MaaStringBufferGet(buffer.Get());
++    const auto parsed = json::parse(raw == nullptr ? "" : raw);
++    if (!parsed.has_value() || !parsed->is_object() || !parsed->contains("screenshot_viewport")) {
++        return false;
++    }
++
++    const auto& viewport = parsed->at("screenshot_viewport");
++    if (!viewport.is_object() || !viewport.contains("alignment") || !viewport.contains("cached_alignment")
++        || !viewport.contains("frame_id")) {
++        return false;
++    }
++
++    const auto alignment = ParseAlignment(viewport.at("alignment").as_string());
++    const auto cached_alignment = ParseAlignment(viewport.at("cached_alignment").as_string());
++    if (!alignment.has_value() || !cached_alignment.has_value()) {
++        return false;
++    }
++
++    ViewportInfo info;
++    info.alignment = alignment.value();
++    info.cached_alignment = cached_alignment.value();
++    info.frame_id = static_cast<std::uint64_t>(std::max(0, viewport.at("frame_id").as_integer()));
++    if (viewport.contains("adaptive")) {
++        info.adaptive = viewport.at("adaptive").as_boolean();
++    }
++    if (viewport.contains("available_alignments") && viewport.at("available_alignments").is_array()) {
++        for (const auto& item : viewport.at("available_alignments").as_array()) {
++            const auto value = ParseAlignment(item.as_string());
++            if (!value.has_value()) {
++                continue;
++            }
++            info.center_available = info.center_available || value.value() == MaaViewportAlignment_Center;
++            info.left_available = info.left_available || value.value() == MaaViewportAlignment_Left;
++            info.right_available = info.right_available || value.value() == MaaViewportAlignment_Right;
++        }
++    }
++    if (!info.center_available && !info.left_available && !info.right_available) {
++        info.center_available = true;
++    }
++
++    *out_info = info;
++    return true;
++}
++
++bool ViewportSession::SetAlignment(MaaViewportAlignment alignment) const
++{
++    return controller_ != nullptr && IsValidAlignment(alignment)
++           && MaaControllerSetOption(controller_, MaaCtrlOption_ScreenshotViewportAlignment, &alignment, sizeof(alignment));
++}
++
++bool ViewportSession::IsAlignmentAvailable(const ViewportInfo& info, MaaViewportAlignment alignment) const
++{
++    switch (alignment) {
++    case MaaViewportAlignment_Center:
++        return info.center_available;
++    case MaaViewportAlignment_Left:
++        return info.left_available;
++    case MaaViewportAlignment_Right:
++        return info.right_available;
++    default:
++        return false;
++    }
++}
++
++bool ViewportSession::PrepareFrame(const ViewportFrame& frame, ViewportInfo* before) const
++{
++    if (!frame.Valid() || before == nullptr || !ReadInfo(before) || !IsAlignmentAvailable(*before, frame.alignment)) {
++        return false;
++    }
++    if (frame.strict && before->frame_id != frame.frame_id) {
++        LogWarn << "ViewportSession: stale recognition frame rejected." << VAR(before->frame_id) << VAR(frame.frame_id);
++        return false;
++    }
++    return SetAlignment(frame.alignment);
++}
++
++bool ViewportSession::RestoreAlignment(MaaViewportAlignment alignment) const
++{
++    if (SetAlignment(alignment)) {
++        return true;
++    }
++    LogWarn << "ViewportSession: failed to restore screenshot viewport alignment." << VAR(alignment);
++    return false;
++}
++
++bool ViewportSession::WaitForAction(MaaCtrlId id, const char* action_name) const
++{
++    if (controller_ == nullptr || id == MaaInvalidId) {
++        LogWarn << "ViewportSession: failed to post controller action." << VAR(action_name);
++        return false;
++    }
++
++    const MaaStatus status = MaaControllerWait(controller_, id);
++    if (status == MaaStatus_Succeeded) {
++        return true;
++    }
++    LogWarn << "ViewportSession: controller action did not succeed." << VAR(action_name) << VAR(id) << VAR(status);
++    return false;
++}
++
++} // namespace maaend::viewport
+diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.h b/agent/cpp-algo/source/Viewport/ViewportSession.h
+new file mode 100644
+index 0000000..c24e708
+--- /dev/null
++++ b/agent/cpp-algo/source/Viewport/ViewportSession.h
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include <cstdint>
++#include <map>
++#include <optional>
++
++#include <MaaFramework/MaaAPI.h>
++#include <MaaUtils/NoWarningCV.hpp>
++
++namespace maaend::viewport
++{
++
++struct ViewportInfo
++{
++    bool adaptive = false;
++    MaaViewportAlignment alignment = MaaViewportAlignment_Center;
++    MaaViewportAlignment cached_alignment = MaaViewportAlignment_Center;
++    std::uint64_t frame_id = 0;
++    bool center_available = false;
++    bool left_available = false;
++    bool right_available = false;
++};
++
++struct ViewportFrame
++{
++    cv::Mat image;
++    MaaViewportAlignment alignment = MaaViewportAlignment_Center;
++    std::uint64_t frame_id = 0;
++    bool strict = true;
++
++    bool Valid() const;
++    ViewportFrame CoordinateLabel() const;
++};
++
++class ViewportSession
++{
++public:
++    explicit ViewportSession(MaaController* controller);
++    ~ViewportSession();
++
++    ViewportSession(const ViewportSession&) = delete;
++    ViewportSession& operator=(const ViewportSession&) = delete;
++
++    std::optional<ViewportFrame> Capture(MaaViewportAlignment alignment, bool refresh) const;
++    std::optional<ViewportFrame> Adopt(const MaaImageBuffer* image, MaaViewportAlignment alignment) const;
++    std::optional<ViewportFrame> PreferredLabel(MaaViewportAlignment preferred) const;
++
++    bool Click(const ViewportFrame& frame, const cv::Point& point) const;
++    bool TouchDown(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const;
++    bool TouchMove(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const;
++    bool TouchUp(int contact) const;
++    bool ReleaseTouches() const;
++
++private:
++    bool ReadInfo(ViewportInfo* out_info) const;
++    bool SetAlignment(MaaViewportAlignment alignment) const;
++    bool IsAlignmentAvailable(const ViewportInfo& info, MaaViewportAlignment alignment) const;
++    bool PrepareFrame(const ViewportFrame& frame, ViewportInfo* before) const;
++    bool RestoreAlignment(MaaViewportAlignment alignment) const;
++    bool WaitForAction(MaaCtrlId id, const char* action_name) const;
++
++    MaaController* controller_ = nullptr;
++    mutable std::map<int, ViewportFrame> active_contacts_;
++};
++
++} // namespace maaend::viewport
+diff --git a/agent/go-service/pkg/viewport/session.go b/agent/go-service/pkg/viewport/session.go
+new file mode 100644
+index 0000000..51f2bef
+--- /dev/null
++++ b/agent/go-service/pkg/viewport/session.go
+@@ -0,0 +1,574 @@
++package viewport
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"image"
++	"sync"
++	"time"
++
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++var (
++	ErrInvalidFrame       = errors.New("viewport frame is invalid")
++	ErrStaleFrame         = errors.New("viewport frame is stale")
++	ErrUnsupportedRuntime = errors.New("controller does not expose the viewport contract")
++	controllerSessionLock sync.Mutex
++)
++
++// Rect describes a rectangle in controller telemetry.
++type Rect struct {
++	X      int `json:"x"`
++	Y      int `json:"y"`
++	Width  int `json:"width"`
++	Height int `json:"height"`
++}
++
++// Info is the public screenshot_viewport section returned by Controller.GetInfo.
++type Info struct {
++	Configured           bool                  `json:"configured"`
++	Active               bool                  `json:"active"`
++	Adaptive             bool                  `json:"adaptive"`
++	Alignment            string                `json:"alignment"`
++	CachedAlignment      string                `json:"cached_alignment"`
++	AlignmentValue       maa.ViewportAlignment `json:"alignment_value"`
++	CachedAlignmentValue maa.ViewportAlignment `json:"cached_alignment_value"`
++	FrameID              uint64                `json:"frame_id"`
++	AvailableAlignments  []string              `json:"available_alignments"`
++	Raw                  Rect                  `json:"raw"`
++	Logical              Rect                  `json:"logical"`
++	Viewport             Rect                  `json:"viewport"`
++	RawWidth             int                   `json:"raw_width"`
++	RawHeight            int                   `json:"raw_height"`
++	LogicalWidth         int                   `json:"logical_width"`
++	LogicalHeight        int                   `json:"logical_height"`
++}
++
++// Frame binds an image or fixed-coordinate input label to the alignment and raw frame that produced it.
++type Frame struct {
++	Image     image.Image
++	Alignment maa.ViewportAlignment
++	FrameID   uint64
++	Info      Info
++	strict    bool
++}
++
++func (f Frame) Valid() bool {
++	return validAlignment(f.Alignment) && f.FrameID != 0
++}
++
++// CoordinateLabel explicitly turns a recognition frame into a fixed-coordinate label.
++// The returned value keeps the viewport alignment and source frame ID for telemetry, but
++// it is no longer tied to the lifetime of the image. Use this only for semantic coordinates
++// whose meaning survives a later screenshot (for example a fixed grid cell or safe hover
++// position); recognition-derived points should keep using the original strict Frame.
++func (f Frame) CoordinateLabel() Frame {
++	f.Image = nil
++	f.strict = false
++	return f
++}
++
++type backend interface {
++	setAlignment(maa.ViewportAlignment) error
++	screencap() error
++	cacheImage() (image.Image, error)
++	info() (Info, error)
++	click(x, y int32) error
++	swipe(x1, y1, x2, y2 int32, duration time.Duration, contact, pressure int32) error
++	touchDown(contact, x, y, pressure int32) error
++	touchMove(contact, x, y, pressure int32) error
++	touchUp(contact int32) error
++	scroll(dx, dy int32) error
++}
++
++type maaBackend struct {
++	controller *maa.Controller
++}
++
++func (b *maaBackend) setAlignment(alignment maa.ViewportAlignment) error {
++	return b.controller.SetScreenshotViewportAlignment(alignment)
++}
++
++func (b *maaBackend) screencap() error {
++	if job := b.controller.PostScreencap().Wait(); job == nil || !job.Success() {
++		return errors.New("controller screencap failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) cacheImage() (image.Image, error) {
++	return b.controller.CacheImage()
++}
++
++func (b *maaBackend) info() (Info, error) {
++	value, err := b.controller.GetInfo()
++	if err != nil {
++		return Info{}, err
++	}
++	var envelope struct {
++		ScreenshotViewport Info `json:"screenshot_viewport"`
++	}
++	if err := json.Unmarshal([]byte(value), &envelope); err != nil {
++		return Info{}, fmt.Errorf("decode controller viewport info: %w", err)
++	}
++	info := envelope.ScreenshotViewport
++	if info.Raw.Width == 0 {
++		info.Raw.Width = info.RawWidth
++		info.Raw.Height = info.RawHeight
++	}
++	if info.Logical.Width == 0 {
++		info.Logical.Width = info.LogicalWidth
++		info.Logical.Height = info.LogicalHeight
++	}
++	if info.Alignment == "" || info.CachedAlignment == "" {
++		return Info{}, ErrUnsupportedRuntime
++	}
++	return info, nil
++}
++
++func (b *maaBackend) click(x, y int32) error {
++	if job := b.controller.PostClick(x, y).Wait(); job == nil || !job.Success() {
++		return errors.New("controller click failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) swipe(x1, y1, x2, y2 int32, duration time.Duration, contact, pressure int32) error {
++	if job := b.controller.PostSwipeV2(x1, y1, x2, y2, duration, contact, pressure).Wait(); job == nil || !job.Success() {
++		return errors.New("controller swipe failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) touchDown(contact, x, y, pressure int32) error {
++	if job := b.controller.PostTouchDown(contact, x, y, pressure).Wait(); job == nil || !job.Success() {
++		return errors.New("controller touch down failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) touchMove(contact, x, y, pressure int32) error {
++	if job := b.controller.PostTouchMove(contact, x, y, pressure).Wait(); job == nil || !job.Success() {
++		return errors.New("controller touch move failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) touchUp(contact int32) error {
++	if job := b.controller.PostTouchUp(contact).Wait(); job == nil || !job.Success() {
++		return errors.New("controller touch up failed")
++	}
++	return nil
++}
++
++func (b *maaBackend) scroll(dx, dy int32) error {
++	if job := b.controller.PostScroll(dx, dy).Wait(); job == nil || !job.Success() {
++		return errors.New("controller scroll failed")
++	}
++	return nil
++}
++
++// Session serializes alignment selection with cache access and coordinate actions.
++type Session struct {
++	backend backend
++	touchMu sync.Mutex
++	touches map[int32]Frame
++}
++
++func New(controller *maa.Controller) (*Session, error) {
++	if controller == nil {
++		return nil, errors.New("nil controller")
++	}
++	return newSession(&maaBackend{controller: controller}), nil
++}
++
++// CaptureController is the audited one-shot entry point for screenshot-only callers.
++// Stateful recognition/input flows should keep a Session and pass the returned Frame to
++// the corresponding action instead of discarding its alignment evidence.
++func CaptureController(ctx context.Context, controller *maa.Controller, alignment maa.ViewportAlignment, refresh bool) (Frame, error) {
++	session, err := New(controller)
++	if err != nil {
++		return Frame{}, err
++	}
++	return session.Capture(ctx, alignment, refresh)
++}
++
++func newSession(value backend) *Session {
++	return &Session{backend: value, touches: make(map[int32]Frame)}
++}
++
++// PreferredAlignmentForROI uses the same 5/16 edge bands as MaaFramework.
++func PreferredAlignmentForROI(roi image.Rectangle, logicalWidth int) maa.ViewportAlignment {
++	if logicalWidth <= 0 {
++		logicalWidth = 1280
++	}
++	centerX := roi.Min.X + roi.Dx()/2
++	edgeBand := logicalWidth * 5 / 16
++	if centerX < edgeBand {
++		return maa.ViewportAlignmentLeft
++	}
++	if centerX >= logicalWidth-edgeBand {
++		return maa.ViewportAlignmentRight
++	}
++	return maa.ViewportAlignmentCenter
++}
++
++// Capture refreshes at most one raw screenshot and returns its selected logical viewport.
++func (s *Session) Capture(ctx context.Context, alignment maa.ViewportAlignment, refresh bool) (Frame, error) {
++	if !validAlignment(alignment) {
++		return Frame{}, fmt.Errorf("%w: invalid alignment %d", ErrInvalidFrame, alignment)
++	}
++	controllerSessionLock.Lock()
++	defer controllerSessionLock.Unlock()
++	return s.captureLocked(ctx, alignment, refresh)
++}
++
++func (s *Session) CaptureROI(ctx context.Context, roi image.Rectangle, refresh bool) (Frame, error) {
++	controllerSessionLock.Lock()
++	info, err := s.backend.info()
++	controllerSessionLock.Unlock()
++	if err != nil {
++		return Frame{}, err
++	}
++	logicalWidth := info.Logical.Width
++	if logicalWidth == 0 {
++		logicalWidth = 1280
++	}
++	alignment := PreferredAlignmentForROI(roi, logicalWidth)
++	if !alignmentAvailable(info, alignment) {
++		alignment = maa.ViewportAlignmentCenter
++	}
++	return s.Capture(ctx, alignment, refresh)
++}
++
++// CaptureCandidates renders Center, Left, and Right from one raw frame. Unsupported duplicate
++// alignments are omitted, so a standard 16:9 device returns Center only.
++func (s *Session) CaptureCandidates(ctx context.Context, refresh bool) (_ []Frame, result error) {
++	controllerSessionLock.Lock()
++	defer controllerSessionLock.Unlock()
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	before, err := s.backend.info()
++	if err != nil && !errors.Is(err, ErrUnsupportedRuntime) {
++		return nil, err
++	}
++	previous := alignmentFromInfo(before)
++	if refresh {
++		if err := s.backend.screencap(); err != nil {
++			return nil, err
++		}
++	}
++	defer func() {
++		if err := s.backend.setAlignment(previous); err != nil {
++			result = errors.Join(result, fmt.Errorf("restore viewport alignment: %w", err))
++		}
++	}()
++
++	var frames []Frame
++	var frameID uint64
++	for _, alignment := range []maa.ViewportAlignment{
++		maa.ViewportAlignmentCenter,
++		maa.ViewportAlignmentLeft,
++		maa.ViewportAlignmentRight,
++	} {
++		info, infoErr := s.backend.info()
++		if infoErr != nil {
++			return nil, infoErr
++		}
++		if !alignmentAvailable(info, alignment) {
++			continue
++		}
++		if err := s.backend.setAlignment(alignment); err != nil {
++			return nil, err
++		}
++		img, err := s.backend.cacheImage()
++		if err != nil {
++			return nil, err
++		}
++		info, err = s.backend.info()
++		if err != nil {
++			return nil, err
++		}
++		frame, err := makeFrame(img, alignment, info, true)
++		if err != nil {
++			return nil, err
++		}
++		if frameID == 0 {
++			frameID = frame.FrameID
++		} else if frame.FrameID != frameID {
++			return nil, fmt.Errorf("candidate viewport changed raw frame: %d != %d", frame.FrameID, frameID)
++		}
++		frames = append(frames, frame)
++	}
++	if len(frames) == 0 {
++		return nil, ErrInvalidFrame
++	}
++	return frames, nil
++}
++
++// Label returns a non-image coordinate label for fixed semantic inputs such as a joystick or
++// camera region. It remains usable across later screenshots but still carries an auditable frame ID.
++func (s *Session) Label(ctx context.Context, alignment maa.ViewportAlignment) (Frame, error) {
++	if err := ctx.Err(); err != nil {
++		return Frame{}, err
++	}
++	controllerSessionLock.Lock()
++	defer controllerSessionLock.Unlock()
++	info, err := s.backend.info()
++	if err != nil {
++		return Frame{}, err
++	}
++	if info.FrameID == 0 || !alignmentAvailable(info, alignment) {
++		return Frame{}, ErrInvalidFrame
++	}
++	return Frame{Alignment: alignment, FrameID: info.FrameID, Info: info, strict: false}, nil
++}
++
++// PreferredLabel selects the preferred semantic viewport on adaptive displays and
++// transparently uses Center on a standard display. It does not weaken the public
++// controller option: explicitly setting Left/Right on a non-adaptive controller still fails.
++func (s *Session) PreferredLabel(ctx context.Context, preferred maa.ViewportAlignment) (Frame, error) {
++	if !validAlignment(preferred) {
++		return Frame{}, ErrInvalidFrame
++	}
++	if err := ctx.Err(); err != nil {
++		return Frame{}, err
++	}
++	controllerSessionLock.Lock()
++	defer controllerSessionLock.Unlock()
++	info, err := s.backend.info()
++	if err != nil {
++		return Frame{}, err
++	}
++	alignment := preferred
++	if !alignmentAvailable(info, alignment) {
++		if info.Adaptive || !alignmentAvailable(info, maa.ViewportAlignmentCenter) {
++			return Frame{}, ErrInvalidFrame
++		}
++		alignment = maa.ViewportAlignmentCenter
++	}
++	if info.FrameID == 0 {
++		return Frame{}, ErrInvalidFrame
++	}
++	return Frame{Alignment: alignment, FrameID: info.FrameID, Info: info, strict: false}, nil
++}
++
++func (s *Session) Click(ctx context.Context, frame Frame, x, y int32) error {
++	return s.withFrame(ctx, frame, func() error { return s.backend.click(x, y) })
++}
++
++func (s *Session) Swipe(
++	ctx context.Context,
++	frame Frame,
++	x1, y1, x2, y2 int32,
++	duration time.Duration,
++	contact, pressure int32,
++) error {
++	return s.withFrame(ctx, frame, func() error {
++		return s.backend.swipe(x1, y1, x2, y2, duration, contact, pressure)
++	})
++}
++
++func (s *Session) TouchDown(ctx context.Context, frame Frame, contact, x, y, pressure int32) error {
++	err := s.withFrame(ctx, frame, func() error { return s.backend.touchDown(contact, x, y, pressure) })
++	if err == nil {
++		s.touchMu.Lock()
++		s.touches[contact] = frame
++		s.touchMu.Unlock()
++	}
++	return err
++}
++
++func (s *Session) TouchMove(ctx context.Context, frame Frame, contact, x, y, pressure int32) error {
++	s.touchMu.Lock()
++	if active, ok := s.touches[contact]; ok {
++		frame = active
++		frame.strict = false
++	}
++	s.touchMu.Unlock()
++	return s.withFrame(ctx, frame, func() error { return s.backend.touchMove(contact, x, y, pressure) })
++}
++
++func (s *Session) TouchUp(ctx context.Context, contact int32) error {
++	ctxErr := ctx.Err()
++	s.touchMu.Lock()
++	active, hasActive := s.touches[contact]
++	s.touchMu.Unlock()
++
++	controllerSessionLock.Lock()
++	info, infoErr := s.backend.info()
++	var selectErr error
++	if hasActive {
++		selectErr = s.backend.setAlignment(active.Alignment)
++	}
++	actionErr := s.backend.touchUp(contact)
++	var restoreErr error
++	if infoErr == nil {
++		if err := s.backend.setAlignment(alignmentFromInfo(info)); err != nil {
++			restoreErr = fmt.Errorf("restore viewport alignment: %w", err)
++		}
++	}
++	controllerSessionLock.Unlock()
++
++	s.touchMu.Lock()
++	delete(s.touches, contact)
++	s.touchMu.Unlock()
++	return errors.Join(ctxErr, infoErr, selectErr, actionErr, restoreErr)
++}
++
++func (s *Session) Scroll(ctx context.Context, frame Frame, dx, dy int32) error {
++	return s.withFrame(ctx, frame, func() error { return s.backend.scroll(dx, dy) })
++}
++
++// ReleaseTouches releases all contacts started through this session. Callers should defer it
++// around long-running input loops so cancellation and panic paths cannot leave contacts active.
++func (s *Session) ReleaseTouches(ctx context.Context) error {
++	s.touchMu.Lock()
++	contacts := make([]int32, 0, len(s.touches))
++	for contact := range s.touches {
++		contacts = append(contacts, contact)
++	}
++	s.touchMu.Unlock()
++
++	result := ctx.Err()
++	for _, contact := range contacts {
++		if err := s.TouchUp(context.Background(), contact); err != nil {
++			result = errors.Join(result, err)
++		}
++	}
++	return result
++}
++
++func (s *Session) captureLocked(ctx context.Context, alignment maa.ViewportAlignment, refresh bool) (_ Frame, result error) {
++	if err := ctx.Err(); err != nil {
++		return Frame{}, err
++	}
++	before, err := s.backend.info()
++	if err != nil && !errors.Is(err, ErrUnsupportedRuntime) {
++		return Frame{}, err
++	}
++	previous := alignmentFromInfo(before)
++	if refresh {
++		if err := s.backend.screencap(); err != nil {
++			return Frame{}, err
++		}
++	}
++	defer func() {
++		if err := s.backend.setAlignment(previous); err != nil {
++			result = errors.Join(result, fmt.Errorf("restore viewport alignment: %w", err))
++		}
++	}()
++	if err := s.backend.setAlignment(alignment); err != nil {
++		return Frame{}, err
++	}
++	img, err := s.backend.cacheImage()
++	if err != nil {
++		return Frame{}, err
++	}
++	info, err := s.backend.info()
++	if err != nil {
++		return Frame{}, err
++	}
++	return makeFrame(img, alignment, info, true)
++}
++
++func (s *Session) withFrame(ctx context.Context, frame Frame, action func() error) (result error) {
++	if !frame.Valid() {
++		return ErrInvalidFrame
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	controllerSessionLock.Lock()
++	defer controllerSessionLock.Unlock()
++	info, err := s.backend.info()
++	if err != nil {
++		return err
++	}
++	if frame.strict && info.FrameID != frame.FrameID {
++		return fmt.Errorf("%w: current=%d recognized=%d", ErrStaleFrame, info.FrameID, frame.FrameID)
++	}
++	previous := alignmentFromInfo(info)
++	defer func() {
++		if err := s.backend.setAlignment(previous); err != nil {
++			result = errors.Join(result, fmt.Errorf("restore viewport alignment: %w", err))
++		}
++	}()
++	if err := s.backend.setAlignment(frame.Alignment); err != nil {
++		return err
++	}
++	return action()
++}
++
++func makeFrame(img image.Image, alignment maa.ViewportAlignment, info Info, strict bool) (Frame, error) {
++	if img == nil || info.FrameID == 0 {
++		return Frame{}, ErrInvalidFrame
++	}
++	expected := alignmentName(alignment)
++	if info.Alignment != expected || info.CachedAlignment != expected {
++		return Frame{}, fmt.Errorf(
++			"%w: selected=%q cached=%q expected=%q",
++			ErrInvalidFrame,
++			info.Alignment,
++			info.CachedAlignment,
++			expected,
++		)
++	}
++	if info.Logical.Width > 0 && (img.Bounds().Dx() != info.Logical.Width || img.Bounds().Dy() != info.Logical.Height) {
++		return Frame{}, fmt.Errorf(
++			"%w: image=%dx%d logical=%dx%d",
++			ErrInvalidFrame,
++			img.Bounds().Dx(),
++			img.Bounds().Dy(),
++			info.Logical.Width,
++			info.Logical.Height,
++		)
++	}
++	return Frame{Image: img, Alignment: alignment, FrameID: info.FrameID, Info: info, strict: strict}, nil
++}
++
++func validAlignment(alignment maa.ViewportAlignment) bool {
++	return alignment >= maa.ViewportAlignmentCenter && alignment <= maa.ViewportAlignmentRight
++}
++
++func alignmentName(alignment maa.ViewportAlignment) string {
++	switch alignment {
++	case maa.ViewportAlignmentLeft:
++		return "left"
++	case maa.ViewportAlignmentRight:
++		return "right"
++	default:
++		return "center"
++	}
++}
++
++func alignmentFromInfo(info Info) maa.ViewportAlignment {
++	switch info.Alignment {
++	case "left":
++		return maa.ViewportAlignmentLeft
++	case "right":
++		return maa.ViewportAlignmentRight
++	default:
++		return maa.ViewportAlignmentCenter
++	}
++}
++
++func alignmentAvailable(info Info, alignment maa.ViewportAlignment) bool {
++	if !validAlignment(alignment) {
++		return false
++	}
++	if len(info.AvailableAlignments) == 0 {
++		return alignment == maa.ViewportAlignmentCenter
++	}
++	expected := alignmentName(alignment)
++	for _, value := range info.AvailableAlignments {
++		if value == expected {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/agent/go-service/pkg/viewport/session_test.go b/agent/go-service/pkg/viewport/session_test.go
+new file mode 100644
+index 0000000..986f665
+--- /dev/null
++++ b/agent/go-service/pkg/viewport/session_test.go
+@@ -0,0 +1,275 @@
++package viewport
++
++import (
++	"context"
++	"errors"
++	"image"
++	"testing"
++	"time"
++
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++type fakeBackend struct {
++	alignment  maa.ViewportAlignment
++	frameID    uint64
++	image      image.Image
++	actions    []maa.ViewportAlignment
++	screencaps int
++	failCache  bool
++	adaptive   bool
++	reject     *maa.ViewportAlignment
++}
++
++func newFakeBackend() *fakeBackend {
++	return &fakeBackend{
++		alignment: maa.ViewportAlignmentCenter,
++		frameID:   1,
++		image:     image.NewRGBA(image.Rect(0, 0, 1280, 720)),
++		adaptive:  true,
++	}
++}
++
++func (b *fakeBackend) setAlignment(alignment maa.ViewportAlignment) error {
++	if !validAlignment(alignment) {
++		return ErrInvalidFrame
++	}
++	if b.reject != nil && *b.reject == alignment {
++		return errors.New("alignment rejected")
++	}
++	b.alignment = alignment
++	return nil
++}
++
++func (b *fakeBackend) screencap() error {
++	b.frameID++
++	b.screencaps++
++	return nil
++}
++
++func (b *fakeBackend) cacheImage() (image.Image, error) {
++	if b.failCache {
++		return nil, errors.New("cache failed")
++	}
++	return b.image, nil
++}
++
++func (b *fakeBackend) info() (Info, error) {
++	name := alignmentName(b.alignment)
++	available := []string{"center", "left", "right"}
++	if !b.adaptive {
++		available = []string{"center"}
++	}
++	return Info{
++		Active:               true,
++		Adaptive:             b.adaptive,
++		Alignment:            name,
++		CachedAlignment:      name,
++		AlignmentValue:       b.alignment,
++		CachedAlignmentValue: b.alignment,
++		FrameID:              b.frameID,
++		AvailableAlignments:  available,
++		Raw:                  Rect{Width: 2800, Height: 1260},
++		Logical:              Rect{Width: 1280, Height: 720},
++	}, nil
++}
++
++func TestPreferredLabelFallsBackToCenterOnStandardDisplay(t *testing.T) {
++	backend := newFakeBackend()
++	backend.adaptive = false
++	backend.alignment = maa.ViewportAlignmentCenter
++	session := newSession(backend)
++
++	label, err := session.PreferredLabel(context.Background(), maa.ViewportAlignmentRight)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if label.Alignment != maa.ViewportAlignmentCenter {
++		t.Fatalf("alignment=%d, want center", label.Alignment)
++	}
++}
++
++func (b *fakeBackend) record() error {
++	b.actions = append(b.actions, b.alignment)
++	return nil
++}
++
++func (b *fakeBackend) click(int32, int32) error { return b.record() }
++func (b *fakeBackend) swipe(int32, int32, int32, int32, time.Duration, int32, int32) error {
++	return b.record()
++}
++func (b *fakeBackend) touchDown(int32, int32, int32, int32) error { return b.record() }
++func (b *fakeBackend) touchMove(int32, int32, int32, int32) error { return b.record() }
++func (b *fakeBackend) touchUp(int32) error                        { return b.record() }
++func (b *fakeBackend) scroll(int32, int32) error                  { return b.record() }
++
++func TestPreferredAlignmentForROI(t *testing.T) {
++	tests := []struct {
++		x    int
++		want maa.ViewportAlignment
++	}{
++		{399, maa.ViewportAlignmentLeft},
++		{400, maa.ViewportAlignmentCenter},
++		{879, maa.ViewportAlignmentCenter},
++		{880, maa.ViewportAlignmentRight},
++	}
++	for _, test := range tests {
++		roi := image.Rect(test.x, 0, test.x+1, 1)
++		if got := PreferredAlignmentForROI(roi, 1280); got != test.want {
++			t.Fatalf("x=%d: got %d, want %d", test.x, got, test.want)
++		}
++	}
++}
++
++func TestCaptureCandidatesUsesOneRawFrameAndRestores(t *testing.T) {
++	backend := newFakeBackend()
++	backend.alignment = maa.ViewportAlignmentRight
++	session := newSession(backend)
++
++	frames, err := session.CaptureCandidates(context.Background(), true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(frames) != 3 || backend.screencaps != 1 {
++		t.Fatalf("frames=%d screencaps=%d", len(frames), backend.screencaps)
++	}
++	for _, frame := range frames {
++		if frame.FrameID != 2 {
++			t.Fatalf("candidate frame id=%d", frame.FrameID)
++		}
++	}
++	if backend.alignment != maa.ViewportAlignmentRight {
++		t.Fatalf("alignment not restored: %d", backend.alignment)
++	}
++}
++
++func TestCaptureErrorRestoresAlignment(t *testing.T) {
++	backend := newFakeBackend()
++	backend.alignment = maa.ViewportAlignmentLeft
++	backend.failCache = true
++	session := newSession(backend)
++
++	if _, err := session.Capture(context.Background(), maa.ViewportAlignmentRight, false); err == nil {
++		t.Fatal("expected cache failure")
++	}
++	if backend.alignment != maa.ViewportAlignmentLeft {
++		t.Fatalf("alignment not restored: %d", backend.alignment)
++	}
++}
++
++func TestStrictFrameRejectsStaleButFixedLabelAllowsIt(t *testing.T) {
++	backend := newFakeBackend()
++	session := newSession(backend)
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentLeft, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	backend.frameID++
++	if err := session.Click(context.Background(), frame, 100, 100); !errors.Is(err, ErrStaleFrame) {
++		t.Fatalf("got %v, want ErrStaleFrame", err)
++	}
++
++	label, err := session.Label(context.Background(), maa.ViewportAlignmentRight)
++	if err != nil {
++		t.Fatal(err)
++	}
++	backend.frameID++
++	if err := session.Click(context.Background(), label, 100, 100); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentRight {
++		t.Fatalf("action alignment=%d", got)
++	}
++}
++
++func TestCoordinateLabelPreservesEvidenceButAllowsLaterFrame(t *testing.T) {
++	backend := newFakeBackend()
++	session := newSession(backend)
++	frame, err := session.Capture(context.Background(), maa.ViewportAlignmentLeft, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	label := frame.CoordinateLabel()
++	backend.frameID++
++	if label.Image != nil || label.FrameID != frame.FrameID || label.Alignment != frame.Alignment {
++		t.Fatalf("coordinate label lost source evidence: %#v", label)
++	}
++	if err := session.Click(context.Background(), label, 100, 100); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentLeft {
++		t.Fatalf("action alignment=%d", got)
++	}
++}
++
++func TestContactKeepsDownAlignmentAndTouchUpClears(t *testing.T) {
++	backend := newFakeBackend()
++	session := newSession(backend)
++	left, _ := session.Label(context.Background(), maa.ViewportAlignmentLeft)
++	right, _ := session.Label(context.Background(), maa.ViewportAlignmentRight)
++
++	if err := session.TouchDown(context.Background(), left, 1, 100, 100, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := session.TouchMove(context.Background(), right, 1, 200, 100, 1); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentLeft {
++		t.Fatalf("active contact moved with alignment=%d", got)
++	}
++	if err := session.TouchUp(context.Background(), 1); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentLeft {
++		t.Fatalf("touch up alignment=%d, want left", got)
++	}
++	if err := session.TouchMove(context.Background(), right, 1, 200, 100, 1); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentRight {
++		t.Fatalf("released contact moved with alignment=%d", got)
++	}
++}
++
++func TestTouchUpStillReleasesWhenContactAlignmentCannotBeSelected(t *testing.T) {
++	backend := newFakeBackend()
++	session := newSession(backend)
++	left, _ := session.Label(context.Background(), maa.ViewportAlignmentLeft)
++	right, _ := session.Label(context.Background(), maa.ViewportAlignmentRight)
++	if err := session.TouchDown(context.Background(), left, 4, 100, 100, 1); err != nil {
++		t.Fatal(err)
++	}
++	backend.reject = new(maa.ViewportAlignment)
++	*backend.reject = maa.ViewportAlignmentLeft
++	actionCount := len(backend.actions)
++	if err := session.TouchUp(context.Background(), 4); err == nil {
++		t.Fatal("expected alignment selection error")
++	}
++	if len(backend.actions) != actionCount+1 {
++		t.Fatalf("touch up was skipped: actions=%d, want %d", len(backend.actions), actionCount+1)
++	}
++	backend.reject = nil
++	if err := session.TouchMove(context.Background(), right, 4, 200, 100, 1); err != nil {
++		t.Fatal(err)
++	}
++	if got := backend.actions[len(backend.actions)-1]; got != maa.ViewportAlignmentRight {
++		t.Fatalf("failed touch up did not clear contact: alignment=%d", got)
++	}
++}
++
++func TestPanicStillRestoresAlignment(t *testing.T) {
++	backend := newFakeBackend()
++	backend.alignment = maa.ViewportAlignmentCenter
++	session := newSession(backend)
++	frame, _ := session.Label(context.Background(), maa.ViewportAlignmentRight)
++
++	func() {
++		defer func() { _ = recover() }()
++		_ = session.withFrame(context.Background(), frame, func() error {
++			panic("test panic")
++		})
++	}()
++	if backend.alignment != maa.ViewportAlignmentCenter {
++		t.Fatalf("alignment not restored after panic: %d", backend.alignment)
++	}
++}
+diff --git a/agent/go-service/taskersink/aspectratio/checker_viewport_test.go b/agent/go-service/taskersink/aspectratio/checker_viewport_test.go
+new file mode 100644
+index 0000000..108d483
+--- /dev/null
++++ b/agent/go-service/taskersink/aspectratio/checker_viewport_test.go
+@@ -0,0 +1,244 @@
++package aspectratio
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++func viewportControllerInfo(fields string) string {
++	return fmt.Sprintf(`{"type":"adb","screenshot_viewport":{%s}}`, fields)
++}
++
++func TestParseCompatibleScreenshotViewport(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name    string
++		info    string
++		width   int32
++		height  int32
++		wantErr bool
++	}{
++		{
++			name: "adaptive ultra-wide phone",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"adaptive","adaptive":true,` +
++					`"raw_width":2800,"raw_height":1260,"logical_width":1280,"logical_height":720,` +
++					`"x":280,"y":0,"width":2240,"height":1260`,
++			),
++			width:  2800,
++			height: 1260,
++		},
++		{
++			name: "scaled 16 by 9 display",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"center","adaptive":false,` +
++					`"raw_width":1920,"raw_height":1080,"logical_width":1280,"logical_height":720,` +
++					`"x":0,"y":0,"width":1920,"height":1080`,
++			),
++			width:  1920,
++			height: 1080,
++		},
++		{
++			name:    "capability missing",
++			info:    `{"type":"adb"}`,
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name: "configured but inactive",
++			info: viewportControllerInfo(
++				`"configured":true,"active":false,"mode":"adaptive","adaptive":false,` +
++					`"raw_width":1260,"raw_height":2800,"logical_width":1280,"logical_height":720`,
++			),
++			width:   1260,
++			height:  2800,
++			wantErr: true,
++		},
++		{
++			name: "wrong logical size",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"adaptive","adaptive":true,` +
++					`"raw_width":2800,"raw_height":1260,"logical_width":1600,"logical_height":720,` +
++					`"x":280,"y":0,"width":2240,"height":1260`,
++			),
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name: "stale raw size",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"adaptive","adaptive":true,` +
++					`"raw_width":2400,"raw_height":1080,"logical_width":1280,"logical_height":720,` +
++					`"x":240,"y":0,"width":1920,"height":1080`,
++			),
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name: "viewport outside raw image",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"adaptive","adaptive":true,` +
++					`"raw_width":2800,"raw_height":1260,"logical_width":1280,"logical_height":720,` +
++					`"x":700,"y":0,"width":2240,"height":1260`,
++			),
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name: "ultra-wide center-only mode",
++			info: viewportControllerInfo(
++				`"configured":true,"active":true,"mode":"center","adaptive":false,` +
++					`"raw_width":2800,"raw_height":1260,"logical_width":1280,"logical_height":720,` +
++					`"x":280,"y":0,"width":2240,"height":1260`,
++			),
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name:    "malformed controller info",
++			info:    `{`,
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			_, err := parseCompatibleScreenshotViewport(tt.info, tt.width, tt.height)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("parseCompatibleScreenshotViewport() error = %v, wantErr %v", err, tt.wantErr)
++			}
++		})
++	}
++}
++
++func TestParseCompatiblePortraitLaunchViewport(t *testing.T) {
++	t.Parallel()
++
++	valid := `"configured":true,"active":false,"mode":"adaptive","adaptive":false,` +
++		`"raw_width":1260,"raw_height":2800,"logical_width":1280,"logical_height":720`
++	tests := []struct {
++		name    string
++		fields  string
++		width   int32
++		height  int32
++		wantErr bool
++	}{
++		{
++			name:   "configured adaptive portrait phone",
++			fields: valid,
++			width:  1260,
++			height: 2800,
++		},
++		{
++			name: "active capability is not a transition",
++			fields: `"configured":true,"active":true,"mode":"adaptive","adaptive":true,` +
++				`"raw_width":1260,"raw_height":2800,"logical_width":1280,"logical_height":720`,
++			width:   1260,
++			height:  2800,
++			wantErr: true,
++		},
++		{
++			name: "center mode is rejected",
++			fields: `"configured":true,"active":false,"mode":"center","adaptive":false,` +
++				`"raw_width":1260,"raw_height":2800,"logical_width":1280,"logical_height":720`,
++			width:   1260,
++			height:  2800,
++			wantErr: true,
++		},
++		{
++			name:    "landscape state is rejected",
++			fields:  valid,
++			width:   2800,
++			height:  1260,
++			wantErr: true,
++		},
++		{
++			name: "stale raw dimensions are rejected",
++			fields: `"configured":true,"active":false,"mode":"adaptive","adaptive":false,` +
++				`"raw_width":1080,"raw_height":2400,"logical_width":1280,"logical_height":720`,
++			width:   1260,
++			height:  2800,
++			wantErr: true,
++		},
++		{
++			name: "rotated resolution is too small",
++			fields: `"configured":true,"active":false,"mode":"adaptive","adaptive":false,` +
++				`"raw_width":700,"raw_height":1200,"logical_width":1280,"logical_height":720`,
++			width:   700,
++			height:  1200,
++			wantErr: true,
++		},
++		{
++			name: "wrong logical size is rejected",
++			fields: `"configured":true,"active":false,"mode":"adaptive","adaptive":false,` +
++				`"raw_width":1260,"raw_height":2800,"logical_width":1920,"logical_height":1080`,
++			width:   1260,
++			height:  2800,
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			_, err := parseCompatiblePortraitLaunchViewport(viewportControllerInfo(tt.fields), tt.width, tt.height)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("parseCompatiblePortraitLaunchViewport() error = %v, wantErr %v", err, tt.wantErr)
++			}
++		})
++	}
++}
++
++func TestPortraitLaunchTransitionEntryIsExact(t *testing.T) {
++	t.Parallel()
++
++	if !isPortraitLaunchTransitionEntry("AndroidOpenGame") {
++		t.Fatal("AndroidOpenGame should be eligible for the portrait launch transition")
++	}
++	for _, entry := range []string{"OpenGame", "AndroidOpenGame_CN", "DailyTask", "androidopengame", " AndroidOpenGame"} {
++		if isPortraitLaunchTransitionEntry(entry) {
++			t.Fatalf("entry %q unexpectedly received the portrait launch exception", entry)
++		}
++	}
++}
++
++func TestValidateCoordinateFreeNode(t *testing.T) {
++	t.Parallel()
++
++	directStart := &maa.Node{
++		Recognition: &maa.Recognition{Type: maa.RecognitionTypeDirectHit},
++		Action:      &maa.Action{Type: maa.ActionTypeStartApp},
++	}
++	if err := validateCoordinateFreeNode(directStart, maa.ActionTypeStartApp); err != nil {
++		t.Fatalf("validateCoordinateFreeNode() error = %v", err)
++	}
++
++	coordinateAction := &maa.Node{
++		Recognition: &maa.Recognition{Type: maa.RecognitionTypeDirectHit},
++		Action:      &maa.Action{Type: maa.ActionTypeClick},
++	}
++	if err := validateCoordinateFreeNode(coordinateAction, maa.ActionTypeStartApp); err == nil {
++		t.Fatal("coordinate action unexpectedly passed the launch-chain guard")
++	}
++
++	imageRecognition := &maa.Node{
++		Recognition: &maa.Recognition{Type: maa.RecognitionTypeOCR},
++		Action:      &maa.Action{Type: maa.ActionTypeStartApp},
++	}
++	if err := validateCoordinateFreeNode(imageRecognition, maa.ActionTypeStartApp); err == nil {
++		t.Fatal("image recognition unexpectedly passed before viewport activation")
++	}
++}
+diff --git a/agent/go-service/viewportprobe/input.go b/agent/go-service/viewportprobe/input.go
+new file mode 100644
+index 0000000..b176908
+--- /dev/null
++++ b/agent/go-service/viewportprobe/input.go
+@@ -0,0 +1,119 @@
++package viewportprobe
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++	"github.com/rs/zerolog/log"
++)
++
++const (
++	component       = "viewport_input_probe"
++	joystickContact = int32(0)
++	cameraContact   = int32(1)
++	joystickX       = int32(195)
++	joystickY       = int32(551)
++	cameraX         = int32(640)
++	cameraY         = int32(264)
++	cameraDeltaX    = int32(24)
++)
++
++type inputSession interface {
++	PreferredLabel(context.Context, maa.ViewportAlignment) (viewport.Frame, error)
++	TouchDown(context.Context, viewport.Frame, int32, int32, int32, int32) error
++	TouchMove(context.Context, viewport.Frame, int32, int32, int32, int32) error
++	TouchUp(context.Context, int32) error
++}
++
++type inputEvidence struct {
++	left  viewport.Frame
++	right viewport.Frame
++}
++
++func runInputProbe(ctx context.Context, session inputSession) (inputEvidence, error) {
++	left, err := session.PreferredLabel(ctx, maa.ViewportAlignmentLeft)
++	if err != nil {
++		return inputEvidence{}, fmt.Errorf("label left viewport: %w", err)
++	}
++	if err := session.TouchDown(ctx, left, joystickContact, joystickX, joystickY, 1); err != nil {
++		return inputEvidence{}, fmt.Errorf("joystick center down: %w", err)
++	}
++	if err := session.TouchUp(ctx, joystickContact); err != nil {
++		return inputEvidence{}, fmt.Errorf("joystick center up: %w", err)
++	}
++
++	right, err := session.PreferredLabel(ctx, maa.ViewportAlignmentRight)
++	if err != nil {
++		return inputEvidence{}, fmt.Errorf("label right viewport: %w", err)
++	}
++	if err := session.TouchDown(ctx, right, cameraContact, cameraX, cameraY, 0); err != nil {
++		return inputEvidence{}, fmt.Errorf("camera down: %w", err)
++	}
++	moveOutErr := session.TouchMove(ctx, right, cameraContact, cameraX+cameraDeltaX, cameraY, 0)
++	moveBackErr := session.TouchMove(ctx, right, cameraContact, cameraX, cameraY, 0)
++	upErr := session.TouchUp(ctx, cameraContact)
++	if err := errors.Join(moveOutErr, moveBackErr, upErr); err != nil {
++		return inputEvidence{}, fmt.Errorf("camera reversible swipe: %w", err)
++	}
++	return inputEvidence{left: left, right: right}, nil
++}
++
++type InputProbeAction struct{}
++
++var _ maa.CustomActionRunner = &InputProbeAction{}
++
++func (a *InputProbeAction) Run(ctx *maa.Context, _ *maa.CustomActionArg) bool {
++	if ctx == nil || ctx.GetTasker() == nil || ctx.GetTasker().GetController() == nil {
++		log.Error().Str("component", component).Msg("ViewportInputProbe: controller unavailable")
++		return false
++	}
++	session, err := viewport.New(ctx.GetTasker().GetController())
++	if err != nil {
++		log.Error().Err(err).Str("component", component).Msg("ViewportInputProbe: session failed")
++		return false
++	}
++	probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	defer func() {
++		if err := session.ReleaseTouches(context.Background()); err != nil {
++			log.Error().Err(err).Str("component", component).Msg("ViewportInputProbe: touch cleanup failed")
++		}
++	}()
++
++	evidence, err := runInputProbe(probeCtx, session)
++	if err != nil {
++		log.Error().Err(err).Str("component", component).Msg("ViewportInputProbe: failed")
++		return false
++	}
++	log.Info().
++		Str("component", component).
++		Str("phase", "joystick_center_released").
++		Str("alignment", alignmentName(evidence.left.Alignment)).
++		Uint64("frame_id", evidence.left.FrameID).
++		Int32("contact", joystickContact).
++		Msg("ViewportInputProbe: joystick verified")
++	log.Info().
++		Str("component", component).
++		Str("phase", "camera_reversed").
++		Str("alignment", alignmentName(evidence.right.Alignment)).
++		Uint64("frame_id", evidence.right.FrameID).
++		Int32("contact", cameraContact).
++		Bool("reversed", true).
++		Msg("ViewportInputProbe: done")
++	return true
++}
++
++func alignmentName(alignment maa.ViewportAlignment) string {
++	switch alignment {
++	case maa.ViewportAlignmentLeft:
++		return "left"
++	case maa.ViewportAlignmentRight:
++		return "right"
++	default:
++		return "center"
++	}
++}
+diff --git a/agent/go-service/viewportprobe/input_test.go b/agent/go-service/viewportprobe/input_test.go
+new file mode 100644
+index 0000000..d101055
+--- /dev/null
++++ b/agent/go-service/viewportprobe/input_test.go
+@@ -0,0 +1,59 @@
++package viewportprobe
++
++import (
++	"context"
++	"fmt"
++	"testing"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++type fakeInputSession struct {
++	events []string
++}
++
++func (s *fakeInputSession) PreferredLabel(_ context.Context, alignment maa.ViewportAlignment) (viewport.Frame, error) {
++	frameID := uint64(11)
++	if alignment == maa.ViewportAlignmentRight {
++		frameID = 12
++	}
++	return viewport.Frame{Alignment: alignment, FrameID: frameID}, nil
++}
++
++func (s *fakeInputSession) TouchDown(_ context.Context, frame viewport.Frame, contact, x, y, pressure int32) error {
++	s.events = append(s.events, fmt.Sprintf("down:%d:%s:%d:%d:%d", contact, alignmentName(frame.Alignment), x, y, pressure))
++	return nil
++}
++
++func (s *fakeInputSession) TouchMove(_ context.Context, frame viewport.Frame, contact, x, y, pressure int32) error {
++	s.events = append(s.events, fmt.Sprintf("move:%d:%s:%d:%d:%d", contact, alignmentName(frame.Alignment), x, y, pressure))
++	return nil
++}
++
++func (s *fakeInputSession) TouchUp(_ context.Context, contact int32) error {
++	s.events = append(s.events, fmt.Sprintf("up:%d", contact))
++	return nil
++}
++
++func TestRunInputProbeUsesLeftJoystickAndReversesRightCamera(t *testing.T) {
++	session := &fakeInputSession{}
++	evidence, err := runInputProbe(context.Background(), session)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := []string{
++		"down:0:left:195:551:1",
++		"up:0",
++		"down:1:right:640:264:0",
++		"move:1:right:664:264:0",
++		"move:1:right:640:264:0",
++		"up:1",
++	}
++	if fmt.Sprint(session.events) != fmt.Sprint(want) {
++		t.Fatalf("events = %v, want %v", session.events, want)
++	}
++	if evidence.left.FrameID != 11 || evidence.right.FrameID != 12 {
++		t.Fatalf("unexpected evidence: %+v", evidence)
++	}
++}
+diff --git a/agent/go-service/viewportprobe/register.go b/agent/go-service/viewportprobe/register.go
+new file mode 100644
+index 0000000..d0049f3
+--- /dev/null
++++ b/agent/go-service/viewportprobe/register.go
+@@ -0,0 +1,7 @@
++package viewportprobe
++
++import maa "github.com/MaaXYZ/maa-framework-go/v4"
++
++func Register() {
++	maa.AgentServerRegisterCustomAction("ViewportInputProbeAction", &InputProbeAction{})
++}
