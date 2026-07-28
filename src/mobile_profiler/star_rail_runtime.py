@@ -28,6 +28,21 @@ from .star_rail_copilot_runner import (
 )
 
 
+STAR_RAIL_OPTION_DEFAULTS: dict[str, object] = {
+    "server": "CN-Official",
+    "screenshot_method": "scrcpy",
+    "scrcpy_max_size": DEFAULT_SCRCPY_MAX_SIZE,
+    "control_method": "MaaTouch",
+    "world": ROGUE_WORLDS[-1],
+    "path": "The_Hunt",
+    "domain_strategy": "combat",
+    "use_immersifier": True,
+    "double_event": True,
+    "weekly_farming": False,
+    "use_stamina": False,
+}
+
+
 def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
@@ -99,7 +114,108 @@ class StarRailCopilotRuntimeController:
         self._started_at: Optional[float] = None
         self._completed_at: Optional[float] = None
         self._logs: deque[dict[str, object]] = deque(maxlen=30)
+        self._options = dict(STAR_RAIL_OPTION_DEFAULTS)
+        self._load_config()
         self._refresh_install_status()
+
+    @property
+    def _config_path(self) -> Path:
+        return self.output_root / "config.json"
+
+    def _load_config(self) -> None:
+        try:
+            payload = json.loads(self._config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        upstream_path = str(payload.get("upstream_path") or "").strip()
+        if upstream_path:
+            self.upstream_path = Path(upstream_path).expanduser().resolve()
+        raw_options = payload.get("options")
+        if isinstance(raw_options, dict):
+            try:
+                self._options = self._validated_options(raw_options)
+            except ValueError:
+                pass
+
+    def _persist_config(self) -> None:
+        _atomic_write(
+            self._config_path,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "upstream_path": str(self.upstream_path),
+                    "options": dict(self._options),
+                    "saved_at": time.time(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+        )
+
+    def _validated_options(self, payload: dict[str, object]) -> dict[str, object]:
+        values = dict(self._options)
+        for key, default in STAR_RAIL_OPTION_DEFAULTS.items():
+            if key not in payload:
+                continue
+            if isinstance(default, bool):
+                values[key] = _bool(payload[key], bool(default))
+            elif isinstance(default, int):
+                try:
+                    values[key] = int(str(payload[key]).strip())
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"StarRailCopilot {key} must be an integer") from exc
+            else:
+                values[key] = str(payload[key] or "").strip()
+        choices = {
+            "server": set(SERVER_PACKAGES),
+            "screenshot_method": set(SCREENSHOT_METHODS),
+            "control_method": set(CONTROL_METHODS),
+            "world": set(ROGUE_WORLDS),
+            "path": set(ROGUE_PATHS),
+            "domain_strategy": set(DOMAIN_STRATEGIES),
+        }
+        for key, allowed in choices.items():
+            if values[key] not in allowed:
+                raise ValueError(f"unsupported StarRailCopilot {key}: {values[key]}")
+        if int(values["scrcpy_max_size"]) not in SCRCPY_MAX_SIZES:
+            raise ValueError("unsupported StarRailCopilot scrcpy_max_size")
+        return values
+
+    def _configuration(self, payload: dict[str, object]) -> dict[str, object]:
+        raw_root = payload.get("upstream_path", str(self.upstream_path))
+        root_text = str(raw_root or "").strip()
+        if not root_text:
+            raise ValueError("StarRailCopilot upstream_path is required")
+        option_payload = {
+            key: payload[key]
+            for key in STAR_RAIL_OPTION_DEFAULTS
+            if key in payload
+        }
+        return {
+            "upstream_path": str(Path(root_text).expanduser().resolve()),
+            **self._validated_options(option_payload),
+        }
+
+    def _apply_configuration(self, configuration: dict[str, object]) -> None:
+        self.upstream_path = Path(str(configuration["upstream_path"])).resolve()
+        self._options = {
+            key: configuration[key] for key in STAR_RAIL_OPTION_DEFAULTS
+        }
+
+    def configure(self, payload: dict[str, object]) -> dict[str, object]:
+        configuration = self._configuration(payload)
+        with self._lock:
+            if self._running:
+                raise RuntimeError("StarRailCopilot Rogue is already running")
+            self._apply_configuration(configuration)
+            self._last_preflight = None
+            self._last_error = ""
+        self._persist_config()
+        self._refresh_install_status()
+        self._log("configured", "已保存 StarRailCopilot 模拟宇宙参数")
+        return self.snapshot()
 
     @property
     def python_executable(self) -> str:
@@ -139,10 +255,11 @@ class StarRailCopilotRuntimeController:
         mode: str,
         payload: dict[str, object],
     ) -> list[str]:
-        use_immersifier = _bool(payload.get("use_immersifier"), True)
-        double_event = _bool(payload.get("double_event"), True)
-        weekly_farming = _bool(payload.get("weekly_farming"), False)
-        use_stamina = _bool(payload.get("use_stamina"), False)
+        configuration = self._configuration(payload)
+        use_immersifier = bool(configuration["use_immersifier"])
+        double_event = bool(configuration["double_event"])
+        weekly_farming = bool(configuration["weekly_farming"])
+        use_stamina = bool(configuration["use_stamina"])
         command = [
             self.python_executable,
             "-m",
@@ -154,19 +271,19 @@ class StarRailCopilotRuntimeController:
             "--adb",
             self.adb,
             "--server",
-            _choice(payload, "server", "CN-Official"),
+            str(configuration["server"]),
             "--screenshot-method",
-            _choice(payload, "screenshot_method", "scrcpy"),
+            str(configuration["screenshot_method"]),
             "--scrcpy-max-size",
-            str(_scrcpy_max_size(payload)),
+            str(configuration["scrcpy_max_size"]),
             "--control-method",
-            _choice(payload, "control_method", "MaaTouch"),
+            str(configuration["control_method"]),
             "--world",
-            _choice(payload, "world", ROGUE_WORLDS[-1]),
+            str(configuration["world"]),
             "--path",
-            _choice(payload, "path", "The_Hunt"),
+            str(configuration["path"]),
             "--domain-strategy",
-            _choice(payload, "domain_strategy", "combat"),
+            str(configuration["domain_strategy"]),
             "--use-immersifier" if use_immersifier else "--no-use-immersifier",
             "--double-event" if double_event else "--no-double-event",
             "--weekly-farming" if weekly_farming else "--no-weekly-farming",
@@ -194,9 +311,11 @@ class StarRailCopilotRuntimeController:
         device = str(payload.get("device") or "").strip()
         if not device:
             raise ValueError("StarRailCopilot preflight requires device")
+        configuration = self._configuration(payload)
         with self._lock:
             if self._running:
                 raise RuntimeError("StarRailCopilot Rogue is already running")
+            self._apply_configuration(configuration)
             self._refresh_install_status()
             if self._status == "not_installed":
                 raise RuntimeError(self._last_error or "StarRailCopilot is not installed")
@@ -204,7 +323,7 @@ class StarRailCopilotRuntimeController:
             self._last_error = ""
             self._device = device
         self._log("preflighting", f"开始检查真机 {device} 与 StarRailCopilot")
-        command = self._command(device, "--preflight", payload)
+        command = self._command(device, "--preflight", configuration)
         try:
             result = self._run_func(
                 command,
@@ -232,12 +351,14 @@ class StarRailCopilotRuntimeController:
             self._log("error", self._last_error)
             raise RuntimeError(self._last_error)
         summary = self._summary_from_output(output)
+        summary["runtime"] = dict(configuration)
         screen = summary.get("screen") if isinstance(summary.get("screen"), dict) else {}
         ready = screen.get("game_ready") is True
         with self._lock:
             self._last_preflight = summary
             self._status = "ready" if ready else "waiting_for_game"
             self._last_error = ""
+        self._persist_config()
         _atomic_write(
             self.output_root / "preflight.json",
             json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -282,6 +403,7 @@ class StarRailCopilotRuntimeController:
         device = str(payload.get("device") or "").strip()
         if not device:
             raise ValueError("StarRailCopilot run requires device")
+        configuration = self._configuration(payload)
         with self._lock:
             if self._running:
                 raise RuntimeError("StarRailCopilot Rogue is already running")
@@ -296,9 +418,15 @@ class StarRailCopilotRuntimeController:
                 if isinstance(preflight.get("device"), dict)
                 else {}
             )
+            checked_runtime = (
+                preflight.get("runtime")
+                if isinstance(preflight.get("runtime"), dict)
+                else {}
+            )
             if (
                 checked_device.get("serial") != device
                 or screen.get("game_ready") is not True
+                or checked_runtime != configuration
             ):
                 raise RuntimeError(
                     "run a successful SRC game-ready preflight for this device before starting"
@@ -308,7 +436,8 @@ class StarRailCopilotRuntimeController:
             run_dir.mkdir(parents=True, exist_ok=True)
             log_path = run_dir / "runtime.log"
             log_handle = log_path.open("wb")
-            command = self._command(device, "--run", payload)
+            self._apply_configuration(configuration)
+            command = self._command(device, "--run", configuration)
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             creationflags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
             try:
@@ -374,6 +503,9 @@ class StarRailCopilotRuntimeController:
         description: str,
         value: str,
         choices: tuple[str, ...] | list[str],
+        *,
+        group: str,
+        scope: str = "task",
     ) -> dict[str, object]:
         return {
             "id": option_id,
@@ -382,6 +514,8 @@ class StarRailCopilotRuntimeController:
             "description": description,
             "value": value,
             "options": [{"value": item, "label": item} for item in choices],
+            "group": group,
+            "scope": scope,
         }
 
     @staticmethod
@@ -390,6 +524,8 @@ class StarRailCopilotRuntimeController:
         label: str,
         description: str,
         value: bool,
+        *,
+        group: str,
     ) -> dict[str, object]:
         return {
             "id": option_id,
@@ -397,6 +533,8 @@ class StarRailCopilotRuntimeController:
             "label": label,
             "description": description,
             "value": value,
+            "group": group,
+            "scope": "task",
         }
 
     def snapshot(self) -> dict[str, object]:
@@ -451,81 +589,107 @@ class StarRailCopilotRuntimeController:
                 },
                 "preflight": self._last_preflight,
                 "runtime_options": [
+                    {
+                        "id": "upstream_path",
+                        "type": "text",
+                        "label": "StarRailCopilot 目录",
+                        "description": "包含 SRC 原生 Android 设备栈与路线资源的 checkout。",
+                        "value": str(self.upstream_path),
+                        "required": True,
+                        "group": "安装路径",
+                        "scope": "environment",
+                    },
                     self._select_option(
                         "server",
                         "游戏服务器",
                         "决定 SRC 使用的安卓包名与资源语言。",
-                        "CN-Official",
+                        str(self._options["server"]),
                         tuple(SERVER_PACKAGES),
+                        group="游戏账号",
                     ),
                     self._select_option(
                         "screenshot_method",
                         "截图后端",
                         "优先验证 scrcpy，异常时可切换 ADB 或 uiautomator2。",
-                        "scrcpy",
+                        str(self._options["screenshot_method"]),
                         SCREENSHOT_METHODS,
+                        group="设备后端",
+                        scope="environment",
                     ),
                     self._select_option(
                         "control_method",
                         "触控后端",
                         "使用 SRC 自带的 MaaTouch 或 minitouch。",
-                        "MaaTouch",
+                        str(self._options["control_method"]),
                         CONTROL_METHODS,
+                        group="设备后端",
+                        scope="environment",
                     ),
                     self._select_option(
                         "scrcpy_max_size",
                         "scrcpy 长边",
                         "超宽屏建议 1920；性能受限设备可先使用 1600。",
-                        str(DEFAULT_SCRCPY_MAX_SIZE),
+                        str(self._options["scrcpy_max_size"]),
                         [str(item) for item in SCRCPY_MAX_SIZES],
+                        group="设备后端",
+                        scope="environment",
                     ),
                     self._select_option(
                         "world",
                         "模拟宇宙世界",
                         "进入前请先在游戏内准备对应队伍。",
-                        ROGUE_WORLDS[-1],
+                        str(self._options["world"]),
                         ROGUE_WORLDS,
+                        group="模拟宇宙目标",
                     ),
                     self._select_option(
                         "path",
                         "命途",
                         "SRC Rogue 的命途选择。",
-                        "The_Hunt",
+                        str(self._options["path"]),
                         ROGUE_PATHS,
+                        group="模拟宇宙目标",
                     ),
                     self._select_option(
                         "domain_strategy",
                         "区域策略",
                         "优先战斗区域或事件区域。",
-                        "combat",
+                        str(self._options["domain_strategy"]),
                         DOMAIN_STRATEGIES,
+                        group="模拟宇宙策略",
                     ),
                     self._checkbox_option(
                         "use_immersifier",
                         "使用沉浸器",
                         "允许 SRC 在结算时消耗沉浸器。",
-                        True,
+                        bool(self._options["use_immersifier"]),
+                        group="奖励消耗",
                     ),
                     self._checkbox_option(
                         "double_event",
                         "双倍事件",
                         "按 SRC 配置处理双倍位面饰品奖励。",
-                        True,
+                        bool(self._options["double_event"]),
+                        group="奖励消耗",
                     ),
                     self._checkbox_option(
                         "weekly_farming",
                         "每周积分刷取",
                         "按每周积分目标继续运行。",
-                        False,
+                        bool(self._options["weekly_farming"]),
+                        group="模拟宇宙策略",
                     ),
                     self._checkbox_option(
                         "use_stamina",
                         "允许使用开拓力",
                         "开启后可能消耗账号资源，默认关闭。",
-                        False,
+                        bool(self._options["use_stamina"]),
+                        group="奖励消耗",
                     ),
                 ],
                 "capabilities": {
+                    "configure": True,
+                    "configure_when_unavailable": True,
                     "preflight": True,
                     "start": True,
                     "stop": True,

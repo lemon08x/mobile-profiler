@@ -265,7 +265,57 @@ class StarRailCopilotRuntimeTests(unittest.TestCase):
         self.assertIn("多分辨率", snapshot["verification"]["reason"])
         self.assertEqual(snapshot["upstream"]["route_count"], 67)
         self.assertTrue(snapshot["capabilities"]["native_android_stack"])
+        options = {row["id"]: row for row in snapshot["runtime_options"]}
+        self.assertEqual(options["world"]["scope"], "task")
+        self.assertEqual(options["upstream_path"]["scope"], "environment")
+        self.assertEqual(options["control_method"]["scope"], "environment")
+        self.assertTrue(snapshot["capabilities"]["configure"])
         self.assertIs(StarRailAsuRuntimeController, StarRailCopilotRuntimeController)
+
+    def test_runtime_configuration_is_validated_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "StarRailCopilot"
+            checkout.mkdir()
+            with patch(
+                "mobile_profiler.star_rail_runtime.validate_upstream_path",
+                return_value=self._metadata(checkout),
+            ):
+                controller = StarRailCopilotRuntimeController(
+                    "host-adb", root, upstream_path=checkout
+                )
+                configured = controller.configure(
+                    {
+                        "world": "Simulated_Universe_World_6",
+                        "path": "Nihility",
+                        "domain_strategy": "occurrence",
+                        "weekly_farming": True,
+                        "use_stamina": True,
+                    }
+                )
+                controller.close()
+                restored_controller = StarRailCopilotRuntimeController(
+                    "host-adb", root, upstream_path=checkout
+                )
+                restored = restored_controller.snapshot()
+                restored_controller.close()
+                invalid_controller = StarRailCopilotRuntimeController(
+                    "host-adb", root, upstream_path=checkout
+                )
+                with self.assertRaisesRegex(ValueError, "unsupported StarRailCopilot world"):
+                    invalid_controller.configure({"world": "Not_A_World"})
+                invalid_controller.close()
+
+        configured_options = {
+            row["id"]: row["value"] for row in configured["runtime_options"]
+        }
+        restored_options = {
+            row["id"]: row["value"] for row in restored["runtime_options"]
+        }
+        self.assertEqual(configured_options["world"], "Simulated_Universe_World_6")
+        self.assertEqual(configured_options["path"], "Nihility")
+        self.assertTrue(configured_options["weekly_farming"])
+        self.assertTrue(restored_options["use_stamina"])
 
     def test_command_prefers_src_toolkit_and_has_no_m7a_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

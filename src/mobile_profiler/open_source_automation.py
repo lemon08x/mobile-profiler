@@ -321,12 +321,12 @@ class OpenSourceAutomationController:
                 "features": [
                     {
                         "id": "maa-arknights-adaptive",
-                        "name": "运行 MAA 真机任务",
+                        "name": "MAA 每日与肉鸽",
                         "category": "daily",
                         "category_label": "自适应真机",
                         "description": (
-                            "已跑通仓库、干员箱、启动、受控领奖，以及带危险退出"
-                            "护栏的界园肉鸽完整单轮。"
+                            "配置每日队列、作战、基建、公招、商店、奖励和本地 Qwen "
+                            "恢复策略，或运行带危险退出护栏的肉鸽完整单轮。"
                         ),
                         "featured": True,
                     },

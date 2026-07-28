@@ -10,6 +10,7 @@ from mobile_profiler.maa_daily_runner import (
     INT_MAX,
     default_daily_plan,
     load_gui_daily_plan,
+    override_daily_task_options,
     override_infrast_facilities,
     prepare_device,
     qwen_recovery_action,
@@ -48,6 +49,29 @@ class FakeAdb:
 
 
 class MaaDailyRunnerTests(unittest.TestCase):
+    def test_web_task_options_override_only_allowlisted_core_parameters(self) -> None:
+        selected = select_daily_plan(default_daily_plan(), "Fight,Recruit,Mall")
+        overridden = override_daily_task_options(
+            selected,
+            json.dumps(
+                {
+                    "Fight": {"stage": "1-7", "medicine": 2, "times": 5},
+                    "Recruit": {"times": 2, "expedite": True},
+                    "Mall": {"buy_first": ["招聘许可", "技巧概要"]},
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        params = {row["task"]: row["params"] for row in overridden}
+        self.assertEqual(params["Fight"]["stage"], "1-7")
+        self.assertEqual(params["Fight"]["medicine"], 2)
+        self.assertEqual(params["Recruit"]["times"], 2)
+        self.assertTrue(params["Recruit"]["expedite"])
+        self.assertEqual(params["Mall"]["buy_first"], ["招聘许可", "技巧概要"])
+        with self.assertRaisesRegex(ValueError, "unsupported Fight option"):
+            override_daily_task_options(selected, {"Fight": {"shell": "bad"}})
+
     def test_task_subset_preserves_requested_order(self) -> None:
         selected = select_daily_plan(default_daily_plan(), "Recruit,Infrast,Award")
 

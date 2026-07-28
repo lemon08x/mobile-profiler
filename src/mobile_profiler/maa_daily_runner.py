@@ -263,6 +263,54 @@ def default_daily_plan(*, client_type: str = "Official") -> list[dict[str, objec
     ]
 
 
+def override_daily_task_options(
+    plan: Sequence[Mapping[str, object]],
+    raw_options: object,
+) -> list[dict[str, object]]:
+    """Merge a validated, task-keyed option object into a selected daily plan."""
+
+    if raw_options in (None, ""):
+        return [
+            {**dict(row), "params": dict(row.get("params", {}))}
+            for row in plan
+        ]
+    if isinstance(raw_options, str):
+        try:
+            decoded = json.loads(raw_options)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--task-options must be valid JSON") from exc
+    else:
+        decoded = raw_options
+    if not isinstance(decoded, Mapping):
+        raise ValueError("--task-options must be a task-keyed JSON object")
+
+    allowed_params = {
+        str(row["task"]): set(dict(row.get("params", {})))
+        for row in default_daily_plan()
+    }
+    for task, values in decoded.items():
+        task_name = str(task)
+        if task_name not in allowed_params:
+            raise ValueError(f"unsupported daily task options: {task_name}")
+        if not isinstance(values, Mapping):
+            raise ValueError(f"daily task options for {task_name} must be an object")
+        unknown = set(str(key) for key in values) - allowed_params[task_name]
+        if unknown:
+            raise ValueError(
+                f"unsupported {task_name} option(s): {', '.join(sorted(unknown))}"
+            )
+
+    result: list[dict[str, object]] = []
+    for row in plan:
+        task = str(row["task"])
+        params = dict(row.get("params", {}))
+        values = decoded.get(task, {})
+        if isinstance(values, Mapping):
+            params.update(dict(values))
+        result.append({**dict(row), "params": params})
+    return result
+
+
 def _convert_gui_task(
     task: str,
     row: Mapping[str, object],
@@ -753,6 +801,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gui-config", type=Path)
     parser.add_argument("--tasks", help="comma-separated ordered subset, for example Infrast,Recruit,Mall,Award")
     parser.add_argument(
+        "--task-options",
+        help="JSON object with per-task MaaCore parameter overrides",
+    )
+    parser.add_argument(
         "--infrast-facilities",
         help="comma-separated Infrast subset for focused verification, for example Power,Reception",
     )
@@ -798,6 +850,7 @@ def main() -> int:
     full_plan, plan_source = resolve_daily_plan(runtime_root, args.gui_config)
     plan = select_daily_plan(full_plan, args.tasks)
     plan = override_infrast_facilities(plan, args.infrast_facilities)
+    plan = override_daily_task_options(plan, args.task_options)
     if any(row["task"] in ACCOUNT_MUTATING_TASKS for row in plan) and not args.allow_account_mutation:
         raise RuntimeError("daily tasks change account state; pass --allow-account-mutation explicitly")
 

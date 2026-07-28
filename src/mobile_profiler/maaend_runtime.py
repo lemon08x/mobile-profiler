@@ -5070,6 +5070,8 @@ class MaaEndRuntimeController:
                         "description": f"解压后的官方 Windows {MAAEND_STANDARD_VERSION} 发布包根目录",
                         "value": str(self.runtime_path),
                         "required": True,
+                        "group": "安装路径",
+                        "scope": "environment",
                     },
                     {
                         "id": "instance_name",
@@ -5079,6 +5081,8 @@ class MaaEndRuntimeController:
                         "value": self.instance_name,
                         "required": True,
                         "options": instance_options,
+                        "group": "实例",
+                        "scope": "environment",
                     },
                 ],
                 "capabilities": {

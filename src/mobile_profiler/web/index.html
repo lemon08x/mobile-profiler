@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-65">
-  <script src="/app.js?v=platform-ui-65" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-67">
+  <script src="/app.js?v=platform-ui-67" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -374,7 +374,7 @@
 
         <section class="view" data-panel="opensource" hidden>
           <div class="view-header opensource-view-header">
-            <div><small>OPEN SOURCE AUTOMATION HUB</small><h2>开源自动化</h2><p>明日方舟 MAA 是当前唯一跑通的端到端真机验收流程，可通过 adaptive MaaCore 运行受控任务，也是后续项目的重构基准。崩铁底层已从 M7A 更换为 StarRailCopilot，并直接使用其 Android 设备栈；多分辨率与完整模拟宇宙尚未验收。终末地仍保留独立重构入口；各流程按 MAA 验收契约闭环前禁止预检和启动。</p></div>
+            <div><small>OPEN SOURCE AUTOMATION HUB</small><h2>开源自动化</h2><p>在主区配置各游戏的任务与业务参数，右侧只负责运行环境、预检、启停和日志。明日方舟 MAA 是当前唯一跑通的端到端真机验收流程；StarRailCopilot 与 MaaEnd 使用同一配置逻辑，但完整真机流程闭环前仍保持禁止启动。</p></div>
             <span class="agent-status-badge opensource-status-badge idle" id="opensource-status-badge"><i></i><span><strong id="opensource-status-label">读取项目目录</strong><small id="opensource-status-detail">等待服务端状态</small></span></span>
           </div>
 
@@ -392,32 +392,21 @@
             </section>
 
             <aside class="panel opensource-selection-panel">
-              <div class="panel-heading"><div><small>RUNTIME PROFILE</small><h2>运行方案</h2></div><span class="data-source" id="opensource-selection-state">读取配置</span></div>
-              <form class="opensource-selection-form" id="opensource-selection-form">
-                <div class="opensource-selection-metrics">
-                  <article><small>CURRENT PROJECT</small><strong id="opensource-selected-project-count">--</strong><span>当前项目</span></article>
-                  <article><small>FEATURES</small><strong id="opensource-selected-feature-count">0</strong><span>已选功能</span></article>
-                </div>
-                <div class="opensource-selection-summary" id="opensource-selection-summary"><div class="opensource-empty">先从左侧选择需要的功能</div></div>
-                <div class="opensource-execution-callout">
-                  <i aria-hidden="true">!</i>
-                  <span><strong id="opensource-execution-state">等待选择功能</strong><small id="opensource-execution-detail">这里只保存已有执行适配器的功能；完成运行时配置后即可预检和运行。</small></span>
-                </div>
-                <button class="button primary" id="opensource-save-selection-button" type="submit" disabled>保存功能方案</button>
-              </form>
               <section class="opensource-runtime-console" id="opensource-runtime-console">
                 <div class="opensource-runtime-console-head">
-                  <span><small>SELECTED FEATURE RUNTIME</small><strong id="opensource-runtime-title">功能运行控制</strong></span>
+                  <span><small>RUNTIME CONSOLE</small><strong id="opensource-runtime-title">运行控制台</strong></span>
                   <em id="opensource-runtime-status">WAITING</em>
                 </div>
-                <p id="opensource-runtime-detail">选择并保存一个适配器入口；只有端到端已验收流程才允许真机预检。</p>
+                <p id="opensource-runtime-detail">选择游戏并配置任务；只有端到端已验收流程才允许真机预检。</p>
                 <div class="opensource-runtime-facts">
                   <span><small>DEVICE</small><strong id="opensource-runtime-device">未选择</strong></span>
                   <span><small>SCREEN</small><strong id="opensource-runtime-screen">未预检</strong></span>
                   <span><small>UPSTREAM</small><strong id="opensource-runtime-upstream">检查中</strong></span>
-                  <span><small>DISK</small><strong id="opensource-runtime-disk">--</strong></span>
                 </div>
-                <div class="opensource-runtime-options" id="opensource-runtime-options"><div class="opensource-empty">选择功能后显示运行参数</div></div>
+                <details class="opensource-runtime-environment" id="opensource-runtime-environment">
+                  <summary><span><strong>运行环境设置</strong><small>安装目录、实例与设备后端等低频参数</small></span><em id="opensource-runtime-environment-count">检查中</em></summary>
+                  <div class="opensource-runtime-options" id="opensource-runtime-options"><div class="opensource-empty">当前游戏没有额外环境参数</div></div>
+                </details>
                 <div class="opensource-runtime-warning"><i>!</i><span>第三方游戏自动化可能违反游戏规则并带来账号处罚风险；启动前请自行确认。</span></div>
                 <div class="opensource-runtime-actions">
                   <button class="button" id="opensource-configure-button" type="button" hidden disabled>载入目录 / 保存任务</button>

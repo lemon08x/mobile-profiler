@@ -2058,8 +2058,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-65', html)
-            self.assertIn('/app.js?v=platform-ui-65', html)
+            self.assertIn('/app.css?v=platform-ui-67', html)
+            self.assertIn('/app.js?v=platform-ui-67', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2397,21 +2397,22 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('id="opensource-graph-view"', html)
             self.assertIn('id="opensource-project-select"', html)
             self.assertIn('id="opensource-feature-groups"', html)
-            self.assertIn('id="opensource-selection-form"', html)
-            self.assertIn('id="opensource-save-selection-button"', html)
+            self.assertNotIn('id="opensource-selection-form"', html)
+            self.assertNotIn('id="opensource-save-selection-button"', html)
             self.assertIn('id="opensource-runtime-console"', html)
             self.assertIn('id="opensource-runtime-options"', html)
+            self.assertIn('id="opensource-runtime-environment"', html)
             self.assertIn('id="opensource-configure-button"', html)
             self.assertIn('id="opensource-preflight-button"', html)
             self.assertIn('id="opensource-start-button"', html)
             self.assertIn('id="opensource-stop-button"', html)
             self.assertIn("开源自动化", html)
             self.assertIn("选择项目", html)
-            self.assertIn("当前项目", html)
-            self.assertIn("adaptive MaaCore", html)
+            self.assertIn("运行环境设置", html)
+            self.assertIn("任务与业务参数", html)
             self.assertIn("端到端真机验收", html)
-            self.assertIn("MAA 是当前唯一跑通", html)
-            self.assertIn("禁止预检和启动", html)
+            self.assertIn("明日方舟 MAA 是当前唯一跑通", html)
+            self.assertIn("保持禁止启动", html)
             self.assertIn("适配能力对齐", html)
             self.assertIn("第三方游戏自动化可能违反游戏规则", html)
             self.assertIn("约 160 MiB", html)
@@ -2522,6 +2523,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("async function saveMaaEndConfiguration", javascript)
             self.assertIn("function renderOpenSourceRuntimeOptions", javascript)
             self.assertIn("function openSourceRuntimeOptionPayload", javascript)
+            self.assertIn("function renderOpenSourceGameConfiguration", javascript)
+            self.assertIn("async function saveOpenSourceRuntimeConfiguration", javascript)
             self.assertIn("execution.preflight_feature_ids", javascript)
             self.assertNotIn('$("#opensource-runtime-speed")', javascript)
             self.assertNotIn('$("#opensource-runtime-bonus")', javascript)
@@ -2599,8 +2602,12 @@ class UiServerTests(unittest.TestCase):
             self.assertIn(".agent-workflow-report", css)
             self.assertIn(".agent-task-result.skipped", css)
             self.assertIn(".opensource-layout", css)
-            self.assertIn(".opensource-project-card", css)
-            self.assertIn(".opensource-feature-card", css)
+            self.assertIn(".opensource-project-switcher", css)
+            self.assertIn(".opensource-game-config", css)
+            self.assertIn(".opensource-config-group", css)
+            self.assertIn(".opensource-runtime-environment", css)
+            self.assertNotIn(".opensource-project-card", css)
+            self.assertNotIn(".opensource-feature-card", css)
             self.assertIn(".maaend-game-catalog", css)
             self.assertIn(".maaend-task-card", css)
             self.assertIn(".maaend-option-row", css)
@@ -2610,6 +2617,7 @@ class UiServerTests(unittest.TestCase):
             self.assertIn(".opensource-diagnostics-panel", css)
             self.assertIn(".opensource-alignment-table", css)
             self.assertIn(".opensource-evidence-grid", css)
+            self.assertIn("function openSourceOptionScopeDirty", javascript)
             self.assertIn("模型不能下发任意 shell", html)
             self.assertIn("局域网千问是默认配置而非协议绑定", html)
             self.assertIn("测试配置", html)
@@ -2743,6 +2751,36 @@ class UiServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("adb", Path(directory))
             self.assertIsNone(manager.report_path("..%2Foutside"))
+
+    def test_open_source_configuration_only_requires_device_for_maaend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager("missing-adb", Path(directory))
+            manager.open_source_automation.configure = Mock(
+                return_value={"execution": {"status": "configured"}}
+            )
+            with patch.object(
+                manager,
+                "_require_open_source_android_device",
+            ) as require_device:
+                for feature_id in ("maa-arknights-adaptive", "src-rogue"):
+                    payload = {"feature_id": feature_id, "parameters": {}}
+                    self.assertEqual(
+                        manager.configure_open_source_automation(payload)["execution"][
+                            "status"
+                        ],
+                        "configured",
+                    )
+                require_device.assert_not_called()
+
+                maaend_payload = {
+                    "feature_id": "maaend-profile",
+                    "device": "USB-DEVICE",
+                    "parameters": {},
+                }
+                manager.configure_open_source_automation(maaend_payload)
+                require_device.assert_called_once_with(maaend_payload)
+
+            self.assertEqual(manager.open_source_automation.configure.call_count, 3)
 
     def test_open_source_automation_demo_and_evidence_routes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

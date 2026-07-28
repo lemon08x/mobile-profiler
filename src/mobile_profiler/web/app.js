@@ -195,10 +195,17 @@
     openSourceCatalogRenderSignature: "",
     openSourceActiveProjectId: "",
     openSourceRuntimeAction: "",
+    openSourceOptionDrafts: new Map(),
+    openSourceOptionServerSignatures: new Map(),
+    openSourceOptionDirtyFeatures: new Set(),
+    openSourceConfigOpenGroups: new Map(),
     maaEndConfigDraft: null,
     maaEndConfigDirty: false,
     maaEndConfigSaving: false,
     maaEndConfigServerSignature: "",
+    maaEndConfigOpenGroups: new Set(),
+    maaEndConfigOpenTasks: new Set(),
+    maaEndOpenStateInitialized: false,
     agentConfigTab: agentConfigTabs.includes(localStorage.getItem(agentConfigTabStorageKey))
       ? localStorage.getItem(agentConfigTabStorageKey)
       : "workflow",
@@ -6860,6 +6867,133 @@
     return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
   }
 
+  function openSourceOptionServerState(adapter = {}) {
+    const options = Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [];
+    return Object.fromEntries(options.map(option => [
+      String(option?.id || ""),
+      option?.type === "checkbox" ? option?.value === true : String(option?.value ?? ""),
+    ]).filter(([optionId]) => optionId));
+  }
+
+  function openSourceOptionStateSignature(value = {}) {
+    return JSON.stringify(Object.keys(value).sort().map(key => [key, value[key]]));
+  }
+
+  function openSourceOptionScopeDirty(adapter = {}, draft = {}, scope = "task") {
+    const optionIds = new Set(
+      (Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [])
+        .filter(option => option?.persisted !== false)
+        .filter(option => {
+          const optionScope = String(option?.scope || "task");
+          return scope === "environment"
+            ? optionScope === "environment"
+            : optionScope !== "environment";
+        })
+        .map(option => String(option?.id || ""))
+        .filter(Boolean),
+    );
+    const server = openSourceOptionServerState(adapter);
+    const scopedDraft = Object.fromEntries(
+      Object.entries(draft).filter(([key]) => optionIds.has(key)),
+    );
+    const scopedServer = Object.fromEntries(
+      Object.entries(server).filter(([key]) => optionIds.has(key)),
+    );
+    return openSourceOptionStateSignature(scopedDraft)
+      !== openSourceOptionStateSignature(scopedServer);
+  }
+
+  function currentOpenSourceOptionDraft(featureId, adapter = {}) {
+    const serverState = openSourceOptionServerState(adapter);
+    const serverSignature = openSourceOptionStateSignature(serverState);
+    const previousSignature = app.openSourceOptionServerSignatures.get(featureId) || "";
+    const dirty = app.openSourceOptionDirtyFeatures.has(featureId);
+    if (!app.openSourceOptionDrafts.has(featureId) || (!dirty && previousSignature !== serverSignature)) {
+      app.openSourceOptionDrafts.set(featureId, { ...serverState });
+    }
+    app.openSourceOptionServerSignatures.set(featureId, serverSignature);
+    return app.openSourceOptionDrafts.get(featureId) || { ...serverState };
+  }
+
+  function openSourceOptionVisible(option = {}, draft = {}) {
+    const condition = option?.visible_when;
+    if (!condition || typeof condition !== "object") return true;
+    const current = draft[String(condition.id || "")];
+    if (Array.isArray(condition.in)) {
+      return condition.in.map(value => String(value)).includes(String(current));
+    }
+    if (Object.prototype.hasOwnProperty.call(condition, "equals")) {
+      return String(current) === String(condition.equals);
+    }
+    return true;
+  }
+
+  function renderOpenSourceOptionControl(featureId, option = {}, draft = {}, disabled = false) {
+    const optionId = String(option?.id || "");
+    const type = String(option?.type || "text");
+    const value = Object.prototype.hasOwnProperty.call(draft, optionId)
+      ? draft[optionId]
+      : option?.value;
+    const label = escapeHtml(option?.label || optionId);
+    const description = escapeHtml(option?.description || "运行参数");
+    const data = `data-runtime-feature-id="${escapeHtml(featureId)}" data-runtime-option-id="${escapeHtml(optionId)}" data-runtime-option-type="${escapeHtml(type)}"`;
+    const disabledMarkup = disabled ? "disabled" : "";
+    if (type === "checkbox") {
+      return `<label class="opensource-runtime-option-checkbox"><input type="checkbox" ${data} ${value === true ? "checked" : ""} ${disabledMarkup}><span><strong>${label}</strong><small>${description}</small></span></label>`;
+    }
+    if (type === "select") {
+      const selectedValue = String(value ?? "");
+      const choices = Array.isArray(option?.options) ? option.options : [];
+      return `<label class="opensource-runtime-option-select"><span><strong>${label}</strong><small>${description}</small></span><select ${data} ${disabledMarkup}>${choices.map(choice => {
+        const choiceValue = String(choice?.value ?? "");
+        return `<option value="${escapeHtml(choiceValue)}" ${choiceValue === selectedValue ? "selected" : ""}>${escapeHtml(choice?.label || choiceValue)}</option>`;
+      }).join("")}</select></label>`;
+    }
+    const inputType = type === "number" ? "number" : "text";
+    const limits = `${finite(option?.min) ? ` min="${Number(option.min)}"` : ""}${finite(option?.max) ? ` max="${Number(option.max)}"` : ""}${finite(option?.step) ? ` step="${Number(option.step)}"` : ""}`;
+    return `<label class="opensource-runtime-option-text"><span><strong>${label}</strong><small>${description}</small></span><input type="${inputType}" ${data} value="${escapeHtml(value ?? "")}" ${option?.required === true ? "required" : ""}${limits} ${disabledMarkup} autocomplete="off"></label>`;
+  }
+
+  function renderOpenSourceGameConfiguration(target, moduleState, project) {
+    const feature = integratedOpenSourceFeatures(project)[0] || {};
+    const featureId = String(feature?.id || "");
+    const adapter = moduleState.adapters?.[featureId] || {};
+    const draft = currentOpenSourceOptionDraft(featureId, adapter);
+    const running = adapter?.running === true;
+    const busy = Boolean(app.openSourceRuntimeAction);
+    const taskOptions = (Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [])
+      .filter(option => String(option?.scope || "task") !== "environment")
+      .filter(option => openSourceOptionVisible(option, draft));
+    const groups = new Map();
+    taskOptions.forEach(option => {
+      const group = String(option?.group || "任务参数");
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(option);
+    });
+    const taskDirty = openSourceOptionScopeDirty(adapter, draft, "task");
+    const rememberedOpenGroups = app.openSourceConfigOpenGroups.get(featureId);
+    const groupMarkup = Array.from(groups.entries()).map(([group, options], index) => `
+      <details class="opensource-config-group" data-open-source-config-group="${escapeHtml(group)}" ${(rememberedOpenGroups ? rememberedOpenGroups.has(group) : index < 2) ? "open" : ""}>
+        <summary><strong>${escapeHtml(group)}</strong><span>${options.length} 项参数</span></summary>
+        <div class="opensource-config-option-grid">${options.map(option => (
+          renderOpenSourceOptionControl(featureId, option, draft, running || busy)
+        )).join("")}</div>
+      </details>`).join("");
+    const implementationStatus = String(feature?.implementation_status || "planned");
+    const implementationLabel = String(feature?.implementation_label || "待适配");
+    const saveDisabled = !taskDirty || running || busy || app.openSourceSelectionDirty;
+    $("#opensource-feature-title").textContent = `${project?.game || "游戏"}任务配置`;
+    $("#opensource-feature-count").textContent = `${taskOptions.length} 项可配置参数`;
+    target.innerHTML = `<div class="opensource-game-config">
+      <section class="opensource-game-config-hero">
+        <div><small>${escapeHtml(project?.short_name || "OPEN SOURCE")} · TASK PROFILE</small><h3>${escapeHtml(feature?.name || project?.game || "自动化任务")}</h3><p>${escapeHtml(feature?.description || project?.summary || "配置当前游戏的自动化任务参数。")}</p></div>
+        <span class="opensource-game-config-state ${escapeHtml(implementationStatus)}"><strong>${escapeHtml(implementationLabel)}</strong><small>${adapter?.available === true ? "运行时已安装" : "运行环境待检查"}</small></span>
+      </section>
+      <section class="maaend-config-toolbar opensource-config-toolbar"><span><small>SAVED TASK PARAMETERS</small><strong>${taskDirty ? "有未保存的任务参数" : "任务参数已同步"}</strong><em>预检会锁定当前参数，修改后需重新预检</em></span><button type="button" class="button primary" data-open-source-save-options="${escapeHtml(featureId)}" ${saveDisabled ? "disabled" : ""}>${app.openSourceRuntimeAction === "configure" ? "正在保存..." : "保存任务参数"}</button></section>
+      <section class="opensource-config-groups">${groupMarkup || '<div class="opensource-feature-empty"><i>CFG</i><strong>无需额外任务参数</strong><p>当前适配器只需要运行环境配置。</p></div>'}</section>
+    </div>`;
+  }
+
   function copyMaaEndValue(value, fallback = {}) {
     try {
       return JSON.parse(JSON.stringify(value ?? fallback));
@@ -7072,7 +7206,9 @@
         ? upstreamTasks.filter(task => !knownGroups.has(String(task?.primary_group || "")))
         : upstreamTasks.filter(task => String(task?.primary_group || "") === groupId);
       if (!rows.length) return "";
-      return `<details class="maaend-task-group" ${group?.default_expand === true ? "open" : ""}><summary><strong>${escapeHtml(group?.name || groupId)}</strong><span>${rows.length} 项 ADB 任务</span></summary><div class="maaend-task-grid">${rows.map(task => {
+      const groupOpen = app.maaEndConfigOpenGroups.has(groupId)
+        || (!app.maaEndOpenStateInitialized && group?.default_expand === true);
+      return `<details class="maaend-task-group" data-maaend-config-group="${escapeHtml(groupId)}" ${groupOpen ? "open" : ""}><summary><strong>${escapeHtml(group?.name || groupId)}</strong><span>${rows.length} 项 ADB 任务</span></summary><div class="maaend-task-grid">${rows.map(task => {
         const taskName = String(task?.name || "");
         const taskConfig = configByName.get(taskName) || { name: taskName, enabled: false, option_values: {} };
         const enabled = taskConfig?.enabled === true;
@@ -7080,7 +7216,7 @@
         const optionMarkup = (Array.isArray(task?.option_ids) ? task.option_ids : [])
           .map(optionId => renderMaaEndOptionEditor(taskConfig, String(optionId), options))
           .join("");
-        return `<article class="maaend-task-card adb-supported ${enabled ? "profile-enabled" : ""}"><header><label class="maaend-task-toggle"><input type="checkbox" data-maaend-task-toggle="${escapeHtml(taskName)}" ${enabled ? "checked" : ""}><i></i><span><strong>${escapeHtml(task?.label || taskName)}</strong><small>${escapeHtml(taskName)}</small></span></label><em>${enabled ? `#${String(enabledOrder.get(taskName) || 0).padStart(2, "0")}` : "未启用"}</em></header><p>${escapeHtml(openSourceCatalogSummary(task?.description || "上游未提供功能说明"))}</p>${optionMarkup ? `<details class="maaend-task-options"><summary><span>配置 ADB 选项</span><em>${optionCount} 个顶层选项</em></summary><div>${optionMarkup}</div></details>` : ""}<footer><span>ADB</span><span>${optionCount ? `${optionCount} 个顶层选项` : "无需额外配置"}</span></footer></article>`;
+        return `<article class="maaend-task-card adb-supported ${enabled ? "profile-enabled" : ""}"><header><label class="maaend-task-toggle"><input type="checkbox" data-maaend-task-toggle="${escapeHtml(taskName)}" ${enabled ? "checked" : ""}><i></i><span><strong>${escapeHtml(task?.label || taskName)}</strong><small>${escapeHtml(taskName)}</small></span></label><em>${enabled ? `#${String(enabledOrder.get(taskName) || 0).padStart(2, "0")}` : "未启用"}</em></header><p>${escapeHtml(openSourceCatalogSummary(task?.description || "上游未提供功能说明"))}</p>${optionMarkup ? `<details class="maaend-task-options" data-maaend-config-task="${escapeHtml(taskName)}" ${app.maaEndConfigOpenTasks.has(taskName) ? "open" : ""}><summary><span>配置 ADB 选项</span><em>${optionCount} 个顶层选项</em></summary><div>${optionMarkup}</div></details>` : ""}<footer><span>ADB</span><span>${optionCount ? `${optionCount} 个顶层选项` : "无需额外配置"}</span></footer></article>`;
       }).join("")}</div></details>`;
     }).join("");
 
@@ -7095,113 +7231,23 @@
       <section class="maaend-config-toolbar"><span><small>MANAGED MXU PROFILE</small><strong>${escapeHtml(profileState)}</strong><em>${app.maaEndConfigDirty ? "有未保存修改" : "任务配置已同步"}</em></span><button type="button" class="button primary" data-maaend-save ${saveDisabled ? "disabled" : ""}>${app.maaEndConfigSaving ? "正在保存..." : "保存 MaaEnd ADB 任务"}</button></section>
       <section class="maaend-catalog-section"><header><span><small>ALL SUPPORTED ADB TASKS</small><strong>全部 ADB 自动化任务</strong></span><em>桌面专用任务已排除</em></header>${groupMarkup}</section>
     </div>`;
+    app.maaEndOpenStateInitialized = true;
   }
 
   function renderOpenSourceFeatures(projects, selection, moduleState) {
     const target = $("#opensource-feature-groups");
-    const selectedFeatures = new Set(selection.featureIds);
     const activeProject = activeOpenSourceProject(projects, selection);
-    const activeProjects = activeProject ? [activeProject] : [];
-    const categoryOrder = ["battle", "daily", "weekly", "rewards", "tools"];
-    const categoryFallback = {
-      battle: "战斗",
-      daily: "每日",
-      weekly: "周常",
-      rewards: "奖励",
-      tools: "工具",
-    };
-    const availableFeatures = activeProjects.flatMap(integratedOpenSourceFeatures);
     if (String(activeProject?.id || "") === "maaend") {
       renderMaaEndGameFeatures(target, moduleState, activeProject);
       return;
     }
-    $("#opensource-feature-title").textContent = activeProject?.game
-      ? `${activeProject.game}功能`
-      : "游戏功能";
-    $("#opensource-feature-count").textContent = activeProjects.length
-      ? `${selectedFeatures.size} / ${availableFeatures.length} 项已选`
-      : "选择项目后配置";
-    if (!activeProjects.length) {
-      target.innerHTML = '<div class="opensource-feature-empty"><i>01</i><strong>先选择一个开源项目</strong><p>从顶部下拉框选择项目后，这里会显示对应游戏功能。</p></div>';
+    if (activeProject) {
+      renderOpenSourceGameConfiguration(target, moduleState, activeProject);
       return;
     }
-    target.innerHTML = activeProjects.map((project, projectIndex) => {
-      const features = integratedOpenSourceFeatures(project);
-      const categories = Array.from(new Set(features.map(feature => String(feature?.category || "tools"))))
-        .sort((left, right) => {
-          const leftIndex = categoryOrder.indexOf(left);
-          const rightIndex = categoryOrder.indexOf(right);
-          return (leftIndex < 0 ? categoryOrder.length : leftIndex)
-            - (rightIndex < 0 ? categoryOrder.length : rightIndex);
-        });
-      const categoryMarkup = categories.map(category => {
-        const rows = features.filter(feature => String(feature?.category || "tools") === category);
-        const label = String(rows[0]?.category_label || categoryFallback[category] || category);
-        return `
-          <section class="opensource-feature-category">
-            <header><strong>${escapeHtml(label)}</strong><span>${rows.length} 项</span></header>
-            <div class="opensource-feature-grid">${rows.map((feature, featureIndex) => {
-              const featureId = String(feature?.id || `${project?.id}-feature-${featureIndex + 1}`);
-              const selected = selectedFeatures.has(featureId);
-              const implementationStatus = String(feature?.implementation_status || "planned");
-              const implementationLabel = String(feature?.implementation_label || "待适配");
-              return `
-                <label class="opensource-feature-card ${selected ? "selected" : ""} ${feature?.featured ? "featured" : ""} status-${escapeHtml(implementationStatus)}">
-                  <input class="opensource-feature-checkbox" type="checkbox" data-open-source-feature="${escapeHtml(featureId)}" data-open-source-project="${escapeHtml(project?.id || "")}" ${selected ? "checked" : ""}>
-                  <i aria-hidden="true"></i>
-                  <span><span class="opensource-feature-meta"><small>${project?.role === "reference_implementation" ? "重构基准" : "重构诊断"}</small><em class="${escapeHtml(implementationStatus)}">${escapeHtml(implementationLabel)}</em></span><strong>${escapeHtml(feature?.name || featureId)}</strong><p>${escapeHtml(feature?.description || "等待功能说明")}</p></span>
-                </label>`;
-            }).join("")}</div>
-          </section>`;
-      }).join("");
-      return `
-        <section class="opensource-feature-project">
-          <div class="opensource-feature-project-head"><span>${escapeHtml(project?.short_name || String(projectIndex + 1).padStart(2, "0"))}</span><div><small>${escapeHtml(project?.game || "开源项目")}</small><strong>${escapeHtml(project?.name || project?.id || "项目")}</strong></div></div>
-          ${categoryMarkup}
-        </section>`;
-    }).join("");
-  }
-
-  function renderOpenSourceSelectionSummary(moduleState, projects, selection) {
-    const selectedProjects = projects.filter(project => selection.projectIds.includes(String(project?.id || "")));
-    const selectedFeatureIds = new Set(selection.featureIds);
-    const selectedFeatures = selectedProjects.flatMap(project => (
-      integratedOpenSourceFeatures(project)
-        .filter(feature => selectedFeatureIds.has(String(feature?.id || "")))
-        .map(feature => ({ ...feature, project }))
-    ));
-    $("#opensource-selected-project-count").textContent = selectedProjects[0]?.short_name || "--";
-    $("#opensource-selected-feature-count").textContent = String(selectedFeatures.length);
-    const target = $("#opensource-selection-summary");
-    target.innerHTML = selectedProjects.length
-      ? selectedProjects.map(project => {
-        const projectFeatures = selectedFeatures.filter(row => row.project === project);
-        return `<div class="opensource-selection-project"><span><i>${escapeHtml(project?.short_name || "OS")}</i><strong>${escapeHtml(project?.name || project?.id || "项目")}</strong></span><div>${projectFeatures.length
-          ? projectFeatures.map(row => `<em class="${row?.can_execute ? "ready" : "pending"}">${escapeHtml(row?.name || row?.id || "功能")}</em>`).join("")
-          : "<small>尚未选择该项目的功能</small>"}</div></div>`;
-      }).join("")
-      : '<div class="opensource-empty">尚未选择项目与功能</div>';
-
-    const savedAt = Number(moduleState.selection?.saved_at || 0);
-    $("#opensource-selection-state").textContent = app.openSourceSelectionDirty
-      ? "有未保存修改"
-      : savedAt > 0
-        ? `已保存 ${new Date(savedAt * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })}`
-        : "默认方案";
-    const saveButton = $("#opensource-save-selection-button");
-    saveButton.disabled = app.openSourceSelectionSaving || !app.openSourceSelectionDirty;
-    saveButton.textContent = app.openSourceSelectionSaving ? "正在保存..." : "保存功能方案";
-    const execution = moduleState.execution || {};
-    const hasFeatures = selectedFeatures.length > 0;
-    const runnableCount = selectedFeatures.filter(feature => feature?.can_execute === true).length;
-    $("#opensource-execution-state").textContent = app.openSourceSelectionDirty
-      ? "保存后应用本次修改"
-      : hasFeatures ? (execution.label || (runnableCount ? "功能可预检" : "等待运行时配置")) : "等待选择功能";
-    $("#opensource-execution-detail").textContent = app.openSourceSelectionDirty
-      ? `当前草稿包含 ${selectedFeatures.length} 项功能，其中 ${runnableCount} 项通过端到端验收。`
-      : hasFeatures
-        ? (execution.detail || `当前 ${runnableCount} 项功能通过端到端验收。`)
-        : "至少选择一个适配器入口，保存后形成当前项目的执行方案。";
+    $("#opensource-feature-title").textContent = "游戏功能";
+    $("#opensource-feature-count").textContent = "选择项目后配置";
+    target.innerHTML = '<div class="opensource-feature-empty"><i>01</i><strong>先选择一个开源项目</strong><p>从顶部下拉框选择项目后，这里会显示对应游戏功能。</p></div>';
   }
 
   function renderOpenSourceCatalog(moduleState = {}) {
@@ -7221,6 +7267,15 @@
           feature?.can_execute === true,
         ]),
       ]),
+      adapterOptions: Object.fromEntries(Object.entries(moduleState.adapters || {}).map(([featureId, adapter]) => [
+        featureId,
+        {
+          server: openSourceOptionServerState(adapter),
+          draft: app.openSourceOptionDrafts.get(featureId) || {},
+          dirty: app.openSourceOptionDirtyFeatures.has(featureId),
+          running: adapter?.running === true,
+        },
+      ])),
       maaendShape: {
         source: String(maaendCatalog?.source || ""),
         version: String(maaendCatalog?.version || ""),
@@ -7257,7 +7312,6 @@
     if (app.openSourceCatalogRenderSignature !== renderSignature) {
       renderOpenSourceProjectSelector(projects, selection);
       renderOpenSourceFeatures(projects, selection, moduleState);
-      renderOpenSourceSelectionSummary(moduleState, projects, selection);
       app.openSourceCatalogRenderSignature = renderSignature;
     }
     const featureCount = selection.featureIds.length;
@@ -7281,27 +7335,105 @@
     badge.className = `agent-status-badge opensource-status-badge ${badgeStatus}`;
     const activeProject = activeOpenSourceProject(projects, selection);
     $("#opensource-status-label").textContent = app.openSourceSelectionDirty
-      ? "功能方案待保存"
-      : featureCount ? (execution.label || "功能方案已配置") : "选择自动化功能";
+      ? "正在切换游戏"
+      : featureCount ? (execution.label || "任务配置已载入") : "选择自动化游戏";
     $("#opensource-status-detail").textContent = featureCount
-      ? `${activeProject?.game || "当前项目"} · ${featureCount} 项运行入口 · ${app.openSourceSelectionDirty ? draftRunnableCount : Number(execution.runnable_feature_ids?.length || 0)} 项运行时就绪`
-      : "项目单选，功能随当前项目切换";
+      ? `${activeProject?.game || "当前项目"} · 任务参数在主区配置 · ${app.openSourceSelectionDirty ? draftRunnableCount : Number(execution.runnable_feature_ids?.length || 0)} 项运行时就绪`
+      : "选择游戏后自动载入唯一适配器入口";
   }
 
-  function updateOpenSourceSelectionFromInput(event) {
-    const featureInput = event.target.closest(".opensource-feature-checkbox");
-    if (!featureInput) return;
-    const moduleState = app.state?.open_source_automation || {};
-    const selection = currentOpenSourceSelection(moduleState);
-    const featureId = String(featureInput.dataset.openSourceFeature || "");
-    if (featureInput.checked) {
-      if (!selection.featureIds.includes(featureId)) selection.featureIds.push(featureId);
+  function updateOpenSourceRuntimeOptionFromInput(event) {
+    const input = event.target.closest("[data-runtime-option-id]");
+    if (!input) return false;
+    const featureId = String(input.dataset.runtimeFeatureId || "");
+    const optionId = String(input.dataset.runtimeOptionId || "");
+    const adapter = app.state?.open_source_automation?.adapters?.[featureId] || {};
+    if (!featureId || !optionId) return true;
+    const draft = currentOpenSourceOptionDraft(featureId, adapter);
+    draft[optionId] = input.dataset.runtimeOptionType === "checkbox"
+      ? input.checked === true
+      : input.value;
+    app.openSourceOptionDrafts.set(featureId, draft);
+    const persistentIds = new Set(
+      (Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [])
+        .filter(option => option?.persisted !== false)
+        .map(option => String(option?.id || "")),
+    );
+    const server = openSourceOptionServerState(adapter);
+    const persistentDraft = Object.fromEntries(Object.entries(draft).filter(([key]) => persistentIds.has(key)));
+    const persistentServer = Object.fromEntries(Object.entries(server).filter(([key]) => persistentIds.has(key)));
+    if (openSourceOptionStateSignature(persistentDraft) === openSourceOptionStateSignature(persistentServer)) {
+      app.openSourceOptionDirtyFeatures.delete(featureId);
     } else {
-      selection.featureIds = selection.featureIds.filter(id => id !== featureId);
+      app.openSourceOptionDirtyFeatures.add(featureId);
     }
-    app.openSourceSelectionDirty = openSourceSelectionSignature(selection)
-      !== app.openSourceSelectionServerSignature;
+    const taskDirty = openSourceOptionScopeDirty(adapter, draft, "task");
+    const environmentDirty = openSourceOptionScopeDirty(adapter, draft, "environment");
+    if (optionId === "task") {
+      app.openSourceCatalogRenderSignature = "";
+      renderOpenSourceAutomation(app.state);
+    } else {
+      const saveButton = document.querySelector(`[data-open-source-save-options="${CSS.escape(featureId)}"]`);
+      if (saveButton) saveButton.disabled = !taskDirty;
+      const toolbar = saveButton?.closest(".opensource-config-toolbar");
+      const state = toolbar?.querySelector("strong");
+      if (state) state.textContent = taskDirty
+        ? "有未保存的任务参数"
+        : "任务参数已同步";
+      if (app.openSourceOptionDirtyFeatures.has(featureId)) {
+        $("#opensource-preflight-button").disabled = true;
+        $("#opensource-start-button").disabled = true;
+      }
+      const configureButton = $("#opensource-configure-button");
+      if (
+        configureButton.dataset.featureId === featureId
+        && featureId !== "maaend-profile"
+      ) {
+        configureButton.disabled = !environmentDirty || app.openSourceSelectionDirty;
+      }
+    }
+    return true;
+  }
+
+  async function saveOpenSourceRuntimeConfiguration(featureId) {
+    if (!featureId || app.openSourceRuntimeAction || !app.openSourceOptionDirtyFeatures.has(featureId)) return;
+    const moduleState = app.state?.open_source_automation || {};
+    const savedFeatures = new Set(
+      Array.isArray(moduleState.selection?.feature_ids)
+        ? moduleState.selection.feature_ids.map(item => String(item || ""))
+        : [],
+    );
+    if (!savedFeatures.has(featureId) || app.openSourceSelectionDirty) {
+      notify("正在切换游戏", "等待当前游戏入口保存后再保存任务参数。", "warning", 6000);
+      return;
+    }
+    const adapter = moduleState.adapters?.[featureId] || {};
+    const draft = { ...currentOpenSourceOptionDraft(featureId, adapter) };
+    app.openSourceRuntimeAction = "configure";
+    app.openSourceCatalogRenderSignature = "";
     renderOpenSourceAutomation(app.state);
+    try {
+      const updated = await api("/api/open-source-automation/configure", {
+        method: "POST",
+        body: JSON.stringify({
+          feature_id: featureId,
+          ...draft,
+        }),
+      });
+      app.openSourceOptionDirtyFeatures.delete(featureId);
+      app.openSourceOptionDrafts.delete(featureId);
+      app.openSourceOptionServerSignatures.delete(featureId);
+      app.state = { ...(app.state || {}), open_source_automation: updated };
+      app.openSourceCatalogRenderSignature = "";
+      renderOpenSourceAutomation(app.state);
+      notify("任务参数已保存", "当前游戏的任务与恢复参数已写入本地运行配置。", "success", 6500);
+    } catch (error) {
+      notify("无法保存任务参数", error.message || "未知错误", "error", 9000);
+    } finally {
+      app.openSourceRuntimeAction = "";
+      app.openSourceCatalogRenderSignature = "";
+      if (app.state) renderOpenSourceAutomation(app.state);
+    }
   }
 
   function updateMaaEndConfigFromInput(event) {
@@ -7427,7 +7559,7 @@
     app.openSourceCatalogRenderSignature = "";
     renderOpenSourceAutomation(app.state);
     try {
-      const runtimeOptions = openSourceRuntimeOptionPayload();
+      const runtimeOptions = openSourceRuntimeOptionPayload("maaend-profile");
       const body = {
         feature_id: "maaend-profile",
         device,
@@ -7442,6 +7574,9 @@
       app.maaEndConfigDirty = false;
       app.maaEndConfigDraft = null;
       app.maaEndConfigServerSignature = "";
+      app.openSourceOptionDirtyFeatures.delete("maaend-profile");
+      app.openSourceOptionDrafts.delete("maaend-profile");
+      app.openSourceOptionServerSignatures.delete("maaend-profile");
       app.state = { ...(app.state || {}), open_source_automation: updated };
       app.openSourceCatalogRenderSignature = "";
       renderOpenSourceAutomation(app.state);
@@ -7667,10 +7802,15 @@
 
   function renderOpenSourceRuntimeOptions(featureId, adapter = {}, disabled = false) {
     const target = $("#opensource-runtime-options");
-    const options = Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [];
+    const draft = currentOpenSourceOptionDraft(featureId, adapter);
+    const options = (Array.isArray(adapter?.runtime_options) ? adapter.runtime_options : [])
+      .filter(option => String(option?.scope || "task") === "environment")
+      .filter(option => openSourceOptionVisible(option, draft));
     const signature = JSON.stringify({
       featureId,
       adapterId: String(adapter?.adapter_id || ""),
+      draft,
+      disabled,
       options: options.map(option => ({
         id: String(option?.id || ""),
         type: String(option?.type || "text"),
@@ -7680,43 +7820,21 @@
     });
     if (target.dataset.signature !== signature) {
       target.dataset.signature = signature;
+      target.dataset.featureId = featureId;
       target.innerHTML = options.length
-        ? options.map((option, index) => {
-          const optionId = String(option?.id || `option-${index + 1}`);
-          const type = String(option?.type || "text");
-          const label = escapeHtml(option?.label || optionId);
-          const description = escapeHtml(option?.description || "运行时参数");
-          const data = `data-runtime-option-id="${escapeHtml(optionId)}" data-runtime-option-type="${escapeHtml(type)}"`;
-          if (type === "checkbox") {
-            return `<label class="opensource-runtime-option-checkbox"><input type="checkbox" ${data} ${option?.value === true ? "checked" : ""}><span><strong>${label}</strong><small>${description}</small></span></label>`;
-          }
-          if (type === "select") {
-            const selectedValue = String(option?.value ?? "");
-            const choices = Array.isArray(option?.options) ? option.options : [];
-            return `<label class="opensource-runtime-option-select"><span><strong>${label}</strong><small>${description}</small></span><select ${data}>${choices.map(choice => {
-              const value = String(choice?.value ?? "");
-              return `<option value="${escapeHtml(value)}" ${value === selectedValue ? "selected" : ""}>${escapeHtml(choice?.label || value)}</option>`;
-            }).join("")}</select></label>`;
-          }
-          return `<label class="opensource-runtime-option-text"><span><strong>${label}</strong><small>${description}</small></span><input type="text" ${data} value="${escapeHtml(option?.value ?? "")}" ${option?.required === true ? "required" : ""} autocomplete="off"></label>`;
-        }).join("")
-        : '<div class="opensource-empty">该功能没有额外运行参数</div>';
+        ? options.map(option => renderOpenSourceOptionControl(featureId, option, draft, disabled)).join("")
+        : '<div class="opensource-empty">当前游戏没有额外环境参数</div>';
     }
-    $$("#opensource-runtime-options input, #opensource-runtime-options select").forEach(input => {
-      input.disabled = disabled;
-    });
+    $("#opensource-runtime-environment-count").textContent = options.length
+      ? `${options.length} 项`
+      : "无需配置";
   }
 
-  function openSourceRuntimeOptionPayload() {
-    const payload = {};
-    $$("#opensource-runtime-options [data-runtime-option-id]").forEach(input => {
-      const optionId = String(input.dataset.runtimeOptionId || "").trim();
-      if (!optionId) return;
-      payload[optionId] = input.dataset.runtimeOptionType === "checkbox"
-        ? input.checked === true
-        : input.value;
-    });
-    return payload;
+  function openSourceRuntimeOptionPayload(featureId = "") {
+    const selectedFeatureId = featureId || String($("#opensource-runtime-options").dataset.featureId || "");
+    if (!selectedFeatureId) return {};
+    const adapter = app.state?.open_source_automation?.adapters?.[selectedFeatureId] || {};
+    return { ...currentOpenSourceOptionDraft(selectedFeatureId, adapter) };
   }
 
   function renderOpenSourceRuntimeConsole(moduleState = {}) {
@@ -7820,9 +7938,6 @@
             ? `${Number(upstream.map_count)} 张地图`
             : available ? "已安装" : "未安装";
     $("#opensource-runtime-upstream").title = upstream.repository || upstream.path || "";
-    $("#opensource-runtime-disk").textContent = finite(upstream.disk_mib)
-      ? `${Number(upstream.disk_mib).toFixed(1)} MiB`
-      : "--";
     const errorLines = String(adapter?.last_error || "")
       .split(/\r?\n/)
       .map(line => line.trim())
@@ -7873,15 +7988,24 @@
     const isMaaEnd = featureId === "maaend-profile";
     const usbReady = androidReady && deviceConnectionType(selectedDeviceRow) === "usb";
     const maaEndDirty = isMaaEnd && app.maaEndConfigDirty;
-    configureButton.hidden = !isMaaEnd;
-    configureButton.disabled = !isMaaEnd || busy || running || !saved || !usbReady || app.openSourceSelectionDirty;
+    const optionDirty = app.openSourceOptionDirtyFeatures.has(featureId);
+    const environmentDirty = openSourceOptionScopeDirty(adapter, currentOpenSourceOptionDraft(featureId, adapter), "environment");
+    const hasMaaEndCatalog = Array.isArray(adapter?.game_catalog?.tasks)
+      && adapter.game_catalog.tasks.length > 0;
+    configureButton.hidden = !featureId;
+    configureButton.dataset.featureId = featureId;
+    configureButton.disabled = isMaaEnd
+      ? busy || running || !saved || !usbReady || app.openSourceSelectionDirty || (hasMaaEndCatalog && !environmentDirty)
+      : busy || running || !saved || !environmentDirty || app.openSourceSelectionDirty;
     configureButton.textContent = app.openSourceRuntimeAction === "configure"
       ? "正在保存..."
-      : (Array.isArray(adapter?.game_catalog?.tasks) && adapter.game_catalog.tasks.length
-        ? "保存 MaaEnd 任务"
-        : "载入目录 / 保存任务");
-    preflightButton.disabled = busy || running || !endToEndVerified || (!available && !canConfigureMissing) || !saved || !(isMaaEnd ? usbReady : androidReady) || app.openSourceSelectionDirty || maaEndDirty;
-    startButton.disabled = busy || running || !endToEndVerified || !available || !saved || !gameReady || app.openSourceSelectionDirty || maaEndDirty;
+      : isMaaEnd
+        ? (hasMaaEndCatalog
+          ? "保存运行环境"
+          : "载入目录 / 保存任务")
+        : "保存运行环境";
+    preflightButton.disabled = busy || running || !endToEndVerified || (!available && !canConfigureMissing) || !saved || !(isMaaEnd ? usbReady : androidReady) || app.openSourceSelectionDirty || maaEndDirty || optionDirty;
+    startButton.disabled = busy || running || !endToEndVerified || !available || !saved || !gameReady || app.openSourceSelectionDirty || maaEndDirty || optionDirty;
     stopButton.disabled = busy || !running;
     preflightButton.textContent = app.openSourceRuntimeAction === "preflight" ? "正在预检..." : "运行预检";
     startButton.textContent = app.openSourceRuntimeAction === "start" ? "正在启动..." : "启动所选功能";
@@ -7945,6 +8069,10 @@
       notify("当前没有可运行功能", "已选功能仍在等待项目适配器。", "warning", 6500);
       return;
     }
+    if (action !== "stop" && app.openSourceOptionDirtyFeatures.has(featureId)) {
+      notify("请先保存任务参数", "任务或运行环境已有修改，保存后重新运行预检。", "warning", 6500);
+      return;
+    }
     const device = selectedDevice();
     if (action !== "stop" && !device) {
       notify("请选择 Android 真机", "请先在顶部设备选择器中选择已授权设备。", "warning", 6500);
@@ -7958,7 +8086,7 @@
         body: JSON.stringify({
           feature_id: featureId,
           device,
-          ...openSourceRuntimeOptionPayload(),
+          ...openSourceRuntimeOptionPayload(featureId),
         }),
       });
       app.state = { ...(app.state || {}), open_source_automation: updated };
@@ -8368,7 +8496,48 @@
       void selectOpenSourceProject(event);
     });
     $("#opensource-feature-groups").addEventListener("change", event => {
-      if (!updateMaaEndConfigFromInput(event)) updateOpenSourceSelectionFromInput(event);
+      if (!updateMaaEndConfigFromInput(event) && updateOpenSourceRuntimeOptionFromInput(event)) {
+        renderOpenSourceRuntimeConsole(app.state?.open_source_automation || {});
+      }
+    });
+    $("#opensource-feature-groups").addEventListener("input", event => {
+      updateOpenSourceRuntimeOptionFromInput(event);
+    });
+    $("#opensource-feature-groups").addEventListener("toggle", event => {
+      const group = event.target.closest?.("[data-open-source-config-group]");
+      if (group) {
+        const featureId = String(
+          group.querySelector("[data-runtime-feature-id]")?.dataset?.runtimeFeatureId || "",
+        );
+        const groupName = String(group.dataset.openSourceConfigGroup || "");
+        if (!featureId || !groupName) return;
+        const openGroups = new Set(app.openSourceConfigOpenGroups.get(featureId) || []);
+        if (group.open) openGroups.add(groupName);
+        else openGroups.delete(groupName);
+        app.openSourceConfigOpenGroups.set(featureId, openGroups);
+        return;
+      }
+      const maaEndTask = event.target.closest?.("[data-maaend-config-task]");
+      if (maaEndTask) {
+        const taskName = String(maaEndTask.dataset.maaendConfigTask || "");
+        if (maaEndTask.open) app.maaEndConfigOpenTasks.add(taskName);
+        else app.maaEndConfigOpenTasks.delete(taskName);
+        return;
+      }
+      const maaEndGroup = event.target.closest?.("[data-maaend-config-group]");
+      if (maaEndGroup) {
+        const groupId = String(maaEndGroup.dataset.maaendConfigGroup || "");
+        if (maaEndGroup.open) app.maaEndConfigOpenGroups.add(groupId);
+        else app.maaEndConfigOpenGroups.delete(groupId);
+      }
+    }, true);
+    $("#opensource-runtime-options").addEventListener("change", event => {
+      if (updateOpenSourceRuntimeOptionFromInput(event)) {
+        renderOpenSourceRuntimeConsole(app.state?.open_source_automation || {});
+      }
+    });
+    $("#opensource-runtime-options").addEventListener("input", event => {
+      updateOpenSourceRuntimeOptionFromInput(event);
     });
     $("#opensource-feature-groups").addEventListener("click", event => {
       const preset = event.target.closest("[data-maaend-preset]");
@@ -8378,16 +8547,20 @@
       }
       if (event.target.closest("[data-maaend-save]")) {
         void saveMaaEndConfiguration();
+        return;
       }
-    });
-    $("#opensource-selection-form").addEventListener("submit", event => {
-      void saveOpenSourceAutomationSelection(event);
+      const saveOptions = event.target.closest("[data-open-source-save-options]");
+      if (saveOptions) {
+        void saveOpenSourceRuntimeConfiguration(String(saveOptions.dataset.openSourceSaveOptions || ""));
+      }
     });
     $("#opensource-preflight-button").addEventListener("click", () => {
       void runOpenSourceFeatureAction("preflight");
     });
     $("#opensource-configure-button").addEventListener("click", () => {
-      void saveMaaEndConfiguration();
+      const featureId = String($("#opensource-configure-button").dataset.featureId || "");
+      if (featureId === "maaend-profile") void saveMaaEndConfiguration();
+      else void saveOpenSourceRuntimeConfiguration(featureId);
     });
     $("#opensource-start-button").addEventListener("click", () => {
       void runOpenSourceFeatureAction("start");

@@ -3127,7 +3127,8 @@ class DashboardManager:
         self,
         payload: Dict[str, object],
     ) -> Dict[str, object]:
-        self._require_open_source_android_device(payload)
+        if str(payload.get("feature_id") or "") == MAAEND_PROFILE_FEATURE_ID:
+            self._require_open_source_android_device(payload)
         return self.open_source_automation.configure(payload)
 
     def preflight_open_source_automation(

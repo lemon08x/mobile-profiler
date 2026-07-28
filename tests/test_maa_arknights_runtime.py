@@ -13,6 +13,7 @@ from mobile_profiler.maa_arknights_runtime import (
     MAA_PACKAGED_RUNNERS,
     MaaArknightsRuntimeController,
 )
+from mobile_profiler.maa_roguelike_runner import resolve_roguelike_params
 
 
 class FakeRun:
@@ -157,7 +158,7 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
         self.assertEqual(snapshot["safety"]["viewport"], "adaptive")
         self.assertEqual(
             snapshot["safety"]["task_allowlist"],
-            ["Depot", "OperBox", "StartUp", "Award", "Roguelike"],
+            ["Daily", "Depot", "OperBox", "StartUp", "Award", "Roguelike"],
         )
         self.assertEqual(snapshot["upstream"]["path"], str(core.resolve()))
         self.assertEqual(snapshot["upstream"]["runtime_path"], str(runtime.resolve()))
@@ -173,8 +174,38 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
         packaged_policy = json.loads(MAA_GUARD_POLICY.read_text(encoding="utf-8"))
 
         self.assertEqual(packaged_policy, source_policy)
-        self.assertEqual(set(MAA_PACKAGED_RUNNERS), {"smoke", "feature", "roguelike"})
+        self.assertEqual(set(MAA_PACKAGED_RUNNERS), {"smoke", "feature", "daily", "roguelike"})
         self.assertTrue(all(path.is_file() for path in MAA_PACKAGED_RUNNERS.values()))
+
+    def test_runtime_options_separate_task_parameters_from_install_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _core, _runtime, adb = self._layout(root)
+            controller = MaaArknightsRuntimeController(
+                str(adb), root / "output", source, platform_name="nt"
+            )
+            options = {
+                row["id"]: row for row in controller.snapshot()["runtime_options"]
+            }
+            controller.close()
+
+        self.assertEqual(options["task"]["scope"], "task")
+        self.assertEqual(options["fight_stage"]["visible_when"], {"id": "task", "equals": "Daily"})
+        self.assertEqual(options["roguelike_theme"]["visible_when"], {"id": "task", "equals": "Roguelike"})
+        self.assertEqual(options["core_root"]["scope"], "environment")
+        self.assertFalse(options["allow_account_mutation"]["persisted"])
+
+    def test_guarded_roguelike_parameter_overrides_are_validated(self) -> None:
+        params = resolve_roguelike_params(
+            "Sami",
+            {"mode": 1, "squad": "指挥分队", "investment_enabled": False},
+        )
+        self.assertEqual(params["theme"], "Sami")
+        self.assertEqual(params["mode"], 1)
+        self.assertEqual(params["squad"], "指挥分队")
+        self.assertFalse(params["investment_enabled"])
+        with self.assertRaisesRegex(ValueError, "unsupported Roguelike option"):
+            resolve_roguelike_params("Sami", {"unsafe": True})
 
     def test_preflight_uses_patched_viewport_and_does_not_persist_consent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +364,54 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
 
         self.assertFalse(snapshot["running"])
         self.assertIn(snapshot["status"], {"stopped", "completed"})
+
+    def test_daily_start_passes_selected_tasks_and_web_parameters_to_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, core, runtime, adb = self._layout(root)
+            run = FakeRun()
+            popen = PopenFactory()
+            controller = MaaArknightsRuntimeController(
+                str(adb),
+                root / "output",
+                source,
+                run_func=run,
+                popen_factory=popen,
+                platform_name="nt",
+            )
+            payload = {
+                "device": "USB-DEVICE",
+                "task": "Daily",
+                "core_root": str(core),
+                "runtime_root": str(runtime),
+                "time_limit": "1800",
+                "daily_startup": True,
+                "daily_fight": True,
+                "daily_infrast": False,
+                "daily_recruit": False,
+                "daily_mall": True,
+                "daily_award": False,
+                "fight_stage": "1-7",
+                "fight_medicine": "2",
+                "fight_times": "5",
+                "mall_buy_first": "招聘许可;技巧概要",
+                "qwen_enabled": False,
+                "allow_account_mutation": True,
+            }
+            controller.preflight(payload)
+            controller.start(payload)
+            command = popen.processes[0].command
+            controller.stop()
+
+        self.assertTrue(any(item.endswith("maa_daily_runner.py") for item in command))
+        self.assertEqual(command[command.index("--tasks") + 1], "StartUp,Fight,Mall")
+        task_options = json.loads(command[command.index("--task-options") + 1])
+        self.assertEqual(task_options["Fight"]["stage"], "1-7")
+        self.assertEqual(task_options["Fight"]["medicine"], 2)
+        self.assertEqual(task_options["Fight"]["times"], 5)
+        self.assertEqual(task_options["Mall"]["buy_first"], ["招聘许可", "技巧概要"])
+        self.assertIn("--no-qwen", command)
+        self.assertIn("--allow-account-mutation", command)
 
 
 if __name__ == "__main__":

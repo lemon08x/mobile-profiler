@@ -79,6 +79,72 @@ PROGRESS_TASK_TOKENS = (
     "Roles",
 )
 
+ROGUELIKE_PARAM_DEFAULTS: dict[str, object] = {
+    "theme": "JieGarden",
+    "mode": 0,
+    "starts_count": 1,
+    "difficulty": 2_147_483_647,
+    "investment_enabled": True,
+    "investments_count": 999,
+    "stop_when_investment_full": False,
+    "stop_at_final_boss": False,
+    "stop_at_max_level": False,
+    "use_support": False,
+    "use_nonfriend_support": False,
+    "refresh_trader_with_dice": False,
+}
+ROGUELIKE_OPTIONAL_TEXT_PARAMS = frozenset({"squad", "roles", "core_char"})
+
+
+def resolve_roguelike_params(theme: str, raw_params: object) -> dict[str, object]:
+    """Validate and merge Web/runtime overrides into the guarded task params."""
+
+    if raw_params in (None, ""):
+        decoded: object = {}
+    elif isinstance(raw_params, str):
+        try:
+            decoded = json.loads(raw_params)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--params-json must be valid JSON") from exc
+    else:
+        decoded = raw_params
+    if not isinstance(decoded, dict):
+        raise ValueError("--params-json must be a JSON object")
+    allowed = set(ROGUELIKE_PARAM_DEFAULTS) | set(ROGUELIKE_OPTIONAL_TEXT_PARAMS)
+    unknown = set(str(key) for key in decoded) - allowed
+    if unknown:
+        raise ValueError(f"unsupported Roguelike option(s): {', '.join(sorted(unknown))}")
+
+    params = dict(ROGUELIKE_PARAM_DEFAULTS)
+    params["theme"] = str(theme or "JieGarden")
+    for key, value in decoded.items():
+        if key in ROGUELIKE_OPTIONAL_TEXT_PARAMS:
+            text = str(value or "").strip()
+            if len(text) > 200:
+                raise ValueError(f"Roguelike {key} is too long")
+            if text:
+                params[key] = text
+            continue
+        default = ROGUELIKE_PARAM_DEFAULTS[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise ValueError(f"Roguelike {key} must be a boolean")
+            params[key] = value
+        elif isinstance(default, int):
+            if isinstance(value, bool):
+                raise ValueError(f"Roguelike {key} must be an integer")
+            try:
+                params[key] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Roguelike {key} must be an integer") from exc
+        else:
+            params[key] = str(value)
+    if int(params["starts_count"]) != 1:
+        raise ValueError("guarded Roguelike runner supports exactly one natural-settlement round")
+    if int(params["mode"]) < 0 or int(params["mode"]) > 5:
+        raise ValueError("Roguelike mode must be within 0..5")
+    return params
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -100,6 +166,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--viewport", default="adaptive")
     parser.add_argument("--theme", default="JieGarden")
+    parser.add_argument("--client-type", default="Official")
+    parser.add_argument(
+        "--params-json",
+        help="validated JSON overrides for the MaaCore Roguelike task",
+    )
     parser.add_argument("--max-seconds", type=float, default=3 * 60 * 60)
     parser.add_argument("--heartbeat-seconds", type=float, default=30)
     parser.add_argument("--snapshot-seconds", type=float, default=30)
@@ -227,23 +298,10 @@ def main() -> int:
     )
 
     startup_params = {
-        "client_type": "Official",
+        "client_type": args.client_type,
         "start_game_enabled": True,
     }
-    roguelike_params = {
-        "theme": args.theme,
-        "mode": 0,
-        "starts_count": 1,
-        "difficulty": 2_147_483_647,
-        "investment_enabled": True,
-        "investments_count": 999,
-        "stop_when_investment_full": False,
-        "stop_at_final_boss": False,
-        "stop_at_max_level": False,
-        "use_support": False,
-        "use_nonfriend_support": False,
-        "refresh_trader_with_dice": False,
-    }
+    roguelike_params = resolve_roguelike_params(args.theme, args.params_json)
     request = {
         "schema_version": 2,
         "core_root": os.fspath(core_root),
@@ -425,7 +483,7 @@ def main() -> int:
             raise RuntimeError("AsstCreateEx failed")
         for option, value in (
             (ASST_OPTION_TOUCH_MODE, "adb"),
-            (ASST_OPTION_CLIENT_TYPE, "Official"),
+            (ASST_OPTION_CLIENT_TYPE, args.client_type),
             (ASST_OPTION_VIEWPORT, args.viewport),
         ):
             if not core.AsstSetInstanceOption(handle, option, value.encode("utf-8")):

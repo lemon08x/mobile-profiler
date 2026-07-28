@@ -19,6 +19,11 @@ MAA_ARKNIGHTS_REPOSITORY = (
     "https://github.com/MaaAssistantArknights/MaaAssistantArknights"
 )
 MAA_ARKNIGHTS_TASKS: dict[str, dict[str, object]] = {
+    "Daily": {
+        "label": "每日任务队列",
+        "risk": "account_mutation",
+        "runner": "daily",
+    },
     "Depot": {
         "label": "仓库识别（只读）",
         "risk": "read_only",
@@ -56,9 +61,80 @@ ARKNIGHTS_PACKAGES = (
 MAA_PACKAGED_RUNNERS = {
     "smoke": Path(__file__).with_name("maa_viewport_smoke.py"),
     "feature": Path(__file__).with_name("maa_feature_runner.py"),
+    "daily": Path(__file__).with_name("maa_daily_runner.py"),
     "roguelike": Path(__file__).with_name("maa_roguelike_runner.py"),
 }
 MAA_GUARD_POLICY = Path(__file__).with_name("maa_guard_policy.json")
+
+MAA_CLIENT_TYPES = ("Official", "Bilibili", "YoStarEN", "YoStarJP", "YoStarKR", "txwy")
+MAA_DAILY_TASK_IDS = ("StartUp", "Fight", "Infrast", "Recruit", "Mall", "Award")
+MAA_INFRAST_FACILITIES = (
+    "Mfg",
+    "Trade",
+    "Control",
+    "Power",
+    "Reception",
+    "Office",
+    "Dorm",
+    "Processing",
+    "Training",
+)
+MAA_ROGUELIKE_THEMES = ("Phantom", "Mizuki", "Sami", "Sarkaz", "JieGarden")
+MAA_OPTION_DEFAULTS: dict[str, object] = {
+    "client_type": "Official",
+    "daily_startup": True,
+    "daily_fight": True,
+    "daily_infrast": True,
+    "daily_recruit": True,
+    "daily_mall": True,
+    "daily_award": True,
+    "fight_stage": "",
+    "fight_medicine": 0,
+    "fight_stone": 0,
+    "fight_times": 0,
+    "infrast_facilities": "Mfg,Trade,Control,Power,Reception,Office,Dorm",
+    "infrast_drones": "Money",
+    "recruit_times": 4,
+    "recruit_refresh": True,
+    "recruit_expedite": False,
+    "mall_visit_friends": True,
+    "mall_shopping": True,
+    "mall_buy_first": "招聘许可",
+    "mall_blacklist": "碳;家具零件;加急许可",
+    "award_mail": False,
+    "award_recruit": False,
+    "award_orundum": False,
+    "award_mining": False,
+    "award_specialaccess": False,
+    "daily_task_retries": 1,
+    "daily_recovery_retries": 2,
+    "qwen_enabled": True,
+    "qwen_url": "http://192.168.31.237:8000",
+    "qwen_model": "qwen3.6-27b",
+    "roguelike_theme": "JieGarden",
+    "roguelike_mode": 0,
+    "roguelike_squad": "",
+    "roguelike_roles": "",
+    "roguelike_core_char": "",
+    "roguelike_difficulty": 0,
+    "roguelike_investment_enabled": True,
+    "roguelike_investments_count": 999,
+    "roguelike_stop_when_investment_full": False,
+    "roguelike_stop_at_final_boss": False,
+    "roguelike_use_support": False,
+    "roguelike_use_nonfriend_support": False,
+}
+MAA_INTEGER_LIMITS: dict[str, tuple[int, int]] = {
+    "fight_medicine": (0, 999),
+    "fight_stone": (0, 999),
+    "fight_times": (0, 10_000),
+    "recruit_times": (0, 100),
+    "daily_task_retries": (0, 10),
+    "daily_recovery_retries": (0, 10),
+    "roguelike_mode": (0, 5),
+    "roguelike_difficulty": (0, 100),
+    "roguelike_investments_count": (0, 9999),
+}
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
@@ -122,6 +198,7 @@ class MaaArknightsRuntimeController:
         self._core_root, self._runtime_root = self._default_runtime_paths()
         self._task = "Depot"
         self._time_limit = 600
+        self._option_values = dict(MAA_OPTION_DEFAULTS)
         self._allow_account_mutation = False
         self._load_config()
         error = self._install_error(self._core_root, self._runtime_root)
@@ -207,6 +284,12 @@ class MaaArknightsRuntimeController:
             self._task = task
         if isinstance(time_limit, int) and 30 <= time_limit <= 10_800:
             self._time_limit = time_limit
+        stored_options = value.get("options")
+        if isinstance(stored_options, dict):
+            try:
+                self._option_values = self._validated_option_values(stored_options)
+            except ValueError:
+                pass
 
     def _persist_config(self) -> None:
         # Account-mutation consent is intentionally process-local and never persisted.
@@ -216,6 +299,7 @@ class MaaArknightsRuntimeController:
             "runtime_root": str(self._runtime_root),
             "task": self._task,
             "time_limit": self._time_limit,
+            "options": dict(self._option_values),
             "viewport": "adaptive",
             "saved_at": time.time(),
         }
@@ -264,6 +348,187 @@ class MaaArknightsRuntimeController:
             raise ValueError("MAA time_limit must be within 30..10800 seconds")
         return parsed
 
+    def _validated_option_values(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        values = dict(self._option_values)
+        for key, default in MAA_OPTION_DEFAULTS.items():
+            if key not in payload:
+                continue
+            raw = payload[key]
+            if isinstance(default, bool):
+                values[key] = _bool(raw, bool(default))
+                continue
+            if isinstance(default, int):
+                try:
+                    parsed = int(str(raw).strip())
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"MAA {key} must be an integer") from exc
+                minimum, maximum = MAA_INTEGER_LIMITS[key]
+                if parsed < minimum or parsed > maximum:
+                    raise ValueError(
+                        f"MAA {key} must be within {minimum}..{maximum}"
+                    )
+                values[key] = parsed
+                continue
+            text = str(raw or "").strip()
+            if len(text) > 1000:
+                raise ValueError(f"MAA {key} is too long")
+            values[key] = text
+
+        client_type = str(values["client_type"])
+        if client_type not in MAA_CLIENT_TYPES:
+            raise ValueError(f"unsupported MAA client_type: {client_type}")
+        theme = str(values["roguelike_theme"])
+        if theme not in MAA_ROGUELIKE_THEMES:
+            raise ValueError(f"unsupported MAA roguelike theme: {theme}")
+        facilities = [
+            item.strip()
+            for item in str(values["infrast_facilities"]).replace("；", ",").split(",")
+            if item.strip()
+        ]
+        invalid_facilities = [
+            item for item in facilities if item not in MAA_INFRAST_FACILITIES
+        ]
+        if invalid_facilities:
+            raise ValueError(
+                "unsupported MAA infrastructure facilities: "
+                + ", ".join(invalid_facilities)
+            )
+        values["infrast_facilities"] = ",".join(dict.fromkeys(facilities))
+        if str(values["infrast_drones"]) not in {
+            "_NotUse",
+            "Money",
+            "SyntheticJade",
+            "CombatRecord",
+            "PureGold",
+            "OriginStone",
+            "Chip",
+        }:
+            raise ValueError("unsupported MAA infrastructure drone target")
+        qwen_url = str(values["qwen_url"])
+        if qwen_url and not qwen_url.startswith(("http://", "https://")):
+            raise ValueError("MAA qwen_url must be an HTTP(S) URL")
+        return values
+
+    @staticmethod
+    def _daily_task_names(options: dict[str, object]) -> list[str]:
+        return [
+            task
+            for task in MAA_DAILY_TASK_IDS
+            if bool(options[f"daily_{task.lower()}"])
+        ]
+
+    @staticmethod
+    def _split_items(value: object) -> list[str]:
+        return [
+            item.strip()
+            for item in str(value or "").replace("；", ";").split(";")
+            if item.strip()
+        ]
+
+    def _daily_task_options(
+        self,
+        options: dict[str, object],
+    ) -> dict[str, dict[str, object]]:
+        fight_times = int(options["fight_times"])
+        return {
+            "StartUp": {
+                "client_type": str(options["client_type"]),
+                "start_game_enabled": True,
+            },
+            "Fight": {
+                "stage": str(options["fight_stage"]),
+                "medicine": int(options["fight_medicine"]),
+                "stone": int(options["fight_stone"]),
+                "times": fight_times if fight_times > 0 else 2_147_483_647,
+                "client_type": str(options["client_type"]),
+            },
+            "Infrast": {
+                "facility": [
+                    item
+                    for item in str(options["infrast_facilities"]).split(",")
+                    if item
+                ],
+                "drones": str(options["infrast_drones"]),
+            },
+            "Recruit": {
+                "times": int(options["recruit_times"]),
+                "refresh": bool(options["recruit_refresh"]),
+                "force_refresh": bool(options["recruit_refresh"]),
+                "expedite": bool(options["recruit_expedite"]),
+            },
+            "Mall": {
+                "visit_friends": bool(options["mall_visit_friends"]),
+                "shopping": bool(options["mall_shopping"]),
+                "buy_first": self._split_items(options["mall_buy_first"]),
+                "blacklist": self._split_items(options["mall_blacklist"]),
+            },
+            "Award": {
+                "award": True,
+                "mail": bool(options["award_mail"]),
+                "recruit": bool(options["award_recruit"]),
+                "orundum": bool(options["award_orundum"]),
+                "mining": bool(options["award_mining"]),
+                "specialaccess": bool(options["award_specialaccess"]),
+            },
+        }
+
+    @staticmethod
+    def _roguelike_params(options: dict[str, object]) -> dict[str, object]:
+        params: dict[str, object] = {
+            "theme": str(options["roguelike_theme"]),
+            "mode": int(options["roguelike_mode"]),
+            "starts_count": 1,
+            "difficulty": (
+                int(options["roguelike_difficulty"])
+                if int(options["roguelike_difficulty"]) > 0
+                else 2_147_483_647
+            ),
+            "investment_enabled": bool(options["roguelike_investment_enabled"]),
+            "investments_count": int(options["roguelike_investments_count"]),
+            "stop_when_investment_full": bool(
+                options["roguelike_stop_when_investment_full"]
+            ),
+            "stop_at_final_boss": bool(options["roguelike_stop_at_final_boss"]),
+            "use_support": bool(options["roguelike_use_support"]),
+            "use_nonfriend_support": bool(options["roguelike_use_nonfriend_support"]),
+        }
+        for source, target in (
+            ("roguelike_squad", "squad"),
+            ("roguelike_roles", "roles"),
+            ("roguelike_core_char", "core_char"),
+        ):
+            value = str(options[source]).strip()
+            if value:
+                params[target] = value
+        return params
+
+    def _mutation_requested(self, configuration: dict[str, object]) -> bool:
+        task = str(configuration["task"])
+        if task == "Award":
+            return True
+        if task != "Daily":
+            return False
+        options = configuration["options"]
+        assert isinstance(options, dict)
+        return any(
+            name != "StartUp" for name in self._daily_task_names(options)
+        )
+
+    def _apply_configuration(self, configuration: dict[str, object]) -> None:
+        core_root = configuration["core_root"]
+        runtime_root = configuration["runtime_root"]
+        options = configuration["options"]
+        assert isinstance(core_root, Path) and isinstance(runtime_root, Path)
+        assert isinstance(options, dict)
+        self._core_root = core_root
+        self._runtime_root = runtime_root
+        self._task = str(configuration["task"])
+        self._time_limit = int(configuration["time_limit"])
+        self._option_values = dict(options)
+
     def _configuration(self, payload: dict[str, object]) -> dict[str, object]:
         core_value = str(payload.get("core_root") or self._core_root).strip()
         runtime_value = str(payload.get("runtime_root") or self._runtime_root).strip()
@@ -272,6 +537,14 @@ class MaaArknightsRuntimeController:
             raise ValueError("MAA core_root and runtime_root are required")
         if task not in MAA_ARKNIGHTS_TASKS:
             raise ValueError(f"unsupported MAA task: {task}")
+        option_payload = {
+            key: payload[key]
+            for key in MAA_OPTION_DEFAULTS
+            if key in payload
+        }
+        options = self._validated_option_values(option_payload)
+        if task == "Daily" and not self._daily_task_names(options):
+            raise ValueError("MAA daily queue must enable at least one task")
         return {
             "core_root": _resolved_path(core_value),
             "runtime_root": _resolved_path(runtime_value),
@@ -283,7 +556,26 @@ class MaaArknightsRuntimeController:
                 payload.get("allow_account_mutation"),
                 self._allow_account_mutation,
             ),
+            "options": options,
         }
+
+    def configure(self, payload: dict[str, object]) -> dict[str, object]:
+        configuration = self._configuration(payload)
+        with self._lock:
+            if self._running:
+                raise RuntimeError("MAA automation is already running")
+            self._apply_configuration(configuration)
+            self._allow_account_mutation = False
+            self._last_preflight = None
+            self._status = (
+                "installed"
+                if not self._install_error(self._core_root, self._runtime_root)
+                else "not_installed"
+            )
+            self._last_error = ""
+        self._persist_config()
+        self._log("configured", f"已保存 MAA {self._task} 参数")
+        return self.snapshot()
 
     def _environment(self) -> dict[str, str]:
         environment = dict(os.environ)
@@ -386,17 +678,14 @@ class MaaArknightsRuntimeController:
         task = str(configuration["task"])
         assert isinstance(core_root, Path) and isinstance(runtime_root, Path)
         allow_mutation = bool(configuration["allow_account_mutation"])
-        if task == "Award" and not allow_mutation:
+        if self._mutation_requested(configuration) and not allow_mutation:
             raise ValueError(
-                "Award changes account state; explicitly enable account-mutation consent"
+                "selected MAA tasks change account state; explicitly enable account-mutation consent"
             )
         with self._lock:
             if self._running:
                 raise RuntimeError("MAA automation is already running")
-            self._core_root = core_root
-            self._runtime_root = runtime_root
-            self._task = task
-            self._time_limit = int(configuration["time_limit"])
+            self._apply_configuration(configuration)
             self._allow_account_mutation = allow_mutation
             self._device = device
             self._status = "preflighting"
@@ -441,7 +730,11 @@ class MaaArknightsRuntimeController:
             height = int(geometry.get("height") or 0)
             landscape = width > height > 0
             foreground_ready = bool(foreground_package)
-            launch_task = task == "StartUp"
+            options = configuration["options"]
+            assert isinstance(options, dict)
+            launch_task = task == "StartUp" or (
+                task == "Daily" and bool(options["daily_startup"])
+            )
             game_ready = screen_awake and landscape and (foreground_ready or launch_task)
             if not screen_awake:
                 screen_state = "device_asleep"
@@ -472,6 +765,7 @@ class MaaArknightsRuntimeController:
                     "runtime_root": str(runtime_root),
                     "task": task,
                     "time_limit": self._time_limit,
+                    "options": options,
                     "viewport": "adaptive",
                 },
                 "policy": {
@@ -512,7 +806,9 @@ class MaaArknightsRuntimeController:
         runtime_root = configuration["runtime_root"]
         task = str(configuration["task"])
         time_limit = int(configuration["time_limit"])
+        options = configuration["options"]
         assert isinstance(core_root, Path) and isinstance(runtime_root, Path)
+        assert isinstance(options, dict)
         common = [
             "--core-root",
             str(core_root),
@@ -535,13 +831,52 @@ class MaaArknightsRuntimeController:
                 str(MAA_PACKAGED_RUNNERS["roguelike"]),
                 *common,
                 "--theme",
-                "JieGarden",
+                str(options["roguelike_theme"]),
+                "--client-type",
+                str(options["client_type"]),
+                "--params-json",
+                json.dumps(
+                    self._roguelike_params(options),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 "--policy",
                 str(MAA_GUARD_POLICY),
             ]
             maa_source_root = core_root.parents[1] if len(core_root.parents) > 1 else None
             if maa_source_root and (maa_source_root / "resource").is_dir():
                 command.extend(["--maa-source-root", str(maa_source_root)])
+            return command
+
+        if task == "Daily":
+            selected_tasks = self._daily_task_names(options)
+            command = [
+                sys.executable,
+                str(MAA_PACKAGED_RUNNERS["daily"]),
+                *common,
+                "--tasks",
+                ",".join(selected_tasks),
+                "--task-options",
+                json.dumps(
+                    self._daily_task_options(options),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "--task-retries",
+                str(options["daily_task_retries"]),
+                "--recovery-retries",
+                str(options["daily_recovery_retries"]),
+                "--qwen-url",
+                str(options["qwen_url"]),
+                "--qwen-model",
+                str(options["qwen_model"]),
+            ]
+            if not bool(options["qwen_enabled"]):
+                command.append("--no-qwen")
+            if self._mutation_requested(configuration):
+                if not bool(configuration["allow_account_mutation"]):
+                    raise ValueError("Daily tasks require account-mutation consent")
+                command.append("--allow-account-mutation")
             return command
 
         command = [
@@ -636,6 +971,7 @@ class MaaArknightsRuntimeController:
                 "runtime_root": str(configuration["runtime_root"]),
                 "task": configuration["task"],
                 "time_limit": configuration["time_limit"],
+                "options": configuration["options"],
                 "viewport": "adaptive",
             }
             if (
@@ -646,10 +982,12 @@ class MaaArknightsRuntimeController:
                 raise RuntimeError(
                     "runtime options changed; rerun a successful MAA preflight"
                 )
-            if configuration["task"] == "Award" and not bool(
+            if self._mutation_requested(configuration) and not bool(
                 configuration["allow_account_mutation"]
             ):
-                raise RuntimeError("Award requires fresh account-mutation consent")
+                raise RuntimeError(
+                    "selected MAA tasks require fresh account-mutation consent"
+                )
 
             run_name = time.strftime("%Y%m%d-%H%M%S")
             run_dir = self.output_root / "runs" / f"{run_name}-{configuration['task']}"
@@ -729,6 +1067,189 @@ class MaaArknightsRuntimeController:
             lines = []
         return {"path": str(path), "lines": lines[-20:]}
 
+    def _runtime_options(self) -> list[dict[str, object]]:
+        values = self._option_values
+
+        def select(
+            option_id: str,
+            label: str,
+            description: str,
+            value: object,
+            choices: list[tuple[object, str]],
+            *,
+            group: str,
+            scope: str = "task",
+            visible_when: Optional[dict[str, object]] = None,
+        ) -> dict[str, object]:
+            row: dict[str, object] = {
+                "id": option_id,
+                "type": "select",
+                "label": label,
+                "description": description,
+                "value": str(value),
+                "options": [
+                    {"value": str(choice), "label": choice_label}
+                    for choice, choice_label in choices
+                ],
+                "group": group,
+                "scope": scope,
+            }
+            if visible_when:
+                row["visible_when"] = visible_when
+            return row
+
+        def field(
+            option_id: str,
+            label: str,
+            description: str,
+            *,
+            group: str,
+            input_type: str = "text",
+            scope: str = "task",
+            visible_when: Optional[dict[str, object]] = None,
+            required: bool = False,
+            minimum: Optional[int] = None,
+            maximum: Optional[int] = None,
+        ) -> dict[str, object]:
+            value = (
+                self._core_root
+                if option_id == "core_root"
+                else self._runtime_root
+                if option_id == "runtime_root"
+                else values.get(option_id, "")
+            )
+            row: dict[str, object] = {
+                "id": option_id,
+                "type": input_type,
+                "label": label,
+                "description": description,
+                "value": str(value),
+                "group": group,
+                "scope": scope,
+                "required": required,
+            }
+            if visible_when:
+                row["visible_when"] = visible_when
+            if minimum is not None:
+                row["min"] = minimum
+            if maximum is not None:
+                row["max"] = maximum
+            return row
+
+        def checkbox(
+            option_id: str,
+            label: str,
+            description: str,
+            *,
+            group: str,
+            visible_when: Optional[dict[str, object]] = None,
+        ) -> dict[str, object]:
+            row: dict[str, object] = {
+                "id": option_id,
+                "type": "checkbox",
+                "label": label,
+                "description": description,
+                "value": bool(values.get(option_id, False)),
+                "group": group,
+                "scope": "task",
+            }
+            if option_id == "allow_account_mutation":
+                row["value"] = self._allow_account_mutation
+                row["persisted"] = False
+            if visible_when:
+                row["visible_when"] = visible_when
+            return row
+
+        daily = {"id": "task", "equals": "Daily"}
+        roguelike = {"id": "task", "equals": "Roguelike"}
+        mutation = {"id": "task", "in": ["Daily", "Award"]}
+        options: list[dict[str, object]] = [
+            select(
+                "task",
+                "运行模式",
+                "选择完整每日队列、肉鸽或只读诊断任务。",
+                self._task,
+                [(task, str(info["label"])) for task, info in MAA_ARKNIGHTS_TASKS.items()],
+                group="运行模式",
+            ),
+            select(
+                "client_type",
+                "客户端",
+                "决定游戏包名、资源语言和商店默认文本。",
+                values["client_type"],
+                [(item, item) for item in MAA_CLIENT_TYPES],
+                group="运行模式",
+            ),
+            select(
+                "time_limit",
+                "最长运行时间",
+                "到时由 runner 停止并保留证据。",
+                self._time_limit,
+                [(600, "10 分钟"), (1800, "30 分钟"), (3600, "1 小时"), (10800, "3 小时")],
+                group="运行限制",
+            ),
+        ]
+        for option_id, label, description in (
+            ("daily_startup", "启动游戏", "队列开始时启动并进入明日方舟。"),
+            ("daily_fight", "理智作战", "按下方关卡与药剂设置执行 Fight。"),
+            ("daily_infrast", "基建换班", "按设施范围执行基建收取和换班。"),
+            ("daily_recruit", "公开招募", "刷新标签并按星级策略确认招募。"),
+            ("daily_mall", "信用商店", "访问好友并按购物清单消耗信用。"),
+            ("daily_award", "领取奖励", "领取日常/周常任务奖励。"),
+        ):
+            options.append(
+                checkbox(
+                    option_id,
+                    label,
+                    description,
+                    group="每日任务队列",
+                    visible_when=daily,
+                )
+            )
+        options.extend(
+            [
+                field("fight_stage", "关卡", "留空由 MAA 选择当前可用关卡，例如 1-7、CE-6。", group="理智作战", visible_when=daily),
+                field("fight_medicine", "可用理智药", "允许使用的理智药数量；0 表示不使用。", group="理智作战", input_type="number", visible_when=daily, minimum=0, maximum=999),
+                field("fight_stone", "可用源石", "允许碎石次数；建议保持 0。", group="理智作战", input_type="number", visible_when=daily, minimum=0, maximum=999),
+                field("fight_times", "作战次数", "0 表示持续到理智不足，否则执行指定次数。", group="理智作战", input_type="number", visible_when=daily, minimum=0, maximum=10000),
+                field("infrast_facilities", "基建设施", "逗号分隔；可用 Mfg, Trade, Control, Power, Reception, Office, Dorm。", group="基建", visible_when=daily),
+                select("infrast_drones", "无人机用途", "选择无人机加速目标。", values["infrast_drones"], [("_NotUse", "不使用"), ("Money", "龙门币"), ("SyntheticJade", "合成玉"), ("CombatRecord", "作战记录"), ("PureGold", "赤金"), ("OriginStone", "源石碎片"), ("Chip", "芯片")], group="基建", visible_when=daily),
+                field("recruit_times", "招募次数", "本轮最多处理的公开招募槽位数。", group="公开招募", input_type="number", visible_when=daily, minimum=0, maximum=100),
+                checkbox("recruit_refresh", "刷新三星标签", "允许刷新没有高星组合的标签。", group="公开招募", visible_when=daily),
+                checkbox("recruit_expedite", "使用加急许可", "允许消耗加急许可立即完成招募。", group="公开招募", visible_when=daily),
+                checkbox("mall_visit_friends", "访问好友", "领取好友信用。", group="信用商店", visible_when=daily),
+                checkbox("mall_shopping", "自动购物", "按优先清单与黑名单购买物品。", group="信用商店", visible_when=daily),
+                field("mall_buy_first", "优先购买", "使用分号分隔物品名称。", group="信用商店", visible_when=daily),
+                field("mall_blacklist", "不购买", "使用分号分隔物品名称。", group="信用商店", visible_when=daily),
+                checkbox("award_mail", "领取邮件", "同时领取邮件附件。", group="奖励", visible_when=daily),
+                checkbox("award_recruit", "领取招募奖励", "同时领取招募相关奖励。", group="奖励", visible_when=daily),
+                checkbox("award_orundum", "领取合成玉", "同时领取可用合成玉奖励。", group="奖励", visible_when=daily),
+                checkbox("award_mining", "领取矿区奖励", "同时处理矿区奖励。", group="奖励", visible_when=daily),
+                checkbox("award_specialaccess", "领取特别登录奖励", "同时处理特别登录活动奖励。", group="奖励", visible_when=daily),
+                field("daily_task_retries", "单任务重试", "任务失败后的原地重试次数。", group="无人值守恢复", input_type="number", visible_when=daily, minimum=0, maximum=10),
+                field("daily_recovery_retries", "恢复重试", "重启游戏后的恢复次数。", group="无人值守恢复", input_type="number", visible_when=daily, minimum=0, maximum=10),
+                checkbox("qwen_enabled", "启用本地 Qwen 恢复判断", "模型只能在“重启 / 停止”之间决策，不能直接操作游戏。", group="无人值守恢复", visible_when=daily),
+                field("qwen_url", "Qwen 服务地址", "OpenAI 兼容本地服务地址。", group="无人值守恢复", visible_when=daily),
+                field("qwen_model", "Qwen 模型", "用于异常恢复判断的本地模型名。", group="无人值守恢复", visible_when=daily),
+                select("roguelike_theme", "肉鸽主题", "选择 MAA 已安装资源支持的集成战略主题。", values["roguelike_theme"], [(item, item) for item in MAA_ROGUELIKE_THEMES], group="肉鸽策略", visible_when=roguelike),
+                select("roguelike_mode", "运行模式", "0 常规刷取；1 侧重投资；2 兼顾刷取与投资。", values["roguelike_mode"], [(0, "常规刷取"), (1, "投资优先"), (2, "刷取 + 投资")], group="肉鸽策略", visible_when=roguelike),
+                field("roguelike_squad", "分队", "留空使用 MAA 默认分队；填写上游资源中的分队名。", group="肉鸽编队", visible_when=roguelike),
+                field("roguelike_roles", "职业组", "留空使用默认；填写上游支持的职业组名。", group="肉鸽编队", visible_when=roguelike),
+                field("roguelike_core_char", "核心干员", "留空自动选择；可填写希望优先招募的干员名。", group="肉鸽编队", visible_when=roguelike),
+                field("roguelike_difficulty", "难度", "0 表示使用当前/最高可用难度。", group="肉鸽策略", input_type="number", visible_when=roguelike, minimum=0, maximum=100),
+                checkbox("roguelike_investment_enabled", "启用投资", "遇到投资系统时尝试存入源石锭。", group="肉鸽投资", visible_when=roguelike),
+                field("roguelike_investments_count", "投资上限", "本轮最多尝试投资的次数。", group="肉鸽投资", input_type="number", visible_when=roguelike, minimum=0, maximum=9999),
+                checkbox("roguelike_stop_when_investment_full", "投资满后停止", "投资系统达到上限后结束本轮。", group="肉鸽投资", visible_when=roguelike),
+                checkbox("roguelike_stop_at_final_boss", "最终 Boss 前停止", "保留最终战前状态。", group="肉鸽策略", visible_when=roguelike),
+                checkbox("roguelike_use_support", "使用助战", "允许在招募时选择好友助战。", group="肉鸽编队", visible_when=roguelike),
+                checkbox("roguelike_use_nonfriend_support", "允许非好友助战", "助战不足时可选择非好友干员。", group="肉鸽编队", visible_when=roguelike),
+                checkbox("allow_account_mutation", "确认本次账号变更", "每日队列或领奖会消耗/领取账号资源；确认不会持久化，运行结束后自动重置。", group="风险确认", visible_when=mutation),
+                field("core_root", "Adaptive Core 目录", "包含已应用非 16:9 viewport 补丁的 MaaCore.dll。", group="安装路径", scope="environment", required=True),
+                field("runtime_root", "MAA 发布目录", "包含官方 resource 目录的 MAA Windows 发布包。", group="安装路径", scope="environment", required=True),
+            ]
+        )
+        return options
+
     def snapshot(self) -> dict[str, object]:
         install_error = self._install_error(self._core_root, self._runtime_root)
         available = not install_error
@@ -777,55 +1298,9 @@ class MaaArknightsRuntimeController:
                     "risk": str(MAA_ARKNIGHTS_TASKS[self._task]["risk"]),
                     "viewport": "adaptive",
                 },
-                "runtime_options": [
-                    {
-                        "id": "task",
-                        "type": "select",
-                        "label": "MAA 任务",
-                        "description": "只读探针、受控领奖或受保护的界园单轮",
-                        "value": self._task,
-                        "options": [
-                            {"value": task, "label": str(info["label"])}
-                            for task, info in MAA_ARKNIGHTS_TASKS.items()
-                        ],
-                    },
-                    {
-                        "id": "core_root",
-                        "type": "text",
-                        "label": "Adaptive Core 目录",
-                        "description": "包含已应用非 16:9 viewport 补丁的 MaaCore.dll",
-                        "value": str(self._core_root),
-                        "required": True,
-                    },
-                    {
-                        "id": "runtime_root",
-                        "type": "text",
-                        "label": "MAA 发布目录",
-                        "description": "包含官方 resource 目录的 MAA Windows 发布包",
-                        "value": str(self._runtime_root),
-                        "required": True,
-                    },
-                    {
-                        "id": "time_limit",
-                        "type": "select",
-                        "label": "最长运行时间",
-                        "description": "到时由 runner 停止并保留证据",
-                        "value": str(self._time_limit),
-                        "options": [
-                            {"value": "600", "label": "10 分钟"},
-                            {"value": "1800", "label": "30 分钟"},
-                            {"value": "10800", "label": "3 小时（肉鸽）"},
-                        ],
-                    },
-                    {
-                        "id": "allow_account_mutation",
-                        "type": "checkbox",
-                        "label": "允许本次领奖改变账号状态",
-                        "description": "仅 Award 使用；不会写入配置，进程结束后自动重置",
-                        "value": self._allow_account_mutation,
-                    },
-                ],
+                "runtime_options": self._runtime_options(),
                 "capabilities": {
+                    "configure": True,
                     "configure_when_unavailable": True,
                     "packaged_runner": True,
                     "preflight": True,
