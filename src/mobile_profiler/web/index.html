@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0f15">
   <title>Mobile Profiler</title>
-  <link rel="stylesheet" href="/app.css?v=platform-ui-67">
-  <script src="/app.js?v=platform-ui-67" defer></script>
+  <link rel="stylesheet" href="/app.css?v=platform-ui-68">
+  <script src="/app.js?v=platform-ui-68" defer></script>
 </head>
 <body data-test-mode="power" data-platform="android">
   <div class="app-shell">
@@ -1060,11 +1060,18 @@
 
             <section class="panel tool-card tool-card-wide portable-card">
               <div class="tool-card-heading"><span class="tool-index">05</span><div><small>SOFTWARE DELIVERY</small><h2>重新构建 Windows 便携包</h2></div></div>
-              <p class="tool-description">修改源码并通过测试后，调用项目统一构建脚本，重新生成内置 Embedded Python、项目代码和可选 ADB 的 ZIP。</p>
+              <p class="tool-description">生成 Standard（不含开源自动化）或 Full（全功能）便携包；两种版本都内置 Embedded Python、AI 自动化依赖和可选 ADB。</p>
               <form class="tool-form portable-form" id="portable-build-form">
                 <div class="form-field tool-field portable-output-field">
                   <label for="portable-output-directory"><span>输出目录（必须位于源码工程 dist 下）</span></label>
-                  <input id="portable-output-directory" type="text" autocomplete="off" placeholder="dist\mobile-profiler-vX.Y.Z-portable">
+                  <input id="portable-output-directory" type="text" autocomplete="off" placeholder="dist\mobile-profiler-vX.Y.Z-full-portable">
+                </div>
+                <div class="form-field tool-field portable-edition-field">
+                  <label for="portable-edition"><span>构建版本</span></label>
+                  <select id="portable-edition">
+                    <option value="full" selected>Full · 全功能</option>
+                    <option value="standard">Standard · 不含开源自动化</option>
+                  </select>
                 </div>
                 <label class="compact-check tool-check"><input id="portable-include-adb" type="checkbox" checked><span>把本机可用的 ADB Platform Tools 一并打包</span></label>
                 <button class="button primary tool-submit" id="portable-build-button" type="submit">生成新版便携包</button>

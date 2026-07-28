@@ -2187,6 +2187,21 @@
     runtimeLayout.classList.add("monitoring-only");
   }
 
+  function openSourceAutomationAvailable(state = app.state) {
+    return state?.build_profile?.features?.open_source_automation !== false;
+  }
+
+  function applyBuildProfile(state) {
+    const profile = state?.build_profile || {};
+    const edition = String(profile.edition || "source");
+    const enabled = openSourceAutomationAvailable(state);
+    document.body.dataset.buildEdition = edition;
+    const navigation = $('.nav-item[data-view="opensource"]');
+    if (navigation) navigation.hidden = !enabled;
+    if (!enabled && app.activeView === "opensource") switchView("live");
+    return enabled;
+  }
+
   function switchView(view) {
     const legacyTools = view === "tools";
     const legacySystem = view === "system" || view === "thermal";
@@ -2194,6 +2209,7 @@
       ? "live"
       : legacyTools ? "history" : view;
     const target = ["live", "config", "agent", "opensource", "device", "history"].includes(requested)
+      && (requested !== "opensource" || openSourceAutomationAvailable())
       ? requested
       : "live";
     app.activeView = target;
@@ -5276,9 +5292,24 @@
       rulesInput.value = rulesInput.value || tooling.default_rules_path;
       rulesInput.dataset.defaultApplied = "true";
     }
+    const editionInput = $("#portable-edition");
+    const editions = Array.isArray(tooling.portable_editions) ? tooling.portable_editions : [];
+    const editionSignature = JSON.stringify(editions.map(item => [item?.id, item?.label]));
+    if (editions.length && editionInput.dataset.signature !== editionSignature) {
+      const previous = editionInput.value || localStorage.getItem("mobile-profiler-portable-edition");
+      editionInput.innerHTML = editions.map(item => (
+        `<option value="${escapeHtml(item?.id || "")}">${escapeHtml(item?.label || item?.id || "")}</option>`
+      )).join("");
+      editionInput.value = editions.some(item => item?.id === previous)
+        ? previous
+        : String(tooling.portable_default_edition || "full");
+      editionInput.dataset.signature = editionSignature;
+    }
     const outputInput = $("#portable-output-directory");
-    if (!outputInput.dataset.defaultApplied && tooling.portable_output_default) {
-      outputInput.value = outputInput.value || tooling.portable_output_default;
+    const outputDefaults = tooling.portable_output_defaults || {};
+    const selectedDefault = outputDefaults[editionInput.value] || tooling.portable_output_default;
+    if (!outputInput.dataset.defaultApplied && selectedDefault) {
+      outputInput.value = outputInput.value || selectedDefault;
       outputInput.dataset.defaultApplied = "true";
     }
 
@@ -5293,6 +5324,7 @@
     const buildAvailable = Boolean(tooling.portable_build_available);
     const activeRecording = Boolean(state?.active?.running && !state?.active?.is_demo);
     $("#portable-build-button").disabled = busy || !buildAvailable || activeRecording;
+    editionInput.disabled = busy || !buildAvailable || activeRecording;
     $(".portable-card").classList.toggle("unavailable", !buildAvailable);
     $("#portable-build-hint").textContent = buildAvailable
       ? activeRecording
@@ -5315,6 +5347,7 @@
       ["证据 ZIP", result.archive_path],
       ["对比报告", result.comparison_path],
       ["对比目录", result.comparison_dir],
+      ["构建版本", result.edition],
       ["便携目录", result.bundle_dir],
       ["便携 ZIP", result.zip_path],
     ].forEach(([label, value]) => { if (value) lines.push(`${label}: ${value}`); });
@@ -8260,6 +8293,7 @@
 
   function render(state) {
     app.state = state;
+    const openSourceEnabled = applyBuildProfile(state);
     const version = String(state?.version || "").trim().replace(/^v/i, "");
     const versionBadge = $("#app-version-badge");
     if (version && versionBadge) {
@@ -8284,7 +8318,7 @@
     renderHistory(state);
     renderTools(state);
     renderAdbAgent(state);
-    renderOpenSourceAutomation(state);
+    if (openSourceEnabled) renderOpenSourceAutomation(state);
   }
 
   async function refreshState() {
@@ -9395,6 +9429,21 @@
       const saved = localStorage.getItem(key);
       if (saved) $("#" + id).value = saved;
     });
+    const savedPortableEdition = localStorage.getItem("mobile-profiler-portable-edition");
+    if (["standard", "full"].includes(savedPortableEdition)) {
+      $("#portable-edition").value = savedPortableEdition;
+    }
+    $("#portable-edition").addEventListener("change", event => {
+      const edition = event.target.value;
+      localStorage.setItem("mobile-profiler-portable-edition", edition);
+      const tooling = app.state?.tooling || {};
+      const defaults = tooling.portable_output_defaults || {};
+      const output = $("#portable-output-directory");
+      const knownDefaults = new Set(Object.values(defaults).map(String));
+      if (!output.value.trim() || knownDefaults.has(output.value.trim())) {
+        output.value = String(defaults[edition] || "");
+      }
+    });
 
     $("#regenerate-report-button").addEventListener("click", async () => {
       const runName = $("#maintenance-run-select").value;
@@ -9487,14 +9536,18 @@
     $("#portable-build-form").addEventListener("submit", async event => {
       event.preventDefault();
       const outputDirectory = $("#portable-output-directory").value.trim();
-      const defaultPortable = `dist\\mobile-profiler-v${String(app.state?.version || "X.Y.Z").replace(/^v/i, "")}-portable`;
-      if (!confirm(`确认重新构建便携包？\n\n输出目录：${outputDirectory || defaultPortable}\n已有同名目录和 ZIP 会被替换。`)) return;
+      const edition = $("#portable-edition").value;
+      const defaultPortable = `dist\\mobile-profiler-v${String(app.state?.version || "X.Y.Z").replace(/^v/i, "")}-${edition}-portable`;
+      const editionLabel = edition === "standard" ? "Standard · 不含开源自动化" : "Full · 全功能";
+      if (!confirm(`确认重新构建便携包？\n\n版本：${editionLabel}\n输出目录：${outputDirectory || defaultPortable}\n已有同名目录和 ZIP 会被替换。`)) return;
       localStorage.setItem("mobile-profiler-portable-output", outputDirectory);
+      localStorage.setItem("mobile-profiler-portable-edition", edition);
       await runToolOperation(
         "/api/build-portable",
         {
           output_directory: outputDirectory,
           include_adb: $("#portable-include-adb").checked,
+          edition,
         },
         "正在构建便携包，首次运行可能需要下载 Embedded Python...",
         "新版便携包已生成",

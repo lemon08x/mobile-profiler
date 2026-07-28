@@ -99,15 +99,27 @@ Do not copy `.venv` to another computer; Windows virtual environments are not
 reliably relocatable. Build a self-contained Embedded Python bundle instead:
 
 ```powershell
-.\build-portable.bat
-# or
-powershell -ExecutionPolicy Bypass -File .\tools\build-portable.ps1
+# Full edition: all Mobile Profiler features, including Open Source Automation
+.\build-portable.bat -Edition Full
+
+# Standard edition: profiling and AI automation, without Open Source Automation
+.\build-portable.bat -Edition Standard
 ```
 
-The output under `dist/` contains Python, the installed profiler package,
-launchers, documentation, and (when found) the required ADB Platform Tools
-files. HDC is not redistributed; install DevEco Studio or pass an existing
-`hdc.exe` path. On the target computer, extract the ZIP and run `start-ui.bat`.
+The default is `Full`. Outputs use edition-specific names under `dist/`, for
+example `mobile-profiler-v1.0.0-full-portable.zip` and
+`mobile-profiler-v1.0.0-standard-portable.zip`. Both editions contain Python,
+the installed profiler package, `uiautomator2`, launchers, documentation, and
+(when found) the required ADB Platform Tools files. `Full` also contains NumPy,
+OpenCV, and the Open Source Automation adapters. `Standard` removes those
+adapters and hides/rejects their UI and API routes.
+
+Third-party game runtimes are not redistributed in either edition. Configure
+separately obtained MAA, StarRailCopilot, and MaaEnd directories in the Full
+edition after launch. HDC is also not redistributed; install DevEco Studio or
+pass an existing `hdc.exe` path. On the target computer, extract the ZIP and
+run `start-ui.bat`. Every artifact includes `BUILD-MANIFEST.json` describing
+its edition, Python version, bundled extras, and ADB status.
 The current portable builder does not bundle `pymobiledevice3`; point
 `--ios-python` at a separately prepared iOS runtime when iOS collection is
 needed.
@@ -116,13 +128,15 @@ After future source changes, run the full tests and rebuild the same bundle:
 
 ```powershell
 python -m unittest discover -s tests -v
-.\build-portable.bat
+.\build-portable.bat -Edition Full
+.\build-portable.bat -Edition Standard
 ```
 
-The **Tools & Delivery** UI view can invoke the same build script when the UI
-is running from a complete source checkout. Portable installations deliberately
-disable software rebuilding; use them for collection, import, recovery,
-archiving, and comparison, then return to the source computer for a new ZIP.
+The **Tools & Delivery** UI view can select either edition and invoke the same
+build script when the UI is running from a complete source checkout. Portable
+installations deliberately disable software rebuilding; use them for
+collection, import, recovery, archiving, and comparison, then return to the
+source computer for a new ZIP.
 
 ## Runtime UI
 

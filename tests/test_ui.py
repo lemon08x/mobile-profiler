@@ -2058,8 +2058,8 @@ class UiServerTests(unittest.TestCase):
             self.assertIn("更多采集设置", html)
             self.assertIn("设备亮度", html)
             self.assertIn('id="brightness-input"', html)
-            self.assertIn('/app.css?v=platform-ui-67', html)
-            self.assertIn('/app.js?v=platform-ui-67', html)
+            self.assertIn('/app.css?v=platform-ui-68', html)
+            self.assertIn('/app.js?v=platform-ui-68', html)
             self.assertNotIn("platform-ui-40", html)
             self.assertIn("默认 1 秒读取电流、CPU 与频率", html)
             self.assertIn("当前电池放电功率", html)
@@ -2390,6 +2390,9 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('data-panel="agent"', html)
             self.assertIn('data-view="opensource"', html)
             self.assertIn('data-panel="opensource"', html)
+            self.assertIn('id="portable-edition"', html)
+            self.assertIn('<option value="full" selected>Full · 全功能</option>', html)
+            self.assertIn('<option value="standard">Standard · 不含开源自动化</option>', html)
             self.assertIn('id="opensource-demo-form"', html)
             self.assertIn('id="opensource-run-demo-button"', html)
             self.assertIn('id="opensource-alignment-body"', html)
@@ -2516,6 +2519,9 @@ class UiServerTests(unittest.TestCase):
             self.assertIn('`/api/open-source-automation/${action}`', javascript)
             self.assertIn("function renderAdbAgent", javascript)
             self.assertIn("function renderOpenSourceAutomation", javascript)
+            self.assertIn("function applyBuildProfile", javascript)
+            self.assertIn("function openSourceAutomationAvailable", javascript)
+            self.assertIn('mobile-profiler-portable-edition', javascript)
             self.assertIn("function renderOpenSourceProjectSelector", javascript)
             self.assertIn("function selectOpenSourceProject", javascript)
             self.assertIn("function renderMaaEndGameFeatures", javascript)
@@ -2686,6 +2692,15 @@ class UiServerTests(unittest.TestCase):
             self.assertTrue(state["active"]["is_demo"])
             self.assertEqual(state["active"]["test_mode"], "performance")
             self.assertIn("portable_build_available", state["tooling"])
+            self.assertEqual(state["build_profile"]["edition"], "source")
+            self.assertTrue(
+                state["build_profile"]["features"]["open_source_automation"]
+            )
+            self.assertEqual(state["tooling"]["portable_default_edition"], "full")
+            self.assertEqual(
+                {item["id"] for item in state["tooling"]["portable_editions"]},
+                {"standard", "full"},
+            )
             self.assertEqual(len(state["active"]["series"]), 240)
             self.assertTrue(
                 all(
@@ -2751,6 +2766,40 @@ class UiServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = DashboardManager("adb", Path(directory))
             self.assertIsNone(manager.report_path("..%2Foutside"))
+
+    def test_standard_build_profile_disables_open_source_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = DashboardManager(
+                "missing-adb",
+                Path(directory),
+                build_profile={
+                    "edition": "standard",
+                    "portable": True,
+                    "features": {"open_source_automation": True},
+                    "bundled_extras": ["uiautomator2"],
+                },
+            )
+            try:
+                self.assertEqual(manager.build_profile["edition"], "standard")
+                self.assertFalse(
+                    manager.build_profile["features"]["open_source_automation"]
+                )
+                disabled = manager.open_source_automation.snapshot()
+                self.assertEqual(disabled["status"], "disabled")
+                self.assertFalse(disabled["enabled"])
+                operations = (
+                    manager.run_open_source_automation_demo,
+                    manager.update_open_source_automation_selection,
+                    manager.configure_open_source_automation,
+                    manager.preflight_open_source_automation,
+                    manager.start_open_source_automation,
+                    manager.stop_open_source_automation,
+                )
+                for operation in operations:
+                    with self.assertRaisesRegex(RuntimeError, "not included"):
+                        operation({})
+            finally:
+                manager.close()
 
     def test_open_source_configuration_only_requires_device_for_maaend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4011,14 +4060,22 @@ class UiServerTests(unittest.TestCase):
             manager = DashboardManager("adb", source / "runs")
             manager.source_root = source
             output_dir = source / "dist" / "portable-test"
+            standard_output_dir = source / "dist" / "portable-standard-test"
+            tooling = manager.tooling_state()
+            self.assertEqual(tooling["portable_default_edition"], "full")
             self.assertEqual(
-                manager.tooling_state()["portable_output_default"],
-                str(source / "dist" / f"mobile-profiler-v{__version__}-portable"),
+                tooling["portable_output_default"],
+                str(source / "dist" / f"mobile-profiler-v{__version__}-full-portable"),
+            )
+            self.assertEqual(
+                tooling["portable_output_defaults"]["standard"],
+                str(source / "dist" / f"mobile-profiler-v{__version__}-standard-portable"),
             )
 
             def fake_build(command, operation, **kwargs):
-                output_dir.mkdir(parents=True)
-                Path(f"{output_dir}.zip").write_bytes(b"zip")
+                built_output = Path(command[command.index("-OutputDirectory") + 1])
+                built_output.mkdir(parents=True)
+                Path(f"{built_output}.zip").write_bytes(b"zip")
                 return "built"
 
             with (
@@ -4028,15 +4085,37 @@ class UiServerTests(unittest.TestCase):
                 result = manager.build_portable_bundle(
                     {"output_directory": str(output_dir), "include_adb": False}
                 )
+                standard_result = manager.build_portable_bundle(
+                    {
+                        "output_directory": str(standard_output_dir),
+                        "include_adb": False,
+                        "edition": "standard",
+                    }
+                )
 
-            command = build.call_args.args[0]
-            self.assertIn("-SkipAdb", command)
-            self.assertIn("-PythonVersion", command)
+            full_command = build.call_args_list[0].args[0]
+            standard_command = build.call_args_list[1].args[0]
+            self.assertIn("-SkipAdb", full_command)
+            self.assertIn("-PythonVersion", full_command)
+            self.assertEqual(
+                full_command[full_command.index("-Edition") + 1],
+                "Full",
+            )
+            self.assertEqual(
+                standard_command[standard_command.index("-Edition") + 1],
+                "Standard",
+            )
             self.assertEqual(result["version"], __version__)
+            self.assertEqual(result["edition"], "full")
+            self.assertTrue(result["open_source_automation"])
+            self.assertEqual(standard_result["edition"], "standard")
+            self.assertFalse(standard_result["open_source_automation"])
             self.assertEqual(
                 Path(result["zip_path"]).resolve(),
                 Path(f"{output_dir}.zip").resolve(),
             )
+            with self.assertRaisesRegex(ValueError, "standard or full"):
+                manager.build_portable_bundle({"edition": "enterprise"})
             with self.assertRaises(ValueError):
                 manager.build_portable_bundle(
                     {"output_directory": str(source / "unsafe-output")}

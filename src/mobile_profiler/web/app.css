@@ -4719,8 +4719,12 @@ button.history-link:disabled {
 }
 
 .portable-form {
-  grid-template-columns: minmax(320px, 1fr) auto auto;
+  grid-template-columns: minmax(280px, 1fr) minmax(210px, auto) auto auto;
   align-items: end;
+}
+
+.portable-edition-field {
+  min-width: 210px;
 }
 
 .portable-form .tool-check {
