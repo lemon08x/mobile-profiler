@@ -44,6 +44,7 @@ controller `1280×720`，但启动任务在加载画面结束前返回；随后
 - `AndroidOpenGame` 后进入可操作大世界的 `InWorld` 或等价强终点证据；
 - 三个 Probe 的真机证据；
 - `PullCountCalculator` 的寻访页面 fail-closed 门禁和完整自然终点；
+- 面向普通任务组合的逐任务状态、精确 expected-negative 分类和幂等恢复矩阵；
 - 获得明确授权后的受保护业务组合自然终点；
 - 人工复核通过后才可解除 UI/API 端到端门禁。
 
@@ -52,6 +53,8 @@ controller `1280×720`，但启动任务在加载画面结束前返回；随后
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)：截图、识别、alignment、坐标和输入完整链路。
 - [`ITERATION-RUNBOOK.md`](ITERATION-RUNBOOK.md)：补丁、构建、部署、Probe、回滚和
   incident/fixture 流程。
+- [`REFACTORING-LESSONS.md`](REFACTORING-LESSONS.md)：从 MAA 每日真机闭环提炼的
+  页面级 viewport、错误分级、幂等恢复、本地 Qwen 边界和 MaaEnd 实施顺序。
 - [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md)：现场问题、已修问题和剩余验收项。
 - [`issues.json`](issues.json)：机器可读问题账本。
 - [`guard-policy.json`](guard-policy.json)：任务风险、资源哈希、Probe 和 watchdog 契约。

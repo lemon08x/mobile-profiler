@@ -79,6 +79,26 @@
 受控功能；`Award` 必须显式确认账号变更。`Fight`、`Recruit`、`Infrast`、`Mall` 不在
 探针白名单中，因为它们可能消耗理智/招募资源、改变基建排班或购物。
 
+## 每日队列真机闭环（2026-07-28）
+
+独立的 `tools/maa-daily-run.py` 在同一台 `2800×1260` 真机完成了 `StartUp → Fight →
+Infrast → Recruit → Mall → Award`，六项均在首次尝试到达任务终点，无恢复运行，总耗时
+`942.4s`。该 runner 与只读功能探针分开，必须显式传入 `--allow-account-mutation`；战斗
+保持 `medicine=0, stone=0`，信用商店使用客户端本地化的优先名单和黑名单。
+
+每日 runner 的无人值守边界：
+
+- 每项任务独立记录 attempts、recoveries、errors、optional_errors 和自然完成事件；
+- 基建关键子任务错误会触发重试，条件探测只按精确 callback 签名降级为 optional；
+- 无进展、任务超时和截图现场都会写入独立 run directory；
+- 失败恢复固定为 force-stop 后执行 StartUp，再决定是否重试；
+- 可选本地 Qwen 只读取诊断和最后截图，输出仅允许 `restart/stop`，不能控制游戏；
+- Qwen 超时、不可用或返回非法动作时立即使用固定恢复策略，不阻塞日常队列。
+
+这轮经验已整理为 MaaEnd 的
+[`REFACTORING-LESSONS.md`](../maaend/REFACTORING-LESSONS.md)，其中明确区分可复用的
+架构方法与必须重新取得的终末地真机证据。
+
 三个 `tools/maa-*.py` 文件现在只是兼容命令入口；正式实现和默认危险动作策略随
 `mobile_profiler` Python 包分发。UI、wheel 和便携版不再依赖仓库根目录仍然存在，
 并用回归测试保证包内策略与本目录的审计源一致。

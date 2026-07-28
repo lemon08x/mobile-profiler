@@ -154,6 +154,147 @@ index 2b8a633..ada723f 100644
          "colorWithClose": false,
          "colorScales": [
              [
+diff --git a/resource/tasks/UiTheme/Friends.json b/resource/tasks/UiTheme/Friends.json
+index 727ab42..9f0aa25 100644
+--- a/resource/tasks/UiTheme/Friends.json
++++ b/resource/tasks/UiTheme/Friends.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "FriendsDefault",
++            "FriendsDefaultAdaptive",
+             "FriendsDark",
+             "FriendsSami",
+             "FriendsMistCity",
+@@ -35,6 +36,12 @@
+         "postDelay": 1000,
+         "next": ["#self", "Stop"]
+     },
++    "FriendsDefaultAdaptive": {
++        "baseTask": "FriendsDefault",
++        "template": "Default/Friends.png",
++        "templThreshold": 0.65,
++        "roi": [250, 500, 300, 200]
++    },
+     "FriendsDark": {
+         "baseTask": "FriendsDefault",
+         "template": "Dark/Friends.png"
+diff --git a/resource/tasks/UiTheme/Mall.json b/resource/tasks/UiTheme/Mall.json
+index 2d7ebce..6ce655b 100644
+--- a/resource/tasks/UiTheme/Mall.json
++++ b/resource/tasks/UiTheme/Mall.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "MallDefault",
++            "MallDefaultAdaptive",
+             "MallDark",
+             "MallSami",
+             "MallMistCity",
+@@ -34,6 +35,12 @@
+         "postDelay": 500,
+         "next": ["#self", "Stop"]
+     },
++    "MallDefaultAdaptive": {
++        "baseTask": "MallDefault",
++        "template": "Default/Mall.png",
++        "templThreshold": 0.7,
++        "roi": [700, 407, 500, 171]
++    },
+     "MallDark": {
+         "baseTask": "MallDefault",
+         "template": "Dark/Mall.png"
+diff --git a/resource/tasks/UiTheme/Recruit.json b/resource/tasks/UiTheme/Recruit.json
+index 9939104..20f1e7f 100644
+--- a/resource/tasks/UiTheme/Recruit.json
++++ b/resource/tasks/UiTheme/Recruit.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "RecruitDefault",
++            "RecruitDefaultAdaptive",
+             "RecruitDark",
+             "RecruitSami",
+             "RecruitMistCity",
+@@ -34,6 +35,12 @@
+         "postDelay": 500,
+         "next": ["#self", "Stop"]
+     },
++    "RecruitDefaultAdaptive": {
++        "baseTask": "RecruitDefault",
++        "template": "Default/Recruit.png",
++        "templThreshold": 0.6,
++        "roi": [840, 425, 440, 150]
++    },
+     "RecruitDark": {
+         "baseTask": "RecruitDefault",
+         "template": "Dark/Recruit.png"
+diff --git a/resource/tasks/UiTheme/SwitchTheme.json b/resource/tasks/UiTheme/SwitchTheme.json
+index 700e695..8b27cc9 100644
+--- a/resource/tasks/UiTheme/SwitchTheme.json
++++ b/resource/tasks/UiTheme/SwitchTheme.json
+@@ -15,7 +15,11 @@
+         "roi": [0, 99, 430, 180],
+         "maxTimes": 10,
+         "exceededNext": ["SwitchTheme@CancelThemeChange"],
+-        "next": ["SwitchTheme@ConfirmThemeChange", "SwitchTheme@SelectLightTheme"]
++        "next": [
++            "SwitchTheme@ConfirmThemeChange",
++            "SwitchTheme@CancelThemeChange",
++            "SwitchTheme@SelectLightTheme"
++        ]
+     },
+     "SwitchTheme@SwipeToLightTheme": {
+         "algorithm": "JustReturn",
+diff --git a/resource/tasks/UiTheme/Terminal.json b/resource/tasks/UiTheme/Terminal.json
+index 29b8eab..726c7f1 100644
+--- a/resource/tasks/UiTheme/Terminal.json
++++ b/resource/tasks/UiTheme/Terminal.json
+@@ -9,6 +9,7 @@
+         },
+         "next": [
+             "TerminalDefault",
++            "TerminalDefaultAdaptive",
+             "TerminalDark",
+             "TerminalSami",
+             "TerminalMistCity",
+@@ -35,6 +36,12 @@
+         "template": "Default/Terminal.png",
+         "next": ["#self", "Stop"]
+     },
++    "TerminalDefaultAdaptive": {
++        "baseTask": "TerminalDefault",
++        "template": "Default/Terminal.png",
++        "templThreshold": 0.65,
++        "roi": [780, 58, 400, 272]
++    },
+     "TerminalDark": {
+         "baseTask": "TerminalDefault",
+         "template": "Dark/Terminal.png"
+diff --git a/resource/tasks/tasks.json b/resource/tasks/tasks.json
+index 2267c77..eb30263 100644
+--- a/resource/tasks/tasks.json
++++ b/resource/tasks/tasks.json
+@@ -2333,7 +2333,7 @@
+         "roi": [850, 340, 220, 170]
+     },
+     "RecruitRefreshConfirm": {
+-        "template": "PopupConfirm.png",
++        "template": "RecruitNowConfirm.png",
+         "action": "ClickSelf",
+         "roi": [630, 400, 650, 160],
+         "preDelay": 500,
+@@ -3058,8 +3058,8 @@
+     "InfrastOperSelected": {
+         "Doc": "参考 InfrastOperImageAnalyzer",
+         "template": "empty.png",
+-        "specialParams_Doc": "这个任务中作为数色个数阈值",
+-        "specialParams": [800],
++        "specialParams_Doc": "数色个数阈值、向卡片内部搜索选中边框的水平距离",
++        "specialParams": [800, 20],
+         "specificRect_Doc": "selected_move",
+         "specificRect": [-18, -220, 10, 160],
+         "rectMove_Doc": "oper_move",
 diff --git a/src/MaaCore/Assistant.cpp b/src/MaaCore/Assistant.cpp
 index b5efeb3..572bde2 100644
 --- a/src/MaaCore/Assistant.cpp
@@ -422,10 +563,22 @@ index c184505..4f8b874 100644
  };
  }
 diff --git a/src/MaaCore/Controller/Controller.cpp b/src/MaaCore/Controller/Controller.cpp
-index 0356910..2dc749c 100644
+index 0356910..a61f3ca 100644
 --- a/src/MaaCore/Controller/Controller.cpp
 +++ b/src/MaaCore/Controller/Controller.cpp
-@@ -145,8 +145,42 @@ cv::Mat asst::Controller::get_resized_image_cache() const
+@@ -97,6 +97,11 @@ std::pair<int, int> asst::Controller::get_scale_size() const noexcept
+     return m_scale_size;
+ }
+ 
++std::pair<int, int> asst::Controller::get_display_size() const noexcept
++{
++    return m_scale_proxy ? m_scale_proxy->get_display_size() : m_scale_size;
++}
++
+ void asst::Controller::clear_info() noexcept
+ {
+     m_uuid.clear();
+@@ -145,8 +150,42 @@ cv::Mat asst::Controller::get_resized_image_cache() const
          Log.error("image is empty");
          return { d_size, CV_8UC3 };
      }
@@ -469,7 +622,7 @@ index 0356910..2dc749c 100644
      return resized_mat;
  }
  
-@@ -211,7 +245,7 @@ bool asst::Controller::swipe(
+@@ -211,7 +250,7 @@ bool asst::Controller::swipe(
  bool asst::Controller::inject_input_event(InputEvent& event)
  {
      CHECK_EXIST(m_controller, false);
@@ -478,7 +631,7 @@ index 0356910..2dc749c 100644
  }
  
  bool asst::Controller::press_esc()
-@@ -279,7 +313,13 @@ bool asst::Controller::connect(const std::string& adb_path, const std::string& a
+@@ -279,7 +318,13 @@ bool asst::Controller::connect(const std::string& adb_path, const std::string& a
      };
  
      try {
@@ -493,7 +646,7 @@ index 0356910..2dc749c 100644
      }
      catch (const std::exception& e) {
          Log.error("Cannot create controller proxy: {}", e.what());
-@@ -338,7 +378,13 @@ bool asst::Controller::attach_window(
+@@ -338,7 +383,13 @@ bool asst::Controller::attach_window(
      };
  
      try {
@@ -508,7 +661,7 @@ index 0356910..2dc749c 100644
      }
      catch (const std::exception& e) {
          Log.error("Cannot create controller proxy: {}", e.what());
-@@ -412,6 +458,76 @@ void asst::Controller::set_client_type(const std::string& client_type) noexcept
+@@ -412,6 +463,76 @@ void asst::Controller::set_client_type(const std::string& client_type) noexcept
      m_client_type = client_type;
  }
  
@@ -585,7 +738,7 @@ index 0356910..2dc749c 100644
  const std::string& asst::Controller::get_client_type() const noexcept
  {
      return m_client_type;
-@@ -454,7 +570,8 @@ cv::Mat asst::Controller::get_image(bool raw)
+@@ -454,7 +575,8 @@ cv::Mat asst::Controller::get_image(bool raw)
          };
          callback(AsstMsg::ConnectionInfo, info);
  
@@ -595,7 +748,7 @@ index 0356910..2dc749c 100644
          m_cache_image = cv::Mat(d_size, CV_8UC3);
  
          break;
-@@ -474,6 +591,29 @@ cv::Mat asst::Controller::get_image_cache() const
+@@ -474,6 +596,29 @@ cv::Mat asst::Controller::get_image_cache() const
      return get_resized_image_cache();
  }
  
@@ -626,7 +779,7 @@ index 0356910..2dc749c 100644
  {
      CHECK_EXIST(m_controller, false);
 diff --git a/src/MaaCore/Controller/Controller.h b/src/MaaCore/Controller/Controller.h
-index caf1815..ea8f374 100644
+index caf1815..5f42a21 100644
 --- a/src/MaaCore/Controller/Controller.h
 +++ b/src/MaaCore/Controller/Controller.h
 @@ -53,6 +53,7 @@ public:
@@ -651,7 +804,15 @@ index caf1815..ea8f374 100644
  
      bool start_game(const std::string& client_type);
      bool stop_game(const std::string& client_type);
-@@ -130,6 +138,9 @@ private:
+@@ -100,6 +108,7 @@ public:
+     ControlFeat::Feat support_features();
+ 
+     std::pair<int, int> get_scale_size() const noexcept;
++    std::pair<int, int> get_display_size() const noexcept;
+ 
+     Controller& operator=(const Controller&) = delete;
+     Controller& operator=(Controller&&) = delete;
+@@ -130,6 +139,9 @@ private:
      bool m_swipe_with_pause = false;
      bool m_kill_adb_on_exit = false;
      std::string m_client_type;
@@ -1161,6 +1322,339 @@ index 178ceac..794a0ee 100644
  }
  
  void asst::BattleHelper::fix_swipe_out_of_limit(
+diff --git a/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp b/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
+index 9712f27..ca91566 100644
+--- a/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
+@@ -1,6 +1,7 @@
+ #include "InfrastAbstractTask.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <boost/regex.hpp>
+ #include <utility>
+ 
+@@ -17,6 +18,30 @@
+ #include "Vision/RegionOCRer.h"
+ #include <ranges>
+ 
++namespace
++{
++asst::ViewportAlignment preferred_facility_alignment(std::string_view facility)
++{
++    if (facility == "Mfg" || facility == "Trade" || facility == "Power") {
++        return asst::ViewportAlignment::Left;
++    }
++    if (facility == "Reception" || facility == "Office" || facility == "Training" ||
++        facility == "Processing") {
++        return asst::ViewportAlignment::Right;
++    }
++    return asst::ViewportAlignment::Center;
++}
++
++double facility_template_scale_hint(std::pair<int, int> display_size)
++{
++    const auto [width, height] = display_size;
++    if (width <= 0 || height <= 0) {
++        return 1.0;
++    }
++    return std::min(1.0, 2.0 * static_cast<double>(height) / static_cast<double>(width));
++}
++} // namespace
++
+ asst::InfrastAbstractTask::InfrastAbstractTask(
+     const AsstCallback& callback,
+     Assistant* inst,
+@@ -205,17 +230,51 @@ bool asst::InfrastAbstractTask::enter_facility(int index)
+         return false;
+     }
+ 
+-    InfrastFacilityImageAnalyzer analyzer(ctrler()->get_image());
+-    analyzer.set_to_be_analyzed({ facility_name() });
+-    if (!analyzer.analyze()) {
+-        Log.info("result is empty");
+-        analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
+-        return false;
++    const std::string name = facility_name();
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const ViewportAlignment preferred_alignment = preferred_facility_alignment(name);
++    std::vector<ViewportAlignment> alignments { preferred_alignment };
++    if (ctrler()->uses_adaptive_viewport()) {
++        for (const ViewportAlignment candidate :
++             std::array { ViewportAlignment::Center, ViewportAlignment::Left, ViewportAlignment::Right }) {
++            if (std::ranges::find(alignments, candidate) == alignments.cend()) {
++                alignments.emplace_back(candidate);
++            }
++        }
++        ctrler()->set_viewport_alignment(preferred_alignment);
++    }
++    else {
++        alignments.front() = original_alignment;
++    }
++
++    const double scale_hint = ctrler()->uses_adaptive_viewport()
++                                  ? facility_template_scale_hint(ctrler()->get_display_size())
++                                  : 1.0;
++    const cv::Mat captured = ctrler()->get_image();
++    Rect rect;
++    for (size_t candidate_index = 0; candidate_index < alignments.size(); ++candidate_index) {
++        const ViewportAlignment alignment = alignments[candidate_index];
++        if (candidate_index != 0) {
++            ctrler()->set_viewport_alignment(alignment);
++        }
++        const cv::Mat image = candidate_index == 0 ? captured : ctrler()->get_image_cache();
++        InfrastFacilityImageAnalyzer analyzer(image);
++        analyzer.set_to_be_analyzed({ name });
++        analyzer.set_template_scale_hint(scale_hint);
++        if (analyzer.analyze()) {
++            rect = analyzer.get_rect(name, index);
++        }
++        if (!rect.empty()) {
++            Log.trace("Infrast facility matched adaptive viewport", name, static_cast<int>(alignment), rect);
++            break;
++        }
++        if (candidate_index + 1 == alignments.size()) {
++            analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
++        }
+     }
+-    Rect rect = analyzer.get_rect(facility_name(), index);
+     if (rect.empty()) {
+-        Log.info("facility index is out of range");
+-        analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
++        ctrler()->set_viewport_alignment(original_alignment);
++        Log.info("facility result is empty or index is out of range", name, index);
+         return false;
+     }
+     ctrler()->click(rect);
+@@ -235,6 +294,19 @@ bool asst::InfrastAbstractTask::enter_oper_list_page()
+     return task.run();
+ }
+ 
++cv::Mat asst::InfrastAbstractTask::capture_oper_list_image()
++{
++    // Sort and filter controls live on the physical right edge, so an adaptive
++    // ProcessTask often leaves the controller in the right viewport. Selected
++    // operators are then sorted to the beginning of the list. The operator grid
++    // is anchored to the physical left edge, so the left viewport restores the
++    // coordinate system used by InfrastSkillsUpper/Lower (which start at x=400).
++    if (ctrler()->uses_adaptive_viewport()) {
++        ctrler()->set_viewport_alignment(ViewportAlignment::Left);
++    }
++    return ctrler()->get_image();
++}
++
+ bool asst::InfrastAbstractTask::is_use_custom_opers()
+ {
+     return m_is_custom && (!current_room_config().names.empty() || !current_room_config().candidates.empty());
+@@ -356,12 +428,13 @@ bool asst::InfrastAbstractTask::select_opers_review(
+     auto room_config = origin_room_config;
+ 
+     sleep(500); // 等待干员选择界面稳定
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(
+         InfrastOperImageAnalyzer::ToBeCalced::Selected | InfrastOperImageAnalyzer::ToBeCalced::Doing);
+     if (!oper_analyzer.analyze()) {
+         Log.warn("No oper");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+     oper_analyzer.sort_by_loc();
+@@ -378,6 +451,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+ 
+     if (selected_count < num_of_opers_expect) {
+         Log.warn("select opers review fail: unexpected number of selected operators ");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+     if (facility_name() != "Dorm" && (!m_is_custom || (room_config.names.empty() && room_config.candidates.empty()))) {
+@@ -385,6 +459,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+     }
+     if (selected_count < room_config.names.size()) {
+         Log.warn("select opers review fail: part of custom operators unselected");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+ 
+@@ -410,6 +485,8 @@ bool asst::InfrastAbstractTask::select_opers_review(
+             if (oper.doing == infrast::Doing::Working) {
+                 Log.warn("selected operators at work:", name);
+                 Log.warn("select opers review fail: non-custom configuration, but an operator at work is selected");
++                oper_analyzer.save_img(
++                    utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+                 return false;
+             }
+         }
+@@ -417,6 +494,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+ 
+     if (room_config.names.size()) {
+         Log.warn("select opers review fail: part of custom operators unselected.");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+ 
+@@ -438,7 +516,7 @@ bool asst::InfrastAbstractTask::select_custom_opers(std::vector<std::string>& pa
+     const auto& ocr_replace = Task.get<OcrTaskInfo>("CharsNameOcrReplace");
+ 
+     // 预检查循环
+-    auto image = ctrler()->get_image();
++    auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer.analyze()) {
+@@ -485,7 +563,7 @@ bool asst::InfrastAbstractTask::select_custom_opers(std::vector<std::string>& pa
+         sleep(500);
+     }
+ 
+-    image = ctrler()->get_image();
++    image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer2(image);
+     oper_analyzer2.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer2.analyze()) {
+@@ -535,7 +613,7 @@ bool asst::InfrastAbstractTask::get_opers(std::vector<std::string>& result, doub
+ {
+     LogTraceFunction;
+ 
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Mood);
+     if (!oper_analyzer.analyze()) {
+@@ -570,7 +648,7 @@ void asst::InfrastAbstractTask::order_opers_selection(const std::vector<std::str
+         return;
+     }
+ 
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer.analyze()) {
+@@ -638,7 +716,7 @@ bool asst::InfrastAbstractTask::click_clear_button()
+         // 有可能点快了，清空按钮刚刚出来，实际点上去还不生效，就点了
+         // 所以多识别一次，如果没清掉就再清一下
+         if (ret) {
+-            InfrastOperImageAnalyzer analyzer(ctrler()->get_image());
++            InfrastOperImageAnalyzer analyzer(capture_oper_list_image());
+             analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+             if (!analyzer.analyze()) {
+                 return false;
+diff --git a/src/MaaCore/Task/Infrast/InfrastAbstractTask.h b/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
+index ec16036..0e6704e 100644
+--- a/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
++++ b/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
+@@ -34,6 +34,7 @@ protected:
+     bool enter_facility(int index = 0);
+     // 从刚点进设施的界面，到干员列表页
+     bool enter_oper_list_page();
++    cv::Mat capture_oper_list_image();
+ 
+     virtual int operlist_swipe_times() const noexcept { return 2; }
+ 
+diff --git a/src/MaaCore/Task/Infrast/InfrastDormTask.cpp b/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
+index a861d0a..f3f12cc 100644
+--- a/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
+@@ -122,7 +122,7 @@ bool asst::InfrastDormTask::fill_dorm_slots()
+         if (need_exit()) {
+             return false;
+         }
+-        const auto image = ctrler()->get_image();
++        const auto image = capture_oper_list_image();
+         InfrastOperImageAnalyzer oper_analyzer(image);
+ 
+         constexpr int without_skill = InfrastOperImageAnalyzer::All ^ InfrastOperImageAnalyzer::Skill;
+diff --git a/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp b/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
+index 4f01517..4e55141 100644
+--- a/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
+@@ -1,5 +1,7 @@
+ #include "InfrastInfoTask.h"
+ 
++#include <algorithm>
++
+ #include "Controller/Controller.h"
+ #include "Status.h"
+ #include "Utils/Logger.hpp"
+@@ -8,20 +10,46 @@
+ bool asst::InfrastInfoTask::_run()
+ {
+     swipe_to_the_left_of_main_ui();
+-    const auto image = ctrler()->get_image();
+ 
+-    InfrastFacilityImageAnalyzer analyzer(image);
++    const bool adaptive = ctrler()->uses_adaptive_viewport();
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    if (adaptive) {
++        ctrler()->set_viewport_alignment(ViewportAlignment::Left);
++    }
++    const cv::Mat captured = ctrler()->get_image();
++    const auto [display_width, display_height] = ctrler()->get_display_size();
++    const double scale_hint = adaptive && display_width > 0 && display_height > 0
++                                  ? std::min(
++                                        1.0,
++                                        2.0 * static_cast<double>(display_height) /
++                                            static_cast<double>(display_width))
++                                  : 1.0;
++
++    const auto analyze_group = [&](ViewportAlignment alignment, const std::vector<std::string>& facilities) {
++        if (adaptive) {
++            ctrler()->set_viewport_alignment(alignment);
++        }
++        const cv::Mat image = alignment == ViewportAlignment::Left ? captured : ctrler()->get_image_cache();
++        InfrastFacilityImageAnalyzer analyzer(image);
++        analyzer.set_to_be_analyzed(facilities);
++        analyzer.set_template_scale_hint(scale_hint);
++        if (!analyzer.analyze()) {
++            return false;
++        }
++        for (const std::string& name : facilities) {
++            const std::string key = "NumOf" + name;
++            const size_t quantity = analyzer.get_quantity(name);
++            status()->set_number(key, quantity);
++            Log.trace("InfrastInfoTask | ", key, quantity);
++        }
++        return true;
++    };
+ 
+-    analyzer.set_to_be_analyzed({ "Mfg", "Trade", "Power", "Dorm" });
+-    if (!analyzer.analyze()) {
++    if (!analyze_group(ViewportAlignment::Left, { "Mfg", "Trade", "Power" }) ||
++        !analyze_group(ViewportAlignment::Center, { "Dorm" })) {
++        ctrler()->set_viewport_alignment(original_alignment);
+         return false;
+     }
+-    for (auto&& [name, res] : analyzer.get_result()) {
+-        std::string key = "NumOf" + name;
+-        // int size = static_cast<int>(res.size());
+-        status()->set_number(key, res.size());
+-        Log.trace("InfrastInfoTask | ", key, res.size());
+-    }
+ 
+     return true;
+ }
+diff --git a/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp b/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
+index 6542785..26ec1f2 100644
+--- a/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
+@@ -476,7 +476,7 @@ bool asst::InfrastProductionTask::opers_detect_with_swipe()
+ size_t asst::InfrastProductionTask::opers_detect()
+ {
+     LogTraceFunction;
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+ 
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::All);
+@@ -786,7 +786,7 @@ bool asst::InfrastProductionTask::opers_choose()
+         if (need_exit()) {
+             return false;
+         }
+-        const auto image = ctrler()->get_image();
++        const auto image = capture_oper_list_image();
+         InfrastOperImageAnalyzer oper_analyzer(image);
+         oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::All);
+         oper_analyzer.set_facility(facility_name());
 diff --git a/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp b/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp
 index c22b580..9c81e3c 100644
 --- a/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp
@@ -1676,6 +2170,231 @@ index 341f695..d706113 100644
 +    // in which that button was recognized.
 +    ctrler()->set_viewport_alignment(original_alignment);
      return true;
+ }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
+index 15b7d81..57ea471 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
++++ b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
+@@ -1,11 +1,72 @@
+ #include "InfrastFacilityImageAnalyzer.h"
+ 
++#include <algorithm>
++#include <array>
++#include <cmath>
++
+ #include "MaaUtils/NoWarningCV.hpp"
+ 
+ #include "Config/TaskData.h"
++#include "Config/TemplResource.h"
+ #include "Utils/Logger.hpp"
+ #include "Vision/MultiMatcher.h"
+ 
++namespace
++{
++std::vector<double> template_scale_candidates(double hint)
++{
++    std::vector<double> candidates { 1.0 };
++    if (hint <= 0.0 || hint >= 0.995) {
++        return candidates;
++    }
++
++    for (const double multiplier : std::array { 0.99, 1.0, 1.01 }) {
++        const double candidate = std::clamp(hint * multiplier, 0.5, 1.0);
++        const bool duplicate = std::ranges::any_of(candidates, [candidate](double existing) {
++            return std::abs(existing - candidate) < 0.001;
++        });
++        if (!duplicate) {
++            candidates.emplace_back(candidate);
++        }
++    }
++    return candidates;
++}
++
++bool set_scaled_task(asst::MultiMatcher& matcher, const std::string& task_name, double scale)
++{
++    matcher.set_task_info(task_name);
++    if (std::abs(scale - 1.0) < 0.001) {
++        return true;
++    }
++
++    const auto task = asst::Task.get<asst::MatchTaskInfo>(task_name);
++    if (!task || task->templ_names.size() != 1) {
++        Log.warn(
++            "Cannot scale facility template",
++            task_name,
++            "template count",
++            task ? task->templ_names.size() : 0);
++        return false;
++    }
++
++    const cv::Mat& source = asst::TemplResource::get_instance().get_templ(task->templ_names.front());
++    if (source.empty()) {
++        return false;
++    }
++
++    cv::Mat resized;
++    cv::resize(
++        source,
++        resized,
++        cv::Size(),
++        scale,
++        scale,
++        scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC);
++    matcher.set_templ(std::move(resized));
++    return true;
++}
++} // namespace
++
+ bool asst::InfrastFacilityImageAnalyzer::analyze()
+ {
+     const static std::unordered_map<std::string, std::string> facility_task_name = {
+@@ -16,8 +77,10 @@ bool asst::InfrastFacilityImageAnalyzer::analyze()
+     // 因为基建的缩放是不确定的，有可能是正常大小，也可能是最小化的
+     // 所以对每种情况都进行一下识别，取其中得分最高的
+     const static std::vector<std::string> task_name_suffix = { "", "Mini" };
++    const std::vector<double> scales = template_scale_candidates(m_template_scale_hint);
+ 
+     int cor_suffix_index = -1;
++    m_result.clear();
+ 
+     for (const auto& key : m_to_be_analyzed) {
+         auto find_iter = facility_task_name.find(key);
+@@ -30,30 +93,42 @@ bool asst::InfrastFacilityImageAnalyzer::analyze()
+         // 已知基建缩放状态的时候，只识别这个缩放状态下的就行了
+         // 否则识别所有状态，直到找出正确的当前缩放状态
+         if (cor_suffix_index >= 0) {
+-            MultiMatcher mm_analyzer(m_image);
+-            mm_analyzer.set_task_info(task_name + task_name_suffix.at(cor_suffix_index));
+-            if (!mm_analyzer.analyze()) {
+-                continue;
+-            }
+-            cur_facility_result = mm_analyzer.get_result();
+-        }
+-        else {
+             double max_score = 0;
+-            for (size_t i = 0; i != task_name_suffix.size(); ++i) {
++            for (const double scale : scales) {
+                 MultiMatcher mm_analyzer(m_image);
+-                mm_analyzer.set_task_info(task_name + task_name_suffix.at(i));
+-                if (!mm_analyzer.analyze()) {
++                const std::string scaled_task_name = task_name + task_name_suffix.at(cor_suffix_index);
++                if (!set_scaled_task(mm_analyzer, scaled_task_name, scale) || !mm_analyzer.analyze()) {
+                     continue;
+                 }
+                 const auto& cur_res = mm_analyzer.get_result();
+-                auto cur_max_iter = std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
+-                if (cur_max_iter == cur_res.cend()) {
+-                    continue;
+-                }
+-                if (double cur_score = cur_max_iter->score; max_score < cur_score) {
+-                    max_score = cur_score;
++                const auto cur_max_iter =
++                    std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
++                if (cur_max_iter != cur_res.cend() && max_score < cur_max_iter->score) {
++                    max_score = cur_max_iter->score;
+                     cur_facility_result = cur_res;
+-                    cor_suffix_index = static_cast<int>(i);
++                }
++            }
++        }
++        else {
++            double max_score = 0;
++            for (size_t i = 0; i != task_name_suffix.size(); ++i) {
++                for (const double scale : scales) {
++                    MultiMatcher mm_analyzer(m_image);
++                    const std::string scaled_task_name = task_name + task_name_suffix.at(i);
++                    if (!set_scaled_task(mm_analyzer, scaled_task_name, scale) || !mm_analyzer.analyze()) {
++                        continue;
++                    }
++                    const auto& cur_res = mm_analyzer.get_result();
++                    const auto cur_max_iter =
++                        std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
++                    if (cur_max_iter == cur_res.cend()) {
++                        continue;
++                    }
++                    if (const double cur_score = cur_max_iter->score; max_score < cur_score) {
++                        max_score = cur_score;
++                        cur_facility_result = cur_res;
++                        cor_suffix_index = static_cast<int>(i);
++                    }
+                 }
+             }
+         }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
+index ed5a200..2e9daf8 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
++++ b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
+@@ -13,6 +13,7 @@ public:
+     bool analyze();
+ 
+     void set_to_be_analyzed(std::vector<std::string> facilities) noexcept { m_to_be_analyzed = std::move(facilities); }
++    void set_template_scale_hint(double scale) noexcept { m_template_scale_hint = scale; }
+ 
+     size_t get_quantity(const std::string& name) const
+     {
+@@ -49,5 +50,6 @@ private:
+     std::unordered_map<std::string, std::vector<MatchRect>> m_result;
+     // 需要识别的设施名
+     std::vector<std::string> m_to_be_analyzed;
++    double m_template_scale_hint = 1.0;
+ };
+ }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp b/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
+index 3daf26a..ec46ee6 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
++++ b/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
+@@ -356,18 +356,45 @@ void asst::InfrastOperImageAnalyzer::selected_analyze()
+         return;
+     }
+     const auto& color_scale = std::get<MatchTaskInfo::ColorRange>(selected_task_ptr->color_scales.front());
++    const int horizontal_search_distance =
++        selected_task_ptr->special_params.size() > 1 ? selected_task_ptr->special_params[1] : 0;
++    const cv::Scalar lower(
++        color_scale.first[0],
++        color_scale.first[1],
++        color_scale.first[2]);
++    const cv::Scalar upper(
++        color_scale.second[0],
++        color_scale.second[1],
++        color_scale.second[2]);
+ 
+     for (auto&& oper : m_result) {
+         Rect selected_rect = oper.smiley.rect.move(selected_move);
+-        cv::Mat roi = m_image(make_rect<cv::Rect>(selected_rect));
++        int max_count = 0;
++        int best_shift = 0;
++        // Search only towards the card interior. Searching left can reach the
++        // right border of a selected card in the preceding column and mark the
++        // current, unselected operator as selected as well.
++        for (int shift = 0; shift <= horizontal_search_distance; ++shift) {
++            Rect candidate = selected_rect;
++            candidate.x += shift;
++            if (candidate.x < 0 || candidate.y < 0 || candidate.x + candidate.width > m_image.cols ||
++                candidate.y + candidate.height > m_image.rows) {
++                continue;
++            }
+ 
+-        cv::Mat hsv, bin;
+-        cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+-        cv::inRange(hsv, color_scale.first, color_scale.second, bin);
+-        int count = cv::countNonZero(bin);
++            const cv::Mat roi = m_image(make_rect<cv::Rect>(candidate));
++            cv::Mat hsv, bin;
++            cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
++            cv::inRange(hsv, lower, upper, bin);
++            const int count = cv::countNonZero(bin);
++            if (count > max_count) {
++                max_count = count;
++                best_shift = shift;
++            }
++        }
+ 
+-        Log.trace("selected_analyze |", count);
+-        oper.selected = count >= selected_task_ptr->special_params.front();
++        Log.trace("selected_analyze |", max_count, "shift", best_shift);
++        oper.selected = max_count >= selected_task_ptr->special_params.front();
+         oper.rect = selected_rect.move(oper_move);
+     }
  }
 diff --git a/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp b/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp
 index e710bb4..833fbee 100644

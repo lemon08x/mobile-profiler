@@ -130,9 +130,15 @@ def callback_task(details: object) -> str:
 def callback_summary(message_name: str, details: object) -> dict[str, object]:
     outer = _as_dict(details)
     result: dict[str, object] = {"message": message_name}
-    for key in ("taskchain", "taskid", "subtask", "what", "why"):
+    for key in ("taskchain", "taskid", "subtask", "what", "why", "pre_task"):
         if key in outer:
             result[key] = outer[key]
+    first = outer.get("first")
+    if isinstance(first, Sequence) and not isinstance(first, (bytes, bytearray, str)):
+        names = [str(item) for item in first]
+        result["first"] = names
+        if len(names) == 1:
+            result["probe"] = names[0]
     task = callback_task(outer)
     if task:
         result["task"] = task

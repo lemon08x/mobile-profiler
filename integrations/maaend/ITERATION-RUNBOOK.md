@@ -16,6 +16,11 @@
 `custom_agent_verified`、`input_verified` 和 `guarded_flow_verified` 是分层证据，不能替代
 最终布尔值。
 
+实现普通任务组合和无人值守恢复前，必须先按
+[`REFACTORING-LESSONS.md`](REFACTORING-LESSONS.md) 核对事件字段、expected-negative、
+幂等等级和模型权限边界。该文档是从 MAA 迁移的设计输入，不构成 MaaEnd 的任何一级
+真机验收证据。
+
 ## 1. 校验账本、源码和补丁
 
 所有命令必须同时指定 Framework、MaaEnd 与 Go binding 三份固定源码：
@@ -163,6 +168,15 @@ Probe 使用专用空任务 ADB Profile；若 Profile 同时启用了普通任�
 普通任务按 `guard-policy.json` 的 wave 放行。未知任务、资源树哈希不符、未声明 ADB、
 RealTimeTask、缺少 `authorized_tasks` 或 BakerEntry 独立授权时均 fail-closed。MXU 队列停止
 不等于业务成功；每项任务必须满足自己的 `terminal_contract`。
+
+后续组合 coordinator 必须为每项任务分别保存 `attempts`、`recoveries`、`errors` 和
+`optional_errors`。预期负向识别只能按任务、事件类型、候选节点完整序列和前置节点的
+精确签名分类；不能把一类识别错误整体降级。自动恢复只对静态策略已证明幂等的任务开放，
+服务端提交状态不明时必须停止并留 incident。
+
+可以使用本地模型辅助选择 `restart/stop`，但模型调用必须在确定失败之后，使用短超时和
+严格枚举输出。模型不能调用 MXU、ADB 或 Agent，不能点击、重放账号动作或扩大
+`authorized_tasks`；模型不可用时仍必须由固定恢复矩阵确定性结束。
 
 ## 5. Watchdog 与问题闭环
 
