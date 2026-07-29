@@ -14,6 +14,11 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
 
+from mobile_profiler.maa_roguelike_runner import (
+    ROGUELIKE_STRATEGY_PRESETS,
+    resolve_roguelike_params,
+)
+
 
 MAA_ARKNIGHTS_REPOSITORY = (
     "https://github.com/MaaAssistantArknights/MaaAssistantArknights"
@@ -111,6 +116,7 @@ MAA_OPTION_DEFAULTS: dict[str, object] = {
     "qwen_enabled": True,
     "qwen_url": "http://192.168.31.237:8000",
     "qwen_model": "qwen3.6-27b",
+    "roguelike_strategy_preset": "stable",
     "roguelike_theme": "JieGarden",
     "roguelike_mode": 0,
     "roguelike_squad": "",
@@ -383,6 +389,9 @@ class MaaArknightsRuntimeController:
         theme = str(values["roguelike_theme"])
         if theme not in MAA_ROGUELIKE_THEMES:
             raise ValueError(f"unsupported MAA roguelike theme: {theme}")
+        strategy_preset = str(values["roguelike_strategy_preset"])
+        if strategy_preset not in ROGUELIKE_STRATEGY_PRESETS:
+            raise ValueError(f"unsupported MAA roguelike strategy preset: {strategy_preset}")
         facilities = [
             item.strip()
             for item in str(values["infrast_facilities"]).replace("；", ",").split(",")
@@ -503,7 +512,11 @@ class MaaArknightsRuntimeController:
             value = str(options[source]).strip()
             if value:
                 params[target] = value
-        return params
+        return resolve_roguelike_params(
+            str(options["roguelike_theme"]),
+            params,
+            strategy_preset=str(options["roguelike_strategy_preset"]),
+        )
 
     def _mutation_requested(self, configuration: dict[str, object]) -> bool:
         task = str(configuration["task"])
@@ -834,6 +847,8 @@ class MaaArknightsRuntimeController:
                 str(options["roguelike_theme"]),
                 "--client-type",
                 str(options["client_type"]),
+                "--strategy-preset",
+                str(options["roguelike_strategy_preset"]),
                 "--params-json",
                 json.dumps(
                     self._roguelike_params(options),
@@ -1231,6 +1246,7 @@ class MaaArknightsRuntimeController:
                 checkbox("qwen_enabled", "启用本地 Qwen 恢复判断", "模型只能在“重启 / 停止”之间决策，不能直接操作游戏。", group="无人值守恢复", visible_when=daily),
                 field("qwen_url", "Qwen 服务地址", "OpenAI 兼容本地服务地址。", group="无人值守恢复", visible_when=daily),
                 field("qwen_model", "Qwen 模型", "用于异常恢复判断的本地模型名。", group="无人值守恢复", visible_when=daily),
+                select("roguelike_strategy_preset", "策略预设", "稳定单轮会关闭投资等非必要分支，但保留难度与账号相关编队设置；自定义则完全使用下方参数。", values["roguelike_strategy_preset"], [("stable", "稳定单轮（推荐）"), ("custom", "自定义参数")], group="肉鸽策略", visible_when=roguelike),
                 select("roguelike_theme", "肉鸽主题", "选择 MAA 已安装资源支持的集成战略主题。", values["roguelike_theme"], [(item, item) for item in MAA_ROGUELIKE_THEMES], group="肉鸽策略", visible_when=roguelike),
                 select("roguelike_mode", "运行模式", "0 常规刷取；1 侧重投资；2 兼顾刷取与投资。", values["roguelike_mode"], [(0, "常规刷取"), (1, "投资优先"), (2, "刷取 + 投资")], group="肉鸽策略", visible_when=roguelike),
                 field("roguelike_squad", "分队", "留空使用 MAA 默认分队；填写上游资源中的分队名。", group="肉鸽编队", visible_when=roguelike),

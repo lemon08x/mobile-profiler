@@ -113,6 +113,51 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+class EvidenceImageWriter:
+    """Write evidence images while suppressing byte-identical periodic frames."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._last_sha256 = ""
+        self._observed = 0
+        self._saved = 0
+        self._skipped_duplicates = 0
+        self._bytes_written = 0
+        self._bytes_avoided = 0
+        self._last_saved = ""
+
+    def write(self, filename: str, payload: bytes, *, force: bool = False) -> bool:
+        if not payload:
+            raise ValueError("evidence image payload must not be empty")
+        digest = sha256_bytes(payload)
+        duplicate = digest == self._last_sha256
+        self._last_sha256 = digest
+        self._observed += 1
+        if duplicate and not force:
+            self._skipped_duplicates += 1
+            self._bytes_avoided += len(payload)
+            return False
+
+        destination = self.root / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        self._saved += 1
+        self._bytes_written += len(payload)
+        self._last_saved = filename
+        return True
+
+    def state(self) -> dict[str, object]:
+        return {
+            "observed": self._observed,
+            "saved": self._saved,
+            "skipped_duplicates": self._skipped_duplicates,
+            "bytes_written": self._bytes_written,
+            "bytes_avoided": self._bytes_avoided,
+            "last_saved": self._last_saved or None,
+            "last_sha256": self._last_sha256 or None,
+        }
+
+
 def task_suffix(value: object) -> str:
     text = str(value or "")
     if not text:
@@ -300,6 +345,7 @@ class CallbackMonitor:
         self.all_tasks_completed = False
         self.settlement: dict[str, object] | None = None
         self.errors: list[dict[str, object]] = []
+        self.optional_errors: list[dict[str, object]] = []
         self.stop_requested = False
         self.stop_reason = ""
         self.guard_trigger: dict[str, object] | None = None
@@ -337,6 +383,21 @@ class CallbackMonitor:
                 return rule
         return None
 
+    @staticmethod
+    def _is_optional_error(message_name: str, details: Mapping[str, object]) -> bool:
+        """Recognize MaaCore process probes that use failure as a branch condition."""
+
+        first = details.get("first")
+        return (
+            message_name == "SubTaskError"
+            and details.get("taskchain") == "Roguelike"
+            and details.get("subtask") == "ProcessTask"
+            and isinstance(first, Sequence)
+            and not isinstance(first, (bytes, bytearray, str))
+            and len(first) == 1
+            and task_suffix(first[0]) == "WaitForStartButtonClicked"
+        )
+
     def observe(
         self,
         message_id: int,
@@ -357,21 +418,25 @@ class CallbackMonitor:
 
         if message_name in ERROR_MESSAGES:
             summary = callback_summary(message_name, outer)
-            self.errors.append(summary)
-            signal = IncidentSignal.create(
-                "maa_error",
-                f"MAA callback reported {message_name}",
-                {
-                    "message": message_name,
-                    "task": task_suffix(callback_task(outer)),
-                    "what": str(outer.get("what") or ""),
-                    "why": str(outer.get("why") or ""),
-                },
-                stop=True,
-            )
-            unique = self._emit_once(signal)
-            if unique:
-                emitted.append(unique)
+            if self._is_optional_error(message_name, outer):
+                summary["optional_reason"] = "expected_negative_probe"
+                self.optional_errors.append(summary)
+            else:
+                self.errors.append(summary)
+                signal = IncidentSignal.create(
+                    "maa_error",
+                    f"MAA callback reported {message_name}",
+                    {
+                        "message": message_name,
+                        "task": task_suffix(callback_task(outer)),
+                        "what": str(outer.get("what") or ""),
+                        "why": str(outer.get("why") or ""),
+                    },
+                    stop=True,
+                )
+                unique = self._emit_once(signal)
+                if unique:
+                    emitted.append(unique)
             self.last_progress_at = current
 
         if message_name in {"TaskChainStart", "TaskChainStopped"}:
@@ -382,8 +447,13 @@ class CallbackMonitor:
             self.last_progress_at = current
             if self.stop_after_settlement:
                 self.stop_requested = True
-                passed = self.settlement.get("game_pass") is True
-                self.stop_reason = "natural_settlement_pass" if passed else "natural_settlement_fail"
+                game_pass = self.settlement.get("game_pass")
+                if game_pass is True:
+                    self.stop_reason = "natural_settlement_pass"
+                elif game_pass is False:
+                    self.stop_reason = "natural_settlement_fail"
+                else:
+                    self.stop_reason = "natural_settlement_unknown"
 
         if message_name == "SubTaskStart":
             task_name = callback_task(outer)
@@ -526,6 +596,7 @@ class CallbackMonitor:
             "all_tasks_completed": self.all_tasks_completed,
             "settlement": self.settlement,
             "errors": list(self.errors),
+            "optional_errors": list(self.optional_errors),
             "stop_requested": self.stop_requested,
             "stop_reason": self.stop_reason,
             "guard_trigger": self.guard_trigger,
@@ -551,13 +622,23 @@ def classify_exit(
     elif monitor.errors:
         reason = "maa_error"
     elif monitor.settlement is not None:
-        reason = "natural_settlement_pass" if monitor.settlement.get("game_pass") is True else "natural_settlement_fail"
+        game_pass = monitor.settlement.get("game_pass")
+        if game_pass is True:
+            reason = "natural_settlement_pass"
+        elif game_pass is False:
+            reason = "natural_settlement_fail"
+        else:
+            reason = "natural_settlement_unknown"
     elif monitor.all_tasks_completed:
         reason = "maa_tasks_completed_without_settlement"
     else:
         reason = "core_stopped_without_terminal_event"
 
-    natural = reason in {"natural_settlement_pass", "natural_settlement_fail"}
+    natural = reason in {
+        "natural_settlement_pass",
+        "natural_settlement_fail",
+        "natural_settlement_unknown",
+    }
     return {
         "exit_reason": reason,
         "one_round_completed": natural,
@@ -1099,6 +1180,62 @@ def sync_worktree_patch(
     )
 
 
+JIEGARDEN_BEGIN_RECOVERY_ROUTES = (
+    "JieGarden@Roguelike@Continue",
+    "JieGarden@Roguelike@MissionFailedFlag2",
+    "JieGarden@Roguelike@GamePass",
+    "JieGarden@RoguelikeSettlementConfirm",
+    "JieGarden@Roguelike@OperationFailed",
+    "JieGarden@Roguelike@Stages#next",
+    "JieGarden@Roguelike@GetDrops#next",
+    "JieGarden@Roguelike@EnterAfterRecruit",
+    "JieGarden@Roguelike@NextLevel",
+    "JieGarden@Roguelike@NextLevel#next",
+)
+
+
+def audit_roguelike_recovery_routes(resource: Mapping[str, object]) -> list[str]:
+    """Validate the screens from which a guarded JieGarden run must resume."""
+
+    failures: list[str] = []
+    begin = _as_dict(resource.get("JieGarden@Roguelike@Begin"))
+    begin_next = begin.get("next")
+    if not isinstance(begin_next, list) or not begin_next:
+        return ["JieGarden Begin.next is missing"]
+    if len(begin_next) != len(set(str(item) for item in begin_next)):
+        failures.append("JieGarden Begin.next contains duplicate recovery routes")
+    for route in JIEGARDEN_BEGIN_RECOVERY_ROUTES:
+        if route not in begin_next:
+            failures.append(f"JieGarden Begin.next no longer resumes from {task_suffix(route)}")
+    if begin_next[-1] != "JieGarden@Roguelike@ExitThenAbandon":
+        failures.append("ExitThenAbandon must remain the final Begin fallback")
+    continue_route = "JieGarden@Roguelike@Continue"
+    if continue_route in begin_next and begin_next.index(continue_route) > 2:
+        failures.append("Continue must remain near the front of Begin.next")
+    settlement_page = "JieGarden@RoguelikeSettlementConfirm"
+    for broad_flag in (
+        "JieGarden@Roguelike@MissionFailedFlag2",
+        "JieGarden@Roguelike@GamePass",
+    ):
+        if (
+            settlement_page in begin_next
+            and broad_flag in begin_next
+            and begin_next.index(settlement_page) > begin_next.index(broad_flag)
+        ):
+            failures.append("final settlement-page recovery must precede broad pass/fail templates")
+    navigation_route = "JieGarden@Roguelike@ChooseDifficulty"
+    if navigation_route in begin_next:
+        for settlement_route in (
+            "JieGarden@Roguelike@MissionFailedFlag2",
+            "JieGarden@Roguelike@GamePass",
+            "JieGarden@RoguelikeSettlementConfirm",
+            "JieGarden@Roguelike@OperationFailed",
+        ):
+            if settlement_route in begin_next and begin_next.index(settlement_route) > begin_next.index(navigation_route):
+                failures.append(f"{task_suffix(settlement_route)} must be checked before new-run navigation")
+    return failures
+
+
 def audit_maa_source(source_root: Path) -> dict[str, object]:
     root = source_root.resolve()
     failures: list[str] = []
@@ -1115,6 +1252,14 @@ def audit_maa_source(source_root: Path) -> dict[str, object]:
         / "Roguelike"
         / "RoguelikeBattleTaskPlugin.cpp"
     )
+    settlement_path = (
+        root
+        / "src"
+        / "MaaCore"
+        / "Task"
+        / "Roguelike"
+        / "RoguelikeSettlementTaskPlugin.cpp"
+    )
     depot_path = (
         root
         / "src"
@@ -1124,14 +1269,17 @@ def audit_maa_source(source_root: Path) -> dict[str, object]:
         / "DepotRecognitionTask.cpp"
     )
     resource_path = root / "resource" / "tasks" / "Roguelike" / "JieGarden.json"
+    base_resource_path = root / "resource" / "tasks" / "Roguelike" / "base.json"
     required_paths = (
         controller_path,
         proxy_path,
         process_path,
         battle_path,
         rogue_battle_path,
+        settlement_path,
         depot_path,
         resource_path,
+        base_resource_path,
     )
     for path in required_paths:
         if not path.is_file():
@@ -1144,6 +1292,7 @@ def audit_maa_source(source_root: Path) -> dict[str, object]:
     process = process_path.read_text(encoding="utf-8")
     battle = battle_path.read_text(encoding="utf-8")
     rogue_battle = rogue_battle_path.read_text(encoding="utf-8")
+    settlement = settlement_path.read_text(encoding="utf-8")
     depot = depot_path.read_text(encoding="utf-8")
     if "return m_scale_proxy->inject_input_event(event);" not in controller:
         failures.append("Controller::inject_input_event no longer routes through ControlScaleProxy")
@@ -1165,17 +1314,22 @@ def audit_maa_source(source_root: Path) -> dict[str, object]:
         or "set_viewport_alignment(ViewportAlignment::Left)" not in depot
     ):
         failures.append("depot basic-item recognition no longer uses Right-tab/Left-content viewports")
+    if 'm_config->get_theme() + "@RoguelikeSettlementOcr-" + task_name' not in settlement:
+        failures.append("settlement battle statistics no longer use theme-specific OCR tasks")
+    if (
+        "set_viewport_alignment(ViewportAlignment::Center)" not in settlement
+        or "restore_original_alignment" not in settlement
+    ):
+        failures.append("settlement OCR no longer fixes Center alignment and restores the caller viewport")
+    if (
+        'task_name.ends_with("RoguelikeSettlementConfirm")' not in settlement
+        or 'json_msg["details"]["resumed_page2"] = true' not in settlement
+    ):
+        failures.append("settlement plugin no longer resumes directly from the final statistics page")
 
     resource = json.loads(resource_path.read_text(encoding="utf-8"))
-    begin = _as_dict(resource.get("JieGarden@Roguelike@Begin"))
-    begin_next = begin.get("next")
-    if not isinstance(begin_next, list) or not begin_next:
-        failures.append("JieGarden Begin.next is missing")
-    else:
-        if begin_next[-1] != "JieGarden@Roguelike@ExitThenAbandon":
-            failures.append("ExitThenAbandon must remain the final Begin fallback")
-        if "JieGarden@Roguelike@Continue" not in begin_next[:3]:
-            failures.append("Continue must remain near the front of Begin.next")
+    base_resource = json.loads(base_resource_path.read_text(encoding="utf-8"))
+    failures.extend(audit_roguelike_recovery_routes(resource))
     continued = _as_dict(resource.get("JieGarden@Roguelike@Continue"))
     if "JieGarden@Roguelike@Begin" not in (continued.get("next") or []):
         failures.append("Continue no longer reconnects to Begin")
@@ -1191,11 +1345,36 @@ def audit_maa_source(source_root: Path) -> dict[str, object]:
         stages = "JieGarden@Roguelike@Stages#next"
         if strategy not in drops_next or stages not in drops_next or drops_next.index(strategy) > drops_next.index(stages):
             failures.append("StrategyChange must be checked before the normal Stages route")
+        enter_after_recruit = "JieGarden@Roguelike@EnterAfterRecruit"
+        if enter_after_recruit not in drops_next:
+            failures.append("DropsFlag_default no longer handles the post-recruit entry screen")
+
+    enter_after_recruit_task = _as_dict(resource.get("JieGarden@Roguelike@EnterAfterRecruit"))
+    if enter_after_recruit_task.get("template") != "JieGarden@Roguelike@EnterAfterRecruit.png":
+        failures.append("EnterAfterRecruit must use its dedicated visual template")
+
+    integrated_strategies = _as_dict(base_resource.get("Roguelike@IntegratedStrategies"))
+    if integrated_strategies.get("roi") != [884, 606, 250, 114]:
+        failures.append("IntegratedStrategies ROI no longer covers the ultrawide terminal icon")
+
+    settlement_rois = {
+        "Floor": [490, 170, 90, 40],
+        "Step": [490, 238, 90, 40],
+        "Combat": [490, 304, 90, 40],
+        "Recruit": [490, 374, 90, 40],
+        "Collection": [1060, 170, 90, 40],
+        "BOSS": [1060, 238, 90, 40],
+        "Emergency": [1060, 304, 90, 40],
+    }
+    for field, roi in settlement_rois.items():
+        task = _as_dict(resource.get(f"JieGarden@RoguelikeSettlementOcr-{field}"))
+        if task.get("roi") != roi:
+            failures.append(f"JieGarden settlement {field} ROI drifted from the verified Center layout")
 
     return {
         "valid": not failures,
         "source_root": os.fspath(root),
-        "checks": 10,
+        "checks": 28,
         "failures": failures,
     }
 

@@ -8,7 +8,9 @@ from pathlib import Path
 
 from mobile_profiler.maa_iteration import (
     CallbackMonitor,
+    EvidenceImageWriter,
     IncidentSignal,
+    audit_roguelike_recovery_routes,
     classify_exit,
     compare_resource_file,
     compare_worktree_patch,
@@ -50,6 +52,66 @@ def policy(**watchdog_overrides: object) -> dict[str, object]:
 
 
 class MaaIterationTests(unittest.TestCase):
+    def test_evidence_writer_deduplicates_periodic_frames_but_keeps_terminal_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = EvidenceImageWriter(root)
+            payload = b"png-payload"
+
+            self.assertTrue(writer.write("snapshot-0001.png", payload))
+            self.assertFalse(writer.write("snapshot-0002.png", payload))
+            self.assertTrue(writer.write("final.png", payload, force=True))
+            state = writer.state()
+
+            self.assertTrue((root / "snapshot-0001.png").is_file())
+            self.assertFalse((root / "snapshot-0002.png").exists())
+            self.assertTrue((root / "final.png").is_file())
+            self.assertEqual(state["observed"], 3)
+            self.assertEqual(state["saved"], 2)
+            self.assertEqual(state["skipped_duplicates"], 1)
+            self.assertEqual(state["bytes_avoided"], len(payload))
+
+    def test_jiegarden_recovery_matrix_is_complete_and_fail_closed(self) -> None:
+        begin_next = [
+            "JieGarden@Roguelike@CloseTutorial",
+            "JieGarden@Roguelike@Continue",
+            "JieGarden@RoguelikeSettlementConfirm",
+            "JieGarden@Roguelike@MissionFailedFlag2",
+            "JieGarden@Roguelike@GamePass",
+            "JieGarden@Roguelike@OperationFailed",
+            "JieGarden@Roguelike@ChooseDifficulty",
+            "JieGarden@Roguelike@Stages#next",
+            "JieGarden@Roguelike@GetDrops#next",
+            "JieGarden@Roguelike@EnterAfterRecruit",
+            "JieGarden@Roguelike@NextLevel",
+            "JieGarden@Roguelike@NextLevel#next",
+            "JieGarden@Roguelike@ExitThenAbandon",
+        ]
+        resource = {"JieGarden@Roguelike@Begin": {"next": begin_next}}
+
+        self.assertEqual(audit_roguelike_recovery_routes(resource), [])
+
+        missing_game_pass = {"JieGarden@Roguelike@Begin": {"next": list(begin_next)}}
+        missing_game_pass["JieGarden@Roguelike@Begin"]["next"].remove(
+            "JieGarden@Roguelike@GamePass"
+        )
+        failures = audit_roguelike_recovery_routes(missing_game_pass)
+        self.assertTrue(any("GamePass" in failure for failure in failures))
+
+        unsafe_fallback = {"JieGarden@Roguelike@Begin": {"next": list(begin_next)}}
+        unsafe_fallback["JieGarden@Roguelike@Begin"]["next"].append(
+            "JieGarden@Roguelike@StartExplore"
+        )
+        failures = audit_roguelike_recovery_routes(unsafe_fallback)
+        self.assertTrue(any("final Begin fallback" in failure for failure in failures))
+
+        wrong_priority = {"JieGarden@Roguelike@Begin": {"next": list(begin_next)}}
+        routes = wrong_priority["JieGarden@Roguelike@Begin"]["next"]
+        routes.remove("JieGarden@RoguelikeSettlementConfirm")
+        routes.insert(routes.index("JieGarden@Roguelike@GamePass") + 1, "JieGarden@RoguelikeSettlementConfirm")
+        failures = audit_roguelike_recovery_routes(wrong_priority)
+        self.assertTrue(any("precede broad" in failure for failure in failures))
+
     def test_feature_probe_allowlist_and_account_mutation_guard(self) -> None:
         depot = prepare_maa_feature_probe("Depot")
         self.assertEqual(depot["risk"], "read_only")
@@ -111,6 +173,86 @@ class MaaIterationTests(unittest.TestCase):
         self.assertEqual(monitor.stop_reason, "natural_settlement_fail")
         self.assertTrue(outcome["one_round_completed"])
         self.assertFalse(outcome["game_pass"])
+
+    def test_resumed_settlement_page_preserves_unknown_game_pass(self) -> None:
+        monitor = CallbackMonitor(policy(), now=100.0)
+        monitor.observe(
+            20003,
+            "SubTaskExtraInfo",
+            {
+                "what": "RoguelikeSettlement",
+                "taskchain": "Roguelike",
+                "details": {"resumed_page2": True, "collection": 5},
+            },
+            now=101.0,
+        )
+
+        outcome = classify_exit(monitor)
+        self.assertEqual(monitor.stop_reason, "natural_settlement_unknown")
+        self.assertTrue(outcome["one_round_completed"])
+        self.assertTrue(outcome["successful"])
+        self.assertIsNone(outcome["game_pass"])
+
+    def test_expected_roguelike_negative_probe_is_optional_but_other_errors_stop(self) -> None:
+        monitor = CallbackMonitor(policy(), now=100.0)
+        optional = {
+            "taskchain": "Roguelike",
+            "taskid": 1,
+            "subtask": "ProcessTask",
+            "pre_task": "JieGarden@Roguelike@WaitForStartButtonClicked",
+            "first": ["JieGarden@Roguelike@WaitForStartButtonClicked"],
+        }
+
+        self.assertEqual(monitor.observe(20000, "SubTaskError", optional, now=101.0), [])
+        self.assertFalse(monitor.stop_requested)
+        self.assertEqual(monitor.errors, [])
+        self.assertEqual(len(monitor.optional_errors), 1)
+        self.assertEqual(monitor.optional_errors[0]["optional_reason"], "expected_negative_probe")
+        self.assertEqual(monitor.state()["optional_errors"], monitor.optional_errors)
+
+        signals = monitor.observe(
+            20000,
+            "SubTaskError",
+            {
+                "taskchain": "Roguelike",
+                "subtask": "ProcessTask",
+                "first": ["JieGarden@Roguelike@UnexpectedPage"],
+            },
+            now=102.0,
+        )
+        self.assertEqual([signal.kind for signal in signals], ["maa_error"])
+        self.assertTrue(monitor.stop_requested)
+        self.assertEqual(len(monitor.errors), 1)
+
+    def test_roguelike_optional_probe_signature_must_match_exactly(self) -> None:
+        variants = [
+            {
+                "taskchain": "Fight",
+                "subtask": "ProcessTask",
+                "first": ["JieGarden@Roguelike@WaitForStartButtonClicked"],
+            },
+            {
+                "taskchain": "Roguelike",
+                "subtask": "OtherTask",
+                "first": ["JieGarden@Roguelike@WaitForStartButtonClicked"],
+            },
+            {
+                "taskchain": "Roguelike",
+                "subtask": "ProcessTask",
+                "first": [
+                    "JieGarden@Roguelike@WaitForStartButtonClicked",
+                    "JieGarden@Roguelike@UnexpectedPage",
+                ],
+            },
+        ]
+
+        for callback in variants:
+            with self.subTest(callback=callback):
+                monitor = CallbackMonitor(policy(), now=100.0)
+                signals = monitor.observe(20000, "SubTaskError", callback, now=101.0)
+                self.assertEqual([signal.kind for signal in signals], ["maa_error"])
+                self.assertTrue(monitor.stop_requested)
+                self.assertEqual(monitor.optional_errors, [])
 
     def test_destructive_task_is_guarded_by_resource_overlay_and_callback(self) -> None:
         monitor = CallbackMonitor(policy(), now=100.0)

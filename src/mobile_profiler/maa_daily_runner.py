@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from mobile_profiler.maa_iteration import (
+    EvidenceImageWriter,
     callback_summary,
     sha256_file,
     write_json_atomic,
@@ -586,6 +587,35 @@ def subtask_error_summary(details: object) -> dict[str, object]:
     return summary
 
 
+def known_recovery_fingerprint(run: Mapping[str, object]) -> str | None:
+    """Return a deterministic restart signature that does not need model triage."""
+
+    if run.get("task") != "Recruit":
+        return None
+    errors = run.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+
+    saw_confirm = False
+    saw_recruit_error = False
+    for value in errors:
+        if not isinstance(value, Mapping) or value.get("taskchain") != "Recruit":
+            return None
+        subtask = value.get("subtask")
+        first = value.get("first")
+        if subtask == "ProcessTask" and first == ["RecruitConfirm"]:
+            saw_confirm = True
+            continue
+        what = str(value.get("what") or "")
+        if subtask == "AutoRecruitTask" and what in {"", "RecruitError"}:
+            saw_recruit_error = saw_recruit_error or what == "RecruitError"
+            continue
+        return None
+    if saw_confirm and saw_recruit_error:
+        return "recruit:recognition:confirm-and-auto-recruit-error"
+    return None
+
+
 def qwen_recovery_action(
     diagnosis: Mapping[str, object] | None,
     *,
@@ -938,6 +968,7 @@ def main() -> int:
     current_run: list[dict[str, object] | None] = [None]
     global_timed_out = [False]
     snapshot_index = 0
+    image_writer = EvidenceImageWriter(run_dir)
     runner_error = ""
     recovery_blocked = False
     bootstrap_failed = False
@@ -1078,9 +1109,9 @@ def main() -> int:
 
         initial = _capture(core, handle)
         if initial:
-            (run_dir / "initial.png").write_bytes(initial)
+            image_writer.write("initial.png", initial, force=True)
 
-        def save_capture(label: str, task_id: int = 0) -> bytes | None:
+        def save_capture(label: str, task_id: int = 0, *, force: bool = False) -> bytes | None:
             nonlocal snapshot_index
             if not core or not handle:
                 return None
@@ -1089,7 +1120,11 @@ def main() -> int:
                 return None
             snapshot_index += 1
             safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "screen"
-            (run_dir / f"snapshot-{snapshot_index:04d}-{safe_label}.png").write_bytes(payload)
+            image_writer.write(
+                f"snapshot-{snapshot_index:04d}-{safe_label}.png",
+                payload,
+                force=force,
+            )
             if task_id > 0:
                 last_images[task_id] = payload
             return payload
@@ -1178,7 +1213,11 @@ def main() -> int:
             else:
                 done.wait(5.0)
 
-            final_image = save_capture(f"{kind}-{task}-attempt-{attempt}-final", task_id)
+            final_image = save_capture(
+                f"{kind}-{task}-attempt-{attempt}-final",
+                task_id,
+                force=True,
+            )
             if final_image:
                 last_images[task_id] = final_image
             run["elapsed_seconds"] = round(time.monotonic() - attempt_started, 1)
@@ -1193,7 +1232,13 @@ def main() -> int:
         qwen_dir = run_dir / "qwen"
 
         def diagnose_failure(run: dict[str, object]) -> dict[str, object] | None:
+            fingerprint = known_recovery_fingerprint(run)
+            if fingerprint:
+                run["recovery_fingerprint"] = fingerprint
+                run["qwen_skipped_reason"] = "known_deterministic_restart"
+                return None
             if advisor is None:
+                run["qwen_skipped_reason"] = "qwen_disabled"
                 return None
             diagnosis = advisor.analyze(
                 last_images.get(_int(run.get("task_id"))),
@@ -1306,7 +1351,7 @@ def main() -> int:
             try:
                 final = _capture(core, handle)
                 if final:
-                    (run_dir / "final.png").write_bytes(final)
+                    image_writer.write("final.png", final, force=True)
             except Exception:
                 pass
             core.AsstDestroy(handle)
@@ -1340,6 +1385,7 @@ def main() -> int:
         "bootstrap_failed": bootstrap_failed,
         "timed_out": global_timed_out[0],
         "runner_error": runner_error or None,
+        "evidence_images": image_writer.state(),
         "qwen": {
             "enabled": advisor is not None,
             "disabled_reason": advisor.disabled_reason if advisor is not None else None,

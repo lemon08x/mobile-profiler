@@ -14,8 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 
+from mobile_profiler.maa_daily_runner import prepare_device, set_device_stay_awake
 from mobile_profiler.maa_iteration import (
     CallbackMonitor,
+    EvidenceImageWriter,
     IncidentSignal,
     callback_summary,
     classify_exit,
@@ -94,9 +96,25 @@ ROGUELIKE_PARAM_DEFAULTS: dict[str, object] = {
     "refresh_trader_with_dice": False,
 }
 ROGUELIKE_OPTIONAL_TEXT_PARAMS = frozenset({"squad", "roles", "core_char"})
+ROGUELIKE_STRATEGY_PRESETS: dict[str, dict[str, object]] = {
+    "stable": {
+        "mode": 0,
+        "investment_enabled": False,
+        "investments_count": 0,
+        "stop_when_investment_full": False,
+        "stop_at_final_boss": False,
+        "refresh_trader_with_dice": False,
+    },
+    "custom": {},
+}
 
 
-def resolve_roguelike_params(theme: str, raw_params: object) -> dict[str, object]:
+def resolve_roguelike_params(
+    theme: str,
+    raw_params: object,
+    *,
+    strategy_preset: str = "stable",
+) -> dict[str, object]:
     """Validate and merge Web/runtime overrides into the guarded task params."""
 
     if raw_params in (None, ""):
@@ -114,6 +132,9 @@ def resolve_roguelike_params(theme: str, raw_params: object) -> dict[str, object
     unknown = set(str(key) for key in decoded) - allowed
     if unknown:
         raise ValueError(f"unsupported Roguelike option(s): {', '.join(sorted(unknown))}")
+    if strategy_preset not in ROGUELIKE_STRATEGY_PRESETS:
+        allowed_presets = ", ".join(ROGUELIKE_STRATEGY_PRESETS)
+        raise ValueError(f"unsupported Roguelike strategy preset {strategy_preset!r}; allowed: {allowed_presets}")
 
     params = dict(ROGUELIKE_PARAM_DEFAULTS)
     params["theme"] = str(theme or "JieGarden")
@@ -139,6 +160,7 @@ def resolve_roguelike_params(theme: str, raw_params: object) -> dict[str, object
                 raise ValueError(f"Roguelike {key} must be an integer") from exc
         else:
             params[key] = str(value)
+    params.update(ROGUELIKE_STRATEGY_PRESETS[strategy_preset])
     if int(params["starts_count"]) != 1:
         raise ValueError("guarded Roguelike runner supports exactly one natural-settlement round")
     if int(params["mode"]) < 0 or int(params["mode"]) > 5:
@@ -168,6 +190,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--theme", default="JieGarden")
     parser.add_argument("--client-type", default="Official")
     parser.add_argument(
+        "--strategy-preset",
+        choices=tuple(ROGUELIKE_STRATEGY_PRESETS),
+        default="stable",
+        help="stable disables optional investment branches; custom uses validated task parameters as-is",
+    )
+    parser.add_argument(
         "--params-json",
         help="validated JSON overrides for the MaaCore Roguelike task",
     )
@@ -176,6 +204,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot-seconds", type=float, default=30)
     parser.add_argument("--skip-startup", action="store_true")
     parser.add_argument("--no-device-manifest", action="store_true")
+    parser.add_argument("--no-keep-awake", action="store_true")
 
     settlement = parser.add_mutually_exclusive_group()
     settlement.add_argument(
@@ -301,7 +330,11 @@ def main() -> int:
         "client_type": args.client_type,
         "start_game_enabled": True,
     }
-    roguelike_params = resolve_roguelike_params(args.theme, args.params_json)
+    roguelike_params = resolve_roguelike_params(
+        args.theme,
+        args.params_json,
+        strategy_preset=args.strategy_preset,
+    )
     request = {
         "schema_version": 2,
         "core_root": os.fspath(core_root),
@@ -309,6 +342,7 @@ def main() -> int:
         "maa_source_root": os.fspath(maa_source_root) if maa_source_root else None,
         "startup": startup_params,
         "roguelike": roguelike_params,
+        "strategy_preset": args.strategy_preset,
         "viewport": args.viewport,
         "address": args.address,
         "skip_startup": args.skip_startup,
@@ -347,6 +381,7 @@ def main() -> int:
     event_file = (run_dir / "events.jsonl").open("a", encoding="utf-8")
     incident_summaries: list[dict[str, object]] = []
     latest_image: bytes | None = None
+    image_writer = EvidenceImageWriter(run_dir)
 
     dll_search = os.add_dll_directory(os.fspath(core_root))
     core = ctypes.WinDLL(os.fspath(core_path))
@@ -410,15 +445,15 @@ def main() -> int:
             return None, duration
         return payload, duration
 
-    def save_periodic_image(handle: int, filename: str) -> bool:
+    def save_periodic_image(handle: int, filename: str, *, force: bool = False) -> bool:
         nonlocal latest_image
         payload, duration = capture_cached_image(handle)
         if not payload:
             return False
         latest_image = payload
-        (run_dir / filename).write_bytes(payload)
         with event_lock:
             pending_signals.extend(monitor.observe_snapshot(payload, duration))
+        image_writer.write(filename, payload, force=force)
         return True
 
     def drain_signals(handle: int | None) -> bool:
@@ -461,8 +496,16 @@ def main() -> int:
     timed_out = False
     interrupted = False
     runner_error = ""
+    keep_awake_enabled = False
     started = time.monotonic()
     try:
+        device_preparation = prepare_device(adb_path, args.address)
+        if not args.no_keep_awake:
+            keep_awake_enabled = set_device_stay_awake(adb_path, args.address, True)
+            device_preparation["keep_awake"] = keep_awake_enabled
+        environment["device_preparation"] = device_preparation
+        write_json_atomic(run_dir / "environment.json", environment)
+
         if not core.AsstSetUserDir(_utf8(user_dir)):
             raise RuntimeError("AsstSetUserDir failed")
         if not core.AsstLoadResource(_utf8(runtime_root)):
@@ -516,6 +559,7 @@ def main() -> int:
                     "guard_destructive_actions": args.guard_destructive_actions,
                     "stop_after_settlement": stop_after_settlement,
                     "parameters": roguelike_params,
+                    "strategy_preset": args.strategy_preset,
                 },
                 ensure_ascii=False,
             ),
@@ -539,7 +583,7 @@ def main() -> int:
                 break
             if stop_requested:
                 filename = "settlement.png" if stop_reason.startswith("natural_settlement") else "terminal.png"
-                save_periodic_image(handle, filename)
+                save_periodic_image(handle, filename, force=True)
                 core.AsstStop(handle)
                 break
             if now - started >= args.max_seconds:
@@ -560,6 +604,7 @@ def main() -> int:
                 heartbeat = {
                     "event": "heartbeat",
                     "elapsed_seconds": round(now - started, 1),
+                    "evidence_images": image_writer.state(),
                     **state,
                 }
                 write_json_atomic(run_dir / "status.json", heartbeat)
@@ -594,7 +639,7 @@ def main() -> int:
             payload, _duration = capture_cached_image(handle)
             if payload:
                 latest_image = payload
-                (run_dir / "final.png").write_bytes(payload)
+                image_writer.write("final.png", payload, force=True)
             core.AsstDestroy(handle)
         with event_lock:
             state = monitor.state()
@@ -612,6 +657,7 @@ def main() -> int:
             "runner_error": runner_error or None,
             "elapsed_seconds": round(elapsed, 1),
             **state,
+            "evidence_images": image_writer.state(),
             "incidents": incident_summaries,
             "finished_at": datetime.now().astimezone().isoformat(),
         }
@@ -619,6 +665,8 @@ def main() -> int:
         write_json_atomic(run_dir / "status.json", {"event": "finished", **result})
         event_file.close()
         dll_search.close()
+        if keep_awake_enabled:
+            set_device_stay_awake(adb_path, args.address, False)
 
     print(json.dumps({"event": "run_finished", **result}, ensure_ascii=False), flush=True)
     if interrupted:

@@ -385,23 +385,35 @@
       "fingerprint": "jiegarden:settlement:statistics-ocr-incomplete",
       "title": "界园结算统计 OCR 在部分 adaptive 布局下不完整",
       "area": "recognition",
-      "status": "open",
+      "status": "fixed",
       "severity": "medium",
       "first_seen": "2026-07-27",
-      "last_seen": "2026-07-27",
+      "last_seen": "2026-07-29",
       "symptoms": [
         "部分运行只返回 difficulty、emergency、game_pass，Floor/Step/Combat/Recruit/Collection/BOSS/Score/Exp/Skill 缺失。",
-        "run-11 曾成功得到较完整字段，说明问题与页面布局/视口有关而非 OCR 永久不可用。"
+        "界园失败结算画面显示获得物品数 5，旧回调却返回 collection=1。"
       ],
-      "root_cause": "RoguelikeSettlementTaskPlugin 直接在当前截图上跑固定 ROI，没有遍历适合该页面的 alignment。",
-      "fix": null,
+      "root_cause": "RoguelikeSettlementTaskPlugin 对战斗统计强制使用跨主题通用 ROI，并继承调用方当前 viewport；界园布局中的通用 ROI 命中了字段左侧装饰数字，而不是右侧真实值。",
+      "fix": {
+        "summary": "结算插件固定使用 Center viewport 并在结束后恢复调用方 alignment；战斗统计改用主题前缀任务，界园为 7 个统计字段提供独立 ROI；Begin 恢复矩阵补齐失败、成功及最终统计结算入口，直接从统计页恢复时保留未知 game_pass 语义。",
+        "files": [
+          "src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp",
+          "resource/tasks/Roguelike/JieGarden.json",
+          "src/mobile_profiler/maa_iteration.py"
+        ]
+      },
       "regression": [
-        "settlement failure and success fixtures required before changing ROIs"
+        "source-audit verifies theme-prefixed settlement OCR and Center viewport restoration",
+        "source-audit verifies all seven JieGarden battle-stat ROIs",
+        "test_jiegarden_recovery_matrix_is_complete_and_fail_closed",
+        "test_resumed_settlement_page_preserves_unknown_game_pass"
       ],
       "evidence": [
         "roguelike-run-09 events 116..118",
         "roguelike-run-11 events 243..245",
-        "roguelike-run-22 events 246..248"
+        "roguelike-run-22 events 246..248",
+        "private physical-device round-08 settlement: visible collection=5 versus callback collection=1",
+        "offline Char OCR replay of private SHA256 eea171dbfa1245b25101821f5956316477a82d96134928025edc0b442b4f71c1 with the patched ROIs: floor/step/combat/recruit/collection/boss/emergency=0/2/0/0/5/0/0"
       ]
     },
     {

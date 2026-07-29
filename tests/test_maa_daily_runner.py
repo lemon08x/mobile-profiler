@@ -9,6 +9,7 @@ from pathlib import Path
 from mobile_profiler.maa_daily_runner import (
     INT_MAX,
     default_daily_plan,
+    known_recovery_fingerprint,
     load_gui_daily_plan,
     override_daily_task_options,
     override_infrast_facilities,
@@ -49,6 +50,53 @@ class FakeAdb:
 
 
 class MaaDailyRunnerTests(unittest.TestCase):
+    def test_known_recruit_recognition_failure_skips_model_triage_only_on_exact_family(self) -> None:
+        known = {
+            "task": "Recruit",
+            "errors": [
+                {
+                    "taskchain": "Recruit",
+                    "subtask": "ProcessTask",
+                    "first": ["RecruitConfirm"],
+                },
+                {
+                    "taskchain": "Recruit",
+                    "subtask": "AutoRecruitTask",
+                    "what": "RecruitError",
+                },
+                {
+                    "taskchain": "Recruit",
+                    "subtask": "AutoRecruitTask",
+                },
+            ],
+        }
+        self.assertEqual(
+            known_recovery_fingerprint(known),
+            "recruit:recognition:confirm-and-auto-recruit-error",
+        )
+
+        variants = [
+            {**known, "task": "Mall"},
+            {
+                **known,
+                "errors": [
+                    *known["errors"],
+                    {
+                        "taskchain": "Recruit",
+                        "subtask": "ProcessTask",
+                        "first": ["UnexpectedPage"],
+                    },
+                ],
+            },
+            {
+                **known,
+                "errors": [known["errors"][0]],
+            },
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertIsNone(known_recovery_fingerprint(variant))
+
     def test_web_task_options_override_only_allowlisted_core_parameters(self) -> None:
         selected = select_daily_plan(default_daily_plan(), "Fight,Recruit,Mall")
         overridden = override_daily_task_options(

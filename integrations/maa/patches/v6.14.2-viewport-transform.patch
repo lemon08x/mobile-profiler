@@ -1,18 +1,23 @@
 diff --git a/resource/tasks/Roguelike/JieGarden.json b/resource/tasks/Roguelike/JieGarden.json
-index 2b8a633..ada723f 100644
+index 2b8a633..240dc67 100644
 --- a/resource/tasks/Roguelike/JieGarden.json
 +++ b/resource/tasks/Roguelike/JieGarden.json
-@@ -1,4 +1,27 @@
+@@ -1,4 +1,32 @@
  {
 +    "JieGarden@Roguelike@Begin": {
 +        "next": [
 +            "JieGarden@Roguelike@CloseTutorial",
 +            "JieGarden@Roguelike@Continue",
++            "JieGarden@RoguelikeSettlementConfirm",
++            "JieGarden@Roguelike@MissionFailedFlag2",
++            "JieGarden@Roguelike@GamePass",
++            "JieGarden@Roguelike@OperationFailed",
 +            "JieGarden@Roguelike@ChooseDifficulty",
 +            "JieGarden@Roguelike@StartExplore",
 +            "JieGarden@Roguelike@Stages#next",
 +            "JieGarden@Roguelike@GetDrops#next",
 +            "JieGarden@Roguelike@ChooseOperFlag",
++            "JieGarden@Roguelike@EnterAfterRecruit",
 +            "JieGarden@Roguelike@StageEncounterGiveUpRecruitConfirm",
 +            "JieGarden@Roguelike@CoppersAbandonConfirm",
 +            "JieGarden@Roguelike@NextLevel",
@@ -30,7 +35,7 @@ index 2b8a633..ada723f 100644
      "JieGarden@StartExplore@Roguelike@ChooseOper": {
          "next": [
              "JieGarden@StartExplore@Roguelike@ChooseOperConfirm",
-@@ -74,9 +97,21 @@
+@@ -74,9 +102,21 @@
          "next": ["JieGarden@Roguelike@LeaveBoskyPassage", "#self"]
      },
      "JieGarden@Roguelike@ClickToDrops": {
@@ -53,7 +58,7 @@ index 2b8a633..ada723f 100644
          "next": [
              "JieGarden@Roguelike@MissionCompletedFlag",
              "JieGarden@Roguelike@MissionFailedFlag2",
-@@ -139,6 +174,24 @@
+@@ -139,6 +179,24 @@
      "JieGarden@Roguelike@CloseInterview": {
          "template": "JieGarden@Roguelike@CloseCollectionClose.png"
      },
@@ -78,7 +83,7 @@ index 2b8a633..ada723f 100644
      "JieGarden@Roguelike@ConfirmToGiveUp": {
          "algorithm": "OcrDetect",
          "text": ["放弃行动"],
-@@ -152,7 +205,9 @@
+@@ -152,7 +210,9 @@
          "roi": [867, 406, 242, 160],
          "next": ["#self", "JieGarden@Roguelike@NextLevel", "JieGarden@Roguelike@NextLevel#next"]
      },
@@ -89,7 +94,7 @@ index 2b8a633..ada723f 100644
      "JieGarden@Roguelike@CoppersAbandonConfirm": {
          "Doc": "放弃交换通宝的确认按钮",
          "baseTask": "JieGarden@Roguelike@CoppersListDialogConfirm",
-@@ -262,7 +317,7 @@
+@@ -262,7 +322,7 @@
          "Doc": "通宝列表界面弹出的确认按钮",
          "template": "JieGarden@Roguelike@CoppersListDialogConfirm.png",
          "action": "ClickSelf",
@@ -98,7 +103,7 @@ index 2b8a633..ada723f 100644
          "postDelay": 1000,
          "templThreshold": 0.85,
          "cache": true
-@@ -501,6 +556,7 @@
+@@ -501,11 +561,13 @@
              "JieGarden@Roguelike@GetDrops#next",
              "JieGarden@Roguelike@GetDropCompleted",
              "JieGarden@Roguelike@GetDropLeave",
@@ -106,7 +111,21 @@ index 2b8a633..ada723f 100644
              "JieGarden@Roguelike@Stages#next",
              "JieGarden@Roguelike@StageEncounterOptions#next",
              "JieGarden@Roguelike@StageEncounterSpecialClose",
-@@ -569,7 +625,11 @@
+             "JieGarden@Roguelike@StageTraderLeave",
+             "JieGarden@Roguelike@CloseEvent",
++            "JieGarden@Roguelike@EnterAfterRecruit",
+             "JieGarden@Roguelike@RecruitOther"
+         ]
+     },
+@@ -524,6 +586,7 @@
+         ]
+     },
+     "JieGarden@Roguelike@EnterAfterRecruit": {
++        "template": "JieGarden@Roguelike@EnterAfterRecruit.png",
+         "roi": [1040, 240, 240, 179]
+     },
+     "JieGarden@Roguelike@ExitThenAbandon": {
+@@ -569,7 +632,11 @@
          "roi": [0, 420, 1280, 175],
          "postDelay": 1000,
          "templThreshold": 0.85,
@@ -119,7 +138,7 @@ index 2b8a633..ada723f 100644
      },
      "JieGarden@Roguelike@GetDrops": {
          "next": [
-@@ -670,6 +730,7 @@
+@@ -670,6 +737,7 @@
          "next": [
              "JieGarden@Roguelike@RandomPickAfterNextLevel",
              "JieGarden@Roguelike@NextLevel@(JieGarden@Roguelike@CloseCollectionContinue)",
@@ -127,7 +146,7 @@ index 2b8a633..ada723f 100644
              "JieGarden@Roguelike@CloseInterview",
              "JieGarden@Roguelike@StrategyChange",
              "JieGarden@Roguelike@NextLevel"
-@@ -707,6 +768,7 @@
+@@ -707,6 +775,7 @@
          "next": [
              "JieGarden@Roguelike@RandomPickAfterNextLevel@NextAfterLoadingText",
              "JieGarden@Roguelike@RandomPickAfterNextLevel@(JieGarden@Roguelike@CloseCollectionContinue)",
@@ -135,7 +154,7 @@ index 2b8a633..ada723f 100644
              "JieGarden@Roguelike@CloseInterview",
              "JieGarden@Roguelike@StrategyChange",
              "#self"
-@@ -718,6 +780,10 @@
+@@ -718,6 +787,10 @@
      "JieGarden@Roguelike@RecruitOther": {
          "template": "JieGarden@Roguelike@Recruit.png"
      },
@@ -146,7 +165,7 @@ index 2b8a633..ada723f 100644
      "JieGarden@Roguelike@RecruitWithoutButton": {
          "next": [
              "JieGarden@Roguelike@RecruitOther",
-@@ -1116,6 +1182,7 @@
+@@ -1116,6 +1189,7 @@
      "JieGarden@Roguelike@StageTrader": {
          "Doc": "商店 绿色系",
          "method": "HSVCount",
@@ -154,6 +173,47 @@ index 2b8a633..ada723f 100644
          "colorWithClose": false,
          "colorScales": [
              [
+@@ -1544,5 +1618,26 @@
+         ],
+         "roi": [891, 648, 58, 58]
+     },
+-    "JieGarden@RoguelikeSettlementConfirm": {}
++    "JieGarden@RoguelikeSettlementConfirm": {},
++    "JieGarden@RoguelikeSettlementOcr-Floor": {
++        "roi": [490, 170, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Step": {
++        "roi": [490, 238, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Combat": {
++        "roi": [490, 304, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Recruit": {
++        "roi": [490, 374, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Collection": {
++        "roi": [1060, 170, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-BOSS": {
++        "roi": [1060, 238, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Emergency": {
++        "roi": [1060, 304, 90, 40]
++    }
+ }
+diff --git a/resource/tasks/Roguelike/base.json b/resource/tasks/Roguelike/base.json
+index 8348d2b..7e6a967 100644
+--- a/resource/tasks/Roguelike/base.json
++++ b/resource/tasks/Roguelike/base.json
+@@ -863,7 +863,7 @@
+     },
+     "Roguelike@IntegratedStrategies": {
+         "action": "ClickSelf",
+-        "roi": [884, 606, 146, 114],
++        "roi": [884, 606, 250, 114],
+         "next": ["Roguelike@IntegratedStrategies", "Roguelike@PreSelectTheme"]
+     },
+     "Roguelike@LastReward": {
 diff --git a/resource/tasks/UiTheme/Friends.json b/resource/tasks/UiTheme/Friends.json
 index 727ab42..9f0aa25 100644
 --- a/resource/tasks/UiTheme/Friends.json
@@ -2083,6 +2143,95 @@ index feb9752..e93acf5 100644
      void clear_and_reselect();
      bool analyze();
      bool select(RoguelikeFormationImageAnalyzer::FormationOper oper);
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
+index bf83f02..1c4b7e7 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
++++ b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
+@@ -17,10 +17,16 @@ bool asst::RoguelikeSettlementTaskPlugin::verify(AsstMsg msg, const json::value&
+     const auto task_name = details.get("details", "task", "");
+     if (task_name.ends_with("Roguelike@GamePass")) {
+         m_game_pass = true;
++        m_resume_page2 = false;
+         return m_config->get_mode() == RoguelikeMode::Exp;
+     }
+     else if (task_name.ends_with("Roguelike@MissionFailedFlag2")) {
+         m_game_pass = false;
++        m_resume_page2 = false;
++        return m_config->get_mode() == RoguelikeMode::Exp;
++    }
++    else if (task_name.ends_with("RoguelikeSettlementConfirm")) {
++        m_resume_page2 = true;
+         return m_config->get_mode() == RoguelikeMode::Exp;
+     }
+     else {
+@@ -33,7 +39,30 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     LogTraceFunction;
+     const auto& task = Task.get("RoguelikeSettlementConfirm");
+     auto json_msg = basic_info_with_what("RoguelikeSettlement");
+-    json_msg["details"]["game_pass"] = m_game_pass;
++    if (m_resume_page2) {
++        json_msg["details"]["resumed_page2"] = true;
++    }
++    else {
++        json_msg["details"]["game_pass"] = m_game_pass;
++    }
++
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const bool restore_alignment =
++        ctrler()->uses_adaptive_viewport() && original_alignment != ViewportAlignment::Center &&
++        ctrler()->set_viewport_alignment(ViewportAlignment::Center);
++    const auto restore_original_alignment = [&]() {
++        if (restore_alignment) {
++            ctrler()->set_viewport_alignment(original_alignment);
++        }
++    };
++
++    if (m_resume_page2) {
++        auto image = ctrler()->get_image();
++        get_settlement_info(json_msg, image);
++        callback(AsstMsg::SubTaskExtraInfo, json_msg);
++        restore_original_alignment();
++        return true;
++    }
+ 
+     sleep(task->special_params[0]);
+     if (m_game_pass) {
+@@ -47,6 +76,7 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     if (!wait_for_whole_page()) {
+         Log.error(__FUNCTION__, "wait for whole page failed");
+         save_img(ctrler()->get_image(), utils::path("debug") / utils::path("roguelike"), "Page2_Error");
++        restore_original_alignment();
+         return true;
+     }
+     sleep(task->post_delay);
+@@ -57,6 +87,7 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     }
+     get_settlement_info(json_msg, image);
+     callback(AsstMsg::SubTaskExtraInfo, json_msg);
++    restore_original_alignment();
+     return true;
+ }
+ 
+@@ -76,7 +107,7 @@ bool asst::RoguelikeSettlementTaskPlugin::get_settlement_info(json::value& info,
+ 
+     auto analyze_battle_data = [&](const std::string& task_name) {
+         RegionOCRer ocr(image);
+-        ocr.set_task_info("RoguelikeSettlementOcr-" + task_name);
++        ocr.set_task_info(m_config->get_theme() + "@RoguelikeSettlementOcr-" + task_name);
+         ocr.set_bin_threshold(0, 160);
+         auto merge_map = number_replace;
+         merge_map.emplace_back("[^\\d]+", "");
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
+index 5d164cf..01cabbf 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
++++ b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
+@@ -18,5 +18,6 @@ private:
+     void save_img(const cv::Mat& image, const std::filesystem::path& path, std::string name);
+ 
+     mutable bool m_game_pass = false;
++    mutable bool m_resume_page2 = false;
+ };
+ } // namespace asst
 diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp
 index 341f695..d706113 100644
 --- a/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp

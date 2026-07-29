@@ -41,7 +41,7 @@
 | mitigated | `MAA-SAFETY-001` ExitThenAbandon 破坏性兜底 | runner 默认资源 overlay 改成 Stop，并先生成 incident |
 | fixed | `MAA-RUNNER-001` 把任务完成误当自然结束 | 只以 RoguelikeSettlement 判定一轮终点 |
 | fixed | `MAA-RUNNER-002` 结算后自动开下一轮 | 结算回调后主动 stop |
-| open | `MAA-OCR-001` 结算统计 OCR 不完整 | 先收集失败/成功页面 fixture，再给 settlement analyzer 加 adaptive |
+| fixed | `MAA-OCR-001` 结算统计 OCR 不完整 | Center 视口不变量 + 界园主题专用统计 ROI + 结算恢复矩阵 |
 | open | `MAA-PERF-002` ADB 截图约 0.9–1.8 秒 | runner 已统计 p50/p95/max；待比较 raw ADB、adb-lite、设备端 client |
 | known_limit | `MAA-STRATEGY-001` 有教无类漏怪 | 属于阵容/策略，不与坐标修复混合判断 |
 | fixed | `MAA-EVIDENCE-001` 临时 runner 缺少证据闭环 | 环境 manifest、watchdog、incident、去重、triage、fixture promotion |
@@ -118,10 +118,14 @@ runner 会把成功与失败结算都视为“完整走完一轮”，但单独�
 
 ### 9. 结算 OCR 结果不稳定
 
-run-11 曾返回 floor、step、combat、recruit、collection、score、exp、skill 等较完整
-字段；run-09、run-10 和 run-22 主要只返回 difficulty、emergency、game_pass。
-这表明页面确认与自然结算本身可工作，但固定 ROI 在不同视口布局上不稳定。下一步必须
-先保留页面样本，再修改 settlement analyzer，避免继续现场猜 ROI。
+run-11 曾返回较完整字段，而后续运行多次缺失；2026-07-29 的失败结算进一步给出确定性
+证据：画面中的“获得物品数”为 5，回调却返回 collection=1。像素投影确认结算缓存图来自
+Center viewport，旧通用 ROI 命中了界园字段左侧的装饰数字。现在插件在结算分析期间固定
+Center 并恢复原 alignment，战斗统计通过主题前缀继承/覆盖，界园的 7 个字段使用独立 ROI。
+失败/成功标志页已过去但仍停在最终统计页时，也可直接恢复结算；此时 `game_pass` 明确保留
+为未知，不会误报失败。对原始结算图用随 MAA 分发的 Char OCR 模型离线重放后，7 个字段
+归一化为 `0/2/0/0/5/0/0`，其中 collection 已与画面中的 5 一致。现场截图含账号环境，
+继续只保存在本机；账本记录截图 SHA256，版本库以资源审计和恢复矩阵单测防回归。
 
 ### 10. 截图慢和动作慢不是同一个问题
 
@@ -179,13 +183,11 @@ UI 适配器最初直接执行仓库根目录的 `tools/maa-*.py`。这种写法
 
 ## 当前开放项的处理顺序
 
-1. `MAA-OCR-001`：从下一次自然结算 incident 提升成功/失败各一张 fixture，给结算
-   analyzer 增加 alignment 选择，并验证字段完整率。
-2. `MAA-PERF-001/002`：在完全相同资源和页面序列下记录截图 p50/p95、识别耗时和
+1. `MAA-PERF-001/002`：在完全相同资源和页面序列下记录截图 p50/p95、识别耗时和
    callback 序列，确认新 adaptive 算法没有优先级回归，再比较截图 backend。
-3. `MAA-BATTLE-001`：把战斗/编队/技能页面加入 fixture manifest，防止后续 UI 更新
+2. `MAA-BATTLE-001`：把战斗/编队/技能页面加入 fixture manifest，防止后续 UI 更新
    再次把直接 analyzer 留在错误视口。
-4. `MAA-SAFETY-001`：长期目标是在 MaaCore 任务层提供正式的 destructive-action
+3. `MAA-SAFETY-001`：长期目标是在 MaaCore 任务层提供正式的 destructive-action
    policy；当前资源 overlay 已能可靠保护诊断运行。
 
 ## 证据边界

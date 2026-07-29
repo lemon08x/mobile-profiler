@@ -192,6 +192,7 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
         self.assertEqual(options["task"]["scope"], "task")
         self.assertEqual(options["fight_stage"]["visible_when"], {"id": "task", "equals": "Daily"})
         self.assertEqual(options["roguelike_theme"]["visible_when"], {"id": "task", "equals": "Roguelike"})
+        self.assertEqual(options["roguelike_strategy_preset"]["value"], "stable")
         self.assertEqual(options["core_root"]["scope"], "environment")
         self.assertFalse(options["allow_account_mutation"]["persisted"])
 
@@ -199,13 +200,23 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
         params = resolve_roguelike_params(
             "Sami",
             {"mode": 1, "squad": "指挥分队", "investment_enabled": False},
+            strategy_preset="custom",
         )
         self.assertEqual(params["theme"], "Sami")
         self.assertEqual(params["mode"], 1)
         self.assertEqual(params["squad"], "指挥分队")
         self.assertFalse(params["investment_enabled"])
+        stable = resolve_roguelike_params(
+            "JieGarden",
+            {"mode": 2, "investment_enabled": True, "investments_count": 999},
+        )
+        self.assertEqual(stable["mode"], 0)
+        self.assertFalse(stable["investment_enabled"])
+        self.assertEqual(stable["investments_count"], 0)
         with self.assertRaisesRegex(ValueError, "unsupported Roguelike option"):
             resolve_roguelike_params("Sami", {"unsafe": True})
+        with self.assertRaisesRegex(ValueError, "strategy preset"):
+            resolve_roguelike_params("Sami", {}, strategy_preset="unknown")
 
     def test_preflight_uses_patched_viewport_and_does_not_persist_consent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -353,6 +364,7 @@ class MaaArknightsRuntimeTests(unittest.TestCase):
             command = popen.processes[0].command
             self.assertTrue(any(item.endswith("maa_roguelike_runner.py") for item in command))
             self.assertNotIn("--allow-destructive-actions", command)
+            self.assertEqual(command[command.index("--strategy-preset") + 1], "stable")
             self.assertIn("--maa-source-root", command)
             self.assertIn("--policy", command)
             controller.stop()
