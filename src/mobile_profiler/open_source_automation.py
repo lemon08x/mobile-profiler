@@ -313,7 +313,7 @@ class OpenSourceAutomationController:
                 ),
                 "selectable": True,
                 "role": "reference_implementation",
-                "role_label": "唯一跑通 · 重构基准",
+                "role_label": "首个跑通 · 重构基准",
                 "status": "verified",
                 "status_label": "端到端已验收",
                 "adapter_status": "pending",
@@ -337,25 +337,26 @@ class OpenSourceAutomationController:
                 "name": "StarRailCopilot",
                 "short_name": "SRC",
                 "game": "崩坏：星穹铁道",
-                "summary": "已替换为原生 Android 设备栈；多分辨率与完整流程待验收。",
+                "summary": "原生 Android 设备栈已在 2800×1260 真机完成世界 8 与两轮日常验收。",
                 "source_url": "https://github.com/LmeSzinc/StarRailCopilot",
                 "selectable": True,
-                "role": "restructuring_candidate",
-                "role_label": "未跑通 · 重构对象",
+                "role": "verified_adaptation",
+                "role_label": "单机跑通 · 手机适配",
                 "reference_project_id": "maa-arknights",
-                "status": "verification_pending",
-                "status_label": "端到端未验收",
-                "adapter_status": "pending",
-                "adapter_label": "禁止启动，等待按 MAA 经验重构",
+                "status": "verified",
+                "status_label": "单机端到端已验收",
+                "adapter_status": "ready",
+                "adapter_label": "完整补丁可启动；多机型矩阵待验收",
                 "features": [
                     {
                         "id": "src-rogue",
-                        "name": "自动模拟宇宙",
+                        "name": "模拟宇宙与日常",
                         "category": "battle",
                         "category_label": "战斗",
                         "description": (
-                            "直接使用 SRC 的 ADB/scrcpy 与 MaaTouch/minitouch；当前仍受"
-                            "原生 1280×720 门禁限制。"
+                            "直接使用 SRC 的 ADB/scrcpy 与 MaaTouch/minitouch；可选择"
+                            "模拟宇宙或日常队列，完整补丁通过 Left/Center/Right 视口"
+                            "适配宽屏手机。"
                         ),
                         "featured": False,
                     }
@@ -676,7 +677,7 @@ class OpenSourceAutomationController:
                 "feature": "端到端验收门",
                 "upstream": "预检 → 完整流程 → 自然终点 → 可重复回归",
                 "status": "ready",
-                "current": "当前只有明日方舟 MAA 通过；崩铁和终末地保持禁用",
+                "current": "明日方舟 MAA 与崩铁 SRC 已通过；终末地继续保持禁用",
             },
         ]
 

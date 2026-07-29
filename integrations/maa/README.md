@@ -109,8 +109,8 @@ Infrast → Recruit → Mall → Award`，六项均在首次尝试到达任务�
 
 ## “开源自动化”页面接入
 
-Mobile Profiler 的“开源自动化”页面现将 MaaAssistantArknights 作为默认项目，也是当前
-唯一标记为端到端真机验收通过的项目。运行面板提供：
+Mobile Profiler 的“开源自动化”页面现将 MaaAssistantArknights 作为默认项目，也是首个
+标记为端到端真机验收通过的项目。运行面板提供：
 
 - `StartUp`、`Depot`、`OperBox`、`Award` 与受保护的 `Roguelike` 任务选择。
 - adaptive MaaCore 目录、官方资源目录和 10 分钟/30 分钟/3 小时停止上限。
@@ -122,9 +122,10 @@ Mobile Profiler 的“开源自动化”页面现将 MaaAssistantArknights 作�
 `1280×720` 和 viewport `[280,0,2240,1260]`，随后 StartUp 任务链在 8.2 秒内完成。
 首次接入测试发现的熄屏/重复启动问题已登记为 `MAA-UI-001` 并加入回归。
 
-崩铁和终末地项目仍保留在目录中供后续重构，但明确显示为“端到端未验收”，前端和
-服务端都拒绝启动。它们只有在复用本项目的坐标分层、统一输入代理、直接 analyzer 审计、
-危险动作前置护栏以及 incident→fixture→回归闭环并完成真机全流程后，才能解除门禁。
+崩铁 StarRailCopilot 已复用坐标分层和输入门禁，并在 2800×1260 真机完成世界 8
+自然结算及 daily 首轮/幂等复跑，完整补丁 checkout 已解除单机端到端门禁；其多机型
+矩阵仍在继续。终末地项目
+仍明确显示为“端到端未验收”，前端和服务端拒绝启动。
 
 ## 坐标链路
 

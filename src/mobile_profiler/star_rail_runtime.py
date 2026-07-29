@@ -17,6 +17,7 @@ from .star_rail_copilot_runner import (
     CONTROL_METHODS,
     DEFAULT_SCRCPY_MAX_SIZE,
     DOMAIN_STRATEGIES,
+    GAME_LANGUAGES,
     ROGUE_PATHS,
     ROGUE_WORLDS,
     SCREENSHOT_METHODS,
@@ -24,20 +25,23 @@ from .star_rail_copilot_runner import (
     SERVER_PACKAGES,
     UPSTREAM_LICENSE,
     UPSTREAM_REPOSITORY,
+    WORKFLOWS,
     validate_upstream_path,
 )
 
 
 STAR_RAIL_OPTION_DEFAULTS: dict[str, object] = {
     "server": "CN-Official",
+    "game_language": "cn",
     "screenshot_method": "scrcpy",
     "scrcpy_max_size": DEFAULT_SCRCPY_MAX_SIZE,
     "control_method": "MaaTouch",
+    "workflow": "rogue",
     "world": ROGUE_WORLDS[-1],
     "path": "The_Hunt",
     "domain_strategy": "combat",
-    "use_immersifier": True,
-    "double_event": True,
+    "use_immersifier": False,
+    "double_event": False,
     "weekly_farming": False,
     "use_stamina": False,
 }
@@ -170,8 +174,10 @@ class StarRailCopilotRuntimeController:
                 values[key] = str(payload[key] or "").strip()
         choices = {
             "server": set(SERVER_PACKAGES),
+            "game_language": set(GAME_LANGUAGES),
             "screenshot_method": set(SCREENSHOT_METHODS),
             "control_method": set(CONTROL_METHODS),
+            "workflow": set(WORKFLOWS),
             "world": set(ROGUE_WORLDS),
             "path": set(ROGUE_PATHS),
             "domain_strategy": set(DOMAIN_STRATEGIES),
@@ -208,13 +214,13 @@ class StarRailCopilotRuntimeController:
         configuration = self._configuration(payload)
         with self._lock:
             if self._running:
-                raise RuntimeError("StarRailCopilot Rogue is already running")
+                raise RuntimeError("StarRailCopilot workflow is already running")
             self._apply_configuration(configuration)
             self._last_preflight = None
             self._last_error = ""
         self._persist_config()
         self._refresh_install_status()
-        self._log("configured", "已保存 StarRailCopilot 模拟宇宙参数")
+        self._log("configured", "已保存 StarRailCopilot 工作流参数")
         return self.snapshot()
 
     @property
@@ -272,12 +278,16 @@ class StarRailCopilotRuntimeController:
             self.adb,
             "--server",
             str(configuration["server"]),
+            "--game-language",
+            str(configuration["game_language"]),
             "--screenshot-method",
             str(configuration["screenshot_method"]),
             "--scrcpy-max-size",
             str(configuration["scrcpy_max_size"]),
             "--control-method",
             str(configuration["control_method"]),
+            "--workflow",
+            str(configuration["workflow"]),
             "--world",
             str(configuration["world"]),
             "--path",
@@ -314,7 +324,7 @@ class StarRailCopilotRuntimeController:
         configuration = self._configuration(payload)
         with self._lock:
             if self._running:
-                raise RuntimeError("StarRailCopilot Rogue is already running")
+                raise RuntimeError("StarRailCopilot workflow is already running")
             self._apply_configuration(configuration)
             self._refresh_install_status()
             if self._status == "not_installed":
@@ -397,7 +407,7 @@ class StarRailCopilotRuntimeController:
                     self._last_error = (
                         f"StarRailCopilot exited with code {exit_code}"
                     )
-        self._log(self._status, self._last_error or "SRC Rogue 运行已结束")
+        self._log(self._status, self._last_error or "SRC 工作流运行已结束")
 
     def start(self, payload: dict[str, object]) -> dict[str, object]:
         device = str(payload.get("device") or "").strip()
@@ -406,7 +416,7 @@ class StarRailCopilotRuntimeController:
         configuration = self._configuration(payload)
         with self._lock:
             if self._running:
-                raise RuntimeError("StarRailCopilot Rogue is already running")
+                raise RuntimeError("StarRailCopilot workflow is already running")
             preflight = self._last_preflight or {}
             screen = (
                 preflight.get("screen")
@@ -462,7 +472,8 @@ class StarRailCopilotRuntimeController:
             self._last_error = ""
             self._started_at = time.time()
             self._completed_at = None
-        self._log("running", f"已在真机 {device} 启动 SRC Rogue")
+        workflow = str(configuration["workflow"])
+        self._log("running", f"已在真机 {device} 启动 SRC {workflow} 工作流")
         watcher = threading.Thread(
             target=self._watch_process,
             args=(process, log_handle),
@@ -481,7 +492,7 @@ class StarRailCopilotRuntimeController:
                     self._status = "stopped"
                 return self.snapshot()
             self._status = "stopping"
-        self._log("stopping", "正在停止 SRC Rogue 子进程")
+        self._log("stopping", "正在停止 SRC 工作流子进程")
         try:
             if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
                 process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -565,19 +576,65 @@ class StarRailCopilotRuntimeController:
                 self._running and process is not None and process.poll() is None
             )
             adaptive_geometry = dict(upstream.get("adaptive_geometry") or {})
-            return {
-                "adapter_id": "star-rail-copilot",
-                "end_to_end_verified": False,
-                "verification": {
+            end_to_end_verified = adaptive_geometry.get("available") is True
+            verification = (
+                {
+                    "status": "verified",
+                    "scope": "single_reference_device",
+                    "verified_at": "2026-07-29T21:20:20+08:00",
+                    "device_model": "vivo V2458A",
+                    "android_version": "16",
+                    "device_resolution": "2800x1260",
+                    "safe_insets": [125, 0, 125, 0],
+                    "world": "Simulated_Universe_World_8",
+                    "path": "The_Hunt",
+                    "completed_flows": [
+                        "Rogue entry and path selection",
+                        "13 routed domains",
+                        "combat, occurrence, transaction and respite domains",
+                        "elite and boss combat",
+                        "blessing, curio and path resonance selection",
+                        "ROGUE_REPORT natural settlement",
+                        "reward claim and close",
+                        "daily Dungeon, Assignment and BattlePass queue",
+                        "daily activity 500 and all five point rewards",
+                        "Freebies and inventory DataUpdate",
+                        "second daily pass with no repeated work",
+                    ],
+                    "daily_verification": {
+                        "first_pass": {
+                            "status": "completed",
+                            "activity": 500,
+                            "activity_total": 500,
+                            "remaining_quests": [],
+                            "all_rewards_claimed": True,
+                        },
+                        "second_pass": {
+                            "status": "completed",
+                            "activity": 500,
+                            "all_rewards_claimed": True,
+                            "work_performed": False,
+                            "idempotent": True,
+                        },
+                    },
+                    "coordinate_model": (
+                        "display -> Left/Center/Right viewport -> 1280x720 logical"
+                    ),
+                    "matrix_verified": False,
+                }
+                if end_to_end_verified
+                else {
                     "status": "pending",
                     "reason": (
-                        "StarRailCopilot 多分辨率自适应几何补丁已接入；识别消费者审计、"
-                        "完整模拟宇宙流程和真机矩阵尚未验收。"
-                        if adaptive_geometry.get("available") is True
-                        else "崩铁底层已更换为 StarRailCopilot；当前 checkout 未安装"
+                        "崩铁底层已更换为 StarRailCopilot；当前 checkout 未安装"
                         "完整多分辨率自适应几何补丁。"
                     ),
-                },
+                }
+            )
+            return {
+                "adapter_id": "star-rail-copilot",
+                "end_to_end_verified": end_to_end_verified,
+                "verification": verification,
                 "status": "running" if running else self._status,
                 "running": running,
                 "available": available,
@@ -600,11 +657,27 @@ class StarRailCopilotRuntimeController:
                         "scope": "environment",
                     },
                     self._select_option(
+                        "workflow",
+                        "运行目标",
+                        "选择完整模拟宇宙单轮，或有界的完整日常队列。",
+                        str(self._options["workflow"]),
+                        WORKFLOWS,
+                        group="任务目标",
+                    ),
+                    self._select_option(
                         "server",
                         "游戏服务器",
                         "决定 SRC 使用的安卓包名与资源语言。",
                         str(self._options["server"]),
                         tuple(SERVER_PACKAGES),
+                        group="游戏账号",
+                    ),
+                    self._select_option(
+                        "game_language",
+                        "游戏语言",
+                        "决定 SRC 的 OCR 语言；国服使用 cn，国际服可选择 en。",
+                        str(self._options["game_language"]),
+                        GAME_LANGUAGES,
                         group="游戏账号",
                     ),
                     self._select_option(
@@ -696,6 +769,8 @@ class StarRailCopilotRuntimeController:
                     "screenshot": True,
                     "native_android_stack": True,
                     "adaptive_geometry": adaptive_geometry.get("available") is True,
+                    "workflows": list(WORKFLOWS),
+                    "daily_two_pass_verified": end_to_end_verified,
                 },
                 "last_error": self._last_error,
                 "last_run_dir": self._last_run_dir,

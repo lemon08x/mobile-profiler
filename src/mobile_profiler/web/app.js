@@ -6869,7 +6869,7 @@
     target.innerHTML = integratedProjects.length
       ? integratedProjects.map(project => {
         const projectId = String(project?.id || "");
-        const maturity = project?.role === "reference_implementation" ? "唯一已验收" : "未跑通";
+        const maturity = project?.status === "verified" ? "已验收" : "未跑通";
         return `<option value="${escapeHtml(projectId)}" ${project === active ? "selected" : ""}>${escapeHtml(project?.game || project?.name || projectId)} · ${maturity}</option>`;
       }).join("")
       : '<option value="">暂无已接入项目</option>';

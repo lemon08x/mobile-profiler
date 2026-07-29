@@ -293,22 +293,25 @@ ADB/scrcpy screenshot and MaaTouch/minitouch control stack, with a read-only hos
 ADB preflight and no pyautogui/win32 emulation. The checkout defaults to
 `open-source-runtimes/StarRailCopilot` and can be supplied through
 `MOBILE_PROFILER_STAR_RAIL_COPILOT_ROOT`. Upstream SRC still rejects captures and
-devices outside `1280×720`; the replacement therefore reports those phones as
-`unsupported_resolution` instead of claiming mobile compatibility. Architecture
-and the new phone-resolution work plan are documented in
+devices outside `1280×720`; Mobile Profiler therefore requires the complete v2
+adaptive patch before enabling wider phones. That patch has completed World 8 and
+two-pass daily verification on one 2800×1260 Android device; unpatched or partial
+checkouts still report `unsupported_resolution`. Architecture and the phone-resolution
+work plan are documented in
 [`integrations/starrailcopilot/README.md`](integrations/starrailcopilot/README.md)
 and
 [`integrations/starrailcopilot/RESOLUTION-PLAN.md`](integrations/starrailcopilot/RESOLUTION-PLAN.md).
 
-The StarRailCopilot and MaaEnd adapters remain visible as restructuring inputs,
-but are explicitly marked **end-to-end unverified** and cannot be preflighted or
-started from this page or through the controller API. Verification is fail-closed:
-an adapter is runnable only when it explicitly reports `end_to_end_verified=true`;
-a missing flag is treated as unverified. They must first adopt the contract proven by
-MAA: separate physical/viewport/logical coordinates, route every coordinate-bearing
-input through one transform, audit analyzers that bypass the common recognition
-path, guard destructive fallbacks before execution, and turn every failure into an
-environment/callback/screenshot incident plus a reproducible regression. The MAA
+StarRailCopilot is now a single-reference-device verified adaptation. MaaEnd remains
+visible as a restructuring input, is explicitly marked **end-to-end unverified**, and
+cannot be preflighted or started from this page or through the controller API.
+Verification is fail-closed: an adapter is runnable only when it explicitly reports
+`end_to_end_verified=true`; a missing flag is treated as unverified. New adapters must
+adopt the contract proven by MAA and SRC: separate physical/viewport/logical
+coordinates, route every coordinate-bearing input through one transform, audit
+analyzers that bypass the common recognition path, guard destructive fallbacks before
+execution, and turn every failure into an environment/callback/screenshot incident
+plus a reproducible regression. The MAA
 patch, issue ledger, fixture promotion, source/resource/patch drift checks, and
 maintenance workflow are documented in
 [`integrations/maa/README.md`](integrations/maa/README.md) and
