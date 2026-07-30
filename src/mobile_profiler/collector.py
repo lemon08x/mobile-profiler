@@ -84,6 +84,12 @@ def run_command(argv: Sequence[str], timeout_s: float = 30.0) -> CommandResult:
         )
     except FileNotFoundError as exc:
         return CommandResult(list(argv), 127, "", str(exc), time.monotonic() - start)
+    except OSError as exc:
+        # Windows App Execution Aliases and stale executable paths can exist
+        # but still fail CreateProcess with access denied.  Device discovery is
+        # optional and must report that command failure instead of crashing the
+        # dashboard state endpoint.
+        return CommandResult(list(argv), 126, "", str(exc), time.monotonic() - start)
     except subprocess.TimeoutExpired as exc:
         return CommandResult(
             list(argv),

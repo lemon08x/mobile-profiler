@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from .star_rail_copilot_runner import (
     CONTROL_METHODS,
+    DEFAULT_WORKFLOW,
     DEFAULT_SCRCPY_MAX_SIZE,
     DOMAIN_STRATEGIES,
     GAME_LANGUAGES,
@@ -36,7 +37,7 @@ STAR_RAIL_OPTION_DEFAULTS: dict[str, object] = {
     "screenshot_method": "scrcpy",
     "scrcpy_max_size": DEFAULT_SCRCPY_MAX_SIZE,
     "control_method": "MaaTouch",
-    "workflow": "rogue",
+    "workflow": DEFAULT_WORKFLOW,
     "world": ROGUE_WORLDS[-1],
     "path": "The_Hunt",
     "domain_strategy": "combat",
@@ -616,6 +617,21 @@ class StarRailCopilotRuntimeController:
                             "work_performed": False,
                             "idempotent": True,
                         },
+                        "additional_device": {
+                            "verified_at": "2026-07-30T12:23:57+08:00",
+                            "device_model": "HONOR AAK-AN00",
+                            "android_version": "16",
+                            "device_resolution": "2800x1272",
+                            "safe_insets": [135, 0, 135, 0],
+                            "capture_resolution": "1920x872",
+                            "first_pass_elapsed_s": 258,
+                            "activity": 500,
+                            "remaining_quests": [],
+                            "all_rewards_claimed": True,
+                            "second_pass_elapsed_s": 11,
+                            "work_performed": False,
+                            "idempotent": True,
+                        },
                     },
                     "coordinate_model": (
                         "display -> Left/Center/Right viewport -> 1280x720 logical"
@@ -633,6 +649,8 @@ class StarRailCopilotRuntimeController:
             )
             return {
                 "adapter_id": "star-rail-copilot",
+                "execution_backend": "src-native",
+                "requires_ai_server": False,
                 "end_to_end_verified": end_to_end_verified,
                 "verification": verification,
                 "status": "running" if running else self._status,
@@ -771,6 +789,7 @@ class StarRailCopilotRuntimeController:
                     "adaptive_geometry": adaptive_geometry.get("available") is True,
                     "workflows": list(WORKFLOWS),
                     "daily_two_pass_verified": end_to_end_verified,
+                    "requires_ai_server": False,
                 },
                 "last_error": self._last_error,
                 "last_run_dir": self._last_run_dir,

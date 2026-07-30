@@ -302,6 +302,14 @@ work plan are documented in
 and
 [`integrations/starrailcopilot/RESOLUTION-PLAN.md`](integrations/starrailcopilot/RESOLUTION-PLAN.md).
 
+The StarRailCopilot adapter defaults to the bounded daily queue. An explicit `rewards`
+workflow rechecks only Battle Pass, daily-training, support, code, and mail reward
+pages after another activity; it never dispatches a resource-consuming task. It does not create a
+model client or contact the AI-agent endpoint: recognition, OCR, scheduling, screenshots,
+and touch input all stay inside SRC's local runtime. Select `rogue` explicitly when a
+Simulated Universe run is intended. Preflight also verifies that the selected Python
+interpreter contains the SRC ADB/OCR stack before enabling a run.
+
 StarRailCopilot is now a single-reference-device verified adaptation. MaaEnd remains
 visible as a restructuring input, is explicitly marked **end-to-end unverified**, and
 cannot be preflighted or started from this page or through the controller API.

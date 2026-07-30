@@ -55,6 +55,7 @@ from mobile_profiler.collector import (
     parse_sampler_line,
     parse_normalized_samples,
     probe_android_performance,
+    run_command,
 )
 from mobile_profiler.cli import (
     _filter_report_events,
@@ -173,6 +174,16 @@ from mobile_profiler.storage import (
 
 
 class ParserTests(unittest.TestCase):
+    def test_run_command_reports_permission_denied_without_crashing(self) -> None:
+        with patch(
+            "mobile_profiler.collector.subprocess.run",
+            side_effect=PermissionError("access denied"),
+        ):
+            result = run_command(["adb", "devices", "-l"])
+
+        self.assertEqual(result.returncode, 126)
+        self.assertIn("access denied", result.stderr)
+
     def test_collection_warning_localization_keeps_measurement_boundaries(self) -> None:
         ios = localize_collection_warning(
             "Average normalized iOS collector CPU overhead was 6.45% during this run."

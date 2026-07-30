@@ -354,9 +354,9 @@ class OpenSourceAutomationController:
                         "category": "battle",
                         "category_label": "战斗",
                         "description": (
-                            "直接使用 SRC 的 ADB/scrcpy 与 MaaTouch/minitouch；可选择"
-                            "模拟宇宙或日常队列，完整补丁通过 Left/Center/Right 视口"
-                            "适配宽屏手机。"
+                            "默认运行无需 AI 服务器的 SRC 每日队列，也可切换模拟宇宙；"
+                            "直接使用 ADB/scrcpy 与 MaaTouch/minitouch，完整补丁通过 "
+                            "Left/Center/Right 视口适配宽屏手机。"
                         ),
                         "featured": False,
                     }

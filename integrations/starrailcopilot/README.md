@@ -5,6 +5,11 @@ Mobile Profiler 的崩铁入口已从 M7A / `Auto_Simulated_Universe` 兼容层�
 当前状态是“底层替换完成、2800×1260 真机已完成世界 8 与两轮日常验收、多机型矩阵
 尚未验收”。
 
+适配器现在默认运行有界的 `daily` 队列；`rogue` 和只访问领奖页面的 `rewards` 需要显式选择。三条路径都直接使用
+SRC 本地运行时，不创建模型客户端，不读取 AI API Key，也不访问 Qwen/OpenAI-compatible
+服务器。预检会同时检查当前解释器是否具备 SRC 的 ADB、OCR 与图像依赖；完整包中的
+`toolkit/python.exe` 可用时宿主会优先使用它。
+
 ## 当前边界
 
 | 项目 | 当前实现 |
@@ -30,7 +35,7 @@ Mobile Profiler
      -> SRC Device
         -> ADB / scrcpy 截图
         -> MaaTouch / minitouch 输入
-     -> Rogue 或有界 daily 队列
+    -> Rogue 或有界 daily 队列
 ```
 
 ## Checkout 与运行参数
@@ -107,6 +112,13 @@ route checkpoint 文件已清除。
 每日实训、支援奖励、邮件与 DataUpdate 均自然结束；最终校验返回活跃度 `500`、无剩余
 任务、五档奖励全部领取。紧接着原样执行第二轮，所有任务均按调度时间跳过，最终返回
 `status=completed`、`work_performed=false`、`idempotent=true`。
+
+2026-07-30，又在 HONOR AAK-AN00、Android 16、2800×1272、safe insets
+`135/0/135/0` 上完成第二机型的日常验收。scrcpy 4.1 返回 `1920×872`，三视口裁剪与
+MaaTouch 坐标映射正常；首轮约 258 秒完成全部六项任务并确认活跃度 `500`、无剩余任务、
+五档奖励全部领取。立即复跑约 11 秒，六项任务全部按调度跳过，返回
+`work_performed=false`、`idempotent=true`。该结果扩展了日常设备样本，但尚未覆盖该机型
+的完整 Rogue、反向横屏和其他触控后端，因此总体多机型矩阵仍标记为未完成。
 
 这构成完整补丁的单参考设备端到端验收，不代表其他分辨率已经稳定；剩余图像消费者
 审计、旋转/其他触控后端和多机型回归仍是后续阶段。

@@ -13,6 +13,7 @@ assets.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -34,6 +36,9 @@ MIN_ADAPTIVE_CAPTURE_HEIGHT = 720
 MAX_ADAPTIVE_ASPECT_RATIO = 3.0
 SCRCPY_MAX_SIZES = (1600, 1920)
 DEFAULT_SCRCPY_MAX_SIZE = 1920
+ROGUE_TRANSPORT_RESTARTS = 2
+ROGUE_ADB_RECOVERY_TIMEOUT_S = 120.0
+ROGUE_ADB_RECOVERY_POLL_S = 2.0
 
 SERVER_PACKAGES = {
     "CN-Official": "com.miHoYo.hkrpg",
@@ -67,7 +72,19 @@ ROGUE_PATHS = (
     "Erudition",
 )
 DOMAIN_STRATEGIES = ("combat", "occurrence")
-WORKFLOWS = ("rogue", "daily")
+WORKFLOWS = ("rogue", "daily", "rewards")
+DEFAULT_WORKFLOW = "daily"
+SRC_RUNTIME_MODULES = (
+    "adbutils",
+    "av",
+    "cv2",
+    "inflection",
+    "numpy",
+    "pydantic",
+    "pponnxcr",
+    "scipy",
+    "uiautomator2",
+)
 DAILY_TASKS = (
     ("Dungeon", "dungeon"),
     ("Assignment", "assignment"),
@@ -75,6 +92,11 @@ DAILY_TASKS = (
     ("DailyQuest", "daily_quest"),
     ("Freebies", "freebies"),
     ("DataUpdate", "data_update"),
+)
+REWARD_TASKS = (
+    ("BattlePass", "battle_pass"),
+    ("DailyQuest", "daily_quest"),
+    ("Freebies", "freebies"),
 )
 
 
@@ -145,6 +167,10 @@ def _adaptive_geometry_metadata(root: Path) -> dict[str, object]:
         "daily_battle_pass_mobile": (
             root / "tasks" / "battle_pass" / "battle_pass.py",
             "scroll.next_page(main=self, alignment=Alignment.RIGHT)",
+        ),
+        "battle_pass_untracked_quest": (
+            root / "tasks" / "battle_pass" / "battle_pass.py",
+            "has no automatable progress counter",
         ),
         "daily_support_reward_mobile": (
             root / "tasks" / "base" / "ui.py",
@@ -258,6 +284,45 @@ def validate_upstream_path(path: Path) -> dict[str, object]:
         "scrcpy_server_versions": scrcpy_versions,
         "logical_resolution": list(LOGICAL_RESOLUTION),
         "adaptive_geometry": _adaptive_geometry_metadata(root),
+    }
+
+
+def probe_src_python_runtime(root: Path) -> dict[str, object]:
+    """Report whether the active interpreter can load SRC's runtime stack."""
+
+    missing: list[str] = []
+    for module in SRC_RUNTIME_MODULES:
+        try:
+            available = importlib.util.find_spec(module) is not None
+        except (ImportError, AttributeError, ValueError):
+            available = False
+        if not available:
+            missing.append(module)
+    bundled = root / "toolkit" / "python.exe"
+    try:
+        using_bundled = (
+            bundled.is_file()
+            and Path(sys.executable).resolve() == bundled.resolve()
+        )
+    except OSError:
+        using_bundled = False
+    if missing and bundled.is_file() and not using_bundled:
+        detail = (
+            "the active Python is missing SRC dependencies; run the adapter with "
+            f"the bundled interpreter: {bundled}"
+        )
+    elif missing:
+        detail = "the active Python is missing SRC dependencies: " + ", ".join(missing)
+    else:
+        detail = "SRC Python dependencies are available"
+    return {
+        "available": not missing,
+        "python": sys.executable,
+        "source": "toolkit" if using_bundled else "host",
+        "bundled_python": str(bundled) if bundled.is_file() else "",
+        "missing_modules": missing,
+        "requires_ai_server": False,
+        "detail": detail,
     }
 
 
@@ -595,7 +660,7 @@ def build_src_config(root: Path, args: argparse.Namespace) -> Path:
             "UseStamina": args.use_stamina,
         }
     )
-    if getattr(args, "workflow", "rogue") == "daily":
+    if getattr(args, "workflow", "rogue") in ("daily", "rewards"):
         for task, _ in DAILY_TASKS:
             try:
                 config[task]["Scheduler"]["Enable"] = True
@@ -623,6 +688,83 @@ def _prepend_adb_binary(adb: str) -> None:
     ]
 
 
+def _adb_device_state(
+    adb: str,
+    serial: str,
+    *,
+    run_func: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> str:
+    """Return one bounded host-side ADB state probe."""
+
+    try:
+        result = _run_adb(
+            adb,
+            serial,
+            ("get-state",),
+            timeout=5,
+            run_func=run_func,
+        )
+    except RuntimeError:
+        return "unavailable"
+    state = _decode(result)
+    return state if result.returncode == 0 and state else "unavailable"
+
+
+def _src_transport_needs_restart(
+    device: object,
+    args: argparse.Namespace,
+    *,
+    run_func: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> bool:
+    """Distinguish a dead Android transport from a semantic takeover."""
+
+    if _adb_device_state(args.adb, args.serial, run_func=run_func) != "device":
+        return True
+    if str(args.screenshot_method).lower() != "scrcpy":
+        return False
+    thread = getattr(device, "_scrcpy_stream_loop_thread", None)
+    if thread is not None:
+        try:
+            if not thread.is_alive():
+                return True
+        except (AttributeError, RuntimeError):
+            return True
+    return getattr(device, "_scrcpy_alive", None) is False
+
+
+def _wait_for_adb_device(
+    adb: str,
+    serial: str,
+    *,
+    timeout_s: float = ROGUE_ADB_RECOVERY_TIMEOUT_S,
+    poll_s: float = ROGUE_ADB_RECOVERY_POLL_S,
+) -> bool:
+    """Wait a bounded grace period for a transient USB disconnect to recover."""
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if _adb_device_state(adb, serial) == "device":
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(max(0.05, poll_s), remaining))
+
+
+def _stop_failed_scrcpy(device: object, screenshot_method: str) -> None:
+    if str(screenshot_method).lower() != "scrcpy":
+        return
+    stop = getattr(device, "_scrcpy_server_stop", None)
+    if not callable(stop):
+        return
+    try:
+        stop()
+    except Exception:
+        # A disconnected transport may make teardown fail.  The new Device
+        # instance owns fresh sockets and forwarding state after ADB recovers.
+        pass
+
+
 def run_src_rogue(root: Path, args: argparse.Namespace) -> bool:
     """Run exactly one Rogue cycle after the preflight accepts the device.
 
@@ -639,24 +781,41 @@ def run_src_rogue(root: Path, args: argparse.Namespace) -> bool:
     _prepend_adb_binary(args.adb)
 
     from module.config.config import AzurLaneConfig
-    from module.exception import HandledError
+    from module.exception import HandledError, RequestHumanTakeover
     from src import StarRailCopilot
     from tasks.rogue.rogue import Rogue
 
-    config = AzurLaneConfig(CONFIG_NAME, task="Rogue")
-    application = StarRailCopilot(CONFIG_NAME)
-    # ``cached_property`` is intentionally seeded so Device and Rogue share the
-    # same task-bound configuration rather than a second Alas-only instance.
-    application.__dict__["config"] = config
-    rogue = Rogue(config=config, device=application.device)
-    while True:
+    for transport_restart in range(ROGUE_TRANSPORT_RESTARTS + 1):
+        config = AzurLaneConfig(CONFIG_NAME, task="Rogue")
+        application = StarRailCopilot(CONFIG_NAME)
+        # ``cached_property`` is intentionally seeded so Device and Rogue share
+        # the same task-bound configuration rather than a second Alas-only
+        # instance.  Recreating both objects also discards dead scrcpy sockets.
+        application.__dict__["config"] = config
+        device = application.device
+        rogue = Rogue(config=config, device=device)
         try:
-            return bool(rogue.rogue_once())
-        except HandledError:
-            # SRC raises this after recovering a known global state such as
-            # the login page.  Its scheduler reruns the same task; mirror that
-            # behavior without dispatching any unrelated scheduled task.
+            while True:
+                try:
+                    return bool(rogue.rogue_once())
+                except HandledError:
+                    # SRC raises this after recovering a known global state such
+                    # as the login page.  Its scheduler reruns the same task;
+                    # mirror that behavior without dispatching unrelated tasks.
+                    continue
+        except RequestHumanTakeover:
+            recoverable = _src_transport_needs_restart(device, args)
+            exhausted = transport_restart >= ROGUE_TRANSPORT_RESTARTS
+            if not recoverable or exhausted:
+                raise
+            _stop_failed_scrcpy(device, args.screenshot_method)
+            if not _wait_for_adb_device(args.adb, args.serial):
+                raise
+            # The adaptive route patch preserves the current domain checkpoint.
+            # A fresh Rogue instance validates it against the live minimap before
+            # resuming, so no traversal is guessed after a disconnect.
             continue
+    return False
 
 
 def _datetime_text(value: object) -> str:
@@ -786,6 +945,74 @@ def run_src_daily(root: Path, args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def run_src_rewards(root: Path, args: argparse.Namespace) -> dict[str, object]:
+    """Force a bounded pass over reward-only SRC tasks.
+
+    Their normal scheduler intentionally avoids reopening already checked pages.
+    This explicit workflow is useful after another activity may have created new
+    Battle Pass, daily-training, support, redemption-code, or mail rewards.
+    It never dispatches Dungeon, Ornament, Weekly, or Rogue.
+    """
+
+    os.chdir(root)
+    os.environ["SRC_SCRCPY_MAX_SIZE"] = str(args.scrcpy_max_size)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    _prepend_adb_binary(args.adb)
+
+    from module.base.resource import release_resources
+    from module.config.config import AzurLaneConfig
+    from src import StarRailCopilot
+
+    bootstrap = AzurLaneConfig(CONFIG_NAME, task=REWARD_TASKS[0][0])
+    application = StarRailCopilot(CONFIG_NAME)
+    application.__dict__["config"] = bootstrap
+    device = application.device
+    task_results: list[dict[str, object]] = []
+
+    for command, method in REWARD_TASKS:
+        release_resources(next_task=command)
+        config = AzurLaneConfig(CONFIG_NAME, task=command)
+        application.__dict__["config"] = config
+        device.config = config
+        success = False
+        exit_code: int | None = None
+        attempts = 0
+        for attempts in range(1, 4):
+            try:
+                success = bool(application.run(method))
+            except SystemExit as exc:
+                exit_code = int(exc.code or 0)
+                success = False
+            if success or exit_code is not None:
+                break
+            config = AzurLaneConfig(CONFIG_NAME, task=command)
+            application.__dict__["config"] = config
+            device.config = config
+        task_results.append(
+            {
+                "task": command,
+                "status": "completed" if success else "failed",
+                "attempts": attempts,
+                "exit_code": exit_code,
+            }
+        )
+        if not success:
+            break
+
+    snapshot = AzurLaneConfig(CONFIG_NAME, task="DailyQuest")
+    activity = int(snapshot.stored.DailyActivity.value or 0)
+    failed = [item for item in task_results if item["status"] == "failed"]
+    return {
+        "success": not failed and len(task_results) == len(REWARD_TASKS),
+        "resource_policy": "reward-pages-only",
+        "tasks": task_results,
+        "activity": activity,
+        "activity_total": 500,
+        "checks_performed": len(task_results),
+    }
+
+
 def capture_src_frames(
     root: Path,
     args: argparse.Namespace,
@@ -889,7 +1116,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
     )
     parser.add_argument("--control-method", choices=CONTROL_METHODS, default="MaaTouch")
-    parser.add_argument("--workflow", choices=WORKFLOWS, default="rogue")
+    parser.add_argument("--workflow", choices=WORKFLOWS, default=DEFAULT_WORKFLOW)
     parser.add_argument("--world", choices=ROGUE_WORLDS, default=ROGUE_WORLDS[-1])
     parser.add_argument("--path", choices=ROGUE_PATHS, default="The_Hunt")
     parser.add_argument(
@@ -994,7 +1221,8 @@ def _summary(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    upstream = validate_upstream_path(args.upstream)
+    root = args.upstream.expanduser().resolve()
+    upstream = validate_upstream_path(root)
     device = preflight_device(
         adb=args.adb,
         serial=args.serial,
@@ -1012,18 +1240,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.run and ready:
         status = "running"
     summary = _summary(status=status, upstream=upstream, device=device, args=args)
+    python_runtime = probe_src_python_runtime(root)
+    summary["python_runtime"] = python_runtime
 
     if args.preflight:
+        if ready and python_runtime.get("available") is not True:
+            summary["status"] = "runtime_unavailable"
+            print(json.dumps(summary, ensure_ascii=False), flush=True)
+            return 4
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         return 0
     if not ready:
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         return 2
-    build_src_config(args.upstream.expanduser().resolve(), args)
+    if python_runtime.get("available") is not True:
+        summary["status"] = "runtime_unavailable"
+        print(json.dumps(summary, ensure_ascii=False), flush=True)
+        return 4
+    build_src_config(root, args)
     if args.capture:
         summary["status"] = "captured"
         summary["capture_evidence"] = capture_src_frames(
-            args.upstream.expanduser().resolve(),
+            root,
             args,
             args.evidence_dir.expanduser().resolve(),
         )
@@ -1031,11 +1269,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     if args.workflow == "daily":
-        result = run_src_daily(args.upstream.expanduser().resolve(), args)
+        result = run_src_daily(root, args)
         summary["daily_result"] = result
         success = result.get("success") is True
+    elif args.workflow == "rewards":
+        result = run_src_rewards(root, args)
+        summary["rewards_result"] = result
+        success = result.get("success") is True
     else:
-        success = run_src_rogue(args.upstream.expanduser().resolve(), args)
+        success = run_src_rogue(root, args)
     summary["status"] = "completed" if success else "skipped"
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     return 0 if success else 3

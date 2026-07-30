@@ -16617,6 +16617,24 @@ index 768ff77..1e41bb2 100644
                  continue
              else:
                  self.device.screenshot()
+@@ -396,7 +404,16 @@ class BattlePassUI(UI):
+                 stored: StoredCounter = dic_quest_to_stored.get(result.quest, None)
+                 # Check if exist
+                 if stored is None:
+-                    logger.error(f'Battle pass quest {result.quest} has not corresponding stored object')
++                    if result.quest == (
++                            KEYWORDS_BATTLE_PASS_QUEST
++                            .Capture_1_creation_in_your_own_or_someone_else_Party_Car):
++                        logger.info(
++                            f'Battle pass quest {result.quest} is recognized but '
++                            'has no automatable progress counter')
++                    else:
++                        logger.error(
++                            f'Battle pass quest {result.quest} has not '
++                            'corresponding stored object')
+                     continue
+                 # Check total
+                 if stored.FIXED_TOTAL and total != stored.FIXED_TOTAL:
 diff --git a/tasks/character/switch.py b/tasks/character/switch.py
 index 24fb7a3..1309aca 100644
 --- a/tasks/character/switch.py

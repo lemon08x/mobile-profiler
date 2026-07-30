@@ -7,6 +7,7 @@ import json
 import struct
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +108,35 @@ class StarRailCopilotRunnerTests(unittest.TestCase):
         self.assertEqual(metadata["route_count"], 1)
         self.assertEqual(metadata["scrcpy_server_versions"], ["1.20", "1.25"])
 
+    def test_parser_defaults_to_daily_without_ai_configuration(self) -> None:
+        args = runner.build_parser().parse_args(
+            ["--upstream", ".", "--serial", "phone-1", "--preflight"]
+        )
+
+        self.assertEqual(args.workflow, "daily")
+        self.assertFalse(
+            any("model" in option.dest or "api" in option.dest for option in runner.build_parser()._actions)
+        )
+        self.assertIn("rewards", runner.WORKFLOWS)
+
+    def test_runtime_probe_reports_missing_src_modules_and_bundled_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundled = root / "toolkit" / "python.exe"
+            bundled.parent.mkdir(parents=True)
+            bundled.write_bytes(b"python")
+
+            def find_spec(name: str):
+                return None if name == "adbutils" else object()
+
+            with patch.object(runner.importlib.util, "find_spec", side_effect=find_spec):
+                result = runner.probe_src_python_runtime(root)
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["missing_modules"], ["adbutils"])
+        self.assertIn(str(bundled), result["detail"])
+        self.assertFalse(result["requires_ai_server"])
+
     def test_checkout_validation_rejects_missing_native_device_layer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = self._checkout(Path(directory))
@@ -202,6 +232,110 @@ class StarRailCopilotRunnerTests(unittest.TestCase):
         self.assertEqual(rogue["DomainStrategy"], "occurrence")
         self.assertTrue(rogue["WeeklyFarming"])
 
+    def test_transport_restart_only_accepts_dead_scrcpy_or_offline_adb(self) -> None:
+        class Thread:
+            def __init__(self, alive: bool) -> None:
+                self.alive = alive
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        args = argparse.Namespace(
+            adb="host-adb",
+            serial="phone-1",
+            screenshot_method="scrcpy",
+        )
+        online = FakeAdbRun()
+        live = types.SimpleNamespace(
+            _scrcpy_stream_loop_thread=Thread(True),
+            _scrcpy_alive=True,
+        )
+        dead = types.SimpleNamespace(
+            _scrcpy_stream_loop_thread=Thread(False),
+            _scrcpy_alive=True,
+        )
+
+        self.assertFalse(
+            runner._src_transport_needs_restart(live, args, run_func=online)
+        )
+        self.assertTrue(
+            runner._src_transport_needs_restart(dead, args, run_func=online)
+        )
+        self.assertTrue(
+            runner._src_transport_needs_restart(
+                live,
+                args,
+                run_func=FakeAdbRun(state="offline"),
+            )
+        )
+
+    def test_rogue_recreates_device_after_recoverable_transport_failure(self) -> None:
+        class HandledError(Exception):
+            pass
+
+        class RequestHumanTakeover(Exception):
+            pass
+
+        devices: list[object] = []
+
+        class Application:
+            def __init__(self, _name: str) -> None:
+                self.device = types.SimpleNamespace()
+                devices.append(self.device)
+
+        class Rogue:
+            calls = 0
+
+            def __init__(self, *, config: object, device: object) -> None:
+                self.config = config
+                self.device = device
+
+            def rogue_once(self) -> bool:
+                type(self).calls += 1
+                if type(self).calls == 1:
+                    raise RequestHumanTakeover
+                return True
+
+        modules = {
+            "module.config.config": types.SimpleNamespace(
+                AzurLaneConfig=lambda *_args, **_kwargs: types.SimpleNamespace()
+            ),
+            "module.exception": types.SimpleNamespace(
+                HandledError=HandledError,
+                RequestHumanTakeover=RequestHumanTakeover,
+            ),
+            "src": types.SimpleNamespace(StarRailCopilot=Application),
+            "tasks.rogue.rogue": types.SimpleNamespace(Rogue=Rogue),
+        }
+        args = argparse.Namespace(
+            adb="host-adb",
+            serial="phone-1",
+            screenshot_method="scrcpy",
+            scrcpy_max_size=1920,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict("sys.modules", modules),
+            patch.object(runner.os, "chdir"),
+            patch.object(runner, "_prepend_adb_binary"),
+            patch.object(runner, "_src_transport_needs_restart", return_value=True),
+            patch.object(runner, "_wait_for_adb_device", return_value=True),
+            patch.object(runner, "_stop_failed_scrcpy") as stop_scrcpy,
+        ):
+            result = runner.run_src_rogue(Path(directory), args)
+
+        self.assertTrue(result)
+        self.assertEqual(len(devices), 2)
+        stop_scrcpy.assert_called_once_with(devices[0], "scrcpy")
+
+    def test_rewards_workflow_excludes_resource_consuming_tasks(self) -> None:
+        commands = {command for command, _method in runner.REWARD_TASKS}
+
+        self.assertEqual(commands, {"BattlePass", "DailyQuest", "Freebies"})
+        self.assertTrue(
+            commands.isdisjoint({"Dungeon", "Ornament", "Weekly", "Rogue"})
+        )
+
     def test_run_mode_refuses_unsupported_resolution_before_loading_src(self) -> None:
         device = {
             "serial": "phone-1",
@@ -269,7 +403,10 @@ class StarRailCopilotRuntimeTests(unittest.TestCase):
         self.assertEqual(options["world"]["scope"], "task")
         self.assertEqual(options["upstream_path"]["scope"], "environment")
         self.assertEqual(options["control_method"]["scope"], "environment")
+        self.assertEqual(options["workflow"]["value"], "daily")
         self.assertTrue(snapshot["capabilities"]["configure"])
+        self.assertFalse(snapshot["requires_ai_server"])
+        self.assertFalse(snapshot["capabilities"]["requires_ai_server"])
         self.assertIs(StarRailAsuRuntimeController, StarRailCopilotRuntimeController)
 
     def test_runtime_configuration_is_validated_and_persisted(self) -> None:
@@ -345,7 +482,9 @@ class StarRailCopilotRuntimeTests(unittest.TestCase):
         self.assertEqual(command[0], str(toolkit))
         self.assertIn("mobile_profiler.star_rail_copilot_runner", command)
         self.assertIn("CN-Bilibili", command)
+        self.assertIn("daily", command)
         self.assertIn("--no-use-immersifier", command)
+        self.assertFalse(any("model" in item.lower() for item in command))
         self.assertNotIn("--speed", command)
         self.assertNotIn("--bonus", command)
 
