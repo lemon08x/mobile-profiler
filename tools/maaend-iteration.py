@@ -60,14 +60,22 @@ FRAMEWORK_UNTRACKED = (
     Path("test/viewport/main.cpp"),
 )
 AGENT_UNTRACKED = (
+    Path("agent/cpp-algo/source/MapLocator/MinimapExtractor.cpp"),
+    Path("agent/cpp-algo/source/MapLocator/MinimapExtractor.h"),
     Path("agent/cpp-algo/source/Viewport/ViewportSession.cpp"),
     Path("agent/cpp-algo/source/Viewport/ViewportSession.h"),
     Path("agent/go-service/pkg/viewport/session.go"),
     Path("agent/go-service/pkg/viewport/session_test.go"),
+    Path("agent/go-service/captureuid/capture_test.go"),
+    Path("agent/go-service/common/autoalt/click_test.go"),
+    Path("agent/go-service/maptracker/default/infer_viewport_test.go"),
+    Path("agent/go-service/maptracker/bigmap/pick_viewport_test.go"),
+    Path("agent/go-service/pkg/control/adaptor_adb_test.go"),
     Path("agent/go-service/taskersink/aspectratio/checker_viewport_test.go"),
     Path("agent/go-service/viewportprobe/input.go"),
     Path("agent/go-service/viewportprobe/input_test.go"),
     Path("agent/go-service/viewportprobe/register.go"),
+    Path("agent/go-service/visitfriends/visitfriends_viewport_test.go"),
 )
 
 

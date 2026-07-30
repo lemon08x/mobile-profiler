@@ -145,6 +145,15 @@ def parse_maaend_log_line(line: str) -> list[dict[str, object]]:
                 }[status]
                 event["kind"] = f"{event_name}_{status_name}"
                 event["status"] = status
+                if node_match.group("event") == "PipelineNode":
+                    node_details = _as_dict(details.get("node_details"))
+                    resolved_name = str(node_details.get("name") or "").strip()
+                    if resolved_name:
+                        # `details.name` is the Pipeline cursor that selected the
+                        # node.  The node that actually completed lives in
+                        # `node_details.name` and may differ at natural tails
+                        # such as AutoCollectFinish -> AutoCollectEnd.
+                        event["resolved_name"] = resolved_name
             task_match = _TASK_MESSAGE_PATTERN.fullmatch(message)
             if task_match:
                 status = task_match.group(1).casefold()

@@ -29,7 +29,7 @@ index 1e1289f..57150ad 100644
      add_subdirectory(test/dlopen)
  endif()
 diff --git a/include/MaaFramework/MaaDef.h b/include/MaaFramework/MaaDef.h
-index 0bb9035..35d5acd 100644
+index 0bb9035..45af6e1 100644
 --- a/include/MaaFramework/MaaDef.h
 +++ b/include/MaaFramework/MaaDef.h
 @@ -187,6 +187,18 @@ enum MaaResOptionEnum
@@ -66,6 +66,103 @@ index 0bb9035..35d5acd 100644
  };
  
  typedef MaaOption MaaTaskerOption;
+@@ -577,6 +597,11 @@ typedef uint64_t MaaControllerFeature;
+ /// When set, ControllerAgent will skip coordinate scaling for touch operations.
+ #define MaaControllerFeature_NoScalingTouchPoints (1ULL << 2)
+ 
++/// Controller prefers its native swipe implementation even when explicit
++/// touch_down/touch_move/touch_up is available. Clicks and explicit touch
++/// contacts keep using the touch-capable transport.
++#define MaaControllerFeature_UseDirectSwipe (1ULL << 3)
++
+ typedef struct MaaRect
+ {
+     int32_t x;
+diff --git a/source/MaaAdbControlUnit/Manager/InputAgent.cpp b/source/MaaAdbControlUnit/Manager/InputAgent.cpp
+index 073b426..2d8bd01 100644
+--- a/source/MaaAdbControlUnit/Manager/InputAgent.cpp
++++ b/source/MaaAdbControlUnit/Manager/InputAgent.cpp
+@@ -86,6 +86,10 @@ InputAgent::InputAgent(MaaAdbInputMethod methods, const std::filesystem::path& a
+             continue;
+         }
+ 
++        if (method == Method::AdbShell) {
++            native_swipe_unit_ = unit;
++        }
++
+         children_.emplace_back(unit);
+         units_.emplace_back(method, unit);
+     }
+@@ -93,6 +97,8 @@ InputAgent::InputAgent(MaaAdbInputMethod methods, const std::filesystem::path& a
+ 
+ bool InputAgent::parse(const json::value& config)
+ {
++    prefer_native_swipe_ = config.get("extras", "native_swipe", "enable", false);
++
+     bool ret = false;
+     for (auto& unit : units_ | std::views::values) {
+         ret |= unit->parse(config);
+@@ -122,6 +128,17 @@ bool InputAgent::init()
+         return false;
+     }
+ 
++    if (prefer_native_swipe_) {
++        if (!native_swipe_unit_) {
++            LogWarn << "Native ADB swipe was requested, but AdbShell is unavailable";
++            prefer_native_swipe_ = false;
++        }
++        else if (native_swipe_unit_ != active_unit_ && !native_swipe_unit_->init()) {
++            LogWarn << "Native ADB swipe initialization failed; retaining the active touch transport";
++            prefer_native_swipe_ = false;
++        }
++    }
++
+     units_.clear();
+     return true;
+ }
+@@ -133,7 +150,11 @@ MaaControllerFeature InputAgent::get_features() const
+         return MaaControllerFeature_None;
+     }
+ 
+-    return active_unit_->get_features();
++    MaaControllerFeature features = active_unit_->get_features();
++    if (prefer_native_swipe_ && native_swipe_unit_) {
++        features |= MaaControllerFeature_UseDirectSwipe;
++    }
++    return features;
+ }
+ 
+ bool InputAgent::click(int x, int y)
+@@ -148,12 +169,13 @@ bool InputAgent::click(int x, int y)
+ 
+ bool InputAgent::swipe(int x1, int y1, int x2, int y2, int duration)
+ {
+-    if (!active_unit_) {
+-        LogError << "No available input method" << VAR(active_unit_);
++    const auto& unit = prefer_native_swipe_ ? native_swipe_unit_ : active_unit_;
++    if (!unit) {
++        LogError << "No available swipe method" << VAR(active_unit_) << VAR(native_swipe_unit_) << VAR(prefer_native_swipe_);
+         return false;
+     }
+ 
+-    return active_unit_->swipe(x1, y1, x2, y2, duration);
++    return unit->swipe(x1, y1, x2, y2, duration);
+ }
+ 
+ bool InputAgent::touch_down(int contact, int x, int y, int pressure)
+diff --git a/source/MaaAdbControlUnit/Manager/InputAgent.h b/source/MaaAdbControlUnit/Manager/InputAgent.h
+index 8f176d7..69bc000 100644
+--- a/source/MaaAdbControlUnit/Manager/InputAgent.h
++++ b/source/MaaAdbControlUnit/Manager/InputAgent.h
+@@ -52,6 +52,8 @@ public: // from ControlUnitSink
+ private:
+     std::vector<std::pair<Method, std::shared_ptr<InputBase>>> units_;
+     std::shared_ptr<InputBase> active_unit_;
++    std::shared_ptr<InputBase> native_swipe_unit_;
++    bool prefer_native_swipe_ = false;
+ };
+ 
+ MAA_CTRL_UNIT_NS_END
 diff --git a/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp b/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp
 index a839ebb..52d9c18 100644
 --- a/source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp
@@ -366,8 +463,40 @@ index cdebe18..f023476 100644
          if (val_size != sizeof(int32_t)) {
              LogError << "invalid val_size for int32_t option" << VAR(key) << VAR(val_size);
              return false;
+diff --git a/source/MaaAgentServer/RemoteInstance/RemoteTasker.cpp b/source/MaaAgentServer/RemoteInstance/RemoteTasker.cpp
+index 3954c8a..1b93783 100644
+--- a/source/MaaAgentServer/RemoteInstance/RemoteTasker.cpp
++++ b/source/MaaAgentServer/RemoteInstance/RemoteTasker.cpp
+@@ -171,6 +171,13 @@ bool RemoteTasker::stopping() const
+ 
+ MaaResource* RemoteTasker::resource() const
+ {
++    // Remote handles borrowed through the public C API must remain valid for
++    // the lifetime of their parent tasker. Replacing this unique_ptr on every
++    // accessor call left previously returned MaaResource pointers dangling.
++    if (resource_) {
++        return resource_.get();
++    }
++
+     TaskerResourceReverseRequest req {
+         .tasker_id = tasker_id_,
+     };
+@@ -185,6 +192,13 @@ MaaResource* RemoteTasker::resource() const
+ 
+ MaaController* RemoteTasker::controller() const
+ {
++    // MaaTaskerGetController returns a borrowed handle. Keep the proxy stable
++    // just as RemoteContext::tasker() does; otherwise a second accessor call
++    // destroys the proxy behind every earlier MaaController pointer.
++    if (controller_) {
++        return controller_.get();
++    }
++
+     TaskerControllerReverseRequest req {
+         .tasker_id = tasker_id_,
+     };
 diff --git a/source/MaaFramework/Controller/ControllerAgent.cpp b/source/MaaFramework/Controller/ControllerAgent.cpp
-index 7268d85..fd78fb3 100644
+index 7268d85..39b6441 100644
 --- a/source/MaaFramework/Controller/ControllerAgent.cpp
 +++ b/source/MaaFramework/Controller/ControllerAgent.cpp
 @@ -1,5 +1,8 @@
@@ -767,7 +896,7 @@ index 7268d85..fd78fb3 100644
  
      bool ret = true;
      if (control_unit_->get_features() & MaaControllerFeature_UseMouseDownAndUpInsteadOfClick) {
-@@ -483,7 +626,7 @@ bool ControllerAgent::handle_long_press(const LongPressParam& param)
+@@ -483,31 +626,33 @@ bool ControllerAgent::handle_long_press(const LongPressParam& param)
      return ret;
  }
  
@@ -776,7 +905,14 @@ index 7268d85..fd78fb3 100644
  {
      if (!control_unit_) {
          LogError << "control_unit_ is nullptr";
-@@ -495,7 +638,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+         return false;
+     }
+ 
+-    const bool use_touch_down_up = control_unit_->get_features() & MaaControllerFeature_UseMouseDownAndUpInsteadOfClick;
++    const MaaControllerFeature features = control_unit_->get_features();
++    const bool use_touch_down_up = features & MaaControllerFeature_UseMouseDownAndUpInsteadOfClick;
++    const bool use_direct_swipe = features & MaaControllerFeature_UseDirectSwipe;
+     if (!use_touch_down_up) {
          LogWarn << "touch not supported, use swipe instead. some features can not work";
      }
  
@@ -784,8 +920,9 @@ index 7268d85..fd78fb3 100644
 +    cv::Point begin = preproc_touch_point(param.begin, alignment);
      bool ret = !param.end.empty();
  
-     if (!param.only_hover && use_touch_down_up) {
-@@ -503,7 +646,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+-    if (!param.only_hover && use_touch_down_up) {
++    if (!param.only_hover && use_touch_down_up && !use_direct_swipe) {
+         ret &= control_unit_->touch_down(param.contact, begin.x, begin.y, param.pressure);
      }
  
      for (size_t i = 0; i < param.end.size(); ++i) {
@@ -794,7 +931,20 @@ index 7268d85..fd78fb3 100644
          const uint duration = param.duration.empty() ? 200 : (i < param.duration.size()) ? param.duration.at(i) : param.duration.back();
          const uint end_hold = param.end_hold.empty() ? 0 : (i < param.end_hold.size()) ? param.end_hold.at(i) : param.end_hold.back();
  
-@@ -550,7 +693,7 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+-        if (use_touch_down_up) {
++        if (use_touch_down_up && !use_direct_swipe) {
+             constexpr double kInterval = 10; // ms
+             const std::chrono::milliseconds delay(static_cast<int>(kInterval));
+ 
+@@ -543,14 +688,14 @@ bool ControllerAgent::handle_swipe(const SwipeParam& param)
+         begin = end;
+     }
+ 
+-    if (!param.only_hover && use_touch_down_up) {
++    if (!param.only_hover && use_touch_down_up && !use_direct_swipe) {
+         ret &= control_unit_->touch_up(param.contact);
+     }
+ 
      return ret;
  }
  
@@ -803,7 +953,7 @@ index 7268d85..fd78fb3 100644
  {
      if (!control_unit_) {
          LogError << "control_unit_ is nullptr";
-@@ -562,136 +705,169 @@ bool ControllerAgent::handle_multi_swipe(const MultiSwipeParam& param)
+@@ -562,136 +707,169 @@ bool ControllerAgent::handle_multi_swipe(const MultiSwipeParam& param)
          return false;
      }
  
@@ -1039,7 +1189,7 @@ index 7268d85..fd78fb3 100644
      bool ret = control_unit_->touch_move(param.contact, point.x, point.y, param.pressure);
  
      return ret;
-@@ -706,6 +882,11 @@ bool ControllerAgent::handle_touch_up(const TouchParam& param)
+@@ -706,6 +884,11 @@ bool ControllerAgent::handle_touch_up(const TouchParam& param)
  
      bool ret = control_unit_->touch_up(param.contact);
  
@@ -1051,7 +1201,7 @@ index 7268d85..fd78fb3 100644
      return ret;
  }
  
-@@ -862,14 +1043,14 @@ bool ControllerAgent::handle_key_up(const ClickKeyParam& param)
+@@ -862,14 +1045,14 @@ bool ControllerAgent::handle_key_up(const ClickKeyParam& param)
      return ret;
  }
  
@@ -1068,7 +1218,7 @@ index 7268d85..fd78fb3 100644
      if (!control_unit_->touch_move(0, point.x, point.y, 0)) {
          LogWarn << "Failed to move to scroll position" << VAR(point);
      }
-@@ -938,6 +1119,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+@@ -938,6 +1121,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
          { "uuid", get_uuid() },
          { "action", action.type },
          { "param", action.param },
@@ -1076,7 +1226,7 @@ index 7268d85..fd78fb3 100644
          { "info", control_unit_->get_info() },
      };
  
-@@ -953,23 +1135,23 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+@@ -953,23 +1137,23 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
          break;
  
      case Action::Type::click:
@@ -1106,7 +1256,7 @@ index 7268d85..fd78fb3 100644
          break;
      case Action::Type::touch_up:
          ret = handle_touch_up(std::get<TouchParam>(action.param));
-@@ -1005,7 +1187,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+@@ -1005,7 +1189,7 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
          break;
  
      case Action::Type::scroll:
@@ -1115,7 +1265,7 @@ index 7268d85..fd78fb3 100644
          break;
  
      case Action::Type::shell:
-@@ -1035,7 +1217,116 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
+@@ -1035,7 +1219,116 @@ bool ControllerAgent::run_action(typename AsyncRunner<Action>::Id id, Action act
      return ret;
  }
  
@@ -1233,7 +1383,7 @@ index 7268d85..fd78fb3 100644
  {
      if (control_unit_ && control_unit_->get_features() & MaaControllerFeature_NoScalingTouchPoints) {
          return p;
-@@ -1045,12 +1336,17 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
+@@ -1045,12 +1338,17 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
          LogWarn << "Invalid image target size" << VAR(image_target_width_) << VAR(image_target_height_);
  
          if (!init_scale_info()) {
@@ -1254,7 +1404,7 @@ index 7268d85..fd78fb3 100644
  
      int proced_x = static_cast<int>(std::round(p.x * scale_width));
      int proced_y = static_cast<int>(std::round(p.y * scale_height));
-@@ -1060,8 +1356,12 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
+@@ -1060,8 +1358,12 @@ cv::Point ControllerAgent::preproc_touch_point(const cv::Point& p)
  
  bool ControllerAgent::postproc_screenshot(const cv::Mat& raw)
  {
@@ -1267,7 +1417,7 @@ index 7268d85..fd78fb3 100644
          LogError << "Empty screenshot";
          return false;
      }
-@@ -1074,13 +1374,29 @@ bool ControllerAgent::postproc_screenshot(const cv::Mat& raw)
+@@ -1074,13 +1376,29 @@ bool ControllerAgent::postproc_screenshot(const cv::Mat& raw)
  
          if (!calc_target_image_size()) {
              image_ = cv::Mat();
@@ -1299,7 +1449,7 @@ index 7268d85..fd78fb3 100644
  }
  
  bool ControllerAgent::calc_target_image_size()
-@@ -1090,6 +1406,28 @@ bool ControllerAgent::calc_target_image_size()
+@@ -1090,6 +1408,28 @@ bool ControllerAgent::calc_target_image_size()
          return false;
      }
  
@@ -1328,7 +1478,7 @@ index 7268d85..fd78fb3 100644
      if (image_use_raw_size_) {
          LogDebug << "image_use_raw_size_" << VAR(image_raw_width_) << VAR(image_raw_height_);
          image_target_width_ = image_raw_width_;
-@@ -1138,6 +1476,9 @@ void ControllerAgent::clear_target_image_size()
+@@ -1138,6 +1478,9 @@ void ControllerAgent::clear_target_image_size()
  
      image_target_width_ = 0;
      image_target_height_ = 0;
@@ -1338,7 +1488,7 @@ index 7268d85..fd78fb3 100644
  }
  
  bool ControllerAgent::request_uuid()
-@@ -1158,6 +1499,53 @@ bool ControllerAgent::init_scale_info()
+@@ -1158,6 +1501,53 @@ bool ControllerAgent::init_scale_info()
      return handle_screencap();
  }
  
@@ -1392,7 +1542,7 @@ index 7268d85..fd78fb3 100644
  bool ControllerAgent::set_image_target_long_side(MaaOptionValue value, MaaOptionValueSize val_size)
  {
      LogDebug;
-@@ -1278,4 +1666,63 @@ bool ControllerAgent::set_background_managed_keys_option(MaaOptionValue value, M
+@@ -1278,4 +1668,63 @@ bool ControllerAgent::set_background_managed_keys_option(MaaOptionValue value, M
      return win32_unit->set_background_managed_keys_option(keycodes, count);
  }
  
@@ -2061,6 +2211,35 @@ index 5e733de..9f4fff1 100644
  
  export using ::MaaTaskerOption;
  export using ::MaaTaskerOptionEnum;
+diff --git a/test/agent/agent_child_test.py b/test/agent/agent_child_test.py
+index c643419..69d5e22 100644
+--- a/test/agent/agent_child_test.py
++++ b/test/agent/agent_child_test.py
+@@ -184,6 +184,12 @@ class MyRecognition(CustomRecognition):
+         # Resource API 测试 (通过 context.tasker.resource)
+         # ============================================================
+         resource = tasker.resource
++        resource_again = tasker.resource
++
++        # Borrowed remote handles must survive repeated accessor calls.
++        # Before this regression was fixed, resource_again destroyed the
++        # proxy referenced by resource and the next property access crashed.
++        assert resource_again.loaded == resource.loaded
+ 
+         # 测试 loaded (valid) 属性
+         print(f"  resource.loaded: {resource.loaded}")
+@@ -247,6 +253,11 @@ class MyAction(CustomAction):
+         # Controller API 测试 (通过 context.tasker.controller)
+         # ============================================================
+         controller = context.tasker.controller
++        controller_again = context.tasker.controller
++
++        # Keep using the first borrowed handle after a second lookup. This is
++        # the exact lifetime pattern used by MaaEnd's viewport-aware locator.
++        assert controller_again.info == controller.info
+ 
+         # 测试 connected 和 uuid
+         connected = controller.connected
 diff --git a/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp b/source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp
 new file mode 100644
 index 0000000..442aed1
@@ -2662,10 +2841,10 @@ index 0000000..57048bf
 +endif()
 diff --git a/test/viewport/controller.cpp b/test/viewport/controller.cpp
 new file mode 100644
-index 0000000..bbf86a5
+index 0000000..477d037
 --- /dev/null
 +++ b/test/viewport/controller.cpp
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,447 @@
 +#include <chrono>
 +#include <condition_variable>
 +#include <cstdlib>
@@ -3018,8 +3197,18 @@ index 0000000..bbf86a5
 +
 +    {
 +        std::unique_lock lock(state.mutex);
-+        state.features = MaaControllerFeature_UseMouseDownAndUpInsteadOfClick;
++        state.features = MaaControllerFeature_UseMouseDownAndUpInsteadOfClick | MaaControllerFeature_UseDirectSwipe;
 +    }
++    const size_t direct_swipe_offset = event_count(state);
++    check(
++        MaaControllerWait(controller, MaaControllerPostSwipeV2(controller, 640, 264, 600, 264, 70, 0, 1))
++            == MaaStatus_Succeeded,
++        "direct swipe succeeds while touch contacts remain available");
++    const auto direct_swipe_events = events_since(state, direct_swipe_offset);
++    check(
++        direct_swipe_events.size() == 2 && direct_swipe_events[0].type == "swipe_begin"
++            && direct_swipe_events[1].type == "swipe_end",
++        "direct swipe feature bypasses touch interpolation");
 +    MaaResource* resource = MaaResourceCreate();
 +    MaaTasker* tasker = MaaTaskerCreate();
 +    check(resource != nullptr && MaaResourceClear(resource), "create an empty valid resource for direct action tests");

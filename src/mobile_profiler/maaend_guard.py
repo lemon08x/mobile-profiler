@@ -768,7 +768,8 @@ def evaluate_terminal_contracts(
                 for row in structured_events
                 if isinstance(row, Mapping)
                 and row.get("kind") == "node_succeeded"
-                and str(row.get("name") or "") in terminal_nodes
+                and str(row.get("resolved_name") or row.get("name") or "")
+                in terminal_nodes
             ]
             correlated_terminal_events = [
                 row

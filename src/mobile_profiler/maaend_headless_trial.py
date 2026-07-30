@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Collection, Mapping, Sequence
 
 from .maaend_runtime import (
     _convert_preset_option_value,
@@ -55,6 +55,26 @@ _ADAPTIVE_ADB_PIPELINE_OVERRIDES: list[dict[str, object]] = [
                 "[JumpBack]SceneWaitLoadingExit",
                 "[JumpBack]__ScenePrivateAnyExit",
             ]
+        },
+        "__ScenePrivateWorldEnterMapAny": {
+            # The upstream 16:9 target [90,90,50,50] lands on the left edge
+            # of the phone minimap after Left-viewport mapping.  It only
+            # opened the map when the action's random point happened to fall
+            # inside the circular hit target.  The observed raw minimap
+            # center is (280,170) on a 2800x1260 display, which maps to
+            # logical (160,97) in the Left 2240x1260 viewport.  Keep the
+            # semantic InWorld recognition but use a deterministic interior
+            # target; AutoAltClickAction labels it Left before injection.
+            "action": {
+                "type": "Custom",
+                "param": {
+                    "custom_action": "AutoAltClickAction",
+                    "target": [145, 82, 30, 30],
+                    "custom_action_param": {
+                        "viewport_alignment": "left",
+                    },
+                },
+            }
         },
         "AdaptiveGuestTerminalExitToWorld": {
             "recognition": "OCR",
@@ -184,6 +204,77 @@ _ADAPTIVE_ADB_PIPELINE_OVERRIDES: list[dict[str, object]] = [
         }
     },
     {
+        "ProtocolSpaceOperationalManualFindProtocolSpaceNormalEnable": {
+            # The desktop OperatorEXP icon is rendered with different card
+            # artwork on Android (observed best score ~0.42), while both the
+            # card title and its row-local Go button remain stable.  Restrict
+            # both OCR signals to the first visible operator-progression row
+            # so the action cannot drift to another protocol-space entry.
+            "recognition": {
+                "type": "And",
+                "param": {
+                    "all_of": [
+                        {
+                            "recognition": {
+                                "type": "OCR",
+                                "param": {
+                                    "roi": [300, 130, 650, 180],
+                                    "expected": [
+                                        "协议空间.*干员进阶",
+                                        "協議空間.*幹員進階",
+                                        "(?i)Protocol\\s*Space.*Operator",
+                                    ],
+                                },
+                            }
+                        },
+                        {
+                            "recognition": {
+                                "type": "OCR",
+                                "param": {
+                                    "roi": [850, 150, 430, 180],
+                                    "expected": [
+                                        "前往",
+                                        "(?i)^Go$",
+                                        "進入",
+                                        "移動",
+                                        "이동",
+                                    ],
+                                },
+                            }
+                        },
+                    ],
+                    "box_index": 1,
+                },
+            },
+            "pre_delay": 0,
+            "action": "Click",
+            "post_wait_freezes": 400,
+            "post_delay": 0,
+            "next": ["ProtocolSpaceNormalPrepareEnter"],
+        },
+        "ProtocolSpaceNormalPrepareEnter": {
+            # Android keeps the semantic title but uses a wider header and a
+            # different glyph scale than the desktop 200x60 fixture.
+            "recognition": {
+                "type": "OCR",
+                "param": {
+                    "roi": [0, 0, 360, 90],
+                    "expected": [
+                        "协议空间",
+                        "協議空間",
+                        "(?i)Protocol\\s*Space",
+                        "協約空間",
+                        "프로토콜\\s*스페이스",
+                    ],
+                },
+            },
+            "pre_delay": 0,
+            "post_wait_freezes": 200,
+            "post_delay": 0,
+            "next": ["ProtocolSpaceLevelChoose"],
+        },
+    },
+    {
         "CheckLocalDepotNodeText": {
             "recognition": {
                 "type": "OCR",
@@ -309,6 +400,50 @@ _ADAPTIVE_ADB_PIPELINE_OVERRIDES: list[dict[str, object]] = [
         }
     },
     {
+        "InMapAny": {
+            # Both upstream templates have low-confidence lookalikes in the
+            # Android world HUD (0.72/0.75 on the current phone), so their
+            # conjunction can report that the map opened while it is still
+            # in the world. The map's top-left Mission Reminder label is a
+            # stable semantic signal and is absent from the world HUD. Keep
+            # MapMind as the independent right-side signal, but replace the
+            # collision-prone MapMissionReminder template with OCR.
+            "recognition": {
+                "type": "And",
+                "param": {
+                    "all_of": [
+                        {
+                            "recognition": {
+                                "type": "TemplateMatch",
+                                "param": {
+                                    "roi": [-350, 0, 350, 60],
+                                    "template": ["SceneManager/MapMind.png"],
+                                    "method": 10001,
+                                },
+                            }
+                        },
+                        {
+                            "recognition": {
+                                "type": "OCR",
+                                "param": {
+                                    "roi": [0, 0, 250, 100],
+                                    "expected": [
+                                        "事务提醒",
+                                        "事務提醒",
+                                        "Mission Reminder",
+                                        "Reminder",
+                                        "業務通知",
+                                        "업무 알림",
+                                    ],
+                                },
+                            }
+                        },
+                    ]
+                },
+            }
+        }
+    },
+    {
         "InMapDijiang": {
             "recognition": {
                 "type": "And",
@@ -335,14 +470,89 @@ _ADAPTIVE_ADB_PIPELINE_OVERRIDES: list[dict[str, object]] = [
     },
     {
         "__ScenePrivateMapTeleportConfirm": {
+            # On the ultrawide Android map the selected protocol point opens
+            # a wide, text-bearing button.  The upstream 94x102 icon template
+            # is not stable across the phone's UI scale: the button can be
+            # plainly visible while both template scores stay below 0.5.
+            # Keep the fast template path, then fall back to OCR within the
+            # same physical-right ROI.  The recognition result still carries
+            # the Right viewport alignment into the inherited Click action.
             "recognition": {
-                "type": "TemplateMatch",
+                "type": "Or",
                 "param": {
-                    "roi": [850, 550, 400, 170],
-                    "template": [
-                        "Common/Button/TeleportButton.png",
-                        "Common/Button/TeleportButtonHover.png",
+                    "any_of": [
+                        {
+                            "recognition": {
+                                "type": "TemplateMatch",
+                                "param": {
+                                    "roi": [850, 550, 430, 170],
+                                    "template": [
+                                        "Common/Button/TeleportButton.png",
+                                        "Common/Button/TeleportButtonHover.png",
+                                    ],
+                                },
+                            }
+                        },
+                        {
+                            "recognition": {
+                                "type": "OCR",
+                                "param": {
+                                    "roi": [850, 550, 430, 170],
+                                    "expected": [
+                                        "传送",
+                                        "傳送",
+                                        "(?i)Teleport",
+                                        "転送",
+                                        "전송",
+                                    ],
+                                },
+                            }
+                        },
                     ],
+                },
+            }
+        }
+    },
+    {
+        "__ScenePrivateMapTeleportSuccess": {
+            # WorldMenu.png and ProtosyncMenuButton.png are byte-identical.
+            # In the ultrawide Android map, the physical-right energy icon
+            # matches that template at >0.9 and used to end teleportation
+            # while the map was still open.  The regional-development button
+            # is a separate in-world HUD signal (0.95 on this phone) and is
+            # absent from all three map viewports, so use it as the adaptive
+            # teleport terminal gate.  Keep the upstream loading/freezes
+            # contract; this override replaces recognition only.
+            "recognition": {
+                "type": "And",
+                "param": {
+                    "all_of": ["RegionalDevelopmentButton"],
+                    "box_index": 0,
+                },
+            }
+        }
+    },
+    {
+        "AutoCollectRoute1AssertLocation": {
+            # The Wuling City 5 teleport is not a pixel-exact spawn.  On the
+            # adaptive Android viewport, two independent high-confidence
+            # minimap matches reported (660.6, 735.0), while the upstream
+            # half-open rectangle starts at x=663.  Preserve the map-name
+            # guard and expand the spawn rectangle by five map units on each
+            # side.  This is deliberately node-local: navigation checkpoints
+            # and assertions for other routes retain their authored bounds.
+            "recognition": {
+                "type": "Custom",
+                "param": {
+                    "custom_recognition": "MapTrackerAssertLocation",
+                    "custom_recognition_param": {
+                        "expected": [
+                            {
+                                "map_name": "map02_lv002",
+                                "target": [658, 728, 30, 30],
+                            }
+                        ]
+                    },
                 },
             }
         }
@@ -632,6 +842,20 @@ _ADAPTIVE_ADB_PIPELINE_OVERRIDES: list[dict[str, object]] = [
 ]
 
 
+# A cold Android launch may spend more than a minute compiling shaders.  The
+# upstream OpenGame loop recognizes its loading icon immediately and jumps
+# back without delay, which exhausts MaaFramework's Pipeline loop budget
+# before the phone reaches the title screen.  Keep the delay launch-scoped so
+# ordinary loading transitions in daily tasks remain fast.
+_ANDROID_OPEN_GAME_PIPELINE_OVERRIDES: list[dict[str, object]] = [
+    {
+        "WaitBlackScreen": {"post_delay": 5_000},
+        "WaitLoadingIcon": {"post_delay": 20_000},
+        "WaitLoadingText": {"post_delay": 10_000},
+    }
+]
+
+
 def _append_adaptive_adb_overrides(task_request: dict[str, object]) -> None:
     raw_override = task_request.get("pipeline_override", [])
     if isinstance(raw_override, str):
@@ -644,9 +868,68 @@ def _append_adaptive_adb_overrides(task_request: dict[str, object]) -> None:
         overrides = list(parsed)
     else:
         raise ValueError("MaaEnd task Pipeline override must be an object or list")
+    protocol_level_index = 4
+    if str(task_request.get("name") or "") == "ProtocolSpace":
+        for override in overrides:
+            if not isinstance(override, dict):
+                continue
+            node = override.get("ProtocolSpaceLevelChoose")
+            if not isinstance(node, dict):
+                continue
+            recognition = node.get("recognition")
+            if not isinstance(recognition, dict):
+                continue
+            param = recognition.get("param")
+            if not isinstance(param, dict):
+                continue
+            index = param.get("index")
+            if isinstance(index, int) and 0 <= index <= 4:
+                protocol_level_index = index
+
     overrides.extend(
         json.loads(json.dumps(row)) for row in _ADAPTIVE_ADB_PIPELINE_OVERRIDES
     )
+    if str(task_request.get("name") or "") == "ProtocolSpace":
+        level_names = ["一级", "二级", "三级", "四级", "五级"]
+        traditional_level_names = ["一級", "二級", "三級", "四級", "五級"]
+        level_number = protocol_level_index + 1
+        overrides.append(
+            {
+                "ProtocolSpaceLevelChoose": {
+                    # Android renders a different 22px completion glyph, so
+                    # the desktop templates peak around 0.60.  Preserve the
+                    # configured upstream level index and select its visible
+                    # semantic label instead.
+                    "recognition": {
+                        "type": "OCR",
+                        "param": {
+                            "roi": [0, 80, 380, 440],
+                            "expected": [
+                                f"^{level_names[protocol_level_index]}$",
+                                f"^{traditional_level_names[protocol_level_index]}$",
+                                f"(?i)^Level\\s*{level_number}$",
+                            ],
+                        },
+                    },
+                    "pre_delay": 0,
+                    "action": "Click",
+                    "post_wait_freezes": 200,
+                    "post_delay": 0,
+                    # The reward set is persisted by the game.  Skipping the
+                    # desktop-only picker removes an unrelated modal from the
+                    # stamina sink while retaining the selected level.
+                    "next": [
+                        "ProtocolSpacePrepareLock",
+                        "ProtocolSpaceEnterSpace",
+                    ],
+                }
+            }
+        )
+    if str(task_request.get("name") or "") == "AndroidOpenGame":
+        overrides.extend(
+            json.loads(json.dumps(row))
+            for row in _ANDROID_OPEN_GAME_PIPELINE_OVERRIDES
+        )
     task_request["pipeline_override"] = json.dumps(
         overrides,
         ensure_ascii=False,
@@ -759,6 +1042,7 @@ def resolve_headless_tasks(
     runtime_root: Path,
     task_names: Sequence[str],
     options_by_task: Mapping[str, object],
+    experimental_adb_tasks: Collection[str] = (),
 ) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
     if not task_names:
         raise ValueError("至少需要一个 MaaEnd 任务")
@@ -778,13 +1062,24 @@ def resolve_headless_tasks(
     unknown_options = sorted(set(options_by_task) - set(task_names))
     if unknown_options:
         raise ValueError("为未选择任务提供了选项: " + ", ".join(unknown_options))
+    experimental = {
+        str(name).strip() for name in experimental_adb_tasks if str(name).strip()
+    }
+    unselected_experimental = sorted(experimental - set(task_names))
+    if unselected_experimental:
+        raise ValueError(
+            "实验 ADB 放行只能指向本次选中的任务: "
+            + ", ".join(unselected_experimental)
+        )
     configurations: list[dict[str, object]] = []
     for name in task_names:
         definition = definitions.get(name)
         if definition is None:
             raise ValueError(f"MaaEnd 任务不存在: {name}")
         controllers = definition.get("controller")
-        if not isinstance(controllers, list) or "ADB" not in controllers:
+        if (
+            not isinstance(controllers, list) or "ADB" not in controllers
+        ) and name not in experimental:
             raise ValueError(f"MaaEnd 任务未声明支持 ADB: {name}")
         raw_values = options_by_task.get(name, {})
         if not isinstance(raw_values, dict):
@@ -822,7 +1117,6 @@ def resolve_headless_tasks(
     )
     for request, row in zip(requests, metadata):
         request["name"] = row["name"]
-        _append_adaptive_adb_overrides(request)
     return interface, requests, metadata
 
 
@@ -837,12 +1131,14 @@ def build_headless_request(
     options_by_task: Mapping[str, object],
     max_seconds: float,
     continue_on_failure: bool,
+    experimental_adb_tasks: Collection[str] = (),
 ) -> dict[str, object]:
     validate_maaend_runtime(runtime_root)
     interface, requests, metadata = resolve_headless_tasks(
         runtime_root,
         task_names,
         options_by_task,
+        experimental_adb_tasks,
     )
     resource_name = next(
         (
@@ -901,6 +1197,11 @@ def build_headless_request(
         "starts_upstream_ui": False,
         "changes_display_resolution": False,
         "installs_device_client": False,
+        "experimental_adb_tasks": sorted(
+            str(name).strip()
+            for name in experimental_adb_tasks
+            if str(name).strip()
+        ),
     }
 
 
@@ -914,6 +1215,15 @@ def _parser() -> argparse.ArgumentParser:
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--task", action="append")
     selection.add_argument("--preset")
+    parser.add_argument(
+        "--allow-undeclared-adb-task",
+        action="append",
+        default=[],
+        help=(
+            "Explicitly allow one selected task whose upstream Project Interface "
+            "does not yet declare ADB support; the task name is recorded in request.json"
+        ),
+    )
     parser.add_argument("--options-file", type=Path)
     parser.add_argument("--max-seconds", type=float, default=1800.0)
     parser.add_argument("--stop-on-failure", action="store_true")
@@ -956,6 +1266,7 @@ def main() -> int:
         options_by_task=options_by_task,
         max_seconds=args.max_seconds,
         continue_on_failure=not args.stop_on_failure,
+        experimental_adb_tasks=args.allow_undeclared_adb_task,
     )
     if args.preset:
         request["preset_name"] = args.preset

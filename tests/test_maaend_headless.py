@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
+import pytest
+
+import mobile_profiler.maaend_headless_trial as maaend_headless_trial
 from mobile_profiler.maaend_headless_host import (
     _TaskOutcomeTracker,
     _effective_task_status,
     _validate_task_terminal,
     _wait_job,
+    _with_native_adb_swipe,
 )
 from mobile_profiler.maaend_headless_trial import (
     _append_adaptive_adb_overrides,
     expand_headless_preset,
+    resolve_headless_tasks,
 )
 
 
@@ -33,6 +39,21 @@ class _DelayedTerminalJob:
 class _DiscardingEvents:
     def emit(self, *_args: object, **_kwargs: object) -> None:
         return None
+
+
+def test_native_adb_swipe_config_preserves_existing_extras() -> None:
+    original = {"extras": {"androws": {"enable": True}}, "command": {}}
+
+    configured = _with_native_adb_swipe(original, enabled=True)
+
+    assert configured == {
+        "extras": {
+            "androws": {"enable": True},
+            "native_swipe": {"enable": True},
+        },
+        "command": {},
+    }
+    assert original == {"extras": {"androws": {"enable": True}}, "command": {}}
 
 
 def test_wait_job_prefers_terminal_state_during_stop_race() -> None:
@@ -84,6 +105,48 @@ def test_expand_headless_preset_converts_upstream_option_values() -> None:
 
     assert names == ["TaskA"]
     assert options == {"TaskA": {"Feature": {"type": "switch", "value": False}}}
+
+
+def test_undeclared_adb_task_requires_per_task_experimental_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interface = {
+        "task": [
+            {
+                "name": "ProtocolSpace",
+                "controller": ["Win32"],
+                "option": [],
+            }
+        ],
+        "option": {},
+        "resource": [{"name": "CN"}],
+    }
+    monkeypatch.setattr(
+        maaend_headless_trial,
+        "_load_interface_bundle",
+        lambda _root: interface,
+    )
+    monkeypatch.setattr(
+        maaend_headless_trial,
+        "_mxu_task_requests",
+        lambda _interface, _config, _profile: (
+            [{"entry": "ProtocolSpaceSchedule", "pipeline_override": "[]"}],
+            [{"name": "ProtocolSpace"}],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="未声明支持 ADB"):
+        resolve_headless_tasks(Path("runtime"), ["ProtocolSpace"], {})
+
+    _, requests, metadata = resolve_headless_tasks(
+        Path("runtime"),
+        ["ProtocolSpace"],
+        {},
+        experimental_adb_tasks=["ProtocolSpace"],
+    )
+
+    assert requests[0]["name"] == "ProtocolSpace"
+    assert metadata == [{"name": "ProtocolSpace"}]
 
 
 def test_pipeline_failure_overrides_succeeded_framework_job() -> None:
@@ -313,6 +376,14 @@ def test_adaptive_overrides_replace_cross_viewport_region_scene_contract() -> No
     assert by_node["AdaptiveGuestTerminalExitToWorld"]["custom_action"] == (
         "VisitFriendsMenuTerminalExitAction"
     )
+    assert by_node["__ScenePrivateWorldEnterMapAny"]["action"] == {
+        "type": "Custom",
+        "param": {
+            "custom_action": "AutoAltClickAction",
+            "target": [145, 82, 30, 30],
+            "custom_action_param": {"viewport_alignment": "left"},
+        },
+    }
     assert "target" not in by_node["AdaptiveGuestWorldExitToOwnWorld"]
     assert by_node["AdaptiveGuestVisitEndConfirm"]["roi"] == [
         450,
@@ -399,12 +470,53 @@ def test_adaptive_overrides_replace_cross_viewport_region_scene_contract() -> No
     assert by_node["__CloseButtonType1"]["recognition"]["param"][
         "roi"
     ] == [1050, 0, 230, 120]
+    assert by_node["InMapAny"]["recognition"] == {
+        "type": "And",
+        "param": {
+            "all_of": [
+                {
+                    "recognition": {
+                        "type": "TemplateMatch",
+                        "param": {
+                            "roi": [-350, 0, 350, 60],
+                            "template": ["SceneManager/MapMind.png"],
+                            "method": 10001,
+                        },
+                    }
+                },
+                {
+                    "recognition": {
+                        "type": "OCR",
+                        "param": {
+                            "roi": [0, 0, 250, 100],
+                            "expected": [
+                                "事务提醒",
+                                "事務提醒",
+                                "Mission Reminder",
+                                "Reminder",
+                                "業務通知",
+                                "업무 알림",
+                            ],
+                        },
+                    }
+                },
+            ]
+        },
+    }
     assert "帝江号" in by_node["InMapDijiang"]["recognition"]["param"][
         "all_of"
     ][1]["recognition"]["param"]["expected"]
-    assert by_node["__ScenePrivateMapTeleportConfirm"]["recognition"]["param"][
-        "roi"
-    ] == [850, 550, 400, 170]
+    teleport_confirm = by_node["__ScenePrivateMapTeleportConfirm"]["recognition"]
+    assert teleport_confirm["type"] == "Or"
+    teleport_paths = teleport_confirm["param"]["any_of"]
+    assert [
+        item["recognition"]["type"] for item in teleport_paths
+    ] == ["TemplateMatch", "OCR"]
+    assert all(
+        item["recognition"]["param"]["roi"] == [850, 550, 430, 170]
+        for item in teleport_paths
+    )
+    assert "传送" in teleport_paths[1]["recognition"]["param"]["expected"]
     assert by_node["InReceptionRoom"]["recognition"]["param"]["roi"] == [
         0,
         0,
@@ -526,4 +638,124 @@ def test_adaptive_overrides_replace_cross_viewport_region_scene_contract() -> No
     assert by_node["ProdManualBackAtProd"]["recognition"]["param"] == {
         "all_of": ["CloseButtonType1"],
         "box_index": 0,
+    }
+
+
+def test_cold_launch_loading_delay_is_scoped_to_android_open_game() -> None:
+    launch: dict[str, object] = {
+        "name": "AndroidOpenGame",
+        "pipeline_override": "[]",
+    }
+    daily: dict[str, object] = {
+        "name": "DailyRewards",
+        "pipeline_override": "[]",
+    }
+
+    _append_adaptive_adb_overrides(launch)
+    _append_adaptive_adb_overrides(daily)
+
+    launch_nodes = {
+        name: definition
+        for override in __import__("json").loads(str(launch["pipeline_override"]))
+        for name, definition in override.items()
+    }
+    daily_nodes = {
+        name: definition
+        for override in __import__("json").loads(str(daily["pipeline_override"]))
+        for name, definition in override.items()
+    }
+    assert launch_nodes["WaitBlackScreen"]["post_delay"] == 5_000
+    assert launch_nodes["WaitLoadingIcon"]["post_delay"] == 20_000
+    assert launch_nodes["WaitLoadingText"]["post_delay"] == 10_000
+    assert "WaitLoadingIcon" not in daily_nodes
+
+
+def test_protocol_space_android_override_preserves_selected_level() -> None:
+    request: dict[str, object] = {
+        "name": "ProtocolSpace",
+        "pipeline_override": __import__("json").dumps(
+            [
+                {
+                    "ProtocolSpaceLevelChoose": {
+                        "recognition": {"param": {"index": 1}}
+                    }
+                }
+            ]
+        ),
+    }
+
+    _append_adaptive_adb_overrides(request)
+
+    nodes = {
+        name: definition
+        for override in __import__("json").loads(str(request["pipeline_override"]))
+        for name, definition in override.items()
+    }
+    assert nodes["ProtocolSpaceOperationalManualFindProtocolSpaceNormalEnable"][
+        "recognition"
+    ]["param"]["all_of"][0]["recognition"]["param"]["expected"] == [
+        "协议空间.*干员进阶",
+        "協議空間.*幹員進階",
+        "(?i)Protocol\\s*Space.*Operator",
+    ]
+    assert nodes["ProtocolSpaceLevelChoose"]["recognition"]["param"] == {
+        "roi": [0, 80, 380, 440],
+        "expected": ["^二级$", "^二級$", "(?i)^Level\\s*2$"],
+    }
+    assert nodes["ProtocolSpaceLevelChoose"]["next"] == [
+        "ProtocolSpacePrepareLock",
+        "ProtocolSpaceEnterSpace",
+    ]
+
+
+def test_adaptive_teleport_success_uses_world_only_hud_signal() -> None:
+    request: dict[str, object] = {
+        "name": "AutoCollect",
+        "pipeline_override": "[]",
+    }
+
+    _append_adaptive_adb_overrides(request)
+
+    nodes = {
+        name: definition
+        for override in __import__("json").loads(str(request["pipeline_override"]))
+        for name, definition in override.items()
+    }
+    recognition = nodes["__ScenePrivateMapTeleportSuccess"]["recognition"]
+    assert recognition == {
+        "type": "And",
+        "param": {
+            "all_of": ["RegionalDevelopmentButton"],
+            "box_index": 0,
+        },
+    }
+
+
+def test_adaptive_auto_collect_route1_accepts_observed_spawn_jitter() -> None:
+    request: dict[str, object] = {
+        "name": "AutoCollect",
+        "pipeline_override": "[]",
+    }
+
+    _append_adaptive_adb_overrides(request)
+
+    nodes = {
+        name: definition
+        for override in __import__("json").loads(str(request["pipeline_override"]))
+        for name, definition in override.items()
+    }
+    recognition = nodes["AutoCollectRoute1AssertLocation"]["recognition"]
+    assert recognition == {
+        "type": "Custom",
+        "param": {
+            "custom_recognition": "MapTrackerAssertLocation",
+            "custom_recognition_param": {
+                "expected": [
+                    {
+                        "map_name": "map02_lv002",
+                        "target": [658, 728, 30, 30],
+                    }
+                ]
+            },
+        },
     }

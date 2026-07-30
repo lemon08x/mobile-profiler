@@ -40,6 +40,12 @@ $GoBindingPatch = Join-Path $RepositoryRoot `
 $Framework = (Resolve-Path -LiteralPath $FrameworkSource).Path
 $MaaEnd = (Resolve-Path -LiteralPath $MaaEndSource).Path
 $GoBinding = (Resolve-Path -LiteralPath $GoBindingSource).Path
+if ($GoExecutable) {
+    # Launch-VsDevShell may change the current directory. Resolve caller-provided
+    # relative paths before entering the developer shell so the Go tool remains
+    # stable for the later test and build stages.
+    $GoExecutable = (Resolve-Path -LiteralPath $GoExecutable).Path
+}
 
 function Invoke-Checked {
     param(
@@ -277,6 +283,15 @@ Invoke-Checked -Description "MaaEnd C++ Agent configuration" -Command {
         -DCMAKE_BUILD_TYPE=Release `
         -DMAADEPS_TRIPLET=maa-x64-windows `
         "-DDEPS_DIR=$FrameworkInstallDirectory"
+}
+# The upstream C++ target has generated and vendored headers whose dependency
+# edges are not complete in every configuration.  An incremental build once
+# linked objects compiled against different public controller layouts and
+# crashed at Agent startup.  Always clean this isolated build directory before
+# compiling the deployable agent so a public-header change cannot create a
+# mixed ABI binary.
+Invoke-Checked -Description "MaaEnd C++ Agent clean" -Command {
+    & $CMake --build $CppBuildDirectory --target clean
 }
 Invoke-Checked -Description "MaaEnd C++ Agent build" -Command {
     & $CMake --build $CppBuildDirectory --target cpp-algo --parallel

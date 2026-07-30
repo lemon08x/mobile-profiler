@@ -1304,20 +1304,29 @@ def _mxu_task_requests(
         option_values = row.get("option_values")
         if not isinstance(option_values, dict):
             option_values = {}
-        requests.append(
-            {
-                "entry": entry,
-                "pipeline_override": _task_pipeline_override(
-                    interface,
-                    definition,
-                    option_values,
-                    global_values,
-                    controller_name="ADB",
-                    resource_name=resource_name,
-                ),
-                "selected_task_id": selected_id,
-            }
-        )
+        request: dict[str, object] = {
+            "entry": entry,
+            "pipeline_override": _task_pipeline_override(
+                interface,
+                definition,
+                option_values,
+                global_values,
+                controller_name="ADB",
+                resource_name=resource_name,
+            ),
+            "selected_task_id": selected_id,
+            "name": task_name,
+        }
+        # The MXU API runner and the direct headless host must submit the same
+        # real-device compatibility contract.  Import lazily because the
+        # headless resolver already builds on this runtime module; at request
+        # generation time both modules are fully initialized.  Keeping the
+        # transform in one place prevents a true-device fix from existing in
+        # direct-host tests while being absent from the production MXU path.
+        from .maaend_headless_trial import _append_adaptive_adb_overrides
+
+        _append_adaptive_adb_overrides(request)
+        requests.append(request)
         metadata.append(
             {
                 "id": selected_id,

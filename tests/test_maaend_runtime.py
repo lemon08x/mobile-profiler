@@ -893,6 +893,42 @@ class MaaEndRuntimeTests(unittest.TestCase):
             [70, 10, 150, 60],
         )
 
+    def test_mxu_requests_share_direct_host_adaptive_overrides(self) -> None:
+        requests, metadata = maaend_runtime._mxu_task_requests(
+            {
+                "task": [{"name": "AutoCollect", "entry": "AutoCollectSchedule"}],
+                "option": {},
+            },
+            {"globalOptionValues": {}},
+            {
+                "resource": "Official",
+                "task_configurations": [
+                    {
+                        "name": "AutoCollect",
+                        "enabled": True,
+                        "option_values": {},
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(metadata[0]["name"], "AutoCollect")
+        self.assertEqual(requests[0]["name"], "AutoCollect")
+        overrides = json.loads(requests[0]["pipeline_override"])
+        teleport = next(
+            row["__ScenePrivateMapTeleportConfirm"]
+            for row in reversed(overrides)
+            if "__ScenePrivateMapTeleportConfirm" in row
+        )
+        self.assertEqual(teleport["recognition"]["type"], "Or")
+        self.assertEqual(
+            [
+                item["recognition"]["type"]
+                for item in teleport["recognition"]["param"]["any_of"]
+            ],
+            ["TemplateMatch", "OCR"],
+        )
+
     def test_preflight_accepts_adb_profile_and_persists_adapter_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

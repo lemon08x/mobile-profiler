@@ -56,6 +56,26 @@ _TASK_TERMINAL_NODES: dict[str, frozenset[str]] = {
 }
 
 
+def _with_native_adb_swipe(
+    raw_config: Mapping[str, object], *, enabled: bool
+) -> dict[str, object]:
+    """Select ADB shell for swipes without giving up MaaTouch contacts."""
+
+    config = dict(raw_config)
+    raw_extras = config.get("extras")
+    extras = dict(raw_extras) if isinstance(raw_extras, Mapping) else {}
+    raw_native_swipe = extras.get("native_swipe")
+    native_swipe = (
+        dict(raw_native_swipe)
+        if isinstance(raw_native_swipe, Mapping)
+        else {}
+    )
+    native_swipe["enable"] = enabled
+    extras["native_swipe"] = native_swipe
+    config["extras"] = extras
+    return config
+
+
 class _TaskOutcomeTracker:
     """Collect semantic task outcomes that MaaStatus alone does not expose.
 
@@ -662,6 +682,15 @@ def run_request(request: Mapping[str, object]) -> dict[str, object]:
         if not input_methods & _GENERIC_INPUT_METHODS:
             input_methods = _GENERIC_INPUT_METHODS
             generic_fallback = True
+        # This physical-device fallback keeps MaaTouch for explicit contacts
+        # and multi-touch, but routes ordinary swipes through Android's native
+        # `input swipe`. Endfield accepts the latter for camera/joystick drags
+        # while silently ignoring the otherwise successful MaaTouch sequence.
+        native_swipe_enabled = generic_fallback and bool(input_methods & 1)
+        controller_config = _with_native_adb_swipe(
+            matched.config,
+            enabled=native_swipe_enabled,
+        )
         result["adb"] = {
             "name": matched.name,
             "path": str(matched.adb_path),
@@ -671,6 +700,7 @@ def run_request(request: Mapping[str, object]) -> dict[str, object]:
             "screencap_methods": screencap_methods,
             "input_methods": input_methods,
             "generic_fallback": generic_fallback,
+            "native_swipe_enabled": native_swipe_enabled,
         }
         events.emit("host", "adb.selected", result["adb"])
 
@@ -679,7 +709,7 @@ def run_request(request: Mapping[str, object]) -> dict[str, object]:
             address=matched.address,
             screencap_methods=screencap_methods,
             input_methods=input_methods,
-            config=matched.config,
+            config=controller_config,
             agent_path=binary_root / "MaaAgentBinary",
         )
         if not controller.set_screenshot_target_short_side(720):

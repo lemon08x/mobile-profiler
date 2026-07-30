@@ -102,19 +102,28 @@ function Copy-And-Verify {
         [Parameter(Mandatory = $true)][string]$Destination
     )
     Assert-File $Source
-    Copy-Item -LiteralPath $Source -Destination $Destination -Force
-    $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Source).Hash
+    $ResolvedSource = (Resolve-Path -LiteralPath $Source).Path
+    $ResolvedDestination = [System.IO.Path]::GetFullPath($Destination)
+    $SamePath = $ResolvedSource.Equals(
+        $ResolvedDestination,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if (-not $SamePath) {
+        Copy-Item -LiteralPath $ResolvedSource -Destination $ResolvedDestination -Force
+    }
+    $SourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ResolvedSource).Hash
     $DestinationHash = (
-        Get-FileHash -Algorithm SHA256 -LiteralPath $Destination
+        Get-FileHash -Algorithm SHA256 -LiteralPath $ResolvedDestination
     ).Hash
     if ($SourceHash -ne $DestinationHash) {
-        throw "Deployment hash mismatch: $Destination"
+        throw "Deployment hash mismatch: $ResolvedDestination"
     }
     [pscustomobject]@{
-        file = [System.IO.Path]::GetFileName($Destination)
-        destination = $Destination
+        file = [System.IO.Path]::GetFileName($ResolvedDestination)
+        destination = $ResolvedDestination
         sha256 = $DestinationHash
         verified = $true
+        copied = -not $SamePath
     }
 }
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-07-30T03:00:02.819346+08:00",
+  "updated_at": "2026-07-30T18:43:30.141855+08:00",
   "issues": [
     {
       "id": "MAAEND-VIEW-001",
@@ -279,18 +279,19 @@
       "status": "open",
       "severity": "high",
       "first_seen": "2026-07-27T00:00:00+08:00",
-      "last_seen": "2026-07-30T02:32:43+08:00",
-      "occurrences": 4,
+      "last_seen": "2026-07-30T18:40:00+08:00",
+      "occurrences": 5,
       "symptoms": [
         "底层 alignment、Agent session、风险清单、Probe、watchdog 和可回滚构建已完成离线验证",
         "AndroidOpenGame、DailyRewards、DijiangRewards、VisitFriends、ReceiveProdManual、SellProduct、DeliveryJobs、AutoStockStaple 和 CreditShoppingN2 已分别达到真机自然终点",
-        "AutoCollect、EnvironmentMonitoring 及 12 项 DailyFull 组合尚未取得完整自然终点证据"
+        "AutoCollect、EnvironmentMonitoring 及 12 项 DailyFull 组合尚未取得完整自然终点证据",
+        "ProtocolSpace 已在真机手工触控闭环中完成一次战斗，但尚未由 headless Pipeline 自主完成入场、战斗、领奖、体力扣除和活跃度核验"
       ],
       "observations": [
         {
           "source": "codex/open-source-automation-draft verification gate",
-          "occurrence_count": 4,
-          "last_seen": "2026-07-30T02:32:43+08:00"
+          "occurrence_count": 5,
+          "last_seen": "2026-07-30T18:40:00+08:00"
         }
       ],
       "fix": null,
@@ -382,6 +383,64 @@
         "preflight must distinguish missing USB ADB interface from a driver-binding failure",
         "the operator recovery instruction must request File Transfer or Android Auto without changing display resolution",
         "ro.serialno must match the expected device identity in the managed run manifest before resuming automation"
+      ]
+    },
+    {
+      "id": "MAAEND-PROTOCOL-001",
+      "fingerprint": "maaend:protocol-space-desktop-character-controller-on-adb:v1",
+      "title": "协议空间寻点流程仍使用桌面角色控制语义，ADB 无法自主进入战斗",
+      "area": "protocol-space-navigation",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-30T17:54:00+08:00",
+      "last_seen": "2026-07-30T18:25:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游 ProtocolSpaceEnterSpaceMove1..8 调用 CharacterControllerForwardAxisAction，后续找点依赖桌面相对鼠标与键盘移动；ADB 路径没有对应的 Left 摇杆和 Right 相机动作",
+        "真机可用上游 ProtocolSpace/best.onnx 稳定识别 class 1 光点；Right 相机对齐后，以 Left 摇杆 200 ms 步进靠近，在第 9 至 10 步出现“触碰”交互条",
+        "持续移动会越过光点并丢失交互提示，因此动作终点必须以提示出现为准，不能只依赖固定时长或检测框距离"
+      ],
+      "observations": [
+        {
+          "source": ".codex-research/captures/protocol-point-found.png and protocol-approach9.png",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T18:25:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "ProtocolSpace entry must use Right camera and Left joystick viewport-labelled touch actions on ADB",
+        "the point-search loop must stop on the mobile Touch prompt before advancing another movement step",
+        "the headless Pipeline must reach ProtocolSpaceFightStartSuccess without raw ADB input outside the wrapper"
+      ]
+    },
+    {
+      "id": "MAAEND-FIGHT-001",
+      "fingerprint": "maaend:autofight-desktop-keymap-on-adb:v1",
+      "title": "AutoFight 仍绑定桌面键鼠，手机战斗缺少可审计的触控动作与终点",
+      "area": "autofight-adb",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-30T18:25:00+08:00",
+      "last_seen": "2026-07-30T18:40:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游 AutoFight 的锁定、普攻、技能、切人、闪避和追敌动作仍落到桌面 KeyDown、KeyUp、Click 与 RelativeMove",
+        "真机 HUD 上用锁定、普攻、两个可用技能和闪避的触控循环可在本轮击败 4 名敌人并进入奖励组选择页，证明战斗可行，但该序列尚未进入 Agent wrapper，也没有技能就绪识别和低血量策略",
+        "本轮未完成奖励领取、体力扣除与活跃度回读，因此不能把战斗胜利或奖励组弹窗记为完整 ProtocolSpace 自然终点"
+      ],
+      "observations": [
+        {
+          "source": ".codex-research/captures/protocol-battle-start.png and protocol-converge.png",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T18:40:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "ADB AutoFight actions must be emitted by a Right-viewport touch wrapper and must not use the desktop keymap",
+        "battle watchdog must sample the timer and objective progress while preserving time for input",
+        "ProtocolSpace terminal success requires battle victory, reward claim confirmation, stamina delta and released contacts"
       ]
     }
   ]

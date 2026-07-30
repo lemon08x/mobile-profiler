@@ -23,6 +23,35 @@ def watchdogs(**overrides: object) -> dict[str, object]:
 
 
 class MaaEndMonitorTests(unittest.TestCase):
+    def test_parser_preserves_resolved_pipeline_terminal_name(self) -> None:
+        details = {
+            "name": "AutoCollectFinish",
+            "task_id": 200000001,
+            "node_id": 300000062,
+            "node_details": {
+                "name": "AutoCollectEnd",
+                "node_id": 300000062,
+                "completed": True,
+            },
+            "reco_details": {
+                "name": "AutoCollectEnd",
+                "algorithm": "DirectHit",
+                "viewport_alignment": "center",
+                "frame_id": 207,
+            },
+        }
+        line = (
+            "[TRC] [message=Node.PipelineNode.Succeeded] "
+            f"[details_json={json.dumps(details, separators=(',', ':'))}] "
+            "[trans_arg=true]"
+        )
+
+        event = parse_maaend_log_line(line)[0]
+
+        self.assertEqual(event["kind"], "node_succeeded")
+        self.assertEqual(event["name"], "AutoCollectFinish")
+        self.assertEqual(event["resolved_name"], "AutoCollectEnd")
+
     def test_parser_extracts_viewport_and_controller_coordinate_evidence(self) -> None:
         viewport_line = json.dumps(
             {

@@ -477,6 +477,38 @@ class MaaEndGuardTests(unittest.TestCase):
 
         self.assertTrue(result["verified"])
 
+    def test_pipeline_terminal_uses_resolved_node_name(self) -> None:
+        policy = load_maaend_guard_policy()
+        result = evaluate_terminal_contracts(
+            policy,
+            [
+                {
+                    "name": "AutoCollect",
+                    "status": "succeeded",
+                    "maa_task_id": 200000001,
+                }
+            ],
+            terminal_screenshot={"width": 1280, "height": 720},
+            viewport_evidence={},
+            structured_events=[
+                {
+                    "kind": "task_succeeded",
+                    "entry": "AutoCollectSchedule",
+                    "task_id": 200000001,
+                },
+                {
+                    "kind": "node_succeeded",
+                    "name": "AutoCollectFinish",
+                    "resolved_name": "AutoCollectEnd",
+                    "task_id": 200000001,
+                },
+            ],
+            active_contacts=[],
+            blocking_incidents=[],
+        )
+
+        self.assertTrue(result["verified"])
+
     def test_internal_probe_terminal_contracts_require_labeled_evidence(self) -> None:
         policy = load_maaend_guard_policy()
         screenshot = {"width": 1280, "height": 720}

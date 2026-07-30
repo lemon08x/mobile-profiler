@@ -100,6 +100,27 @@ class MaaEndDeployTests(unittest.TestCase):
             for destination, old in destinations.items():
                 self.assertNotEqual(destination.read_bytes(), old)
 
+            same_path_deploy = self._run_script(
+                script,
+                "Deploy",
+                runtime,
+                "-FrameworkBin",
+                framework,
+                "-AgentExecutable",
+                artifacts / "go-service.exe",
+                "-CppAgentExecutable",
+                artifacts / "cpp-algo.exe",
+                "-MxuConfig",
+                runtime_config,
+                "-InterfaceFile",
+                runtime_interface,
+            )
+            same_path_rows = {
+                Path(row["destination"]): row for row in same_path_deploy["files"]
+            }
+            self.assertFalse(same_path_rows[runtime_config]["copied"])
+            self.assertFalse(same_path_rows[runtime_interface]["copied"])
+
             rollback = self._run_script(
                 script,
                 "Rollback",

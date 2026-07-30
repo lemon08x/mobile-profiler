@@ -127,12 +127,14 @@ def audit_maaframework_source(source_root: Path) -> dict[str, object]:
     transform_name = "source/MaaFramework/Controller/ViewportTransform.cpp"
     screencap_name = "source/MaaAdbControlUnit/Manager/ScreencapAgent.cpp"
     failover_name = "source/MaaAdbControlUnit/Manager/ScreencapFailoverPolicy.cpp"
+    remote_tasker_name = "source/MaaAgentServer/RemoteInstance/RemoteTasker.cpp"
     controller = _read_required(root, controller_name, failures)
     pipeline = _read_required(root, pipeline_name, failures)
     result_types = _read_required(root, result_name, failures)
     transform = _read_required(root, transform_name, failures)
     screencap = _read_required(root, screencap_name, failures)
     failover = _read_required(root, failover_name, failures)
+    remote_tasker = _read_required(root, remote_tasker_name, failures)
 
     _require_markers(
         controller,
@@ -234,6 +236,19 @@ def audit_maaframework_source(source_root: Path) -> dict[str, object]:
         },
         failures,
     )
+    _require_markers(
+        remote_tasker,
+        remote_tasker_name,
+        {
+            "if (resource_) {\n        return resource_.get();": (
+                "repeated remote resource lookup can invalidate borrowed handles"
+            ),
+            "if (controller_) {\n        return controller_.get();": (
+                "repeated remote controller lookup can invalidate borrowed handles"
+            ),
+        },
+        failures,
+    )
     return {
         "valid": not failures,
         "source_root": os.fspath(root),
@@ -251,6 +266,18 @@ def audit_maaend_agent_source(source_root: Path) -> dict[str, object]:
     viewport_probe_name = "agent/go-service/viewportprobe/input.go"
     service_register_name = "agent/go-service/register.go"
     cpp_viewport_name = "agent/cpp-algo/source/Viewport/ViewportSession.cpp"
+    adb_input_name = (
+        "agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp"
+    )
+    adb_camera_name = (
+        "agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp"
+    )
+    action_wrapper_name = "agent/cpp-algo/source/MapNavigator/action_wrapper.cpp"
+    navi_config_name = "agent/cpp-algo/source/MapNavigator/navi_config.h"
+    navigation_name = (
+        "agent/cpp-algo/source/MapNavigator/navigation_state_machine.cpp"
+    )
+    map_locate_name = "agent/cpp-algo/source/MapLocator/MapLocateAction.cpp"
     checker = _read_required(root, checker_name, failures)
     register = _read_required(root, register_name, failures)
     go_viewport = _read_required(root, go_viewport_name, failures)
@@ -258,6 +285,12 @@ def audit_maaend_agent_source(source_root: Path) -> dict[str, object]:
     viewport_probe = _read_required(root, viewport_probe_name, failures)
     service_register = _read_required(root, service_register_name, failures)
     cpp_viewport = _read_required(root, cpp_viewport_name, failures)
+    adb_input = _read_required(root, adb_input_name, failures)
+    adb_camera = _read_required(root, adb_camera_name, failures)
+    action_wrapper = _read_required(root, action_wrapper_name, failures)
+    navi_config = _read_required(root, navi_config_name, failures)
+    navigation = _read_required(root, navigation_name, failures)
+    map_locate = _read_required(root, map_locate_name, failures)
     _require_markers(
         checker,
         checker_name,
@@ -311,6 +344,10 @@ def audit_maaend_agent_source(source_root: Path) -> dict[str, object]:
         {
             "ViewportSession::Capture": "C++ viewport capture wrapper is missing",
             "ViewportSession::TouchDown": "C++ touch wrapper is missing",
+            "ViewportSession::Swipe": "C++ swipe wrapper is missing",
+            "MaaControllerPostSwipeV2": (
+                "C++ swipe wrapper no longer preserves contact and pressure"
+            ),
             "ViewportSession::TouchUp": "C++ touch release wrapper is missing",
             "const bool selected =": (
                 "C++ TouchUp may skip release when contact alignment is unavailable"
@@ -379,6 +416,210 @@ def audit_maaend_agent_source(source_root: Path) -> dict[str, object]:
         },
         failures,
     )
+    camera_config_start = adb_input.find(
+        "AdbCameraSwipeDriverConfig MakeDefaultCameraSwipeDriverConfig"
+    )
+    joystick_config_start = adb_input.find(
+        "AdbVirtualJoystickDriverConfig MakeDefaultJoystickDriverConfig"
+    )
+    camera_config = (
+        adb_input[camera_config_start:joystick_config_start]
+        if camera_config_start >= 0 and joystick_config_start > camera_config_start
+        else ""
+    )
+    _require_markers(
+        camera_config,
+        adb_input_name,
+        {
+            "config.contact_id = 0;": (
+                "serialized ADB camera swipe no longer reuses the only valid first contact"
+            ),
+        },
+        failures,
+    )
+    _require_markers(
+        adb_input,
+        adb_input_name,
+        {
+            ".max_batch_delta_deg = 45.0": (
+                "sample-and-hold camera batch cap drifted from the measured ADB contract"
+            ),
+        },
+        failures,
+    )
+    _require_markers(
+        adb_camera,
+        adb_camera_name,
+        {
+            "const int touch_dx = dx;": (
+                "ADB camera default direction drifted from the physical-device measurement"
+            ),
+            'LogInfo << "ADB camera swipe transport."': (
+                "ADB camera no longer records the issued transport delta"
+            ),
+            "viewport_->Swipe(": (
+                "ADB camera no longer uses the canonical viewport swipe contract"
+            ),
+            "config_.turn_swipe_duration_ms": (
+                "ADB camera swipe no longer carries its measured duration"
+            ),
+            "config_.pressure": "ADB camera swipe no longer carries nonzero pressure",
+        },
+        failures,
+    )
+    _require_markers(
+        action_wrapper,
+        action_wrapper_name,
+        {
+            "bool ActionWrapper::SetViewDeltaPolarity(int polarity)": (
+                "view-delta polarity can no longer be calibrated per navigation session"
+            ),
+            "dx * view_delta_polarity_": (
+                "calibrated view-delta polarity no longer covers every camera caller"
+            ),
+            'LogWarn << "View-delta polarity changed from closed-loop evidence."': (
+                "view-delta polarity changes are no longer auditable"
+            ),
+        },
+        failures,
+    )
+    _require_markers(
+        navi_config,
+        navi_config_name,
+        {
+            "kAdbSampleHoldHeadingCommitPulseMs = 80": (
+                "ADB body-heading commit pulse is missing or changed"
+            ),
+            "kAdbSampleHoldAuthoredRunMaxPulseMs = 100": (
+                "ADB authored-route pulse cap is missing or changed"
+            ),
+            "kAdbSampleHoldMotionHeadingMinDistanceM = 0.5": (
+                "ADB motion-heading evidence threshold is missing or changed"
+            ),
+            "kAdbSampleHoldTurnResponseMinDeg = 2.0": (
+                "ADB body-heading response threshold is missing or changed"
+            ),
+            "kAdbSampleHoldPolarityResponseMinDeg = 10.0": (
+                "ADB polarity calibration lower evidence bound is missing or changed"
+            ),
+            "kAdbSampleHoldPolarityResponseMaxDeg = 100.0": (
+                "ADB polarity calibration no longer excludes near-180-degree aliases"
+            ),
+            "kAdbSampleHoldPolarityConfirmResponses = 2": (
+                "ADB polarity calibration confirmation budget is missing or changed"
+            ),
+            "kAdbSampleHoldTurnResponseTimeoutMs = 12000": (
+                "ADB camera response timeout is missing or changed"
+            ),
+            "kAdbSampleHoldOutlierConfirmFrames = 2": (
+                "ADB stable heading-outlier confirmation budget is missing or changed"
+            ),
+            "kUnstickHeadingCorrectionDeg = 20.0": (
+                "physical unstick heading feedback threshold is missing or changed"
+            ),
+        },
+        failures,
+    )
+    _require_markers(
+        navigation,
+        navigation_name,
+        {
+            "const bool sample_hold_waiting_for_turn =": (
+                "sample-and-hold no longer exposes its stationary turn state"
+            ),
+            "turn_wait_ms >= kAdbSampleHoldTurnResponseTimeoutMs": (
+                "sample-and-hold no longer fails closed on an unresponsive camera"
+            ),
+            '"adb_turn_no_response"': (
+                "unresponsive ADB camera no longer has a stable failure reason"
+            ),
+            "sample_hold_waiting_for_turn && !degraded_fix": (
+                "ADB heading commit no longer requires a coherent coarse turn"
+            ),
+            "sample_hold_pulse_ms = kAdbSampleHoldHeadingCommitPulseMs": (
+                "ADB camera turn no longer schedules its body-heading commit pulse"
+            ),
+            "NoteSampleAndHoldPulse(sample_hold_pulse_ms)": (
+                "ADB heading commit pulse no longer feeds displacement calibration"
+            ),
+            "action_wrapper_->PulseForwardSync(sample_hold_pulse_ms)": (
+                "ADB camera turn no longer commits the avatar body heading"
+            ),
+            "const bool turn_responded = directional_turn_response": (
+                "ADB turn watchdog no longer requires a same-direction body-heading response"
+            ),
+            "sample_hold_turn_started_at_ = std::chrono::steady_clock::now()": (
+                "ADB turn watchdog no longer renews after a valid body-heading response"
+            ),
+            'RebaseSampleAndHoldHeading("stable_stationary_outlier")': (
+                "stable stationary heading outliers can no longer recover a stale baseline"
+            ),
+            'RebaseSampleAndHoldHeading("physical_unstick")': (
+                "physical unstick no longer commits its fresh heading baseline"
+            ),
+            'LogInfo << "ADB sample-and-hold motion heading."': (
+                "ADB navigation no longer derives heading from real displacement"
+            ),
+            'LogWarn << "ADB sample-and-hold released stale motion heading after stable stationary confirmation."': (
+                "a stale motion heading can again suppress stable stationary evidence forever"
+            ),
+            "sample_hold_polarity_opposition_count_ >= kAdbSampleHoldPolarityConfirmResponses": (
+                "ADB view-delta polarity no longer requires repeated opposing motion evidence"
+            ),
+            "action_wrapper_->SetViewDeltaPolarity(-previous_polarity)": (
+                "ADB view-delta polarity can no longer self-correct from motion evidence"
+            ),
+            'LogWarn << "ADB view-delta polarity calibrated from motion response."': (
+                "ADB polarity calibration is no longer visible in structured logs"
+            ),
+            'LogInfo << "Physical unstick rebased ADB heading from displacement."': (
+                "physical unstick no longer exports its measured movement heading"
+            ),
+            "if (!sample_and_hold && route.valid && session_->HasCurrentWaypoint())": (
+                "ADB navigation can again bypass authored RUN points through NavRun lookahead"
+            ),
+            'LogDebug << "ADB sample-and-hold coarse turn requested."': (
+                "ADB large turns can again degrade into long proportional movement arcs"
+            ),
+            "sample_hold_pulse_ms = std::min(sample_hold_pulse_ms, kAdbSampleHoldAuthoredRunMaxPulseMs)": (
+                "ADB authored RUN pulses are no longer bounded before the next physical fix"
+            ),
+            'LogInfo << "Physical unstick heading correction."': (
+                "physical unstick no longer re-aims from closed-loop heading feedback"
+            ),
+            'LogInfo << "Physical unstick resumed the authored ADB route after dislodge."': (
+                "ADB physical recovery can again skip authored water-edge route points"
+            ),
+        },
+        failures,
+    )
+    _require_markers(
+        map_locate,
+        map_locate_name,
+        {
+            "constexpr int kAssertSettleMaxFrames = 8;": (
+                "real-device location assertion frame budget drifted"
+            ),
+            "constexpr int kAssertMaxUnavailableFrames = 3;": (
+                "unavailable minimap frames no longer fail fast"
+            ),
+            "IsPositionConclusiveOutsideRect": (
+                "stable far-outside location can no longer select the safe teleport fallback"
+            ),
+            "const bool usable = located && !result.position->isHeld;": (
+                "held low-confidence map positions can again become positive location evidence"
+            ),
+            '"MapLocateAssertLocation quick miss (location unavailable)"': (
+                "location assertion no longer records its fast-failure reason"
+            ),
+        },
+        failures,
+    )
+    if navigation.count("!sample_hold_waiting_for_turn") < 2:
+        failures.append(
+            f"{navigation_name}: off-route and obstacle recovery may inject physical "
+            "movement while an ADB camera turn is still pending"
+        )
 
     go_allowed = {
         Path("agent/go-service/pkg/viewport/session.go"),

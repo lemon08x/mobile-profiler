@@ -60,10 +60,10 @@ index 3c0d67a..276e237 100644
  
  message(STATUS "WebView2 SDK enabled (arch=${_webview2_arch}, dynamic): ${WEBVIEW2_SDK_DIR}")
 diff --git a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
-index 48f2ed5..161f2db 100644
+index 48f2ed5..733fb25 100644
 --- a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
 +++ b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
-@@ -17,6 +17,7 @@
+@@ -17,9 +17,11 @@
  #include <unistd.h>
  #endif
  #include "../utils.h"
@@ -71,7 +71,11 @@ index 48f2ed5..161f2db 100644
  
  #include "MapLocateAction.h"
  #include "MapLocator.h"
-@@ -46,8 +47,20 @@ struct LocateOutput
++#include "MinimapExtractor.h"
+ 
+ #ifndef MAA_TRUE
+ #define MAA_TRUE 1
+@@ -46,8 +48,20 @@ struct LocateOutput
      double rot = 0.0;
      double locConf = 0.0;
      int latencyMs = 0;
@@ -93,7 +97,7 @@ index 48f2ed5..161f2db 100644
  };
  
  struct MapLocateAssertLocationParam
-@@ -74,6 +87,8 @@ struct MapLocateAssertLocationOutput
+@@ -74,6 +88,8 @@ struct MapLocateAssertLocationOutput
      double locConf = 0.0;
      int latencyMs = 0;
      std::vector<double> target;
@@ -102,7 +106,7 @@ index 48f2ed5..161f2db 100644
  
      MEO_JSONIZATION(
          status,
-@@ -86,7 +101,9 @@ struct MapLocateAssertLocationOutput
+@@ -86,7 +102,9 @@ struct MapLocateAssertLocationOutput
          MEO_OPT rot,
          MEO_OPT locConf,
          MEO_OPT latencyMs,
@@ -113,7 +117,7 @@ index 48f2ed5..161f2db 100644
  };
  
  fs::path getExeDir()
-@@ -116,11 +133,15 @@ void WriteJsonDetail(MaaStringBuffer* out_detail, const T& payload)
+@@ -116,11 +134,15 @@ void WriteJsonDetail(MaaStringBuffer* out_detail, const T& payload)
      MaaStringBufferSet(out_detail, json_text.c_str());
  }
  
@@ -130,7 +134,7 @@ index 48f2ed5..161f2db 100644
      if (!result.position.has_value()) {
          return output;
      }
-@@ -135,7 +156,11 @@ LocateOutput BuildLocateOutput(const LocateResult& result)
+@@ -135,7 +157,11 @@ LocateOutput BuildLocateOutput(const LocateResult& result)
      return output;
  }
  
@@ -143,7 +147,7 @@ index 48f2ed5..161f2db 100644
  {
      MapLocateAssertLocationOutput output;
      output.status = static_cast<int>(result.status);
-@@ -144,6 +169,10 @@ MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& resu
+@@ -144,6 +170,10 @@ MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& resu
      output.message = result.debugMessage;
      output.zoneId = param.zone_id;
      output.target = param.target;
@@ -154,7 +158,35 @@ index 48f2ed5..161f2db 100644
      if (!result.position.has_value()) {
          return output;
      }
-@@ -282,28 +311,39 @@ bool UsesAdbMinimapRoi(std::string_view controller_type)
+@@ -205,11 +235,26 @@ bool IsPositionInsideRect(const MapPosition& position, const MaaRect& rect)
+     return position.x >= left && position.x < right && position.y >= top && position.y < bottom;
+ }
+ 
+-constexpr int kAssertSettleMaxFrames = 60;
++// Location assertions only decide whether the caller can continue from the
++// current spawn point. A negative result falls through to an authored
++// teleport, so waiting for a full navigation-grade tracking lock is both
++// unnecessary and harmful on real devices where every ADB frame is costly.
++constexpr int kAssertSettleMaxFrames = 8;
++constexpr int kAssertMaxUnavailableFrames = 3;
+ constexpr int kAssertStableWindow = kColdStartConsensusFrames;
+ constexpr double kAssertStableRadius = kPositionConsensusRadius;
++constexpr double kAssertConclusiveOutsideMargin = 25.0;
+ constexpr auto kAssertSettlePollDelay = std::chrono::milliseconds(250);
+ 
++bool IsPositionConclusiveOutsideRect(const MapPosition& position, const MaaRect& rect)
++{
++    const double left = static_cast<double>(rect.x) - kAssertConclusiveOutsideMargin;
++    const double top = static_cast<double>(rect.y) - kAssertConclusiveOutsideMargin;
++    const double right = static_cast<double>(rect.x + rect.width) + kAssertConclusiveOutsideMargin;
++    const double bottom = static_cast<double>(rect.y + rect.height) + kAssertConclusiveOutsideMargin;
++    return position.x < left || position.x >= right || position.y < top || position.y >= bottom;
++}
++
+ bool IsAssertWindowSettled(const std::vector<MapPosition>& window, MapPosition* out_centroid)
+ {
+     if (static_cast<int>(window.size()) < kAssertStableWindow) {
+@@ -282,28 +327,39 @@ bool UsesAdbMinimapRoi(std::string_view controller_type)
      return equals_ignore_case("adb") || equals_ignore_case("playcover") || equals_ignore_case("play_cover");
  }
  
@@ -210,23 +242,31 @@ index 48f2ed5..161f2db 100644
      }
  
      auto locator = getOrInitLocator();
-@@ -313,13 +353,13 @@ bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const
+@@ -313,13 +369,21 @@ bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const
      }
  
      cv::Mat minimap;
 -    const cv::Mat image_mat = to_mat(actual_image);
 -    if (!TryExtractMinimap(image_mat, UsesAdbMinimapRoi(DetectControllerType(context)), &minimap)) {
-+	if (!TryExtractMinimap(frame->image, uses_adb_minimap, &minimap)) {
++	static AdaptiveMinimapExtractor minimap_extractor;
++	if (!minimap_extractor.Extract(
++	        frame->image,
++	        uses_adb_minimap,
++	        frame->alignment == MaaViewportAlignment_Left,
++	        options.expected_zone_id,
++	        locator.get(),
++	        &minimap)) {
          LogError << "MapLocateRecognition: ROI empty";
          return false;
      }
  
      *out_result = locator->locate(minimap, options);
++	minimap_extractor.ObserveLocateResult(*out_result);
 +	*out_frame = std::move(frame.value());
      return true;
  }
  
-@@ -371,11 +411,12 @@ MaaBool MAA_CALL MapLocateRecognitionRun(
+@@ -371,11 +435,12 @@ MaaBool MAA_CALL MapLocateRecognitionRun(
      const LocateOptions options = ParseCustomRecognitionParam<LocateOptions>(custom_recognition_param);
  
      LocateResult result;
@@ -241,10 +281,11 @@ index 48f2ed5..161f2db 100644
  
      if (result.status == LocateStatus::Success && result.position.has_value()) {
          if (out_box != nullptr) {
-@@ -430,10 +471,11 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+@@ -430,15 +495,37 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
      LocateResult result;
      bool settled = false;
      MapPosition stable_pos {};
++    int unavailable_frames = 0;
 +	maaend::viewport::ViewportFrame viewport_frame;
  
      for (int frame = 0; frame < kAssertSettleMaxFrames; ++frame) {
@@ -254,7 +295,47 @@ index 48f2ed5..161f2db 100644
              return MAA_FALSE;
          }
  
-@@ -466,7 +508,7 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+-        const bool usable = result.status == LocateStatus::Success && result.position.has_value()
+-                            && result.position->zoneId == param.zone_id && !result.position->isHeld;
++        const bool located = result.status == LocateStatus::Success && result.position.has_value()
++                             && result.position->zoneId == param.zone_id;
++        const bool usable = located && !result.position->isHeld;
++        if (located) {
++            unavailable_frames = 0;
++            // MapLocator already requires cold-start consensus before it can
++            // release a low-confidence held peak. If that consensus is far
++            // outside the target (with a generous guard band), it is enough
++            // to select the caller's safe teleport fallback. It must never be
++            // used as positive evidence for being inside the target.
++            if (IsPositionConclusiveOutsideRect(result.position.value(), target_rect)) {
++                stable_pos = result.position.value();
++                settled = true;
++                LogInfo << "MapLocateAssertLocation conclusive outside target" << VAR(frame) << VAR(param.zone_id)
++                        << VAR(stable_pos.x) << VAR(stable_pos.y) << VAR(stable_pos.score) << VAR(stable_pos.isHeld);
++                break;
++            }
++        }
++        else {
++            ++unavailable_frames;
++        }
++
+         if (usable) {
+             window.push_back(result.position.value());
+             if (static_cast<int>(window.size()) > kAssertStableWindow) {
+@@ -453,6 +540,12 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+             window.clear();
+         }
+ 
++        if (unavailable_frames >= kAssertMaxUnavailableFrames) {
++            LogInfo << "MapLocateAssertLocation quick miss (location unavailable)" << VAR(frame) << VAR(param.zone_id)
++                    << VAR(result.status) << VAR(result.debugMessage);
++            break;
++        }
++
+         LogInfo << "MapLocateAssertLocation settling" << VAR(frame) << VAR(param.zone_id) << VAR(usable) << VAR(window.size())
+                 << VAR(result.debugMessage);
+         if (frame + 1 < kAssertSettleMaxFrames) {
+@@ -466,7 +559,7 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
          result.position->x = stable_pos.x;
          result.position->y = stable_pos.y;
      }
@@ -263,8 +344,197 @@ index 48f2ed5..161f2db 100644
  
      if (!matched) {
          if (settled) {
+diff --git a/agent/cpp-algo/source/MapLocator/MapLocator.cpp b/agent/cpp-algo/source/MapLocator/MapLocator.cpp
+index 06f65a2..d3b9692 100644
+--- a/agent/cpp-algo/source/MapLocator/MapLocator.cpp
++++ b/agent/cpp-algo/source/MapLocator/MapLocator.cpp
+@@ -32,6 +32,18 @@ namespace maplocator
+ namespace
+ {
+ 
++void ApplyInferredHeading(MapPosition* position, double inferred_angle)
++{
++    if (position == nullptr) {
++        return;
++    }
++    position->heading_valid = std::isfinite(inferred_angle) && inferred_angle >= 0.0;
++    // InferYellowArrowRotation uses a negative value as a failure sentinel.
++    // Never let that sentinel become a plausible 359-degree navigation
++    // heading; consumers must inspect heading_valid instead.
++    position->angle = position->heading_valid ? inferred_angle : 0.0;
++}
++
+ std::string TrimLeadingZeros(std::string value)
+ {
+     value.erase(0, std::min(value.find_first_not_of('0'), value.size() - 1));
+@@ -127,7 +139,6 @@ public:
+         if (asyncYoloTask.valid()) {
+             asyncYoloTask.wait();
+         }
+-        drainBackgroundGlobalSearchTasks();
+     }
+ 
+     bool initialize(const MapLocatorConfig& cfg);
+@@ -176,8 +187,6 @@ private:
+         MapPosition* outBestRaw = nullptr);
+     MapPosition stabilizePosition(const MapPosition& raw);
+     MapPosition acceptPosition(const MapPosition& raw, TimePoint now);
+-    void drainBackgroundGlobalSearchTasks();
+-
+     void loadAvailableZones(const std::string& root);
+ 
+     bool isInitialized = false;
+@@ -190,7 +199,6 @@ private:
+     std::unique_ptr<YoloPredictor> zoneClassifier;
+     std::mutex taskMutex;
+     std::future<YoloCoarseResult> asyncYoloTask;
+-    std::vector<std::future<GlobalSearchAttempt>> backgroundGlobalSearchTasks;
+     std::chrono::steady_clock::time_point lastYoloCheckTime;
+ 
+     std::vector<MapPosition> coldStartBuffer;
+@@ -285,23 +293,6 @@ void MapLocator::Impl::loadAvailableZones(const std::string& root)
+     }
+ }
+ 
+-void MapLocator::Impl::drainBackgroundGlobalSearchTasks()
+-{
+-    for (auto& task : backgroundGlobalSearchTasks) {
+-        if (!task.valid()) {
+-            continue;
+-        }
+-        try {
+-            task.wait();
+-            task.get();
+-        }
+-        catch (const std::exception& e) {
+-            LogError << "Background global search task failed: " << e.what();
+-        }
+-    }
+-    backgroundGlobalSearchTasks.clear();
+-}
+-
+ MapPosition MapLocator::Impl::stabilizePosition(const MapPosition& raw)
+ {
+     if (raw.zoneId == "None") {
+@@ -969,9 +960,6 @@ std::optional<MapPosition> MapLocator::Impl::tryGlobalSearchWithFallback(
+     MapPosition* outBestRaw)
+ {
+     const bool isPathHeatmapZone = IsPathHeatmapZone(targetZoneId);
+-    const unsigned hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
+-    const bool canSpeculateDualMode = !isPathHeatmapZone && constraint.yolo_validated && hardwareThreads >= 8;
+-
+     auto runSearch = [this, &constraint, &targetZoneId](const cv::Mat& searchMinimap, MatchMode mode) -> GlobalSearchAttempt {
+         GlobalSearchAttempt attempt;
+         auto strategy = MatchStrategyFactory::create(targetZoneId, trackingCfg, matchCfg, baseImgCfg, tierImgCfg, mode);
+@@ -984,25 +972,6 @@ std::optional<MapPosition> MapLocator::Impl::tryGlobalSearchWithFallback(
+         return attempt;
+     };
+ 
+-    std::future<GlobalSearchAttempt> fallbackTask;
+-    if (canSpeculateDualMode) {
+-        cv::Mat fallbackMinimap = minimap.clone();
+-        SearchConstraint fallbackConstraint = constraint;
+-        std::string fallbackZoneId = targetZoneId;
+-        fallbackTask = std::async(std::launch::async, [this, fallbackMinimap, fallbackConstraint, fallbackZoneId]() {
+-            GlobalSearchAttempt attempt;
+-            auto fallbackStrategy =
+-                MatchStrategyFactory::create(fallbackZoneId, trackingCfg, matchCfg, baseImgCfg, tierImgCfg, MatchMode::ForcePathHeatmap);
+-            if (!fallbackStrategy) {
+-                return attempt;
+-            }
+-
+-            auto fallbackTmpl = fallbackStrategy->extractTemplateFeature(fallbackMinimap);
+-            attempt.result = tryGlobalSearch(fallbackTmpl, fallbackStrategy.get(), fallbackZoneId, fallbackConstraint, &attempt.rawPos);
+-            return attempt;
+-        });
+-    }
+-
+     auto primaryAttempt = runSearch(minimap, MatchMode::Auto);
+     auto globalResult = primaryAttempt.result;
+     const MapPosition& rawGlobalPrimaryPos = primaryAttempt.rawPos;
+@@ -1013,20 +982,14 @@ std::optional<MapPosition> MapLocator::Impl::tryGlobalSearchWithFallback(
+ 
+     const bool shouldTryDualMode = !globalResult && !isPathHeatmapZone && (constraint.yolo_validated || rawGlobalPrimaryPos.score > 0.1);
+     if (!shouldTryDualMode) {
+-        if (fallbackTask.valid()) {
+-            // Keep the future alive so its destructor cannot block the successful path.
+-            backgroundGlobalSearchTasks.emplace_back(std::move(fallbackTask));
+-        }
+         return globalResult;
+     }
+ 
+-    GlobalSearchAttempt fallbackAttempt;
+-    if (fallbackTask.valid()) {
+-        fallbackAttempt = fallbackTask.get();
+-    }
+-    else {
+-        fallbackAttempt = runSearch(minimap, MatchMode::ForcePathHeatmap);
+-    }
++    // The search implementation owns mutable OpenCV scratch buffers and is
++    // not re-entrant.  Running the fallback speculatively beside a successful
++    // primary search caused an access violation on Windows.  A fallback is
++    // only useful after the primary result fails, so execute it sequentially.
++    GlobalSearchAttempt fallbackAttempt = runSearch(minimap, MatchMode::ForcePathHeatmap);
+ 
+     auto fallbackResult = fallbackAttempt.result;
+     const MapPosition& rawGlobalFallbackPos = fallbackAttempt.rawPos;
+@@ -1061,8 +1024,6 @@ LocateResult MapLocator::Impl::locate(const cv::Mat& minimap, const LocateOption
+         return LocateResult { .status = LocateStatus::NotInitialized, .debugMessage = "MapLocator not initialized." };
+     }
+ 
+-    drainBackgroundGlobalSearchTasks();
+-
+     matchCfg.passThreshold = options.loc_threshold;
+     matchCfg.yoloConfThreshold = options.yolo_threshold;
+     if (zoneClassifier) {
+@@ -1083,7 +1044,7 @@ LocateResult MapLocator::Impl::locate(const cv::Mat& minimap, const LocateOption
+     const std::string expectedZoneId = NormalizeExpectedZoneId(expectedZoneSelector, zoneClassifier.get());
+     if (auto trackingResult = tryTrackingLocate(minimap, options, expectedZoneId, now)) {
+         if (trackingResult->position.has_value()) {
+-            trackingResult->position->angle = resolveAngle();
++            ApplyInferredHeading(&trackingResult->position.value(), resolveAngle());
+         }
+         return *trackingResult;
+     }
+@@ -1100,6 +1061,7 @@ LocateResult MapLocator::Impl::locate(const cv::Mat& minimap, const LocateOption
+     if (coarse.valid && coarse.is_none) {
+         return LocateResult {
+             .status = LocateStatus::TrackingLost,
++            .coarse_was_none = true,
+             .debugMessage = kColdStartCollectingMessage,
+         };
+     }
+@@ -1201,7 +1163,7 @@ LocateResult MapLocator::Impl::locate(const cv::Mat& minimap, const LocateOption
+     }
+ 
+     currentZoneId = globalResult->zoneId;
+-    globalResult->angle = inferredAngle;
++    ApplyInferredHeading(&globalResult.value(), inferredAngle);
+     MapPosition accepted = acceptPosition(*globalResult, now);
+     return LocateResult { .status = LocateStatus::Success, .position = accepted, .debugMessage = "Global Search Success" };
+ }
+diff --git a/agent/cpp-algo/source/MapLocator/MapTypes.h b/agent/cpp-algo/source/MapLocator/MapTypes.h
+index 4e08576..51eb16b 100644
+--- a/agent/cpp-algo/source/MapLocator/MapTypes.h
++++ b/agent/cpp-algo/source/MapLocator/MapTypes.h
+@@ -18,6 +18,7 @@ struct MapPosition
+     int sliceIndex = 0;
+     double scale = 1.0;
+     double angle = 0.0;
++    bool heading_valid = false;
+     long long latencyMs = 0;
+     bool isHeld = false;
+ };
+@@ -60,6 +61,7 @@ struct LocateResult
+ {
+     LocateStatus status;
+     std::optional<MapPosition> position;
++    bool coarse_was_none = false;
+     std::string debugMessage; // 用于向 Pipeline 输出日志
+ };
+ 
 diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
-index df4534b..dff27a2 100644
+index df4534b..b6b8b1a 100644
 --- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
 +++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_camera_swipe_driver.cpp
 @@ -26,8 +26,12 @@ cv::Point ClampPoint(const cv::Point& point, const cv::Size& resolution)
@@ -281,7 +551,55 @@ index df4534b..dff27a2 100644
      , config_(std::move(config))
  {
  }
-@@ -86,10 +90,18 @@ bool AdbCameraSwipeDriver::ExecuteSwipe(const ScreenGeometry& geometry, int swip
+@@ -45,11 +49,19 @@ bool AdbCameraSwipeDriver::SwipeByPixels(int dx, int dy) const
+         return false;
+     }
+ 
+-    const int clamped_dx = std::clamp(dx, -geometry->left_limit, geometry->right_limit);
++    // On the physical Android build the game's camera follows the injected
++    // drag direction.  The measured heading response therefore has the same
++    // sign as MotionController's view delta.  Session-level closed-loop
++    // calibration lives in ActionWrapper and may invert dx before it reaches
++    // this transport when a different device reports two opposing responses.
++    const int touch_dx = dx;
++    const int clamped_dx = std::clamp(touch_dx, -geometry->left_limit, geometry->right_limit);
+     if (clamped_dx == 0) {
+         return false;
+     }
+ 
++    LogInfo << "ADB camera swipe transport." << VAR(dx) << VAR(touch_dx) << VAR(clamped_dx)
++            << VAR(geometry->center.x) << VAR(geometry->center.y);
+     return ExecuteSwipe(*geometry, clamped_dx);
+ }
+ 
+@@ -81,15 +93,44 @@ std::optional<AdbCameraSwipeDriver::ScreenGeometry> AdbCameraSwipeDriver::GetScr
+ 
+ bool AdbCameraSwipeDriver::ExecuteSwipe(const ScreenGeometry& geometry, int swipe_dx) const
+ {
+-    return ExecuteStableDrag(geometry, swipe_dx);
++    if (viewport_ == nullptr) {
++        return false;
++    }
++    const auto frame = viewport_->PreferredLabel(MaaViewportAlignment_Right);
++    if (!frame.has_value()) {
++        return false;
++    }
++
++    const cv::Point start = geometry.center;
++    const cv::Point end = ClampPoint({ geometry.center.x + swipe_dx, geometry.center.y }, geometry.resolution);
++    // Use MaaFramework's canonical swipe implementation so camera drags get
++    // the same pressure, 10 ms interpolation and queued alignment snapshot as
++    // Pipeline swipes that are already proven on this device.  The explicit
++    // stable-drag implementation remains as documentation/fallback material,
++    // but must not be the primary ADB camera transport.
++    return viewport_->Swipe(
++        frame.value(),
++        start,
++        end,
++        config_.turn_swipe_duration_ms,
++        config_.contact_id,
++        config_.pressure);
+ }
  
  bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int swipe_dx) const
  {
@@ -301,7 +619,7 @@ index df4534b..dff27a2 100644
          return false;
      }
  
-@@ -101,7 +113,7 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
+@@ -101,7 +142,7 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
          const int next_x = static_cast<int>(std::lround(start.x + static_cast<double>(end.x - start.x) * ratio));
          const int next_y = static_cast<int>(std::lround(start.y + static_cast<double>(end.y - start.y) * ratio));
  
@@ -310,7 +628,7 @@ index df4534b..dff27a2 100644
              const bool ignored = PostTouchUp();
              (void)ignored;
              return false;
-@@ -122,59 +134,28 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
+@@ -122,59 +163,28 @@ bool AdbCameraSwipeDriver::ExecuteStableDrag(const ScreenGeometry& geometry, int
      return true;
  }
  
@@ -343,8 +661,9 @@ index df4534b..dff27a2 100644
  bool AdbCameraSwipeDriver::PostTouchUp() const
  {
 -    if (controller_ == nullptr) {
--        return false;
--    }
++    if (viewport_ == nullptr) {
+         return false;
+     }
 -
 -    const MaaCtrlId ctrl_id = MaaControllerPostTouchUp(controller_, config_.contact_id);
 -    return WaitForControllerAction(ctrl_id, "touch_up");
@@ -363,9 +682,8 @@ index df4534b..dff27a2 100644
 -bool AdbCameraSwipeDriver::WaitForControllerAction(MaaCtrlId ctrl_id, const char* action_name) const
 -{
 -    if (!EnsureControllerActionPosted(ctrl_id, action_name)) {
-+    if (viewport_ == nullptr) {
-         return false;
-     }
+-        return false;
+-    }
 -
 -    const MaaStatus status = MaaControllerWait(controller_, ctrl_id);
 -    if (status == MaaStatus_Succeeded) {
@@ -427,12 +745,14 @@ index b360002..5138b84 100644
  };
  
 diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
-index 61e9e35..95faf47 100644
+index 61e9e35..f897fda 100644
 --- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
 +++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.cpp
-@@ -18,25 +18,6 @@ namespace
+@@ -17,31 +17,20 @@ namespace
+ {
  
  constexpr int32_t kReferenceFrameHeight = 720;
++constexpr int32_t kAdbDefaultTouchPressure = 1;
  
 -class ScopedImageBuffer
 -{
@@ -453,10 +773,25 @@ index 61e9e35..95faf47 100644
 -    MaaImageBuffer* buffer_ = nullptr;
 -};
 -
- AdbCameraSwipeDriverConfig MakeDefaultCameraSwipeDriverConfig(std::string_view controller_type)
+-AdbCameraSwipeDriverConfig MakeDefaultCameraSwipeDriverConfig(std::string_view controller_type)
++AdbCameraSwipeDriverConfig MakeDefaultCameraSwipeDriverConfig(std::string_view /* controller_type */)
  {
      AdbCameraSwipeDriverConfig config;
-@@ -92,12 +73,13 @@ bool HasUsableBlindActionZoneGate(const maplocator::YoloCoarseResult& coarse)
+-    config.contact_id = IsPlayCoverControllerType(controller_type) ? 0 : config.contact_id;
+-    config.pressure = 0;
++    // Both PlayCover and high-latency ADB serialize movement and camera input.
++    // Android touch injection cannot reliably start a gesture with contact 1
++    // while contact 0 is absent, so the serialized camera gesture must reuse
++    // contact 0. Concurrent desktop-style input never enters this backend.
++    config.contact_id = 0;
++    // MaaController's public click/swipe contract uses pressure 1.  A zero
++    // pressure contact is accepted by minitouch itself but this game ignores
++    // it for camera drags on the physical Android device.
++    config.pressure = 1;
+     config.turn_swipe_duration_ms = kAdbTouchTurnProfile.swipe_duration_ms;
+     config.post_swipe_settle_ms = kAdbTouchTurnProfile.post_swipe_settle_ms;
+     return config;
+@@ -92,12 +81,13 @@ bool HasUsableBlindActionZoneGate(const maplocator::YoloCoarseResult& coarse)
  
  AdbInputBackend::AdbInputBackend(MaaController* ctrl, std::string controller_type, std::shared_ptr<maplocator::MapLocator> locator)
      : ctrl_(ctrl)
@@ -472,7 +807,7 @@ index 61e9e35..95faf47 100644
      , action_buttons_(MakeDefaultActionButtonLayout(controller_type_))
  {
      if (ctrl_ == nullptr) {
-@@ -113,6 +95,14 @@ AdbInputBackend::AdbInputBackend(MaaController* ctrl, std::string controller_typ
+@@ -113,6 +103,14 @@ AdbInputBackend::AdbInputBackend(MaaController* ctrl, std::string controller_typ
              << VAR(kAdbTouchTurnProfile.post_swipe_settle_ms);
  }
  
@@ -487,7 +822,33 @@ index 61e9e35..95faf47 100644
  MaaController* AdbInputBackend::GetCtrl() const
  {
      return ctrl_;
-@@ -285,23 +275,16 @@ void AdbInputBackend::ApplyMovementState(int delay_millis)
+@@ -159,11 +157,23 @@ SteeringTransportProfile AdbInputBackend::steering_transport_profile() const
+         .supports_concurrent_move_and_look = true,
+         .min_send_interval_ms = 0,
+         .min_emit_delta_deg = 1.5,
+-        .max_batch_delta_deg = 20.0,
+-        .action_quiet_period_ms = 60,
++        // The ADB sample-and-hold path is stationary while turning, so a
++        // larger batch is both safe and necessary to avoid spending seven
++        // 1.5-second captures on a 140-degree correction.
++        .max_batch_delta_deg = 45.0,
++        .action_quiet_period_ms = 0,
+     };
+ }
+ 
++bool AdbInputBackend::requires_sample_and_hold_navigation() const
++{
++    // ADB screencap is a high-latency request/response operation. Keeping the
++    // virtual joystick down while it runs turns every observation into an
++    // uncontrolled 1-2 second movement burst. PlayCover uses a local capture
++    // path and retains the original continuous-input behavior.
++    return !IsPlayCoverControllerType(controller_type_);
++}
++
+ bool AdbInputBackend::supports_sprint() const
+ {
+     return !IsPlayCoverControllerType(controller_type_);
+@@ -285,23 +295,19 @@ void AdbInputBackend::ApplyMovementState(int delay_millis)
  
  bool AdbInputBackend::CaptureFrame(cv::Mat* out_image) const
  {
@@ -500,7 +861,10 @@ index 61e9e35..95faf47 100644
 -    const MaaCtrlId screencap_id = MaaControllerPostScreencap(ctrl_);
 -    MaaControllerWait(ctrl_, screencap_id);
 -    if (!MaaControllerCachedImage(ctrl_, buffer.Get()) || MaaImageBufferIsEmpty(buffer.Get())) {
-+	const auto frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++	auto frame = viewport_->Capture(MaaViewportAlignment_Left, true);
++	if (!frame.has_value()) {
++		frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++	}
 +	if (!frame.has_value() || frame->image.empty()) {
          return false;
      }
@@ -515,7 +879,7 @@ index 61e9e35..95faf47 100644
      return !out_image->empty();
  }
  
-@@ -344,8 +327,7 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
+@@ -344,8 +350,7 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
  
      SleepIfNeeded(hold_millis);
  
@@ -525,7 +889,7 @@ index 61e9e35..95faf47 100644
          return false;
      }
  
-@@ -355,14 +337,16 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
+@@ -355,14 +360,16 @@ bool AdbInputBackend::ClickTargetSync(const AdbTapTarget& target, int hold_milli
  
  bool AdbInputBackend::TouchDownTargetSync(const AdbTapTarget& target) const
  {
@@ -536,17 +900,17 @@ index 61e9e35..95faf47 100644
 -    const MaaCtrlId move_id = MaaControllerPostTouchMove(ctrl_, target.contact_id, point.x, point.y, 0);
 -    if (!WaitForControllerAction(move_id, "touch_move")) {
 +	const auto frame = viewport_->PreferredLabel(MaaViewportAlignment_Right);
-+	if (!frame.has_value() || !viewport_->TouchMove(frame.value(), target.contact_id, point, 0)) {
++	if (!frame.has_value() || !viewport_->TouchMove(frame.value(), target.contact_id, point, kAdbDefaultTouchPressure)) {
          return false;
      }
  
 -    const MaaCtrlId down_id = MaaControllerPostTouchDown(ctrl_, target.contact_id, point.x, point.y, 0);
 -    if (!WaitForControllerAction(down_id, "touch_down")) {
-+	if (!viewport_->TouchDown(frame.value(), target.contact_id, point, 0)) {
++	if (!viewport_->TouchDown(frame.value(), target.contact_id, point, kAdbDefaultTouchPressure)) {
          return false;
      }
  
-@@ -394,29 +378,12 @@ void AdbInputBackend::MouseRightUpOnTargetSync(int contact_id, int delay_millis)
+@@ -394,29 +401,12 @@ void AdbInputBackend::MouseRightUpOnTargetSync(int contact_id, int delay_millis)
          return;
      }
  
@@ -578,7 +942,7 @@ index 61e9e35..95faf47 100644
  {
      if (delay_millis <= 0) {
 diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
-index d30c153..af41108 100644
+index d30c153..80f1b82 100644
 --- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
 +++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_input_backend.h
 @@ -9,6 +9,7 @@
@@ -597,7 +961,15 @@ index d30c153..af41108 100644
  
      MaaController* GetCtrl() const override;
      const std::string& controller_type() const override;
-@@ -70,10 +72,10 @@ private:
+@@ -48,6 +50,7 @@ public:
+     const std::string& unsupported_reason() const override;
+     double default_turn_units_per_degree() const override;
+     SteeringTransportProfile steering_transport_profile() const override;
++    bool requires_sample_and_hold_navigation() const override;
+     bool supports_sprint() const override;
+ 
+     void SetMovementStateSync(bool forward, bool left, bool backward, bool right, int delay_millis) override;
+@@ -70,10 +73,10 @@ private:
      bool TouchDownTargetSync(const AdbTapTarget& target) const;
      void MouseRightDownOnTargetSync(const AdbTapTarget& target, int delay_millis);
      void MouseRightUpOnTargetSync(int contact_id, int delay_millis);
@@ -610,10 +982,18 @@ index d30c153..af41108 100644
      std::string unsupported_reason_;
      double default_turn_units_per_degree_ = 0.0;
 diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
-index cb258f1..bba8aa0 100644
+index cb258f1..60564c0 100644
 --- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
 +++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_virtual_joystick_driver.cpp
-@@ -21,8 +21,10 @@ constexpr int32_t kAdbDefaultTouchPressure = 0;
+@@ -14,15 +14,17 @@ namespace mapnavigator::backend::adb
+ namespace
+ {
+ 
+-constexpr int32_t kAdbDefaultTouchPressure = 0;
++constexpr int32_t kAdbDefaultTouchPressure = 1;
+ 
+ } // namespace
+ 
  AdbVirtualJoystickDriver::AdbVirtualJoystickDriver(
      MaaController* controller,
      std::shared_ptr<maplocator::MapLocator> locator,
@@ -624,7 +1004,40 @@ index cb258f1..bba8aa0 100644
      , config_(std::move(config))
  {
      (void)locator;
-@@ -73,6 +75,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+@@ -61,11 +63,29 @@ bool AdbVirtualJoystickDriver::SetMovementState(bool forward, bool left, bool ba
+ 
+ bool AdbVirtualJoystickDriver::PulseForward(int hold_millis)
+ {
+-    if (!SetMovementState(true, false, false, false, 0)) {
++    if (viewport_ == nullptr || (touch_active_ && !Release(0))) {
+         return false;
+     }
+-    SleepIfNeeded(hold_millis);
+-    return Release(0);
++
++    const auto frame = viewport_->PreferredLabel(MaaViewportAlignment_Left);
++    active_geometry_ = AcquireControlGeometry();
++    if (!frame.has_value() || !active_geometry_.has_value()) {
++        active_geometry_.reset();
++        return false;
++    }
++
++    const cv::Point start = ClampPoint(active_geometry_->control_origin, active_geometry_->frame_size);
++    const cv::Point end = ComputeTargetPoint(Direction::kForward);
++    const bool succeeded = viewport_->Swipe(
++        frame.value(),
++        start,
++        end,
++        std::max(1, hold_millis),
++        config_.contact_id,
++        kAdbDefaultTouchPressure);
++    active_geometry_.reset();
++    SleepIfNeeded(config_.release_settle_ms);
++    return succeeded;
+ }
+ 
+ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+@@ -73,6 +93,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
      if (!touch_active_) {
          active_direction_ = Direction::kNone;
          active_geometry_.reset();
@@ -632,7 +1045,7 @@ index cb258f1..bba8aa0 100644
          active_touch_point_ = {};
          SleepIfNeeded(delay_millis);
          return true;
-@@ -83,6 +86,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+@@ -83,6 +104,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
          touch_active_ = false;
          active_direction_ = Direction::kNone;
          active_geometry_.reset();
@@ -640,7 +1053,7 @@ index cb258f1..bba8aa0 100644
          active_touch_point_ = {};
          SleepIfNeeded(delay_millis);
          return false;
-@@ -91,6 +95,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
+@@ -91,6 +113,7 @@ bool AdbVirtualJoystickDriver::Release(int delay_millis)
      touch_active_ = false;
      active_direction_ = Direction::kNone;
      active_geometry_.reset();
@@ -648,7 +1061,7 @@ index cb258f1..bba8aa0 100644
      active_touch_point_ = {};
      SleepIfNeeded(std::max(delay_millis, config_.release_settle_ms));
      return true;
-@@ -138,15 +143,24 @@ std::optional<AdbVirtualJoystickDriver::ControlGeometry> AdbVirtualJoystickDrive
+@@ -138,15 +161,24 @@ std::optional<AdbVirtualJoystickDriver::ControlGeometry> AdbVirtualJoystickDrive
  
  bool AdbVirtualJoystickDriver::BeginDirectionalDrag(Direction direction)
  {
@@ -673,7 +1086,7 @@ index cb258f1..bba8aa0 100644
          active_direction_ = Direction::kNone;
          return false;
      }
-@@ -193,35 +207,26 @@ bool AdbVirtualJoystickDriver::UpdateDirectionalDrag(Direction direction)
+@@ -193,35 +225,26 @@ bool AdbVirtualJoystickDriver::UpdateDirectionalDrag(Direction direction)
  
  bool AdbVirtualJoystickDriver::PostTouchDown(const cv::Point& point) const
  {
@@ -749,6 +1162,134 @@ index 74ba0eb..6fb0f74 100644
      cv::Point active_touch_point_ {};
  };
  
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.cpp b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.cpp
+index 7a8aecf..09b1a0d 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.cpp
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.cpp
+@@ -16,7 +16,7 @@ bool AdbZoneGuard::ExtractMinimap(const cv::Mat& image, cv::Mat* out_minimap) co
+         return false;
+     }
+ 
+-    return maplocator::TryExtractMinimap(image, true, out_minimap);
++    return minimap_extractor_.Extract(image, true, true, std::string(), locator_.get(), out_minimap);
+ }
+ 
+ maplocator::YoloCoarseResult AdbZoneGuard::ProbeYolo(const cv::Mat& image) const
+@@ -26,7 +26,9 @@ maplocator::YoloCoarseResult AdbZoneGuard::ProbeYolo(const cv::Mat& image) const
+         return {};
+     }
+ 
+-    return locator_->predictCoarse(minimap);
++    auto result = locator_->predictCoarse(minimap);
++    minimap_extractor_.ObserveCoarseResult(result);
++    return result;
+ }
+ 
+ } // namespace mapnavigator::backend::adb
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.h b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.h
+index e658569..a499ab3 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.h
++++ b/agent/cpp-algo/source/MapNavigator/Backend/Adb/adb_zone_guard.h
+@@ -3,6 +3,7 @@
+ #include <memory>
+ 
+ #include "MapLocator/MapLocator.h"
++#include "MapLocator/MinimapExtractor.h"
+ 
+ namespace mapnavigator::backend::adb
+ {
+@@ -18,6 +19,7 @@ private:
+     bool ExtractMinimap(const cv::Mat& image, cv::Mat* out_minimap) const;
+ 
+     std::shared_ptr<maplocator::MapLocator> locator_;
++    mutable maplocator::AdaptiveMinimapExtractor minimap_extractor_;
+ };
+ 
+ } // namespace mapnavigator::backend::adb
+diff --git a/agent/cpp-algo/source/MapNavigator/Backend/backend.h b/agent/cpp-algo/source/MapNavigator/Backend/backend.h
+index 10b305a..b00bc40 100644
+--- a/agent/cpp-algo/source/MapNavigator/Backend/backend.h
++++ b/agent/cpp-algo/source/MapNavigator/Backend/backend.h
+@@ -29,6 +29,7 @@ public:
+     virtual const std::string& unsupported_reason() const = 0;
+     virtual double default_turn_units_per_degree() const = 0;
+     virtual SteeringTransportProfile steering_transport_profile() const = 0;
++    virtual bool requires_sample_and_hold_navigation() const { return false; }
+ 
+     virtual bool supports_sprint() const { return true; }
+ 
+diff --git a/agent/cpp-algo/source/MapNavigator/action_wrapper.cpp b/agent/cpp-algo/source/MapNavigator/action_wrapper.cpp
+index b69e2c3..58c8a87 100644
+--- a/agent/cpp-algo/source/MapNavigator/action_wrapper.cpp
++++ b/agent/cpp-algo/source/MapNavigator/action_wrapper.cpp
+@@ -48,11 +48,35 @@ SteeringTransportProfile ActionWrapper::SteeringProfile() const
+     return backend_->steering_transport_profile();
+ }
+ 
++bool ActionWrapper::RequiresSampleAndHoldNavigation() const
++{
++    return backend_->requires_sample_and_hold_navigation();
++}
++
+ bool ActionWrapper::SupportsSprint() const
+ {
+     return backend_->supports_sprint();
+ }
+ 
++int ActionWrapper::ViewDeltaPolarity() const
++{
++    return view_delta_polarity_;
++}
++
++bool ActionWrapper::SetViewDeltaPolarity(int polarity)
++{
++    if (polarity != -1 && polarity != 1) {
++        LogError << "Rejected invalid view-delta polarity." << VAR(polarity);
++        return false;
++    }
++    if (view_delta_polarity_ != polarity) {
++        LogWarn << "View-delta polarity changed from closed-loop evidence."
++                << VAR(view_delta_polarity_) << VAR(polarity);
++        view_delta_polarity_ = polarity;
++    }
++    return true;
++}
++
+ void ActionWrapper::SetMovementStateSync(bool forward, bool left, bool backward, bool right, int delay_millis)
+ {
+     backend_->SetMovementStateSync(forward, left, backward, right, delay_millis);
+@@ -100,7 +124,7 @@ void ActionWrapper::MouseRightUpSync(int delay_millis)
+ 
+ bool ActionWrapper::SendViewDeltaSync(int dx, int dy)
+ {
+-    return backend_->SendViewDeltaSync(dx, dy);
++    return backend_->SendViewDeltaSync(dx * view_delta_polarity_, dy);
+ }
+ 
+ } // namespace mapnavigator
+diff --git a/agent/cpp-algo/source/MapNavigator/action_wrapper.h b/agent/cpp-algo/source/MapNavigator/action_wrapper.h
+index a015afb..b36591f 100644
+--- a/agent/cpp-algo/source/MapNavigator/action_wrapper.h
++++ b/agent/cpp-algo/source/MapNavigator/action_wrapper.h
+@@ -25,7 +25,10 @@ public:
+     const char* unsupported_reason() const;
+     double DefaultTurnUnitsPerDegree() const;
+     SteeringTransportProfile SteeringProfile() const;
++    bool RequiresSampleAndHoldNavigation() const;
+     bool SupportsSprint() const;
++    int ViewDeltaPolarity() const;
++    bool SetViewDeltaPolarity(int polarity);
+ 
+     void SetMovementStateSync(bool forward, bool left, bool backward, bool right, int delay_millis);
+     void TriggerJumpSync(int hold_millis);
+@@ -42,6 +45,7 @@ public:
+ 
+ private:
+     std::unique_ptr<IInputBackend> backend_;
++    int view_delta_polarity_ = 1;
+ };
+ 
+ } // namespace mapnavigator
 diff --git a/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp b/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp
 index 8735e83..dbbb179 100644
 --- a/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp
@@ -771,11 +1312,694 @@ index 8735e83..dbbb179 100644
      const auto info = ParseControllerInfo(controller);
      return info.type;
  }
+diff --git a/agent/cpp-algo/source/MapNavigator/navi_config.h b/agent/cpp-algo/source/MapNavigator/navi_config.h
+index fbb9c71..6501259 100644
+--- a/agent/cpp-algo/source/MapNavigator/navi_config.h
++++ b/agent/cpp-algo/source/MapNavigator/navi_config.h
+@@ -65,6 +65,43 @@ constexpr int32_t kLocatorRetryIntervalMs = 20;
+ constexpr int32_t kHighLatencyCaptureMs = 180;
+ constexpr int32_t kStopWaitMs = 150;
+ constexpr int32_t kTargetTickMs = 33;
++// ADB sample-and-hold navigation. The avatar is stationary while a slow ADB
++// frame is captured, then receives one bounded forward pulse. Pulse length is
++// adapted from observed world displacement and shortened around close goals
++// and sharp corners.
++constexpr int32_t kAdbSampleHoldMinPulseMs = 60;
++constexpr int32_t kAdbSampleHoldMaxPulseMs = 240;
++constexpr int32_t kAdbSampleHoldSharpTurnMaxPulseMs = 100;
++constexpr int32_t kAdbSampleHoldNearGoalMaxPulseMs = 80;
++// Camera-only turns do not rotate the avatar body until movement is sampled.
++// Keep this commit pulse short enough to avoid meaningful route drift while
++// still exceeding the minimum gesture duration proven on physical Android.
++constexpr int32_t kAdbSampleHoldHeadingCommitPulseMs = 80;
++// ADB must preserve authored RUN geometry around cliffs and water.  Limiting
++// every serial-route pulse gives the next physical-device fix a chance to
++// close the loop before a narrow corner can be overrun.
++constexpr int32_t kAdbSampleHoldAuthoredRunMaxPulseMs = 100;
++constexpr double kAdbSampleHoldInitialUnitsPerMs = 0.008;
++constexpr double kAdbSampleHoldMinUnitsPerMs = 0.002;
++constexpr double kAdbSampleHoldMaxUnitsPerMs = 0.030;
++constexpr double kAdbSampleHoldPulseTargetFraction = 0.45;
++// After a forward sample, the displacement vector is a more reliable body
++// heading than the minimap arrow, which can lag a large touch-camera turn by
++// one or more captures on physical Android devices.
++constexpr double kAdbSampleHoldMotionHeadingMinDistanceM = 0.5;
++constexpr double kAdbSampleHoldHeadingOutlierDeg = 65.0;
++constexpr double kAdbSampleHoldOutlierStableHeadingDeg = 8.0;
++constexpr double kAdbSampleHoldOutlierStationaryDistanceM = 0.5;
++constexpr int32_t kAdbSampleHoldOutlierConfirmFrames = 2;
++constexpr double kAdbSampleHoldMoveHeadingLimitDeg = 32.0;
++constexpr double kAdbSampleHoldTurnResponseMinDeg = 2.0;
++// A transport polarity change requires two clear, motion-derived responses in
++// the direction opposite to the requested turn.  The upper bound excludes
++// near-180-degree locator aliases, which do not carry reliable sign evidence.
++constexpr double kAdbSampleHoldPolarityResponseMinDeg = 10.0;
++constexpr double kAdbSampleHoldPolarityResponseMaxDeg = 100.0;
++constexpr int32_t kAdbSampleHoldPolarityConfirmResponses = 2;
++constexpr int32_t kAdbSampleHoldTurnResponseTimeoutMs = 12000;
+ constexpr int32_t kSteeringRateMaxGapMs = 400;
+ constexpr int32_t kSteeringRateReferenceMs = 100;
+ constexpr double kSteeringHeadingChangeEpsilonDeg = 0.05;
+@@ -104,6 +141,7 @@ constexpr double kUnstickMinDistanceM = 2.5; // shortest committed dislodge step
+ constexpr double kUnstickMaxDistanceM = 6.0; // ray-scan reach / longest dislodge step
+ constexpr int32_t kUnstickPulseMs = 270;     // per forward pulse after turning to the escape bearing
+ constexpr int32_t kUnstickMaxPulses = 8;     // committed-walk cap; displacement exit usually ends it sooner
++constexpr double kUnstickHeadingCorrectionDeg = 20.0; // re-aim between pulses when a large touch turn only partly commits
+ constexpr double kUnstickResetDistanceM = 2.0;  // relocated this far from the unstick origin => reset bearing rotation
+ constexpr double kUnstickSuccessFraction = 0.6; // displacement >= this * planned dist => a real dislodge step
+ // When the locator yields no usable fix for a sustained period (e.g. the agent was shoved across a
+diff --git a/agent/cpp-algo/source/MapNavigator/navi_domain_types.h b/agent/cpp-algo/source/MapNavigator/navi_domain_types.h
+index bdc9bca..452d14a 100644
+--- a/agent/cpp-algo/source/MapNavigator/navi_domain_types.h
++++ b/agent/cpp-algo/source/MapNavigator/navi_domain_types.h
+@@ -157,6 +157,7 @@ struct NaviPosition
+     double x = 0.0;
+     double y = 0.0;
+     double angle = 0.0;
++    bool heading_valid = false;
+     bool valid = false;
+     std::string zone_id;
+     std::chrono::steady_clock::time_point timestamp;
+diff --git a/agent/cpp-algo/source/MapNavigator/navigation_state_machine.cpp b/agent/cpp-algo/source/MapNavigator/navigation_state_machine.cpp
+index 36e61ee..d315a9d 100644
+--- a/agent/cpp-algo/source/MapNavigator/navigation_state_machine.cpp
++++ b/agent/cpp-algo/source/MapNavigator/navigation_state_machine.cpp
+@@ -507,6 +507,223 @@ bool NavigationStateMachine::CaptureCurrentPosition(bool force_global_search)
+     return position_provider_->Capture(position_, force_global_search, session_->current_zone_id());
+ }
+ 
++bool NavigationStateMachine::ObserveSampleAndHoldFix()
++{
++    std::optional<double> pulse_motion_heading;
++    if (sample_hold_pulse_pending_) {
++        const double displacement = std::hypot(
++            position_->x - sample_hold_pulse_origin_.x,
++            position_->y - sample_hold_pulse_origin_.y);
++        const double observed_units_per_ms =
++            sample_hold_pulse_ms_ > 0 ? displacement / static_cast<double>(sample_hold_pulse_ms_) : 0.0;
++        const bool usable_speed = !position_provider_->LastCaptureWasHeld()
++                                  && observed_units_per_ms >= kAdbSampleHoldMinUnitsPerMs
++                                  && observed_units_per_ms <= kAdbSampleHoldMaxUnitsPerMs;
++        if (usable_speed) {
++            constexpr double kSpeedObservationWeight = 0.25;
++            sample_hold_units_per_ms_ = std::clamp(
++                sample_hold_units_per_ms_ * (1.0 - kSpeedObservationWeight)
++                    + observed_units_per_ms * kSpeedObservationWeight,
++                kAdbSampleHoldMinUnitsPerMs,
++                kAdbSampleHoldMaxUnitsPerMs);
++        }
++        if (!position_provider_->LastCaptureWasHeld() && !position_provider_->LastCaptureWasBlackScreen()
++            && displacement >= kAdbSampleHoldMotionHeadingMinDistanceM) {
++            pulse_motion_heading = NaviMath::NormalizeAngle(NaviMath::CalcTargetRotation(
++                sample_hold_pulse_origin_.x,
++                sample_hold_pulse_origin_.y,
++                position_->x,
++                position_->y));
++            // All downstream route and recovery decisions in this tick must
++            // see the same motion-derived heading used by the observer.
++            position_->angle = *pulse_motion_heading;
++            LogInfo << "ADB sample-and-hold motion heading."
++                    << VAR(*pulse_motion_heading) << VAR(displacement)
++                    << VAR(sample_hold_pulse_origin_.x) << VAR(sample_hold_pulse_origin_.y)
++                    << VAR(position_->x) << VAR(position_->y);
++        }
++        LogInfo << "ADB sample-and-hold pulse observation." << VAR(sample_hold_pulse_ms_) << VAR(displacement)
++                << VAR(observed_units_per_ms) << VAR(usable_speed) << VAR(sample_hold_units_per_ms_)
++                << VAR(position_->x) << VAR(position_->y);
++        sample_hold_pulse_pending_ = false;
++        sample_hold_pulse_ms_ = 0;
++    }
++
++    const double observed_heading = pulse_motion_heading.value_or(NaviMath::NormalizeAngle(position_->angle));
++    if (!sample_hold_has_heading_) {
++        sample_hold_has_heading_ = true;
++        sample_hold_heading_deg_ = observed_heading;
++        sample_hold_heading_from_motion_ = pulse_motion_heading.has_value();
++        sample_hold_expected_turn_deg_ = 0.0;
++        sample_hold_outlier_pending_ = false;
++        sample_hold_outlier_confirmations_ = 0;
++        LogInfo << "ADB sample-and-hold heading baseline." << VAR(observed_heading);
++        return true;
++    }
++
++    const double observed_delta = NaviMath::NormalizeAngle(observed_heading - sample_hold_heading_deg_);
++    const double response_residual = NaviMath::NormalizeAngle(observed_delta - sample_hold_expected_turn_deg_);
++    const bool outlier = std::abs(response_residual) > kAdbSampleHoldHeadingOutlierDeg;
++    const bool polarity_evidence = pulse_motion_heading.has_value()
++                                   && std::abs(sample_hold_expected_turn_deg_) >= kAdbSampleHoldPolarityResponseMinDeg
++                                   && std::abs(observed_delta) >= kAdbSampleHoldPolarityResponseMinDeg
++                                   && std::abs(observed_delta) <= kAdbSampleHoldPolarityResponseMaxDeg;
++    if (!sample_hold_view_polarity_calibrated_ && polarity_evidence) {
++        const bool opposing_response = observed_delta * sample_hold_expected_turn_deg_ < 0.0;
++        if (opposing_response) {
++            ++sample_hold_polarity_opposition_count_;
++            LogWarn << "ADB view-delta polarity opposing response observed."
++                    << VAR(sample_hold_polarity_opposition_count_) << VAR(sample_hold_expected_turn_deg_)
++                    << VAR(observed_delta) << VAR(action_wrapper_->ViewDeltaPolarity());
++            if (sample_hold_polarity_opposition_count_ >= kAdbSampleHoldPolarityConfirmResponses) {
++                const int previous_polarity = action_wrapper_->ViewDeltaPolarity();
++                if (action_wrapper_->SetViewDeltaPolarity(-previous_polarity)) {
++                    sample_hold_view_polarity_calibrated_ = true;
++                    sample_hold_polarity_opposition_count_ = 0;
++                    sample_hold_turn_started_at_ = std::chrono::steady_clock::now();
++                    LogWarn << "ADB view-delta polarity calibrated from motion response."
++                            << VAR(previous_polarity) << VAR(action_wrapper_->ViewDeltaPolarity())
++                            << VAR(sample_hold_expected_turn_deg_) << VAR(observed_delta);
++                }
++            }
++        }
++        else {
++            sample_hold_view_polarity_calibrated_ = true;
++            sample_hold_polarity_opposition_count_ = 0;
++            LogInfo << "ADB view-delta polarity confirmed from motion response."
++                    << VAR(sample_hold_expected_turn_deg_) << VAR(observed_delta)
++                    << VAR(action_wrapper_->ViewDeltaPolarity());
++        }
++    }
++    const bool directional_turn_response = std::abs(sample_hold_expected_turn_deg_) >= kAdbSampleHoldTurnResponseMinDeg
++                                && std::abs(observed_delta) >= kAdbSampleHoldTurnResponseMinDeg
++                                && observed_delta * sample_hold_expected_turn_deg_ > 0.0;
++    const bool turn_responded = directional_turn_response && (!outlier || pulse_motion_heading.has_value());
++    LogInfo << "ADB sample-and-hold heading observation." << VAR(sample_hold_heading_deg_) << VAR(observed_heading)
++            << VAR(observed_delta) << VAR(sample_hold_expected_turn_deg_) << VAR(response_residual) << VAR(outlier)
++            << VAR(turn_responded);
++    sample_hold_expected_turn_deg_ = 0.0;
++    if (outlier && pulse_motion_heading.has_value()) {
++        // A real translation vector is authoritative even when a camera turn
++        // committed by a very different amount than requested.  Rejecting it
++        // would preserve the stale minimap baseline and steer the next long
++        // pulse in the wrong direction.
++        LogWarn << "ADB sample-and-hold accepted motion heading despite camera-response residual."
++                << VAR(observed_heading) << VAR(response_residual);
++    }
++    else if (outlier) {
++        // Minimap orientation occasionally aliases by a large angle on mobile
++        // captures.  A single outlier must never drive the camera.  A second
++        // stationary fix at the same new heading is evidence that an explicit
++        // recovery turn changed the avatar body or that a motion-derived
++        // baseline became stale across a black-screen/fall transition.  Accept
++        // that stable pair so neither baseline can deadlock the steering loop.
++        const double candidate_heading_delta = sample_hold_outlier_pending_
++                                                   ? std::abs(NaviMath::NormalizeAngle(
++                                                         observed_heading - sample_hold_outlier_fix_.angle))
++                                                   : std::numeric_limits<double>::infinity();
++        const double candidate_displacement = sample_hold_outlier_pending_
++                                                  ? std::hypot(
++                                                        position_->x - sample_hold_outlier_fix_.x,
++                                                        position_->y - sample_hold_outlier_fix_.y)
++                                                  : std::numeric_limits<double>::infinity();
++        const bool stable_confirmation = sample_hold_outlier_pending_
++                                         && candidate_heading_delta <= kAdbSampleHoldOutlierStableHeadingDeg
++                                         && candidate_displacement <= kAdbSampleHoldOutlierStationaryDistanceM;
++        if (stable_confirmation) {
++            ++sample_hold_outlier_confirmations_;
++        }
++        else {
++            sample_hold_outlier_pending_ = true;
++            sample_hold_outlier_fix_ = *position_;
++            sample_hold_outlier_fix_.angle = observed_heading;
++            sample_hold_outlier_confirmations_ = 1;
++        }
++        if (sample_hold_outlier_confirmations_ >= kAdbSampleHoldOutlierConfirmFrames) {
++            if (sample_hold_heading_from_motion_) {
++                LogWarn << "ADB sample-and-hold released stale motion heading after stable stationary confirmation."
++                        << VAR(sample_hold_heading_deg_) << VAR(observed_heading);
++            }
++            RebaseSampleAndHoldHeading("stable_stationary_outlier");
++            return true;
++        }
++        position_->angle = sample_hold_heading_deg_;
++        LogWarn << "ADB sample-and-hold awaiting stable stationary outlier confirmation."
++                << VAR(sample_hold_outlier_confirmations_) << VAR(candidate_heading_delta)
++                << VAR(candidate_displacement) << VAR(observed_heading) << VAR(sample_hold_heading_from_motion_);
++        return false;
++    }
++
++    sample_hold_outlier_pending_ = false;
++    sample_hold_outlier_confirmations_ = 0;
++
++    if (turn_responded && sample_hold_turn_started_at_.time_since_epoch().count() != 0) {
++        // The watchdog measures absence of a body-heading response, not total
++        // wall time spent negotiating a sharp corner. A physical-device frame
++        // costs roughly 1.5 seconds, so several healthy closed-loop steps can
++        // legitimately exceed the original 12-second absolute deadline.
++        sample_hold_turn_started_at_ = std::chrono::steady_clock::now();
++        LogInfo << "ADB sample-and-hold turn watchdog renewed by body-heading response."
++                << VAR(observed_delta);
++    }
++
++    sample_hold_heading_deg_ = observed_heading;
++    if (pulse_motion_heading.has_value()) {
++        sample_hold_heading_from_motion_ = true;
++    }
++    return true;
++}
++
++void NavigationStateMachine::RebaseSampleAndHoldHeading(const char* reason)
++{
++    if (!action_wrapper_->RequiresSampleAndHoldNavigation() || !position_->valid
++        || position_provider_->LastCaptureWasHeld() || position_provider_->LastCaptureWasBlackScreen()) {
++        return;
++    }
++    sample_hold_has_heading_ = true;
++    sample_hold_heading_deg_ = NaviMath::NormalizeAngle(position_->angle);
++    sample_hold_heading_from_motion_ = false;
++    sample_hold_expected_turn_deg_ = 0.0;
++    sample_hold_turn_started_at_ = {};
++    sample_hold_outlier_pending_ = false;
++    sample_hold_outlier_confirmations_ = 0;
++    LogInfo << "ADB sample-and-hold heading rebased from a fresh recovery fix."
++            << VAR(reason) << VAR(sample_hold_heading_deg_) << VAR(position_->x) << VAR(position_->y);
++}
++
++int NavigationStateMachine::ComputeSampleAndHoldPulseMs(
++    double waypoint_distance,
++    double arrival_distance,
++    double upcoming_turn_deg,
++    bool strict_arrival) const
++{
++    const double remaining_budget = std::max(0.25, waypoint_distance - arrival_distance * 0.5);
++    const double target_displacement = remaining_budget * kAdbSampleHoldPulseTargetFraction;
++    const double speed = std::clamp(
++        sample_hold_units_per_ms_,
++        kAdbSampleHoldMinUnitsPerMs,
++        kAdbSampleHoldMaxUnitsPerMs);
++    int pulse_ms = static_cast<int>(std::lround(target_displacement / speed));
++    pulse_ms = std::clamp(pulse_ms, kAdbSampleHoldMinPulseMs, kAdbSampleHoldMaxPulseMs);
++
++    if (upcoming_turn_deg >= kNavRunSharpTurnDeg) {
++        pulse_ms = std::min(pulse_ms, kAdbSampleHoldSharpTurnMaxPulseMs);
++    }
++    if (waypoint_distance <= kMicroThreshold || (strict_arrival && waypoint_distance <= arrival_distance + 2.0)) {
++        pulse_ms = std::min(pulse_ms, kAdbSampleHoldNearGoalMaxPulseMs);
++    }
++    return pulse_ms;
++}
++
++void NavigationStateMachine::NoteSampleAndHoldPulse(int pulse_ms)
++{
++    sample_hold_pulse_origin_ = *position_;
++    sample_hold_pulse_ms_ = pulse_ms;
++    sample_hold_pulse_pending_ = true;
++    LogInfo << "ADB sample-and-hold forward pulse." << VAR(pulse_ms) << VAR(sample_hold_units_per_ms_)
++            << VAR(position_->x) << VAR(position_->y) << VAR(position_->angle);
++}
++
+ // A sustained run of unusable fixes (commonly: the agent was shoved across a zone boundary into a
+ // sub-zone the route was not planned in, so every locate fails zone validation) would otherwise hold
+ // forward into the obstacle forever — the recovery block and its timeout sit past this point and are
+@@ -800,17 +1017,32 @@ bool NavigationStateMachine::ExecutePhysicalUnstick(double stuck_heading)
+     }
+ 
+     const double target_heading = NaviMath::CalcTargetRotation(position_->x, position_->y, target->x, target->y);
+-    const double heading_delta = NaviMath::CalcDeltaRotation(position_->angle, target_heading);
+     motion_controller_->SetForwardState(false);
+     utils::SleepFor(kStopWaitMs);
+-    int units = static_cast<int>(std::lround(heading_delta * action_wrapper_->DefaultTurnUnitsPerDegree()));
+-    if (units == 0) {
+-        units = heading_delta > 0.0 ? 1 : -1;
+-    }
+-    action_wrapper_->SendViewDeltaSync(units, 0);
++
++    int heading_corrections = 0;
++    const auto correct_unstick_heading = [&]() {
++        const double remaining_heading_error = NaviMath::CalcDeltaRotation(position_->angle, target_heading);
++        if (std::abs(remaining_heading_error) <= kUnstickHeadingCorrectionDeg) {
++            return true;
++        }
++        int units = static_cast<int>(std::lround(
++            remaining_heading_error * action_wrapper_->DefaultTurnUnitsPerDegree()));
++        if (units == 0) {
++            units = remaining_heading_error > 0.0 ? 1 : -1;
++        }
++        const bool corrected = action_wrapper_->SendViewDeltaSync(units, 0);
++        ++heading_corrections;
++        LogInfo << "Physical unstick heading correction."
++                << VAR(remaining_heading_error) << VAR(units) << VAR(corrected)
++                << VAR(heading_corrections) << VAR(target_heading);
++        return corrected;
++    };
++    correct_unstick_heading();
+ 
+     const NaviPosition step_start = *position_;
+     double moved = 0.0;
++    bool has_fresh_fix = false;
+     for (int pulse = 0; pulse < kUnstickMaxPulses; ++pulse) {
+         action_wrapper_->PulseForwardSync(kUnstickPulseMs);
+         // Stop the moment tracking goes blind (held / black screen = a likely river fall) so we don't keep
+@@ -819,16 +1051,69 @@ bool NavigationStateMachine::ExecutePhysicalUnstick(double stuck_heading)
+             || !position_->valid) {
+             break;
+         }
++        has_fresh_fix = true;
+         moved = std::hypot(position_->x - step_start.x, position_->y - step_start.y);
+         if (moved >= distance * kUnstickSuccessFraction) {
+             break;
+         }
++        // A large touch-camera command can commit only part of its requested
++        // body rotation on the first joystick pulse.  Re-aim from the fresh
++        // minimap heading before spending the next pulse against the same prop.
++        correct_unstick_heading();
+     }
+     motion_controller_->SetForwardState(false);
++    if (has_fresh_fix) {
++        if (action_wrapper_->RequiresSampleAndHoldNavigation()
++            && moved >= kAdbSampleHoldMotionHeadingMinDistanceM) {
++            const double reported_heading = position_->angle;
++            const double motion_heading = NaviMath::NormalizeAngle(NaviMath::CalcTargetRotation(
++                step_start.x,
++                step_start.y,
++                position_->x,
++                position_->y));
++            position_->angle = motion_heading;
++            RebaseSampleAndHoldHeading("physical_unstick");
++            sample_hold_heading_from_motion_ = true;
++            LogInfo << "Physical unstick rebased ADB heading from displacement."
++                    << VAR(reported_heading) << VAR(motion_heading) << VAR(moved);
++        }
++        else {
++            RebaseSampleAndHoldHeading("physical_unstick");
++        }
++    }
+     ++unstick.count;
+     const bool dislodged = moved >= distance * kUnstickSuccessFraction;
+     LogInfo << "Physical unstick step executed." << VAR(distance) << VAR(moved) << VAR(dislodged) << VAR(unstick.count)
+-            << VAR(target_heading) << VAR(target->x) << VAR(target->y);
++            << VAR(target_heading) << VAR(position_->angle) << VAR(heading_corrections)
++            << VAR(target->x) << VAR(target->y);
++
++    // A genuine relocation invalidates the off-route wedge sample that
++    // triggered this escape. Without resetting it, the rebuilt route inherits
++    // the old 12-second deadline and can be failed one or two seconds after a
++    // successful unstick, before it has any chance to make inward progress.
++    // Keep the session hard-progress clock below intact; it still bounds
++    // repeated sideways escapes at kDynamicRecoveryTotalTimeoutMs.
++    if (dislodged) {
++        runtime_state_.offroute.Reset();
++        LogInfo << "Off-route watchdog reset after physical dislodge." << VAR(moved);
++    }
++
++    // The authored collect-route RUN points encode narrow safe ground around
++    // water and cliffs.  On ADB, a successful physical escape must return to
++    // that serial route instead of replacing every intermediate RUN point
++    // with one navmesh corridor to the next COLLECT semantic anchor.  The
++    // latter shortcut was observed to run seven map units left of Route1 at
++    // the river bank and a subsequent jump recovery fell into the water.
++    if (dislodged && action_wrapper_->RequiresSampleAndHoldNavigation()) {
++        runtime_state_.route.ResetTracking();
++        runtime_state_.dynamic_replan_requested = false;
++        runtime_state_.nav_run_dirty = true;
++        session_->ResetProgress();
++        LogInfo << "Physical unstick resumed the authored ADB route after dislodge."
++                << VAR(session_->current_node_idx()) << VAR(position_->x) << VAR(position_->y);
++        SelectPhaseForCurrentWaypoint("recovery_adb_authored_route");
++        return true;
++    }
+ 
+     // Refresh the route from the new spot but keep the hard-progress clock: this replan re-fires every recovery
+     // retry while stuck, and resetting the clock each time would defeat the 30s recovery timeout (livelock).
+@@ -872,9 +1157,27 @@ bool NavigationStateMachine::TickNavigate()
+         return true;
+     }
+ 
+-    if (!CaptureCurrentPosition(false)) {
++    const bool sample_and_hold = action_wrapper_->RequiresSampleAndHoldNavigation();
++    if (sample_and_hold && motion_controller_->IsMoving()) {
++        motion_controller_->SetForwardState(false);
++    }
++    const auto capture_started_at = std::chrono::steady_clock::now();
++    const bool capture_succeeded = CaptureCurrentPosition(false);
++    const int64_t capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                   std::chrono::steady_clock::now() - capture_started_at)
++                                   .count();
++    if (sample_and_hold) {
++        LogInfo << "ADB sample-and-hold capture." << VAR(capture_succeeded) << VAR(capture_ms)
++                << VAR(position_provider_->LastCaptureWasHeld()) << VAR(position_provider_->LastCaptureWasBlackScreen());
++    }
++    if (!capture_succeeded) {
+         return HandleLocalizationLoss();
+     }
++    if (sample_and_hold && !ObserveSampleAndHoldFix()) {
++        LogWarn << "ADB sample-and-hold rejected incoherent heading; waiting for a stationary confirmation frame.";
++        utils::SleepFor(kTargetTickMs);
++        return true;
++    }
+     {
+         LocalizationLossState& loss = runtime_state_.localization_loss;
+         if (loss.started_at != std::chrono::steady_clock::time_point {}) {
+@@ -925,7 +1228,13 @@ bool NavigationStateMachine::TickNavigate()
+     }
+ 
+     if (session_->CurrentWaypoint().IsZoneDeclaration()) {
+-        motion_controller_->SetForwardState(true);
++        if (sample_and_hold) {
++            NoteSampleAndHoldPulse(kAdbSampleHoldSharpTurnMaxPulseMs);
++            action_wrapper_->PulseForwardSync(kAdbSampleHoldSharpTurnMaxPulseMs);
++        }
++        else {
++            motion_controller_->SetForwardState(true);
++        }
+         utils::SleepFor(kTargetTickMs);
+         return true;
+     }
+@@ -945,7 +1254,11 @@ bool NavigationStateMachine::TickNavigate()
+     }
+ 
+     NavRunTickResult nav_run_result;
+-    if (route.valid && session_->HasCurrentWaypoint()) {
++    // ADB physical-device navigation deliberately follows the serial authored
++    // RUN points.  NavRun's corridor projection may skip multiple narrow-bank
++    // waypoints after an off-route recovery, which defeats their safety
++    // geometry.  Desktop backends keep the lookahead corridor optimisation.
++    if (!sample_and_hold && route.valid && session_->HasCurrentWaypoint()) {
+         const Waypoint& current_waypoint = session_->CurrentWaypoint();
+         if (current_waypoint.HasPosition() && current_waypoint.action == ActionType::RUN) {
+             // Strict RUN must be hit precisely, so its corridor anchor is the waypoint itself;
+@@ -1114,6 +1427,31 @@ bool NavigationStateMachine::TickNavigate()
+         }
+     }
+ 
++    const double effective_route_heading =
++        nav_run_result.has_corridor_heading ? nav_run_result.corridor_heading : route.route_heading;
++    const double heading_error = NaviMath::NormalizeAngle(effective_route_heading - current_heading);
++    const bool sample_hold_waiting_for_turn =
++        sample_and_hold && std::abs(heading_error) > kAdbSampleHoldMoveHeadingLimitDeg;
++    if (sample_hold_waiting_for_turn) {
++        if (sample_hold_turn_started_at_.time_since_epoch().count() == 0) {
++            sample_hold_turn_started_at_ = now;
++        }
++        const int64_t turn_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                         now - sample_hold_turn_started_at_)
++                                         .count();
++        if (turn_wait_ms >= kAdbSampleHoldTurnResponseTimeoutMs) {
++            return FailNavigation(
++                "adb_turn_no_response",
++                "ADB camera turn did not converge before the sample-and-hold timeout.",
++                route.waypoint_distance,
++                heading_error,
++                turn_wait_ms);
++        }
++    }
++    else {
++        sample_hold_turn_started_at_ = {};
++    }
++
+     if (runtime_state_.river_fall.pending) {
+         RiverFallRecoveryState& rf = runtime_state_.river_fall;
+         if (session_->HardStalledMs(now) > kRiverFallRecoveryTimeoutMs) {
+@@ -1156,7 +1494,7 @@ bool NavigationStateMachine::TickNavigate()
+     // where on_route is meaningful; the stall clocks above are fed corridor progress and miss a pinned-off-route
+     // cursor. Fed straight-line distance, so the timer only grows while genuinely off-route with no inward gain.
+     if (session_->phase() == NaviPhase::Navigate && waypoint.action == ActionType::RUN && !waypoint.RequiresStrictArrival()
+-        && !route.on_route && !runtime_state_.cross_tier_escape.active) {
++        && !route.on_route && !runtime_state_.cross_tier_escape.active && !sample_hold_waiting_for_turn) {
+         OffRouteWedgeState& wedge = runtime_state_.offroute;
+         const double progress_epsilon = std::max(kNoProgressDistanceEpsilon, kMeasurementDefaultPositionQuantum);
+         if (!wedge.active || route.progress_distance + progress_epsilon < wedge.best_distance) {
+@@ -1180,6 +1518,18 @@ bool NavigationStateMachine::TickNavigate()
+             wedge.last_replan_at = now;
+             LogWarn << "Off-route wedge detected; replanning from current position." << VAR(wedge_ms) << VAR(route.waypoint_distance)
+                     << VAR(route.cross_track) << VAR(session_->current_node_idx());
++
++            // A navmesh-only replan cannot free the avatar when the current
++            // world position is valid but physically pinned against an
++            // unmodelled prop (for example, the Wuling teleport relay).  The
++            // ordinary obstacle recovery is keyed off stalled_ms, which can
++            // be repeatedly reset by sub-meter localization jitter while the
++            // off-route watchdog correctly observes no inward progress.  Use
++            // the watchdog as the second, independent trigger for one bounded
++            // on-mesh escape step before replanning from the new position.
++            if (ExecutePhysicalUnstick(route.route_heading)) {
++                return true;
++            }
+             HandleDynamicReplanRequest("offroute_wedge");
+             return true;
+         }
+@@ -1194,8 +1544,8 @@ bool NavigationStateMachine::TickNavigate()
+     const bool near_strict_goal =
+         waypoint.RequiresStrictArrival() && route.waypoint_distance <= arrival_distance + kCloseGoalDetourSuppressSlack;
+     const bool should_try_recovery = session_->phase() == NaviPhase::Navigate && stalled_ms >= kObstacleRecoveryMinTriggerMs
+-                                     && (route.progress_distance > kNoProgressMinDistance || waypoint.RequiresStrictArrival())
+-                                     && !runtime_state_.cross_tier_escape.active;
++                                      && (route.progress_distance > kNoProgressMinDistance || waypoint.RequiresStrictArrival())
++                                      && !runtime_state_.cross_tier_escape.active && !sample_hold_waiting_for_turn;
+     if (should_try_recovery) {
+         const std::optional<DynamicAnchor> anchor = ResolveCurrentAnchor(session_, *position_);
+         if (anchor) {
+@@ -1312,8 +1662,6 @@ bool NavigationStateMachine::TickNavigate()
+         }
+     }
+ 
+-    const double effective_route_heading = nav_run_result.has_corridor_heading ? nav_run_result.corridor_heading : route.route_heading;
+-
+     double heading_rate_deg = 0.0;
+     double heading_rate_raw_delta_deg = 0.0;
+     int64_t heading_rate_gap_ms = 0;
+@@ -1336,23 +1684,69 @@ bool NavigationStateMachine::TickNavigate()
+         runtime_state_.steering_rate.has_prev = true;
+     }
+ 
+-    const double heading_error = NaviMath::NormalizeAngle(effective_route_heading - current_heading);
+-    const SteeringCommand steering = SteeringController::Update(heading_error, heading_rate_deg, motion_controller_->IsMovingForward());
++    SteeringCommand steering = SteeringController::Update(heading_error, heading_rate_deg, motion_controller_->IsMovingForward());
++    if (sample_hold_waiting_for_turn) {
++        // We are stopped and each verification frame costs roughly 1.5 s.  A
++        // proportional 0.3 command needs many forward commit pulses to finish
++        // a U-turn and draws a wide, unsafe arc.  Request the full residual;
++        // MotionController still enforces the backend's 45-degree batch cap.
++        steering.yaw_delta_deg = heading_error;
++        steering.issued = true;
++        LogDebug << "ADB sample-and-hold coarse turn requested." << VAR(heading_error);
++    }
+ 
+-    motion_controller_->SetForwardState(true);
++    if (!sample_and_hold) {
++        motion_controller_->SetForwardState(true);
++    }
+ 
+     double issued_delta_deg = 0.0;
++    int sample_hold_pulse_ms = 0;
+     if (steering.issued) {
+         const TurnCommandResult steering_result = motion_controller_->ApplySteering(steering.yaw_delta_deg);
+         if (steering_result.issued) {
+             issued_delta_deg = steering_result.issued_delta_degrees;
++            if (sample_and_hold) {
++                sample_hold_expected_turn_deg_ = issued_delta_deg;
++                // On touch devices a camera swipe changes the view, but the
++                // minimap continues to report the avatar body's old heading
++                // until the joystick moves. Commit every successful coarse
++                // turn with one bounded forward sample so the next capture can
++                // observe the new body heading and close the steering loop.
++                if (sample_hold_waiting_for_turn && !degraded_fix
++                    && std::abs(issued_delta_deg) > kSteeringHeadingChangeEpsilonDeg) {
++                    sample_hold_pulse_ms = kAdbSampleHoldHeadingCommitPulseMs;
++                    NoteSampleAndHoldPulse(sample_hold_pulse_ms);
++                    action_wrapper_->PulseForwardSync(sample_hold_pulse_ms);
++                    LogInfo << "ADB sample-and-hold heading commit pulse." << VAR(sample_hold_pulse_ms)
++                            << VAR(heading_error) << VAR(issued_delta_deg);
++                }
++            }
+         }
+     }
+ 
++    const bool sample_hold_heading_safe = std::abs(heading_error) <= kAdbSampleHoldMoveHeadingLimitDeg;
++    if (sample_and_hold && !degraded_fix && sample_hold_heading_safe) {
++        sample_hold_pulse_ms = ComputeSampleAndHoldPulseMs(
++            route.waypoint_distance,
++            arrival_distance,
++            nav_run_result.upcoming_turn_deg,
++            waypoint.RequiresStrictArrival());
++        if (waypoint.action == ActionType::RUN) {
++            sample_hold_pulse_ms = std::min(sample_hold_pulse_ms, kAdbSampleHoldAuthoredRunMaxPulseMs);
++        }
++        NoteSampleAndHoldPulse(sample_hold_pulse_ms);
++        action_wrapper_->PulseForwardSync(sample_hold_pulse_ms);
++    }
++    else if (sample_and_hold && sample_hold_pulse_ms == 0) {
++        LogInfo << "ADB sample-and-hold movement deferred." << VAR(degraded_fix) << VAR(sample_hold_heading_safe)
++                << VAR(heading_error) << VAR(issued_delta_deg) << VAR(route.waypoint_distance);
++    }
++
+     LogDebug << "TickNavigate steering decision." << VAR(current_heading) << VAR(route.route_heading) << VAR(effective_route_heading)
+              << VAR(nav_run_result.has_corridor_heading) << VAR(nav_run_result.cross_track) << VAR(nav_run_result.upcoming_turn_deg)
+              << VAR(heading_rate_deg) << VAR(heading_rate_raw_delta_deg) << VAR(heading_rate_gap_ms) << VAR(heading_error)
+-             << VAR(steering.yaw_delta_deg) << VAR(issued_delta_deg) << VAR(route.waypoint_distance) << VAR(route.on_route);
++             << VAR(steering.yaw_delta_deg) << VAR(issued_delta_deg) << VAR(sample_hold_pulse_ms) << VAR(route.waypoint_distance)
++             << VAR(route.on_route);
+ 
+     // Collect routes: keep sprint for travel but drop to walking speed once near a COLLECT point (cancels any
+     // active sprint), so the detection-stop can land before we overrun the collectible. No-op off collect
+@@ -1375,7 +1769,7 @@ bool NavigationStateMachine::TickNavigate()
+     const bool has_strict_arrival_braking_room =
+         !target_requires_strict_arrival || route.waypoint_distance > arrival_distance + kStrictArrivalSprintBrakeDistance;
+     const bool allow_sprint =
+-        turn_calm && motion_controller_->SupportsSprint() && startup_grace_elapsed && param_.sprint_threshold > 0.0
++        !sample_and_hold && turn_calm && motion_controller_->SupportsSprint() && startup_grace_elapsed && param_.sprint_threshold > 0.0
+         && has_strict_arrival_braking_room && sprint_remaining > param_.sprint_threshold
+         && (runtime_state_.flow.last_auto_sprint_time.time_since_epoch().count() == 0
+             || std::chrono::duration_cast<std::chrono::milliseconds>(now - runtime_state_.flow.last_auto_sprint_time).count()
+diff --git a/agent/cpp-algo/source/MapNavigator/navigation_state_machine.h b/agent/cpp-algo/source/MapNavigator/navigation_state_machine.h
+index efcfd5f..7f79356 100644
+--- a/agent/cpp-algo/source/MapNavigator/navigation_state_machine.h
++++ b/agent/cpp-algo/source/MapNavigator/navigation_state_machine.h
+@@ -5,6 +5,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "navi_config.h"
+ #include "nav_run_controller.h"
+ #include "navi_controller.h"
+ #include "navigation_runtime_state.h"
+@@ -61,6 +62,14 @@ private:
+     bool TryEnterCrossTierEscape();
+     bool PlanCrossTierEscapeCorridorFromHere(const char* reason);
+     bool ExecutePhysicalUnstick(double stuck_heading);
++    bool ObserveSampleAndHoldFix();
++    void RebaseSampleAndHoldHeading(const char* reason);
++    int ComputeSampleAndHoldPulseMs(
++        double waypoint_distance,
++        double arrival_distance,
++        double upcoming_turn_deg,
++        bool strict_arrival) const;
++    void NoteSampleAndHoldPulse(int pulse_ms);
+     void SelectPhaseForCurrentWaypoint(const char* reason);
+     void StopMotion();
+     bool FailNavigation(const char* reason, const char* log_message, double current_distance, double yaw_error, int64_t stalled_ms);
+@@ -89,6 +98,21 @@ private:
+     // Anti-stuck: position of the last detection-triggered collect attempt.
+     NaviPosition collect_attempt_pos_ {};
+     bool collect_attempt_pos_valid_ = false;
++
++    bool sample_hold_has_heading_ = false;
++    double sample_hold_heading_deg_ = 0.0;
++    bool sample_hold_heading_from_motion_ = false;
++    double sample_hold_expected_turn_deg_ = 0.0;
++    std::chrono::steady_clock::time_point sample_hold_turn_started_at_ {};
++    bool sample_hold_view_polarity_calibrated_ = false;
++    int sample_hold_polarity_opposition_count_ = 0;
++    bool sample_hold_outlier_pending_ = false;
++    NaviPosition sample_hold_outlier_fix_ {};
++    int sample_hold_outlier_confirmations_ = 0;
++    bool sample_hold_pulse_pending_ = false;
++    NaviPosition sample_hold_pulse_origin_ {};
++    int sample_hold_pulse_ms_ = 0;
++    double sample_hold_units_per_ms_ = kAdbSampleHoldInitialUnitsPerMs;
+ };
+ 
+ } // namespace mapnavigator
 diff --git a/agent/cpp-algo/source/MapNavigator/position_provider.cpp b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
-index 4a4d5a5..3f0de64 100644
+index 4a4d5a5..c4e5f72 100644
 --- a/agent/cpp-algo/source/MapNavigator/position_provider.cpp
 +++ b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
-@@ -46,8 +46,10 @@ bool IsBlackScreen(const cv::Mat& image)
+@@ -1,5 +1,7 @@
+ #include <chrono>
+ 
++#include <MaaUtils/Logger.h>
++
+ #include "../utils.h"
+ #include "MapNavigator/controller_info_utils.h"
+ #include "controller_type_utils.h"
+@@ -46,8 +48,10 @@ bool IsBlackScreen(const cv::Mat& image)
  
  PositionProvider::PositionProvider(MaaController* controller, std::shared_ptr<maplocator::MapLocator> locator)
      : controller_(controller)
@@ -787,7 +2011,7 @@ index 4a4d5a5..3f0de64 100644
  {
  }
  
-@@ -65,15 +67,19 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
+@@ -65,21 +69,43 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
      last_capture_was_black_screen_ = false;
      const auto capture_started_at = std::chrono::steady_clock::now();
  
@@ -805,34 +2029,90 @@ index 4a4d5a5..3f0de64 100644
 +        frame = viewport_->Capture(MaaViewportAlignment_Center, true);
 +    }
 +	if (!frame.has_value() || frame->image.empty()) {
++        const int64_t screenshot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                          std::chrono::steady_clock::now() - capture_started_at)
++                                          .count();
++        LogWarn << "Position capture metrics: screenshot failed." << VAR(screenshot_ms) << VAR(uses_adb_minimap_roi_);
          return false;
      }
  
 -    cv::Mat image = to_mat(buffer.Get());
 +	const cv::Mat& image = frame->image;
++    const auto screenshot_completed_at = std::chrono::steady_clock::now();
++    const int64_t screenshot_ms =
++        std::chrono::duration_cast<std::chrono::milliseconds>(screenshot_completed_at - capture_started_at).count();
      last_capture_was_black_screen_ = IsBlackScreen(image);
      if (frame_observer_) {
          frame_observer_(image);
+     }
+     cv::Mat minimap;
+-    if (!maplocator::TryExtractMinimap(image, uses_adb_minimap_roi_, &minimap)) {
++    if (!minimap_extractor_.Extract(
++            image,
++            uses_adb_minimap_roi_,
++            frame->alignment == MaaViewportAlignment_Left,
++            expected_zone_id,
++            locator_.get(),
++            &minimap)) {
++        const int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                     std::chrono::steady_clock::now() - capture_started_at)
++                                     .count();
++        LogWarn << "Position capture metrics: minimap extraction failed." << VAR(screenshot_ms) << VAR(total_ms)
++                << VAR(frame->frame_id) << VAR(frame->alignment);
+         return false;
+     }
+ 
+@@ -88,9 +114,17 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
+     options.expected_zone_id = expected_zone_id;
+ 
+     const auto locate_result = locator_->locate(minimap, options);
++    const auto locate_completed_at = std::chrono::steady_clock::now();
++    const int64_t locate_ms =
++        std::chrono::duration_cast<std::chrono::milliseconds>(locate_completed_at - screenshot_completed_at).count();
++    const int64_t total_ms =
++        std::chrono::duration_cast<std::chrono::milliseconds>(locate_completed_at - capture_started_at).count();
++    minimap_extractor_.ObserveLocateResult(locate_result);
+     if (locate_result.status != maplocator::LocateStatus::Success || !locate_result.position) {
+         last_capture_was_held_ = false;
+         held_fix_streak_ = 0;
++        LogWarn << "Position capture metrics: localization failed." << VAR(screenshot_ms) << VAR(locate_ms) << VAR(total_ms)
++                << VAR(frame->frame_id) << VAR(frame->alignment) << VAR(force_global_search) << VAR(expected_zone_id);
+         return false;
+     }
+ 
+@@ -109,6 +143,9 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
+     if (position_normalizer_) {
+         position_normalizer_(*out_pos);
+     }
++    LogInfo << "Position capture metrics." << VAR(screenshot_ms) << VAR(locate_ms) << VAR(total_ms) << VAR(frame->frame_id)
++            << VAR(frame->alignment) << VAR(out_pos->x) << VAR(out_pos->y) << VAR(out_pos->angle) << VAR(out_pos->zone_id)
++            << VAR(last_capture_was_held_);
+     return true;
+ }
+ 
 diff --git a/agent/cpp-algo/source/MapNavigator/position_provider.h b/agent/cpp-algo/source/MapNavigator/position_provider.h
-index 90bcd8f..ba2bf06 100644
+index 90bcd8f..df7142f 100644
 --- a/agent/cpp-algo/source/MapNavigator/position_provider.h
 +++ b/agent/cpp-algo/source/MapNavigator/position_provider.h
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,8 @@
  #include <MaaFramework/MaaAPI.h>
  
  #include "../MapLocator/MapLocator.h"
++#include "../MapLocator/MinimapExtractor.h"
 +#include "../Viewport/ViewportSession.h"
  #include "navi_domain_types.h"
  
  namespace mapnavigator
-@@ -42,6 +43,7 @@ public:
+@@ -42,7 +44,9 @@ public:
  
  private:
      MaaController* controller_;
 +	std::shared_ptr<maaend::viewport::ViewportSession> viewport_;
      std::shared_ptr<maplocator::MapLocator> locator_;
++    maplocator::AdaptiveMinimapExtractor minimap_extractor_;
      std::function<void(NaviPosition&)> position_normalizer_;
      std::function<void(const cv::Mat&)> frame_observer_;
+     bool uses_adb_minimap_roi_ = false;
 diff --git a/agent/go-service/accountswitch/action_windows.go b/agent/go-service/accountswitch/action_windows.go
 index 91500ab..8d73aee 100644
 --- a/agent/go-service/accountswitch/action_windows.go
@@ -1208,6 +2488,139 @@ index 0ff8ce2..e707859 100644
  }
  
  func targetRect(r maa.Rect) maa.Target {
+diff --git a/agent/go-service/common/autoalt/click.go b/agent/go-service/common/autoalt/click.go
+index 4c64931..b5be565 100644
+--- a/agent/go-service/common/autoalt/click.go
++++ b/agent/go-service/common/autoalt/click.go
+@@ -1,8 +1,13 @@
+ package autoalt
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"fmt"
++	"strings"
+ 
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -12,6 +17,11 @@ type autoAltClickParam struct {
+ 	// recognition box before clicking, matching the semantics of the
+ 	// built-in Click action's target_offset.
+ 	TargetOffset []int `json:"target_offset,omitempty"`
++	// ViewportAlignment labels fixed semantic targets whose coordinates were
++	// authored for a specific ultrawide viewport. Recognition-derived boxes
++	// must leave this unset so the nested action inherits the recognizer's
++	// alignment from MaaFramework.
++	ViewportAlignment *string `json:"viewport_alignment,omitempty"`
+ }
+ 
+ type AutoAltClickAction struct{}
+@@ -19,11 +29,57 @@ type AutoAltClickAction struct{}
+ // Compile-time interface check
+ var _ maa.CustomActionRunner = &AutoAltClickAction{}
+ 
++type viewportClickSession interface {
++	PreferredLabel(context.Context, maa.ViewportAlignment) (viewport.Frame, error)
++	Click(context.Context, viewport.Frame, int32, int32) error
++}
++
++func resolveViewportClick(box maa.Rect) (int32, int32, error) {
++	if box.Width() <= 0 || box.Height() <= 0 {
++		return 0, 0, fmt.Errorf(
++			"invalid click box: [%d,%d,%d,%d]",
++			box.X(), box.Y(), box.Width(), box.Height(),
++		)
++	}
++	return int32(box.X() + box.Width()/2), int32(box.Y() + box.Height()/2), nil
++}
++
++func parseViewportAlignment(value *string) (maa.ViewportAlignment, bool, error) {
++	if value == nil {
++		return maa.ViewportAlignmentCenter, false, nil
++	}
++	switch strings.ToLower(strings.TrimSpace(*value)) {
++	case "center":
++		return maa.ViewportAlignmentCenter, true, nil
++	case "left":
++		return maa.ViewportAlignmentLeft, true, nil
++	case "right":
++		return maa.ViewportAlignmentRight, true, nil
++	default:
++		return maa.ViewportAlignmentCenter, true, fmt.Errorf("invalid viewport_alignment %q", *value)
++	}
++}
++
++func clickAdaptiveADB(ctx context.Context, session viewportClickSession, box maa.Rect, alignment maa.ViewportAlignment) (viewport.Frame, error) {
++	x, y, err := resolveViewportClick(box)
++	if err != nil {
++		return viewport.Frame{}, err
++	}
++	frame, err := session.PreferredLabel(ctx, alignment)
++	if err != nil {
++		return viewport.Frame{}, fmt.Errorf("label viewport %d: %w", alignment, err)
++	}
++	if err := session.Click(ctx, frame, x, y); err != nil {
++		return viewport.Frame{}, fmt.Errorf("click viewport %d at (%d,%d): %w", alignment, x, y, err)
++	}
++	return frame, nil
++}
++
+ func (a *AutoAltClickAction) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
+ 	box := arg.Box
++	var p autoAltClickParam
+ 	// custom_action_param is optional; only parse it when present.
+ 	if param := arg.CustomActionParam; param != "" {
+-		var p autoAltClickParam
+ 		if err := json.Unmarshal([]byte(param), &p); err != nil {
+ 			log.Warn().
+ 				Err(err).
+@@ -39,6 +95,43 @@ func (a *AutoAltClickAction) Run(ctx *maa.Context, arg *maa.CustomActionArg) boo
+ 			}
+ 		}
+ 	}
++	alignment, hasExplicitAlignment, err := parseViewportAlignment(p.ViewportAlignment)
++	if err != nil {
++		log.Error().Err(err).Str("component", "AutoAltClickAction").Msg("reject invalid viewport alignment")
++		return false
++	}
++
++	// Only fixed semantic targets may override the current viewport. Ordinary
++	// recognition boxes must use RunAction below so MaaFramework preserves the
++	// alignment that produced the box. Inferring an alignment from box.X is
++	// incorrect because all three cropped images use the same 1280x720 space.
++	if hasExplicitAlignment && ctx != nil && ctx.GetTasker() != nil && ctx.GetTasker().GetController() != nil {
++		controller := ctx.GetTasker().GetController()
++		controlType, err := control.GetControlType(controller)
++		if err != nil {
++			log.Error().Err(err).Str("component", "AutoAltClickAction").Msg("get controller type")
++			return false
++		}
++		if controlType == control.CONTROL_TYPE_ADB {
++			session, err := viewport.New(controller)
++			if err != nil {
++				log.Error().Err(err).Str("component", "AutoAltClickAction").Msg("create viewport session")
++				return false
++			}
++			frame, err := clickAdaptiveADB(context.Background(), session, box, alignment)
++			if err != nil {
++				log.Error().Err(err).Str("component", "AutoAltClickAction").Msg("adaptive ADB click failed")
++				return false
++			}
++			log.Info().
++				Str("component", "AutoAltClickAction").
++				Int("alignment", int(frame.Alignment)).
++				Uint64("frame_id", frame.FrameID).
++				Ints("box", []int{box.X(), box.Y(), box.Width(), box.Height()}).
++				Msg("adaptive ADB click succeeded")
++			return true
++		}
++	}
+ 
+ 	ctx.RunAction("__AutoAltClickAltKeyDownAction",
+ 		maa.Rect{0, 0, 0, 0}, "", nil)
 diff --git a/agent/go-service/creditshopping/adb_shelf.go b/agent/go-service/creditshopping/adb_shelf.go
 index 34681fc..65de680 100644
 --- a/agent/go-service/creditshopping/adb_shelf.go
@@ -1538,6 +2951,23 @@ index c3bc8a5..cb0968b 100644
  	return false
  }
  
+diff --git a/agent/go-service/maptracker/bigmap/const.go b/agent/go-service/maptracker/bigmap/const.go
+index 4852a57..22e71d8 100644
+--- a/agent/go-service/maptracker/bigmap/const.go
++++ b/agent/go-service/maptracker/bigmap/const.go
+@@ -36,6 +36,12 @@ const (
+ const (
+ 	BIG_MAP_PAN_FACTOR_NUMERATOR = 2500.0 // panFactor = this constant / screen diagonal size
+ 	BIG_MAP_PICK_RETRY           = 10
++	// A target whose center is merely inside the terrain-matching rectangle
++	// may still have most of its icon clipped by the map header or footer. On
++	// touch devices that produces a successful input event without selecting
++	// the teleport point. Keep one full marker-sized margin before accepting a
++	// target as clickable, otherwise pan it farther into the viewport.
++	BIG_MAP_PICK_SAFE_PADDING = 48.0
+ )
+ 
+ // Big map delay configuration
 diff --git a/agent/go-service/maptracker/bigmap/find_image.go b/agent/go-service/maptracker/bigmap/find_image.go
 index afad914..38ee02c 100644
 --- a/agent/go-service/maptracker/bigmap/find_image.go
@@ -1610,7 +3040,7 @@ index afad914..38ee02c 100644
  		if err != nil {
  			log.Error().Err(err).Msg("Failed to infer viewport in multi-viewport search")
 diff --git a/agent/go-service/maptracker/bigmap/pick.go b/agent/go-service/maptracker/bigmap/pick.go
-index 731849c..10965cf 100644
+index 731849c..ef53eac 100644
 --- a/agent/go-service/maptracker/bigmap/pick.go
 +++ b/agent/go-service/maptracker/bigmap/pick.go
 @@ -2,6 +2,7 @@
@@ -1655,7 +3085,40 @@ index 731849c..10965cf 100644
  			log.Warn().Err(err).Float64("zoomValue", zoomValue).Msg("Failed to auto adjust big-map zoom")
  		}
  	}
-@@ -246,14 +256,14 @@ func runBigMapTeleportNode(ctx *maa.Context, ca control.ControlAdaptor, targetIn
+@@ -120,8 +130,12 @@ func (a *MapTrackerBigMapPick) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 
+ 		targetInViewX, targetInViewY := inferRes.ViewPort.GetScreenCoordOf(param.Target[0], param.Target[1])
+ 
+-		// If the target is already in view
+-		if inferRes.ViewPort.IsScreenCoordInView(targetInViewX, targetInViewY) {
++		// A marker center just inside the matching crop is not necessarily
++		// clickable: the icon can be clipped by the map header/footer. Require a
++		// full marker-sized margin and pan again when the target is too close to
++		// an edge. This also prevents a no-op click from falling through to a
++		// long teleport-confirm recognition loop.
++		if isBigMapPickTargetSafe(&inferRes.ViewPort, param.Target[0], param.Target[1]) {
+ 			switch param.OnFind {
+ 			case ON_FIND_CLICK:
+ 				ca.TouchClick(0, int(math.Round(targetInViewX)), int(math.Round(targetInViewY)), 100, 0)
+@@ -169,6 +183,17 @@ func (a *MapTrackerBigMapPick) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	return false
+ }
+ 
++func isBigMapPickTargetSafe(viewPort *BigMapViewport, mapX, mapY float64) bool {
++	if viewPort == nil {
++		return false
++	}
++	return viewPort.IsMapCoordInViewWithPadding(
++		mapX,
++		mapY,
++		BIG_MAP_PICK_SAFE_PADDING,
++	)
++}
++
+ func (a *MapTrackerBigMapPick) parseParam(paramStr string) (*MapTrackerBigMapPickParam, error) {
+ 	if paramStr == "" {
+ 		return nil, fmt.Errorf("custom_action_param is required")
+@@ -246,14 +271,14 @@ func runBigMapTeleportNode(ctx *maa.Context, ca control.ControlAdaptor, targetIn
  }
  
  func doBigMapInferForMap(ctx *maa.Context, ctrl *maa.Controller, mapName string) (*MapTrackerBigMapInferResult, error) {
@@ -1792,6 +3255,236 @@ index 596eb17..76da3f0 100644
  	param := struct {
  		Template      string   `json:"template"`
  		Expected      bool     `json:"expected"`
+diff --git a/agent/go-service/maptracker/default/infer.go b/agent/go-service/maptracker/default/infer.go
+index 84d5ffe..0d88e85 100644
+--- a/agent/go-service/maptracker/default/infer.go
++++ b/agent/go-service/maptracker/default/infer.go
+@@ -78,10 +78,27 @@ type InferRotationRawResult struct {
+ 	Rot           int
+ 	Conf          float64
+ 	ElapsedTimeMs int64
++	CenterX       int
++	CenterY       int
+ }
+ 
+ var mapCoreNameRegexp = regexp.MustCompile(`^(.+?)(?:_tier_\w+)?$`)
+ 
++const (
++	adbMiniMapDefaultCenterX = 136
++	adbMiniMapDefaultCenterY = 131
++	adbMiniMapSearchMinX     = 48
++	adbMiniMapSearchMaxX     = 320
++	adbMiniMapSearchStepX    = 8
++	adbMiniMapFineRadiusX    = 7
++	adbMiniMapCalibratedConf = 0.60
++)
++
++var adbMiniMapCenterCache = struct {
++	sync.RWMutex
++	x int
++}{x: adbMiniMapDefaultCenterX}
++
+ var MapTrackerInferRunner maa.CustomRecognitionRunner = &MapTrackerInfer{}
+ 
+ // Run implements maa.CustomRecognitionRunner
+@@ -115,14 +132,22 @@ func (i *MapTrackerInfer) Run(ctx *maa.Context, arg *maa.CustomRecognitionArg) (
+ 	screenImg := minicv.ImageConvertRGBA(arg.Img)
+ 	t0 := time.Now()
+ 
+-	ch := make(chan *InferLocationRawResult, 1)
+-
+-	go func() {
+-		ch <- i.inferLocation(ctrlType, screenImg, mapNameRegex, param)
+-	}()
+-
+ 	rot := i.inferRotation(ctrlType, screenImg, rotStep)
+-	loc := <-ch
++	if rot == nil {
++		log.Info().Msg("Map tracking inference did not hit, rotation unavailable")
++		return &maa.CustomRecognitionResult{
++			Box:    arg.Roi,
++			Detail: "",
++		}, false
++	}
++	loc := i.inferLocation(
++		ctrlType,
++		screenImg,
++		mapNameRegex,
++		param,
++		rot.CenterX,
++		rot.CenterY,
++	)
+ 
+ 	// Determine if recognition hit natively
+ 	internalLocHit := loc != nil && loc.Conf > param.Threshold
+@@ -278,7 +303,14 @@ func isMapNameCoreMatch(mapName1, mapName2 string) bool {
+ 
+ // inferLocation infers the player's location on the map.
+ // Returns a raw result with mapName, x/y (map coordinates), conf, source, and elapsedTimeMs.
+-func (i *MapTrackerInfer) inferLocation(ctrlType string, screenImg *image.RGBA, mapNameRegex *regexp.Regexp, param *MapTrackerInferParam) *InferLocationRawResult {
++func (i *MapTrackerInfer) inferLocation(
++	ctrlType string,
++	screenImg *image.RGBA,
++	mapNameRegex *regexp.Regexp,
++	param *MapTrackerInferParam,
++	miniMapCenterX int,
++	miniMapCenterY int,
++) *InferLocationRawResult {
+ 	t0 := time.Now()
+ 
+ 	// Use cached scaled maps
+@@ -293,7 +325,12 @@ func (i *MapTrackerInfer) inferLocation(ctrlType string, screenImg *image.RGBA,
+ 	var miniMap *image.RGBA
+ 	switch ctrlType {
+ 	case control.CONTROL_TYPE_ADB:
+-		miniMap = minicv.ImageCropSquareByRadius(screenImg, 136, 131, 50)
++		miniMap = minicv.ImageCropSquareByRadius(
++			screenImg,
++			miniMapCenterX,
++			miniMapCenterY,
++			50,
++		)
+ 		miniMap = minicv.ImageScale(miniMap, 0.8)
+ 	default: // Win32 and others
+ 		miniMap = minicv.ImageCropSquareByRadius(screenImg, 108, 111, 40)
+@@ -487,16 +524,104 @@ func (i *MapTrackerInfer) inferRotation(ctrlType string, screenImg *image.RGBA,
+ 		return nil
+ 	}
+ 
+-	// Crop pointer area from screen
+-	var patch *image.RGBA
+-	switch ctrlType {
+-	case control.CONTROL_TYPE_ADB:
+-		patch = minicv.ImageCropSquareByRadius(screenImg, 136, 131, 15)
+-		patch = minicv.ImageScale(patch, 0.8)
+-	default: // Win32 and others
+-		patch = minicv.ImageCropSquareByRadius(screenImg, 108, 111, 12)
++	if ctrlType != control.CONTROL_TYPE_ADB {
++		result := i.inferRotationAt(
++			screenImg,
++			108,
++			111,
++			12,
++			1.0,
++			rotStep,
++			pointerTemplate,
++		)
++		result.ElapsedTimeMs = time.Since(t0).Milliseconds()
++		return result
++	}
++
++	adbMiniMapCenterCache.RLock()
++	cachedX := adbMiniMapCenterCache.x
++	adbMiniMapCenterCache.RUnlock()
++
++	best := i.inferRotationAt(
++		screenImg,
++		cachedX,
++		adbMiniMapDefaultCenterY,
++		15,
++		0.8,
++		rotStep,
++		pointerTemplate,
++	)
++	if best.Conf < adbMiniMapCalibratedConf {
++		for x := adbMiniMapSearchMinX; x <= adbMiniMapSearchMaxX; x += adbMiniMapSearchStepX {
++			if x == cachedX {
++				continue
++			}
++			candidate := i.inferRotationAt(
++				screenImg,
++				x,
++				adbMiniMapDefaultCenterY,
++				15,
++				0.8,
++				rotStep,
++				pointerTemplate,
++			)
++			if candidate.Conf > best.Conf {
++				best = candidate
++			}
++		}
++
++		coarseX := best.CenterX
++		for x := max(adbMiniMapSearchMinX, coarseX-adbMiniMapFineRadiusX); x <= min(adbMiniMapSearchMaxX, coarseX+adbMiniMapFineRadiusX); x++ {
++			if x == coarseX {
++				continue
++			}
++			candidate := i.inferRotationAt(
++				screenImg,
++				x,
++				adbMiniMapDefaultCenterY,
++				15,
++				0.8,
++				rotStep,
++				pointerTemplate,
++			)
++			if candidate.Conf > best.Conf {
++				best = candidate
++			}
++		}
++
++		if best.Conf >= adbMiniMapCalibratedConf {
++			adbMiniMapCenterCache.Lock()
++			adbMiniMapCenterCache.x = best.CenterX
++			adbMiniMapCenterCache.Unlock()
++			log.Info().
++				Int("centerX", best.CenterX).
++				Int("centerY", best.CenterY).
++				Float64("confidence", best.Conf).
++				Msg("Adaptive ADB minimap center calibrated")
++		}
+ 	}
+ 
++	best.ElapsedTimeMs = time.Since(t0).Milliseconds()
++	return best
++}
++
++func (i *MapTrackerInfer) inferRotationAt(
++	screenImg *image.RGBA,
++	centerX int,
++	centerY int,
++	radius int,
++	scale float64,
++	rotStep int,
++	pointerTemplate *minicv.Template,
++) *InferRotationRawResult {
++	patch := minicv.ImageCropSquareByRadius(
++		screenImg,
++		centerX,
++		centerY,
++		radius,
++	)
++	patch = minicv.ImageScale(patch, scale)
++
+ 	// Try all rotation angles in parallel
+ 	type result struct {
+ 		angle int
+@@ -537,18 +662,18 @@ func (i *MapTrackerInfer) inferRotation(ctrlType string, screenImg *image.RGBA,
+ 
+ 	// Convert to clockwise angle
+ 	bestAngle = (360 - bestAngle) % 360
+-	elapsedTimeMs := time.Since(t0).Milliseconds()
+-
+ 	log.Debug().
+ 		Float64("bestConf", maxVal).
+ 		Int("bestAngle", bestAngle).
+-		Int64("elapsedTimeMs", elapsedTimeMs).
++		Int("centerX", centerX).
++		Int("centerY", centerY).
+ 		Msg("Internal rotation inference completed")
+ 
+ 	return &InferRotationRawResult{
+-		Rot:           bestAngle,
+-		Conf:          maxVal,
+-		ElapsedTimeMs: time.Since(t0).Milliseconds(),
++		Rot:     bestAngle,
++		Conf:    maxVal,
++		CenterX: centerX,
++		CenterY: centerY,
+ 	}
+ }
+ 
 diff --git a/agent/go-service/maptracker/default/move.go b/agent/go-service/maptracker/default/move.go
 index 8df4df1..0ec208d 100644
 --- a/agent/go-service/maptracker/default/move.go
@@ -3592,12 +5285,309 @@ index 539af89..deb6447 100644
                  "WebEvent202605Action",
                  "autoEcoFarmInterruptibleSleep",
                  "autoEcoFarmOverrideTargetTemplate",
+diff --git a/agent/cpp-algo/source/MapLocator/MinimapExtractor.cpp b/agent/cpp-algo/source/MapLocator/MinimapExtractor.cpp
+new file mode 100644
+index 0000000..3e6ef6f
+--- /dev/null
++++ b/agent/cpp-algo/source/MapLocator/MinimapExtractor.cpp
+@@ -0,0 +1,233 @@
++#include "MinimapExtractor.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <vector>
++
++#include <MaaUtils/Logger.h>
++
++#include "MapAlgorithm.h"
++#include "MapLocator.h"
++
++namespace maplocator
++{
++
++namespace
++{
++
++constexpr float kCalibrationConfidenceFloor = 0.70F;
++constexpr int kCoarseSearchStep = 40;
++constexpr int kMaximumPositiveShift = 240;
++constexpr std::array<int, 4> kRefinementOffsets { -20, -10, 10, 20 };
++
++struct Candidate
++{
++    int x = 0;
++    YoloCoarseResult coarse {};
++    bool expected_match = false;
++    bool heading_valid = false;
++    double heading = 0.0;
++};
++
++bool TryCrop(const cv::Mat& image, const MinimapRoiConfig& config, int x, cv::Mat* out)
++{
++    if (out == nullptr || image.empty()) {
++        return false;
++    }
++
++    const cv::Rect roi(x, config.y, config.width, config.height);
++    const cv::Rect bounds(0, 0, image.cols, image.rows);
++    const cv::Rect clipped = roi & bounds;
++    if (clipped != roi || roi.width <= 0 || roi.height <= 0) {
++        return false;
++    }
++
++    *out = image(roi).clone();
++    return !out->empty();
++}
++
++bool MatchesExpectedSelector(const std::string& expected, const YoloCoarseResult& coarse)
++{
++    if (expected.empty()) {
++        return true;
++    }
++    if (coarse.zone_id == expected || coarse.base_class == expected || coarse.raw_class == expected) {
++        return true;
++    }
++    return coarse.raw_class.starts_with(expected);
++}
++
++bool IsUsable(const YoloCoarseResult& coarse)
++{
++    return coarse.valid && !coarse.is_none && !coarse.zone_id.empty() && coarse.zone_id != "None"
++           && coarse.raw_class != "None" && std::isfinite(coarse.confidence)
++           && coarse.confidence >= kCalibrationConfidenceFloor;
++}
++
++bool IsBetter(const Candidate& candidate, const Candidate& best, bool expected_is_available)
++{
++    if (expected_is_available && candidate.expected_match != best.expected_match) {
++        return candidate.expected_match;
++    }
++    // The zone classifier can confidently identify an off-centre slice of the
++    // minimap even when the player arrow is outside the tiny heading sample.
++    // Prefer a candidate that satisfies both contracts before comparing YOLO
++    // confidence; otherwise a ten-pixel ROI drift silently destroys heading.
++    if (candidate.heading_valid != best.heading_valid) {
++        return candidate.heading_valid;
++    }
++    return candidate.coarse.confidence > best.coarse.confidence;
++}
++
++} // namespace
++
++bool AdaptiveMinimapExtractor::Extract(
++    const cv::Mat& image,
++    bool use_adb_minimap_roi,
++    bool allow_horizontal_calibration,
++    const std::string& expected_zone_selector,
++    MapLocator* locator,
++    cv::Mat* out_minimap,
++    MinimapExtractionDetails* out_details)
++{
++    if (out_minimap == nullptr || image.empty()) {
++        return false;
++    }
++
++    cv::Mat scaled_image = image;
++    if (use_adb_minimap_roi && kAdbMinimapFullImageScale != 1.0) {
++        cv::resize(image, scaled_image, cv::Size(), kAdbMinimapFullImageScale, kAdbMinimapFullImageScale, cv::INTER_AREA);
++    }
++
++    const MinimapRoiConfig& roi_config = GetMinimapRoiConfig(use_adb_minimap_roi);
++    if (!use_adb_minimap_roi || !allow_horizontal_calibration || locator == nullptr || !locator->isInitialized()) {
++        return TryCrop(scaled_image, roi_config, roi_config.x, out_minimap);
++    }
++
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (cached_scaled_size_.has_value() && cached_roi_x_.has_value() && cached_scaled_size_.value() == scaled_image.size()) {
++        if (TryCrop(scaled_image, roi_config, cached_roi_x_.value(), out_minimap)) {
++            if (out_details != nullptr) {
++                out_details->roi_x = cached_roi_x_.value();
++                out_details->roi_y = roi_config.y;
++                out_details->used_cached_roi = true;
++            }
++            return true;
++        }
++        InvalidateLocked();
++    }
++
++    std::vector<Candidate> candidates;
++    std::vector<int> attempted_x;
++    auto probe = [&](int x) {
++        if (std::find(attempted_x.begin(), attempted_x.end(), x) != attempted_x.end()) {
++            return;
++        }
++        cv::Mat minimap;
++        if (!TryCrop(scaled_image, roi_config, x, &minimap)) {
++            return;
++        }
++        attempted_x.push_back(x);
++        YoloCoarseResult coarse = locator->predictCoarse(minimap);
++        if (!IsUsable(coarse)) {
++            return;
++        }
++        const bool expected_match = MatchesExpectedSelector(expected_zone_selector, coarse);
++        const double heading = InferYellowArrowRotation(minimap);
++        const bool heading_valid = std::isfinite(heading) && heading >= 0.0;
++        candidates.push_back(Candidate {
++            .x = x,
++            .coarse = std::move(coarse),
++            .expected_match = expected_match,
++            .heading_valid = heading_valid,
++            .heading = heading_valid ? heading : 0.0,
++        });
++    };
++
++    probe(roi_config.x);
++    const bool fixed_is_expected = !candidates.empty() && candidates.front().expected_match;
++    if (!fixed_is_expected) {
++        const int maximum_x = std::min(scaled_image.cols - roi_config.width, roi_config.x + kMaximumPositiveShift);
++        probe(std::max(0, roi_config.x - kCoarseSearchStep));
++        for (int x = roi_config.x + kCoarseSearchStep; x <= maximum_x; x += kCoarseSearchStep) {
++            probe(x);
++        }
++    }
++
++    if (candidates.empty()) {
++        LogWarn << "Adaptive minimap calibration failed closed: no non-None candidate met the confidence floor."
++                << VAR(scaled_image.cols) << VAR(scaled_image.rows);
++        return false;
++    }
++
++    const bool expected_is_available = std::any_of(candidates.begin(), candidates.end(), [](const Candidate& row) {
++        return row.expected_match;
++    });
++    auto best_it = candidates.begin();
++    for (auto it = std::next(candidates.begin()); it != candidates.end(); ++it) {
++        if (IsBetter(*it, *best_it, expected_is_available)) {
++            best_it = it;
++        }
++    }
++
++    const int coarse_best_x = best_it->x;
++    for (int offset : kRefinementOffsets) {
++        probe(coarse_best_x + offset);
++    }
++
++    const bool refined_expected_is_available = std::any_of(candidates.begin(), candidates.end(), [](const Candidate& row) {
++        return row.expected_match;
++    });
++    best_it = candidates.begin();
++    for (auto it = std::next(candidates.begin()); it != candidates.end(); ++it) {
++        if (IsBetter(*it, *best_it, refined_expected_is_available)) {
++            best_it = it;
++        }
++    }
++
++    if (!TryCrop(scaled_image, roi_config, best_it->x, out_minimap)) {
++        return false;
++    }
++
++    cached_scaled_size_ = scaled_image.size();
++    cached_roi_x_ = best_it->x;
++    if (out_details != nullptr) {
++        out_details->roi_x = best_it->x;
++        out_details->roi_y = roi_config.y;
++        out_details->calibrated = true;
++        out_details->coarse = best_it->coarse;
++    }
++    LogInfo << "Adaptive minimap ROI calibrated." << VAR(best_it->x) << VAR(roi_config.y) << VAR(best_it->coarse.raw_class)
++            << VAR(best_it->coarse.zone_id) << VAR(best_it->coarse.confidence) << VAR(best_it->expected_match)
++            << VAR(best_it->heading_valid) << VAR(best_it->heading);
++    return true;
++}
++
++void AdaptiveMinimapExtractor::ObserveLocateResult(const LocateResult& result)
++{
++    if (result.coarse_was_none || result.status == LocateStatus::YoloFailed) {
++        Invalidate();
++    }
++}
++
++void AdaptiveMinimapExtractor::ObserveCoarseResult(const YoloCoarseResult& result)
++{
++    if (!result.valid || result.is_none || result.zone_id.empty() || result.zone_id == "None") {
++        Invalidate();
++    }
++}
++
++void AdaptiveMinimapExtractor::Invalidate()
++{
++    std::lock_guard<std::mutex> lock(mutex_);
++    InvalidateLocked();
++}
++
++void AdaptiveMinimapExtractor::InvalidateLocked()
++{
++    cached_scaled_size_.reset();
++    cached_roi_x_.reset();
++}
++
++} // namespace maplocator
+diff --git a/agent/cpp-algo/source/MapLocator/MinimapExtractor.h b/agent/cpp-algo/source/MapLocator/MinimapExtractor.h
+new file mode 100644
+index 0000000..1e6d88e
+--- /dev/null
++++ b/agent/cpp-algo/source/MapLocator/MinimapExtractor.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <mutex>
++#include <optional>
++#include <string>
++
++#include <MaaUtils/NoWarningCV.hpp>
++
++#include "MapTypes.h"
++
++namespace maplocator
++{
++
++class MapLocator;
++
++struct MinimapExtractionDetails
++{
++    int roi_x = 0;
++    int roi_y = 0;
++    bool used_cached_roi = false;
++    bool calibrated = false;
++    YoloCoarseResult coarse {};
++};
++
++// Preserves the fixed upstream ROI for normal 16:9 frames. Adaptive ADB
++// viewports may move the whole HUD inward, so their first frame is validated
++// by the existing classifier and, when needed, searched horizontally.
++class AdaptiveMinimapExtractor
++{
++public:
++    bool Extract(
++        const cv::Mat& image,
++        bool use_adb_minimap_roi,
++        bool allow_horizontal_calibration,
++        const std::string& expected_zone_selector,
++        MapLocator* locator,
++        cv::Mat* out_minimap,
++        MinimapExtractionDetails* out_details = nullptr);
++
++    void ObserveLocateResult(const LocateResult& result);
++    void ObserveCoarseResult(const YoloCoarseResult& result);
++    void Invalidate();
++
++private:
++    void InvalidateLocked();
++
++    std::mutex mutex_;
++    std::optional<cv::Size> cached_scaled_size_;
++    std::optional<int> cached_roi_x_;
++};
++
++} // namespace maplocator
 diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.cpp b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
 new file mode 100644
-index 0000000..7594c15
+index 0000000..c1311c6
 --- /dev/null
 +++ b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,498 @@
 +#include "ViewportSession.h"
 +
 +#include <algorithm>
@@ -3837,6 +5827,34 @@ index 0000000..7594c15
 +    return RestoreAlignment(before.alignment) && succeeded;
 +}
 +
++bool ViewportSession::Swipe(
++    const ViewportFrame& frame,
++    const cv::Point& begin,
++    const cv::Point& end,
++    int duration,
++    int contact,
++    int pressure) const
++{
++    std::scoped_lock lock(ControllerMutex());
++    ViewportInfo before;
++    if (!PrepareFrame(frame, &before)) {
++        return false;
++    }
++
++    const bool succeeded = WaitForAction(
++        MaaControllerPostSwipeV2(
++            controller_,
++            begin.x,
++            begin.y,
++            end.x,
++            end.y,
++            std::max(1, duration),
++            contact,
++            pressure),
++        "swipe");
++    return RestoreAlignment(before.alignment) && succeeded;
++}
++
 +bool ViewportSession::TouchDown(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const
 +{
 +    std::scoped_lock lock(ControllerMutex());
@@ -4070,10 +6088,10 @@ index 0000000..7594c15
 +} // namespace maaend::viewport
 diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.h b/agent/cpp-algo/source/Viewport/ViewportSession.h
 new file mode 100644
-index 0000000..b86ba70
+index 0000000..fdb1063
 --- /dev/null
 +++ b/agent/cpp-algo/source/Viewport/ViewportSession.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -4124,6 +6142,13 @@ index 0000000..b86ba70
 +    std::optional<ViewportFrame> PreferredLabel(MaaViewportAlignment preferred) const;
 +
 +    bool Click(const ViewportFrame& frame, const cv::Point& point) const;
++    bool Swipe(
++        const ViewportFrame& frame,
++        const cv::Point& begin,
++        const cv::Point& end,
++        int duration,
++        int contact,
++        int pressure) const;
 +    bool TouchDown(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const;
 +    bool TouchMove(const ViewportFrame& frame, int contact, const cv::Point& point, int pressure) const;
 +    bool TouchUp(int contact) const;
@@ -5005,6 +7030,303 @@ index 0000000..986f665
 +		t.Fatalf("alignment not restored after panic: %d", backend.alignment)
 +	}
 +}
+diff --git a/agent/go-service/captureuid/capture_test.go b/agent/go-service/captureuid/capture_test.go
+new file mode 100644
+index 0000000..28ab4ea
+--- /dev/null
++++ b/agent/go-service/captureuid/capture_test.go
+@@ -0,0 +1,59 @@
++package captureuid
++
++import (
++	"testing"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++func TestUIDCandidatesKeepLatencyDigitsOutOfUID(t *testing.T) {
++	labelled, fallback := uidCandidates([]string{
++		"22ms UID: 1467472365",
++	})
++	if len(labelled) != 1 || labelled[0] != "1467472365" {
++		t.Fatalf("unexpected labelled candidates: %v", labelled)
++	}
++	if len(fallback) != 0 {
++		t.Fatalf("labelled UID must not remain as fallback: %v", fallback)
++	}
++}
++
++func TestUIDCandidatesJoinSplitOCRResults(t *testing.T) {
++	labelled, _ := uidCandidates([]string{
++		"UID:",
++		"1467472365",
++		"UID: 1467472365",
++	})
++	if len(labelled) != 1 || labelled[0] != "1467472365" {
++		t.Fatalf("unexpected labelled candidates: %v", labelled)
++	}
++}
++
++func TestSelectUIDMatchPrefersUniqueLabelledCandidate(t *testing.T) {
++	center := viewport.Frame{
++		Alignment: maa.ViewportAlignmentCenter,
++		FrameID:   7,
++	}
++	left := viewport.Frame{
++		Alignment: maa.ViewportAlignmentLeft,
++		FrameID:   7,
++	}
++	selected, ok := selectUIDMatch([]uidMatch{
++		{digits: "1467472365", frame: center, labelled: true},
++		{digits: "12345678", frame: left},
++	})
++	if !ok || selected.digits != "1467472365" || selected.frame.Alignment != maa.ViewportAlignmentCenter {
++		t.Fatalf("unexpected selection: %#v, ok=%v", selected, ok)
++	}
++}
++
++func TestSelectUIDMatchRejectsAmbiguousLabelledCandidates(t *testing.T) {
++	_, ok := selectUIDMatch([]uidMatch{
++		{digits: "1467472365", labelled: true},
++		{digits: "2467472365", labelled: true},
++	})
++	if ok {
++		t.Fatal("ambiguous labelled UID candidates must be rejected")
++	}
++}
+diff --git a/agent/go-service/common/autoalt/click_test.go b/agent/go-service/common/autoalt/click_test.go
+new file mode 100644
+index 0000000..4d38cb8
+--- /dev/null
++++ b/agent/go-service/common/autoalt/click_test.go
+@@ -0,0 +1,68 @@
++package autoalt
++
++import (
++	"context"
++	"testing"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++type fakeViewportClickSession struct {
++	alignment maa.ViewportAlignment
++	x         int32
++	y         int32
++}
++
++func (f *fakeViewportClickSession) PreferredLabel(_ context.Context, alignment maa.ViewportAlignment) (viewport.Frame, error) {
++	f.alignment = alignment
++	return viewport.Frame{Alignment: alignment, FrameID: 7}, nil
++}
++
++func (f *fakeViewportClickSession) Click(_ context.Context, _ viewport.Frame, x, y int32) error {
++	f.x = x
++	f.y = y
++	return nil
++}
++
++func TestClickAdaptiveADBLabelsFixedWorldMapTargetLeft(t *testing.T) {
++	session := &fakeViewportClickSession{}
++	frame, err := clickAdaptiveADB(
++		context.Background(),
++		session,
++		maa.Rect{145, 82, 30, 30},
++		maa.ViewportAlignmentLeft,
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if frame.Alignment != maa.ViewportAlignmentLeft || session.alignment != maa.ViewportAlignmentLeft {
++		t.Fatalf("alignment = %d, want left", frame.Alignment)
++	}
++	if session.x != 160 || session.y != 97 {
++		t.Fatalf("click = (%d,%d), want (160,97)", session.x, session.y)
++	}
++}
++
++func TestResolveViewportClickRejectsEmptyBox(t *testing.T) {
++	if _, _, err := resolveViewportClick(maa.Rect{90, 90, 0, 50}); err == nil {
++		t.Fatal("expected empty click box to fail")
++	}
++}
++
++func TestParseViewportAlignmentAbsentKeepsLegacyActionPath(t *testing.T) {
++	_, explicit, err := parseViewportAlignment(nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if explicit {
++		t.Fatal("absent viewport_alignment must not override recognition alignment")
++	}
++}
++
++func TestParseViewportAlignmentRejectsUnknownValue(t *testing.T) {
++	value := "adaptive"
++	if _, _, err := parseViewportAlignment(&value); err == nil {
++		t.Fatal("expected unknown viewport_alignment to fail")
++	}
++}
+diff --git a/agent/go-service/maptracker/default/infer_viewport_test.go b/agent/go-service/maptracker/default/infer_viewport_test.go
+new file mode 100644
+index 0000000..c59efd3
+--- /dev/null
++++ b/agent/go-service/maptracker/default/infer_viewport_test.go
+@@ -0,0 +1,69 @@
++package maptrackerdefault
++
++import (
++	"image"
++	"image/color"
++	"path/filepath"
++	"testing"
++
++	internal "github.com/MaaXYZ/MaaEnd/agent/go-service/maptracker/internal"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/control"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/minicv"
++)
++
++func TestInferRotationCalibratesShiftedADBMinimap(t *testing.T) {
++	pointerPath := filepath.Join(
++		"..", "..", "..", "..", "assets", "resource", "image",
++		"MapTracker", "MiniMapIcons", "Pointer.png",
++	)
++	originalLoader := internal.Resource.PointerTemplateLoader
++	internal.Resource.PointerTemplateLoader = minicv.NewTemplateLoaderOfPath(pointerPath)
++	defer func() { internal.Resource.PointerTemplateLoader = originalLoader }()
++
++	template, err := internal.Resource.PointerTemplateLoader.Get()
++	if err != nil {
++		t.Fatal(err)
++	}
++	const expectedX = 65
++	screen := image.NewRGBA(image.Rect(0, 0, 1280, 720))
++	for y := range screen.Bounds().Dy() {
++		for x := range screen.Bounds().Dx() {
++			shade := uint8(35 + (x+y)%11)
++			screen.SetRGBA(x, y, color.RGBA{R: shade, G: shade, B: shade, A: 255})
++		}
++	}
++	scaledPointer := minicv.ImageScale(template.Image, 1.25)
++	left := expectedX - scaledPointer.Bounds().Dx()/2
++	top := adbMiniMapDefaultCenterY - scaledPointer.Bounds().Dy()/2
++	for y := range scaledPointer.Bounds().Dy() {
++		for x := range scaledPointer.Bounds().Dx() {
++			pixel := scaledPointer.RGBAAt(x, y)
++			if pixel.G > 240 && pixel.R < 20 && pixel.B < 20 {
++				continue
++			}
++			screen.SetRGBA(left+x, top+y, pixel)
++		}
++	}
++
++	adbMiniMapCenterCache.Lock()
++	originalX := adbMiniMapCenterCache.x
++	adbMiniMapCenterCache.x = adbMiniMapDefaultCenterX
++	adbMiniMapCenterCache.Unlock()
++	defer func() {
++		adbMiniMapCenterCache.Lock()
++		adbMiniMapCenterCache.x = originalX
++		adbMiniMapCenterCache.Unlock()
++	}()
++
++	result := (&MapTrackerInfer{}).inferRotation(
++		control.CONTROL_TYPE_ADB,
++		screen,
++		4,
++	)
++	if result.Conf < adbMiniMapCalibratedConf {
++		t.Fatalf("expected calibrated confidence, got %.4f", result.Conf)
++	}
++	if result.CenterX < expectedX-adbMiniMapSearchStepX || result.CenterX > expectedX+adbMiniMapSearchStepX {
++		t.Fatalf("expected center near %d, got %d", expectedX, result.CenterX)
++	}
++}
+diff --git a/agent/go-service/maptracker/bigmap/pick_viewport_test.go b/agent/go-service/maptracker/bigmap/pick_viewport_test.go
+new file mode 100644
+index 0000000..840c666
+--- /dev/null
++++ b/agent/go-service/maptracker/bigmap/pick_viewport_test.go
+@@ -0,0 +1,35 @@
++// Copyright (c) 2026 Harry Huang
++package maptrackerbigmap
++
++import "testing"
++
++func TestBigMapPickTargetRequiresSafeMarkerMargin(t *testing.T) {
++	viewPort := NewBigMapViewport(100, 200, 2)
++
++	mapAtScreen := func(screenX, screenY float64) (float64, float64) {
++		return viewPort.GetMapCoordOf(screenX, screenY)
++	}
++
++	insideX := viewPort.Left + BIG_MAP_PICK_SAFE_PADDING
++	insideY := viewPort.Top + BIG_MAP_PICK_SAFE_PADDING
++	mapX, mapY := mapAtScreen(insideX, insideY)
++	if !isBigMapPickTargetSafe(viewPort, mapX, mapY) {
++		t.Fatal("target exactly on the safe margin should be accepted")
++	}
++
++	mapX, mapY = mapAtScreen(insideX-1, insideY)
++	if isBigMapPickTargetSafe(viewPort, mapX, mapY) {
++		t.Fatal("target with a clipped horizontal marker margin should be rejected")
++	}
++
++	mapX, mapY = mapAtScreen(insideX, insideY-1)
++	if isBigMapPickTargetSafe(viewPort, mapX, mapY) {
++		t.Fatal("target with a clipped vertical marker margin should be rejected")
++	}
++}
++
++func TestBigMapPickTargetRejectsNilViewport(t *testing.T) {
++	if isBigMapPickTargetSafe(nil, 0, 0) {
++		t.Fatal("nil viewport must fail closed")
++	}
++}
+diff --git a/agent/go-service/pkg/control/adaptor_adb_test.go b/agent/go-service/pkg/control/adaptor_adb_test.go
+new file mode 100644
+index 0000000..2d0bf72
+--- /dev/null
++++ b/agent/go-service/pkg/control/adaptor_adb_test.go
+@@ -0,0 +1,36 @@
++package control
++
++import (
++	"testing"
++
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++func TestADBControlAdaptorPinnedAlignmentOverridesCoordinateBands(t *testing.T) {
++	center := maa.ViewportAlignmentCenter
++	adaptor := &ADBControlAdaptor{w: 1280, h: 720, pinnedAlignment: &center}
++
++	for _, span := range [][4]int{
++		{50, 50, 100, 100},
++		{640, 360, 640, 360},
++		{1180, 600, 1240, 650},
++	} {
++		if got := adaptor.alignmentForSpan(span[0], span[1], span[2], span[3]); got != center {
++			t.Fatalf("alignmentForSpan%v = %v, want Center", span, got)
++		}
++	}
++}
++
++func TestADBControlAdaptorUnpinnedAlignmentKeepsEdgeSemantics(t *testing.T) {
++	adaptor := &ADBControlAdaptor{w: 1280, h: 720}
++
++	if got := adaptor.alignmentForSpan(50, 50, 100, 100); got != maa.ViewportAlignmentLeft {
++		t.Fatalf("left span alignment = %v, want Left", got)
++	}
++	if got := adaptor.alignmentForSpan(600, 300, 700, 400); got != maa.ViewportAlignmentCenter {
++		t.Fatalf("center span alignment = %v, want Center", got)
++	}
++	if got := adaptor.alignmentForSpan(1100, 500, 1200, 600); got != maa.ViewportAlignmentRight {
++		t.Fatalf("right span alignment = %v, want Right", got)
++	}
++}
 diff --git a/agent/go-service/taskersink/aspectratio/checker_viewport_test.go b/agent/go-service/taskersink/aspectratio/checker_viewport_test.go
 new file mode 100644
 index 0000000..108d483
@@ -5457,4 +7779,69 @@ index 0000000..d0049f3
 +
 +func Register() {
 +	maa.AgentServerRegisterCustomAction("ViewportInputProbeAction", &InputProbeAction{})
++}
+diff --git a/agent/go-service/visitfriends/visitfriends_viewport_test.go b/agent/go-service/visitfriends/visitfriends_viewport_test.go
+new file mode 100644
+index 0000000..3ea0328
+--- /dev/null
++++ b/agent/go-service/visitfriends/visitfriends_viewport_test.go
+@@ -0,0 +1,59 @@
++package visitfriends
++
++import (
++	"context"
++	"testing"
++
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
++	maa "github.com/MaaXYZ/maa-framework-go/v4"
++)
++
++type fakeVisitFriendsDetailClickSession struct {
++	alignment maa.ViewportAlignment
++	x         int32
++	y         int32
++}
++
++func (f *fakeVisitFriendsDetailClickSession) PreferredLabel(_ context.Context, alignment maa.ViewportAlignment) (viewport.Frame, error) {
++	f.alignment = alignment
++	return viewport.Frame{Alignment: alignment, FrameID: 17}, nil
++}
++
++func (f *fakeVisitFriendsDetailClickSession) Click(_ context.Context, _ viewport.Frame, x, y int32) error {
++	f.x = x
++	f.y = y
++	return nil
++}
++
++func TestClickVisitFriendsDetailButtonKeepsCenterFrameCoordinates(t *testing.T) {
++	view := &fakeVisitFriendsDetailClickSession{}
++	if err := clickVisitFriendsDetailButton(context.Background(), view, []int{1229, 181, 32, 33}); err != nil {
++		t.Fatal(err)
++	}
++	if view.alignment != maa.ViewportAlignmentCenter {
++		t.Fatalf("alignment=%d, want center", view.alignment)
++	}
++	if view.x != 1245 || view.y != 197 {
++		t.Fatalf("point=(%d,%d), want (1245,197)", view.x, view.y)
++	}
++}
++
++func TestClickVisitFriendsDetailButtonRejectsInvalidBox(t *testing.T) {
++	view := &fakeVisitFriendsDetailClickSession{}
++	if err := clickVisitFriendsDetailButton(context.Background(), view, []int{1, 2, 0, 4}); err == nil {
++		t.Fatal("expected invalid-size error")
++	}
++}
++
++func TestClickVisitFriendsTerminalCloseUsesRightViewport(t *testing.T) {
++	view := &fakeVisitFriendsDetailClickSession{}
++	if err := clickVisitFriendsTerminalClose(context.Background(), view); err != nil {
++		t.Fatal(err)
++	}
++	if view.alignment != maa.ViewportAlignmentRight {
++		t.Fatalf("alignment=%d, want right", view.alignment)
++	}
++	if view.x != 1133 || view.y != 34 {
++		t.Fatalf("point=(%d,%d), want (1133,34)", view.x, view.y)
++	}
 +}
