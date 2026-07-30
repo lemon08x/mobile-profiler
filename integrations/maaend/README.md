@@ -29,7 +29,7 @@ controller `1280×720`，但启动任务在加载画面结束前返回；随后
 6. 构建链可复现生成六个 Framework/Agent DLL、Go Agent 和 C++ Agent；部署/回滚覆盖
    这八个二进制、MXU 配置和禁用自动更新的 `interface.json`，共十个文件，逐文件校验
    SHA-256。
-7. 41 项任务均进入风险清单，其中 24 项声明支持 ADB；未知任务、上游资源哈希漂移和
+7. 41 项任务均进入风险清单，其中 27 项声明支持 ADB；未知任务、上游资源哈希漂移和
    未授权持久化操作默认拒绝。
 8. 已实现 `SceneProbe`、`CaptureUidProbe`、`ViewportInputProbe` 三个内部 Probe，
    以及自然终点、结构化事件、alignment 轨迹、截图/节点/触点 watchdog、incident

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-07-28T17:20:00+08:00",
+  "updated_at": "2026-07-30T03:00:02.819346+08:00",
   "issues": [
     {
       "id": "MAAEND-VIEW-001",
@@ -279,23 +279,109 @@
       "status": "open",
       "severity": "high",
       "first_seen": "2026-07-27T00:00:00+08:00",
-      "last_seen": "2026-07-28T17:03:30+08:00",
-      "occurrences": 3,
+      "last_seen": "2026-07-30T02:32:43+08:00",
+      "occurrences": 4,
       "symptoms": [
         "底层 alignment、Agent session、风险清单、Probe、watchdog 和可回滚构建已完成离线验证",
-        "已取得 AndroidOpenGame succeeded 与终态 1280×720，但没有 InWorld 强启动终点、Probe 或完整业务组合真机证据"
+        "AndroidOpenGame、DailyRewards、DijiangRewards、VisitFriends、ReceiveProdManual、SellProduct、DeliveryJobs、AutoStockStaple 和 CreditShoppingN2 已分别达到真机自然终点",
+        "AutoCollect、EnvironmentMonitoring 及 12 项 DailyFull 组合尚未取得完整自然终点证据"
       ],
       "observations": [
         {
           "source": "codex/open-source-automation-draft verification gate",
-          "occurrence_count": 3,
-          "last_seen": "2026-07-28T17:03:30+08:00"
+          "occurrence_count": 4,
+          "last_seen": "2026-07-30T02:32:43+08:00"
         }
       ],
       "fix": null,
       "regression": [
         "tools/maaend-viewport-trial.py must return successful=true",
         "A complete guarded physical-device task must reach its natural terminal state"
+      ]
+    },
+    {
+      "id": "MAAEND-GO-002",
+      "fingerprint": "maaend:maptracker-big-map-stale-adaptive-alignment:v1",
+      "title": "Go 地图追踪在异形屏上使用错误 viewport 导致大地图坐标错位",
+      "area": "go-agent-viewport",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-30T02:18:28+08:00",
+      "last_seen": "2026-07-30T02:21:39+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "AutoCollect 已通过 Backpack 前置门禁，但大地图识别与 pick/find/zoom 没有固定 Center，点击和拖动会继承先前 Left/Right alignment",
+        "画面识别本身可成功，映射后的物理坐标却落在错误地图位置，无法继续导航"
+      ],
+      "observations": [
+        {
+          "source": "profiler-runs/maaend-headless/auto-collect-route1-backpack-single-20260730",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T02:21:39+08:00"
+        }
+      ],
+      "fix": "新增 NewControlAdaptorPinned，并将 MapTracker 大地图截图、识别、pick、find 和 zoom 全部固定到 Center；左摇杆继续固定 Left，右相机继续固定 Right。Go 全量测试通过且新二进制已哈希部署，仍需恢复 ADB 后完成 AutoCollect 真机回归。",
+      "regression": [
+        "go test ./...",
+        "AutoCollect big-map actions must report center alignment",
+        "AutoCollect movement must report left joystick and right camera alignment",
+        "AutoCollect must reach AutoCollectEnd with no active contacts"
+      ]
+    },
+    {
+      "id": "MAAEND-HOST-001",
+      "fingerprint": "maaend:headless-stop-file-terminal-race:v1",
+      "title": "headless stop-file 竞争会把被中止任务误记为 Framework succeeded",
+      "area": "headless-business-terminal",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-30T02:03:07+08:00",
+      "last_seen": "2026-07-30T02:06:47+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "EnvironmentMonitoring 尚在任务循环时收到 stop.requested，MaaTaskerPostStop 促使 Tasker.Task.Succeeded 回调出现",
+        "旧 host 会把队列终态直接当作业务完成，虽然事件中从未出现 EnvironmentMonitoringFinish"
+      ],
+      "observations": [
+        {
+          "source": "profiler-runs/maaend-headless/environment-monitoring-rpc-safe-20260730-0205",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T02:06:47+08:00"
+        }
+      ],
+      "fix": "_wait_job 在 stop-file 竞争时只给终态回调 0.5 秒宽限，并对 DailyFull 每一项独立要求明确 Pipeline 自然终点；Framework succeeded 但缺少终点节点时强制失败。",
+      "regression": [
+        "test_wait_job_prefers_terminal_state_during_stop_race",
+        "test_daily_task_terminal_rejects_framework_only_success",
+        "EnvironmentMonitoring must reach EnvironmentMonitoringFinish"
+      ]
+    },
+    {
+      "id": "MAAEND-USB-001",
+      "fingerprint": "maaend:physical-device-usb-midi-without-adb-interface:v1",
+      "title": "真机 USB 用途切到 MIDI 后不再枚举 ADB 接口",
+      "area": "device-transport",
+      "status": "open",
+      "severity": "medium",
+      "first_seen": "2026-07-30T02:32:43+08:00",
+      "last_seen": "2026-07-30T03:00:02+08:00",
+      "occurrences": 2,
+      "symptoms": [
+        "Windows 只能看到 vivo X200s 的 USB Composite Device VID_0E8D:PID_2046 与单一 MIDI function 子接口",
+        "adb devices 为空；不存在可通过驱动重绑恢复的 ADB 子接口，旧无线 ADB 地址和 mDNS 服务也不可达"
+      ],
+      "observations": [
+        {
+          "source": "Windows PnP and adb preflight 2026-07-30",
+          "occurrence_count": 2,
+          "last_seen": "2026-07-30T03:00:02+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "preflight must distinguish missing USB ADB interface from a driver-binding failure",
+        "the operator recovery instruction must request File Transfer or Android Auto without changing display resolution",
+        "ro.serialno must match the expected device identity in the managed run manifest before resuming automation"
       ]
     }
   ]

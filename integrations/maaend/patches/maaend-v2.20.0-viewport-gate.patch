@@ -60,7 +60,7 @@ index 3c0d67a..276e237 100644
  
  message(STATUS "WebView2 SDK enabled (arch=${_webview2_arch}, dynamic): ${WEBVIEW2_SDK_DIR}")
 diff --git a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
-index 48f2ed5..ab88be9 100644
+index 48f2ed5..161f2db 100644
 --- a/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
 +++ b/agent/cpp-algo/source/MapLocator/MapLocateAction.cpp
 @@ -17,6 +17,7 @@
@@ -113,7 +113,7 @@ index 48f2ed5..ab88be9 100644
  };
  
  fs::path getExeDir()
-@@ -116,11 +133,13 @@ void WriteJsonDetail(MaaStringBuffer* out_detail, const T& payload)
+@@ -116,11 +133,15 @@ void WriteJsonDetail(MaaStringBuffer* out_detail, const T& payload)
      MaaStringBufferSet(out_detail, json_text.c_str());
  }
  
@@ -123,12 +123,14 @@ index 48f2ed5..ab88be9 100644
      LocateOutput output;
      output.status = static_cast<int>(result.status);
      output.message = result.debugMessage;
-+    output.viewportAlignment = "center";
++    output.viewportAlignment = frame.alignment == MaaViewportAlignment_Left
++                                   ? "left"
++                                   : (frame.alignment == MaaViewportAlignment_Right ? "right" : "center");
 +    output.frameId = frame.frame_id;
      if (!result.position.has_value()) {
          return output;
      }
-@@ -135,7 +154,11 @@ LocateOutput BuildLocateOutput(const LocateResult& result)
+@@ -135,7 +156,11 @@ LocateOutput BuildLocateOutput(const LocateResult& result)
      return output;
  }
  
@@ -141,16 +143,18 @@ index 48f2ed5..ab88be9 100644
  {
      MapLocateAssertLocationOutput output;
      output.status = static_cast<int>(result.status);
-@@ -144,6 +167,8 @@ MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& resu
+@@ -144,6 +169,10 @@ MapLocateAssertLocationOutput BuildAssertLocationOutput(const LocateResult& resu
      output.message = result.debugMessage;
      output.zoneId = param.zone_id;
      output.target = param.target;
-+    output.viewportAlignment = "center";
++    output.viewportAlignment = frame.alignment == MaaViewportAlignment_Left
++                                   ? "left"
++                                   : (frame.alignment == MaaViewportAlignment_Right ? "right" : "center");
 +    output.frameId = frame.frame_id;
      if (!result.position.has_value()) {
          return output;
      }
-@@ -282,28 +307,26 @@ bool UsesAdbMinimapRoi(std::string_view controller_type)
+@@ -282,28 +311,39 @@ bool UsesAdbMinimapRoi(std::string_view controller_type)
      return equals_ignore_case("adb") || equals_ignore_case("playcover") || equals_ignore_case("play_cover");
  }
  
@@ -176,32 +180,43 @@ index 48f2ed5..ab88be9 100644
 -        if (!MaaControllerCachedImage(controller, captured_image.Get()) || MaaImageBufferIsEmpty(captured_image.Get())) {
 -            LogError << "MapLocateRecognition: Image buffer is empty";
 -            return false;
--        }
++	MaaController* controller = MaaTaskerGetController(MaaContextGetTasker(context));
++	maaend::viewport::ViewportSession viewport(controller);
++    const bool uses_adb_minimap = maaend::viewport::UseHeadlessAdaptiveContract()
++                                   || UsesAdbMinimapRoi(DetectControllerType(context));
++    const MaaViewportAlignment preferred_alignment =
++        uses_adb_minimap ? MaaViewportAlignment_Left : MaaViewportAlignment_Center;
++	auto frame = viewport.Adopt(image, preferred_alignment);
++	if (!frame.has_value()) {
++		frame = viewport.Capture(preferred_alignment, true);
++	}
++    // A 16:9 controller has no distinct Left viewport. Keep the legacy Center
++    // path as a compatibility fallback while ultrawide ADB devices explicitly
++    // capture the physical left edge containing the minimap.
++    if (!frame.has_value() && preferred_alignment != MaaViewportAlignment_Center) {
++        frame = viewport.Adopt(image, MaaViewportAlignment_Center);
++        if (!frame.has_value()) {
++            frame = viewport.Capture(MaaViewportAlignment_Center, true);
+         }
 -        actual_image = captured_image.Get();
--    }
+     }
 -
 -    if (actual_image == nullptr || MaaImageBufferIsEmpty(actual_image)) {
 -        LogError << "MapLocateRecognition: Image buffer is empty";
 -        return false;
-+	MaaController* controller = MaaTaskerGetController(MaaContextGetTasker(context));
-+	maaend::viewport::ViewportSession viewport(controller);
-+	auto frame = viewport.Adopt(image, MaaViewportAlignment_Center);
-+	if (!frame.has_value()) {
-+		frame = viewport.Capture(MaaViewportAlignment_Center, true);
-+	}
 +	if (!frame.has_value() || frame->image.empty()) {
 +		LogError << "MapLocateRecognition: Image buffer is empty";
 +		return false;
      }
  
      auto locator = getOrInitLocator();
-@@ -313,13 +336,13 @@ bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const
+@@ -313,13 +353,13 @@ bool TryLocateOnMinimap(MaaContext* context, const MaaImageBuffer* image, const
      }
  
      cv::Mat minimap;
 -    const cv::Mat image_mat = to_mat(actual_image);
 -    if (!TryExtractMinimap(image_mat, UsesAdbMinimapRoi(DetectControllerType(context)), &minimap)) {
-+	if (!TryExtractMinimap(frame->image, UsesAdbMinimapRoi(DetectControllerType(context)), &minimap)) {
++	if (!TryExtractMinimap(frame->image, uses_adb_minimap, &minimap)) {
          LogError << "MapLocateRecognition: ROI empty";
          return false;
      }
@@ -211,7 +226,7 @@ index 48f2ed5..ab88be9 100644
      return true;
  }
  
-@@ -371,11 +394,12 @@ MaaBool MAA_CALL MapLocateRecognitionRun(
+@@ -371,11 +411,12 @@ MaaBool MAA_CALL MapLocateRecognitionRun(
      const LocateOptions options = ParseCustomRecognitionParam<LocateOptions>(custom_recognition_param);
  
      LocateResult result;
@@ -226,7 +241,7 @@ index 48f2ed5..ab88be9 100644
  
      if (result.status == LocateStatus::Success && result.position.has_value()) {
          if (out_box != nullptr) {
-@@ -430,10 +454,11 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+@@ -430,10 +471,11 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
      LocateResult result;
      bool settled = false;
      MapPosition stable_pos {};
@@ -239,7 +254,7 @@ index 48f2ed5..ab88be9 100644
              return MAA_FALSE;
          }
  
-@@ -466,7 +491,7 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
+@@ -466,7 +508,7 @@ MaaBool MAA_CALL MapLocateAssertLocationRun(
          result.position->x = stable_pos.x;
          result.position->y = stable_pos.y;
      }
@@ -734,19 +749,45 @@ index 74ba0eb..6fb0f74 100644
      cv::Point active_touch_point_ {};
  };
  
+diff --git a/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp b/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp
+index 8735e83..dbbb179 100644
+--- a/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp
++++ b/agent/cpp-algo/source/MapNavigator/controller_info_utils.cpp
+@@ -4,6 +4,7 @@
+ #include <meojson/json.hpp>
+ 
+ #include "controller_info_utils.h"
++#include "../Viewport/ViewportSession.h"
+ 
+ namespace mapnavigator
+ {
+@@ -45,6 +46,9 @@ ControllerInfo ParseControllerInfo(MaaController* controller)
+ 
+ std::string DetectControllerType(MaaController* controller)
+ {
++    if (maaend::viewport::UseHeadlessAdaptiveContract()) {
++        return "ADB";
++    }
+     const auto info = ParseControllerInfo(controller);
+     return info.type;
+ }
 diff --git a/agent/cpp-algo/source/MapNavigator/position_provider.cpp b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
-index 4a4d5a5..40a7abd 100644
+index 4a4d5a5..3f0de64 100644
 --- a/agent/cpp-algo/source/MapNavigator/position_provider.cpp
 +++ b/agent/cpp-algo/source/MapNavigator/position_provider.cpp
-@@ -46,6 +46,7 @@ bool IsBlackScreen(const cv::Mat& image)
+@@ -46,8 +46,10 @@ bool IsBlackScreen(const cv::Mat& image)
  
  PositionProvider::PositionProvider(MaaController* controller, std::shared_ptr<maplocator::MapLocator> locator)
      : controller_(controller)
 +    , viewport_(std::make_shared<maaend::viewport::ViewportSession>(controller))
      , locator_(std::move(locator))
-     , uses_adb_minimap_roi_(IsAdbLikeControllerType(DetectControllerType(controller_)))
+-    , uses_adb_minimap_roi_(IsAdbLikeControllerType(DetectControllerType(controller_)))
++    , uses_adb_minimap_roi_(
++          maaend::viewport::UseHeadlessAdaptiveContract() || IsAdbLikeControllerType(DetectControllerType(controller_)))
  {
-@@ -65,15 +66,12 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
+ }
+ 
+@@ -65,15 +67,19 @@ bool PositionProvider::Capture(NaviPosition* out_pos, bool force_global_search,
      last_capture_was_black_screen_ = false;
      const auto capture_started_at = std::chrono::steady_clock::now();
  
@@ -755,7 +796,14 @@ index 4a4d5a5..40a7abd 100644
 -    ScopedImageBuffer buffer;
 -
 -    if (!MaaControllerCachedImage(controller_, buffer.Get()) || MaaImageBufferIsEmpty(buffer.Get())) {
-+	const auto frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++	auto frame = viewport_->Capture(
++        uses_adb_minimap_roi_ ? MaaViewportAlignment_Left : MaaViewportAlignment_Center,
++        true);
++    // Standard 16:9 ADB/PlayCover controllers expose Center only. Adaptive
++    // ultrawide controllers expose Left, which is where the minimap lives.
++    if (!frame.has_value() && uses_adb_minimap_roi_) {
++        frame = viewport_->Capture(MaaViewportAlignment_Center, true);
++    }
 +	if (!frame.has_value() || frame->image.empty()) {
          return false;
      }
@@ -1491,7 +1539,7 @@ index c3bc8a5..cb0968b 100644
  }
  
 diff --git a/agent/go-service/maptracker/bigmap/find_image.go b/agent/go-service/maptracker/bigmap/find_image.go
-index afad914..c9c16e7 100644
+index afad914..38ee02c 100644
 --- a/agent/go-service/maptracker/bigmap/find_image.go
 +++ b/agent/go-service/maptracker/bigmap/find_image.go
 @@ -2,6 +2,7 @@
@@ -1510,7 +1558,15 @@ index afad914..c9c16e7 100644
  	maa "github.com/MaaXYZ/maa-framework-go/v4"
  	"github.com/rs/zerolog/log"
  )
-@@ -280,6 +282,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+@@ -275,11 +277,19 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+ 	param *MapTrackerBigMapFindImageParam,
+ ) (*maa.CustomRecognitionResult, bool) {
+ 	ctrl := ctx.GetTasker().GetController()
+-	ca, err := control.NewControlAdaptor(ctx, ctrl, WORK_W, WORK_H)
++	ca, err := control.NewControlAdaptorPinned(
++		ctx, ctrl, WORK_W, WORK_H, maa.ViewportAlignmentCenter,
++	)
+ 	if err != nil {
  		log.Error().Err(err).Msg("Failed to create control adaptor for multi-viewport search")
  		return nil, false
  	}
@@ -1523,7 +1579,7 @@ index afad914..c9c16e7 100644
  
  	panFactor := BIG_MAP_PAN_FACTOR_NUMERATOR / control.GetScreenDiagonalSize(ctrl)
  
-@@ -291,12 +299,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+@@ -291,12 +301,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
  	pickAttempt := 0
  
  	// Initial screenshot, infer, and match.
@@ -1538,7 +1594,7 @@ index afad914..c9c16e7 100644
  	inferRes, err = r.inferResultWithImg(ctx, arg, img, &param.MapTrackerBigMapInferParam)
  	if err != nil {
  		log.Error().Err(err).Msg("Failed to infer viewport in multi-viewport search")
-@@ -336,12 +344,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
+@@ -336,12 +346,12 @@ func (r *MapTrackerBigMapFindImage) runMultiViewportSearch(
  
  		// Fresh screenshot + infer after drag.
  		ca.TouchMove(0, 1, 1, 0)
@@ -1554,7 +1610,7 @@ index afad914..c9c16e7 100644
  		if err != nil {
  			log.Error().Err(err).Msg("Failed to infer viewport in multi-viewport search")
 diff --git a/agent/go-service/maptracker/bigmap/pick.go b/agent/go-service/maptracker/bigmap/pick.go
-index 731849c..fbea01d 100644
+index 731849c..10965cf 100644
 --- a/agent/go-service/maptracker/bigmap/pick.go
 +++ b/agent/go-service/maptracker/bigmap/pick.go
 @@ -2,6 +2,7 @@
@@ -1573,7 +1629,15 @@ index 731849c..fbea01d 100644
  	maa "github.com/MaaXYZ/maa-framework-go/v4"
  	"github.com/rs/zerolog/log"
  )
-@@ -92,10 +94,16 @@ func (a *MapTrackerBigMapPick) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+@@ -87,15 +89,23 @@ func (a *MapTrackerBigMapPick) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	}
+ 
+ 	ctrl := ctx.GetTasker().GetController()
+-	ca, err := control.NewControlAdaptor(ctx, ctrl, WORK_W, WORK_H)
++	ca, err := control.NewControlAdaptorPinned(
++		ctx, ctrl, WORK_W, WORK_H, maa.ViewportAlignmentCenter,
++	)
+ 	if err != nil {
  		log.Error().Err(err).Msg("Failed to create control adaptor")
  		return false
  	}
@@ -1591,7 +1655,7 @@ index 731849c..fbea01d 100644
  			log.Warn().Err(err).Float64("zoomValue", zoomValue).Msg("Failed to auto adjust big-map zoom")
  		}
  	}
-@@ -246,14 +254,14 @@ func runBigMapTeleportNode(ctx *maa.Context, ca control.ControlAdaptor, targetIn
+@@ -246,14 +256,14 @@ func runBigMapTeleportNode(ctx *maa.Context, ca control.ControlAdaptor, targetIn
  }
  
  func doBigMapInferForMap(ctx *maa.Context, ctrl *maa.Controller, mapName string) (*MapTrackerBigMapInferResult, error) {
@@ -1610,7 +1674,7 @@ index 731849c..fbea01d 100644
  	inferConfig := map[string]any{
  		"map_name_regex": "^" + regexp.QuoteMeta(mapName) + "$",
 diff --git a/agent/go-service/maptracker/bigmap/zoom.go b/agent/go-service/maptracker/bigmap/zoom.go
-index 263a1e3..cbfeec7 100644
+index 263a1e3..519bb89 100644
 --- a/agent/go-service/maptracker/bigmap/zoom.go
 +++ b/agent/go-service/maptracker/bigmap/zoom.go
 @@ -2,6 +2,7 @@
@@ -1629,7 +1693,15 @@ index 263a1e3..cbfeec7 100644
  	maa "github.com/MaaXYZ/maa-framework-go/v4"
  	"github.com/rs/zerolog/log"
  )
-@@ -52,8 +54,14 @@ func (a *MapTrackerBigMapZoom) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+@@ -47,13 +49,21 @@ func (a *MapTrackerBigMapZoom) Run(ctx *maa.Context, arg *maa.CustomActionArg) b
+ 	}
+ 
+ 	ctrl := ctx.GetTasker().GetController()
+-	ca, err := control.NewControlAdaptor(ctx, ctrl, WORK_W, WORK_H)
++	ca, err := control.NewControlAdaptorPinned(
++		ctx, ctrl, WORK_W, WORK_H, maa.ViewportAlignmentCenter,
++	)
+ 	if err != nil {
  		log.Error().Err(err).Msg("Failed to create control adaptor")
  		return false
  	}
@@ -1645,7 +1717,7 @@ index 263a1e3..cbfeec7 100644
  		log.Error().Err(err).Float64("zoomValue", param.ZoomValue).Msg("Failed to adjust big-map zoom")
  		return false
  	}
-@@ -77,7 +85,7 @@ func (a *MapTrackerBigMapZoom) parseParam(paramStr string) (*MapTrackerBigMapZoo
+@@ -77,7 +87,7 @@ func (a *MapTrackerBigMapZoom) parseParam(paramStr string) (*MapTrackerBigMapZoo
  	return &param, nil
  }
  
@@ -1654,7 +1726,7 @@ index 263a1e3..cbfeec7 100644
  	// Zoom-in (+) button template
  	zoomInTemplate, err := internal.Resource.ZoomInTemplate.Get()
  	if err != nil {
-@@ -92,16 +100,15 @@ func doBigMapZoom(ctrl *maa.Controller, ca control.ControlAdaptor, position floa
+@@ -92,16 +102,15 @@ func doBigMapZoom(ctrl *maa.Controller, ca control.ControlAdaptor, position floa
  
  	triedAgain := false
  	for {
@@ -1826,10 +1898,10 @@ index cc01696..5057e0d 100644
 +	return minicv.ImageConvertRGBA(frame.Image), nil
  }
 diff --git a/agent/go-service/pkg/control/adaptor.go b/agent/go-service/pkg/control/adaptor.go
-index 823f375..8603534 100644
+index 823f375..f4e7e12 100644
 --- a/agent/go-service/pkg/control/adaptor.go
 +++ b/agent/go-service/pkg/control/adaptor.go
-@@ -72,6 +72,10 @@ type ControlAdaptor interface {
+@@ -72,11 +72,43 @@ type ControlAdaptor interface {
  	// AggressivelyResetPlayerMovement provides an aggressive way to reset player movement for initialization purpose.
  	// Different implementations may have different ways to achieve this.
  	AggressivelyResetPlayerMovement()
@@ -1840,20 +1912,53 @@ index 823f375..8603534 100644
  }
  
  // NewControlAdaptor creates a new ControlAdaptor instance.
-@@ -88,7 +92,7 @@ func NewControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (Contro
+ // The implementation type is determined by the controller info obtained from the Maa Controller.
+ func NewControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (ControlAdaptor, error) {
++	return newControlAdaptor(ctx, ctrl, w, h, nil)
++}
++
++// NewControlAdaptorPinned creates an adaptor whose screen-coordinate actions
++// stay in one explicit viewport. Use it when every coordinate is derived from
++// an image captured with that alignment (for example the Center big-map
++// frame). World controls should keep using NewControlAdaptor so joystick and
++// camera semantics can select Left and Right independently.
++func NewControlAdaptorPinned(
++	ctx *maa.Context,
++	ctrl *maa.Controller,
++	w, h int,
++	alignment maa.ViewportAlignment,
++) (ControlAdaptor, error) {
++	if alignment != maa.ViewportAlignmentCenter &&
++		alignment != maa.ViewportAlignmentLeft &&
++		alignment != maa.ViewportAlignmentRight {
++		return nil, fmt.Errorf("invalid pinned viewport alignment: %d", alignment)
++	}
++	return newControlAdaptor(ctx, ctrl, w, h, &alignment)
++}
++
++func newControlAdaptor(
++	ctx *maa.Context,
++	ctrl *maa.Controller,
++	w, h int,
++	pinnedAlignment *maa.ViewportAlignment,
++) (ControlAdaptor, error) {
+ 	controlType, err := GetControlType(ctrl)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get control type: %w", err)
+@@ -88,7 +120,7 @@ func NewControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (Contro
  	case CONTROL_TYPE_WLROOTS:
  		return newWlrootsControlAdaptor(ctx, ctrl, w, h), nil
  	case CONTROL_TYPE_ADB:
 -		return newADBControlAdaptor(ctx, ctrl, w, h), nil
-+		return newADBControlAdaptor(ctx, ctrl, w, h)
++		return newADBControlAdaptor(ctx, ctrl, w, h, pinnedAlignment)
  	default:
  		return nil, fmt.Errorf("unsupported control type: %s", controlType)
  	}
 diff --git a/agent/go-service/pkg/control/adaptor_adb.go b/agent/go-service/pkg/control/adaptor_adb.go
-index ff78dae..1b34d1f 100644
+index ff78dae..e061d4a 100644
 --- a/agent/go-service/pkg/control/adaptor_adb.go
 +++ b/agent/go-service/pkg/control/adaptor_adb.go
-@@ -2,14 +2,20 @@
+@@ -2,24 +2,44 @@
  package control
  
  import (
@@ -1868,28 +1973,43 @@ index ff78dae..1b34d1f 100644
  )
  
  type ADBControlAdaptor struct {
- 	ctx  *maa.Context
- 	ctrl *maa.Controller
-+	view *viewport.Session
- 	w    int
- 	h    int
+-	ctx  *maa.Context
+-	ctrl *maa.Controller
+-	w    int
+-	h    int
++	ctx             *maa.Context
++	ctrl            *maa.Controller
++	view            *viewport.Session
++	w               int
++	h               int
++	pinnedAlignment *maa.ViewportAlignment
  
-@@ -18,8 +24,12 @@ type ADBControlAdaptor struct {
+ 	pm               PlayerMovement
+ 	lastDirection    PlayerDirection
  	lastMotionIsWalk bool
  }
  
 -func newADBControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) *ADBControlAdaptor {
 -	return &ADBControlAdaptor{ctx: ctx, ctrl: ctrl, w: w, h: h, pm: MovementStop, lastDirection: DirectionF, lastMotionIsWalk: false}
-+func newADBControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (*ADBControlAdaptor, error) {
++func newADBControlAdaptor(
++	ctx *maa.Context,
++	ctrl *maa.Controller,
++	w, h int,
++	pinnedAlignment *maa.ViewportAlignment,
++) (*ADBControlAdaptor, error) {
 +	view, err := viewport.New(ctrl)
 +	if err != nil {
 +		return nil, fmt.Errorf("create viewport session: %w", err)
 +	}
-+	return &ADBControlAdaptor{ctx: ctx, ctrl: ctrl, view: view, w: w, h: h, pm: MovementStop, lastDirection: DirectionF, lastMotionIsWalk: false}, nil
++	return &ADBControlAdaptor{
++		ctx: ctx, ctrl: ctrl, view: view, w: w, h: h,
++		pinnedAlignment: pinnedAlignment,
++		pm:              MovementStop, lastDirection: DirectionF, lastMotionIsWalk: false,
++	}, nil
  }
  
  func (aca *ADBControlAdaptor) Ctx() *maa.Context {
-@@ -27,36 +37,36 @@ func (aca *ADBControlAdaptor) Ctx() *maa.Context {
+@@ -27,36 +47,36 @@ func (aca *ADBControlAdaptor) Ctx() *maa.Context {
  }
  
  func (aca *ADBControlAdaptor) TouchDown(contact, x, y int, delayMillis int) {
@@ -1935,7 +2055,7 @@ index ff78dae..1b34d1f 100644
  	time.Sleep(time.Duration(delayMillis) * time.Millisecond)
  }
  
-@@ -77,7 +87,7 @@ func (aca *ADBControlAdaptor) KeyType(keyCode int, delayMillis int) {
+@@ -77,7 +97,7 @@ func (aca *ADBControlAdaptor) KeyType(keyCode int, delayMillis int) {
  
  func (aca *ADBControlAdaptor) RotateCamera(dx, dy int) {
  	cx, cy := aca.w/4*3, aca.h/2
@@ -1944,7 +2064,7 @@ index ff78dae..1b34d1f 100644
  }
  
  func (aca *ADBControlAdaptor) GetPlayerMovement() PlayerMovement {
-@@ -87,11 +97,11 @@ func (aca *ADBControlAdaptor) GetPlayerMovement() PlayerMovement {
+@@ -87,11 +107,11 @@ func (aca *ADBControlAdaptor) GetPlayerMovement() PlayerMovement {
  func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy PlayerMovementPolicy) {
  	joystickRunForward := func() {
  		dx, dy := joystickOffset(aca.lastDirection, -JOYSTICK_RUN_DY)
@@ -1958,7 +2078,7 @@ index ff78dae..1b34d1f 100644
  	}
  	joystickStopForward := func() {
  		aca.TouchUp(joystickContact, defaultTouchActionDelayMillis)
-@@ -123,7 +133,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
+@@ -123,7 +143,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
  		if aca.lastMotionIsWalk {
  			if movement.speed >= MovementSprint.speed {
  				// Set to "sprint"
@@ -1967,7 +2087,7 @@ index ff78dae..1b34d1f 100644
  				aca.lastMotionIsWalk = false
  			} else if movement.speed >= MovementRun.speed {
  				// Set to "run"
-@@ -151,7 +161,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
+@@ -151,7 +171,7 @@ func (aca *ADBControlAdaptor) SetPlayerMovement(movement PlayerMovement, policy
  				}
  			} else {
  				// Set to "sprint"
@@ -1976,7 +2096,7 @@ index ff78dae..1b34d1f 100644
  				if policy >= PolicyDefault {
  					joystickRunForward()
  				}
-@@ -169,16 +179,16 @@ func (aca *ADBControlAdaptor) SetPlayerDirection(direction PlayerDirection) {
+@@ -169,16 +189,16 @@ func (aca *ADBControlAdaptor) SetPlayerDirection(direction PlayerDirection) {
  	if aca.pm.speed > MovementStop.speed {
  		if aca.pm.speed >= MovementRun.speed {
  			dx, dy := joystickOffset(direction, -JOYSTICK_RUN_DY)
@@ -1996,7 +2116,7 @@ index ff78dae..1b34d1f 100644
  }
  
  func (aca *ADBControlAdaptor) ResetCursor(_ CursorResetPolicy) {
-@@ -189,6 +199,65 @@ func (aca *ADBControlAdaptor) AggressivelyResetPlayerMovement() {
+@@ -189,6 +209,68 @@ func (aca *ADBControlAdaptor) AggressivelyResetPlayerMovement() {
  	// ADB has no need to reset player movement aggressively
  }
  
@@ -2005,6 +2125,9 @@ index ff78dae..1b34d1f 100644
 +}
 +
 +func (aca *ADBControlAdaptor) alignmentForSpan(x1, y1, x2, y2 int) maa.ViewportAlignment {
++	if aca.pinnedAlignment != nil {
++		return *aca.pinnedAlignment
++	}
 +	minX, maxX := min(x1, x2), max(x1, x2)
 +	minY, maxY := min(y1, y2), max(y1, y2)
 +	return viewport.PreferredAlignmentForROI(image.Rect(minX, minY, maxX+1, maxY+1), aca.w)
@@ -2954,6 +3077,203 @@ index ca7f3e9..7ea9022 100644
  	count := parseAbandCount(text)
  
  	// ② 点取消 → 等回抽牌页 → freeze。失败只记日志（次数已读到，界面若残留由上游兜底）。
+diff --git a/agent/go-service/visitfriends/register.go b/agent/go-service/visitfriends/register.go
+index 46011a1..da6f3b0 100644
+--- a/agent/go-service/visitfriends/register.go
++++ b/agent/go-service/visitfriends/register.go
+@@ -6,6 +6,8 @@ func Register() {
+ 	maa.AgentServerRegisterCustomAction("VisitFriendsMainAction", &VisitFriendsMainAction{})
+ 	maa.AgentServerRegisterCustomRecognition("VisitFriendsMenuScanTargetFriendOpenRecognition", &VisitFriendsMenuScanTargetFriendOpenRecognition{})
+ 	maa.AgentServerRegisterCustomAction("VisitFriendsMenuScanTargetFriendOpenAction", &VisitFriendsMenuScanTargetFriendOpenAction{})
++	maa.AgentServerRegisterCustomAction("VisitFriendsMenuScanDetailOpenAction", &VisitFriendsMenuScanDetailOpenAction{})
++	maa.AgentServerRegisterCustomAction("VisitFriendsMenuTerminalExitAction", &VisitFriendsMenuTerminalExitAction{})
+ 	maa.AgentServerRegisterCustomRecognition("VisitFriendsMenuScanDetailClueExchangeRecognition", &VisitFriendsMenuScanDetailClueExchangeRecognition{})
+ 	maa.AgentServerRegisterCustomRecognition("VisitFriendsMenuScanDetailAssistRecognition", &VisitFriendsMenuScanDetailAssistRecognition{})
+ 	maa.AgentServerRegisterCustomRecognition("VisitFriendsMenuScanScrollFinishRecognition", &VisitFriendsMenuScanScrollFinishRecognition{})
+diff --git a/agent/go-service/visitfriends/visitfriends.go b/agent/go-service/visitfriends/visitfriends.go
+index d01ad1d..695a586 100644
+--- a/agent/go-service/visitfriends/visitfriends.go
++++ b/agent/go-service/visitfriends/visitfriends.go
+@@ -1,11 +1,14 @@
+ package visitfriends
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"strings"
+ 
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/i18n"
+ 	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/maafocus"
++	"github.com/MaaXYZ/MaaEnd/agent/go-service/pkg/viewport"
+ 	maa "github.com/MaaXYZ/maa-framework-go/v4"
+ 	"github.com/rs/zerolog/log"
+ )
+@@ -198,6 +201,96 @@ func (r *VisitFriendsMenuScanTargetFriendOpenRecognition) Run(ctx *maa.Context,
+ 
+ type VisitFriendsMenuScanTargetFriendOpenAction struct{}
+ 
++type visitFriendsDetailClickSession interface {
++	PreferredLabel(context.Context, maa.ViewportAlignment) (viewport.Frame, error)
++	Click(context.Context, viewport.Frame, int32, int32) error
++}
++
++type visitFriendsMenuScanDetailOpenParam struct {
++	ButtonBox []int `json:"button_box"`
++}
++
++func clickVisitFriendsDetailButton(ctx context.Context, view visitFriendsDetailClickSession, buttonBox []int) error {
++	if len(buttonBox) < 4 {
++		return fmt.Errorf("button_box requires x, y, width, and height")
++	}
++	x, y, width, height := buttonBox[0], buttonBox[1], buttonBox[2], buttonBox[3]
++	if width <= 0 || height <= 0 {
++		return fmt.Errorf("button_box has invalid size %dx%d", width, height)
++	}
++
++	// VisitFriendsMenuScanTargetFriendOpenRecognition receives the Center
++	// Pipeline frame. Keep that semantic viewport attached to its coordinates
++	// instead of inheriting whichever alignment a nested recognition used last.
++	frame, err := view.PreferredLabel(ctx, maa.ViewportAlignmentCenter)
++	if err != nil {
++		return fmt.Errorf("label center viewport: %w", err)
++	}
++	if err := view.Click(ctx, frame, int32(x+width/2), int32(y+height/2)); err != nil {
++		return fmt.Errorf("click friend detail button: %w", err)
++	}
++	return nil
++}
++
++type VisitFriendsMenuScanDetailOpenAction struct{}
++
++func (a *VisitFriendsMenuScanDetailOpenAction) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
++	var params visitFriendsMenuScanDetailOpenParam
++	if arg == nil || json.Unmarshal([]byte(arg.CustomActionParam), &params) != nil {
++		log.Error().Str("component", "VisitFriends").Str("step", "open_detail").Msg("parse custom action param")
++		return false
++	}
++	tasker := ctx.GetTasker()
++	if tasker == nil || tasker.GetController() == nil {
++		log.Error().Str("component", "VisitFriends").Str("step", "open_detail").Msg("controller is unavailable")
++		return false
++	}
++	view, err := viewport.New(tasker.GetController())
++	if err != nil {
++		log.Error().Err(err).Str("component", "VisitFriends").Str("step", "open_detail").Msg("create viewport session")
++		return false
++	}
++	if err := clickVisitFriendsDetailButton(context.Background(), view, params.ButtonBox); err != nil {
++		log.Error().Err(err).Str("component", "VisitFriends").Str("step", "open_detail").Msg("click")
++		return false
++	}
++	return true
++}
++
++func clickVisitFriendsTerminalClose(ctx context.Context, view visitFriendsDetailClickSession) error {
++	// On ultrawide Android devices the guest-terminal title belongs to the
++	// Center viewport while its close button belongs to the Right viewport.
++	// Never reuse the title recognition's implicit alignment for this point.
++	frame, err := view.PreferredLabel(ctx, maa.ViewportAlignmentRight)
++	if err != nil {
++		return fmt.Errorf("label right viewport: %w", err)
++	}
++	if err := view.Click(ctx, frame, 1133, 34); err != nil {
++		return fmt.Errorf("click guest terminal close button: %w", err)
++	}
++	return nil
++}
++
++type VisitFriendsMenuTerminalExitAction struct{}
++
++func (a *VisitFriendsMenuTerminalExitAction) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
++	tasker := ctx.GetTasker()
++	if tasker == nil || tasker.GetController() == nil {
++		log.Error().Str("component", "VisitFriends").Str("step", "close_terminal").Msg("controller is unavailable")
++		return false
++	}
++	view, err := viewport.New(tasker.GetController())
++	if err != nil {
++		log.Error().Err(err).Str("component", "VisitFriends").Str("step", "close_terminal").Msg("create viewport session")
++		return false
++	}
++	if err := clickVisitFriendsTerminalClose(context.Background(), view); err != nil {
++		log.Error().Err(err).Str("component", "VisitFriends").Str("step", "close_terminal").Msg("click")
++		return false
++	}
++	return true
++}
++
+ func (a *VisitFriendsMenuScanTargetFriendOpenAction) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
+ 	customResult, ok := arg.RecognitionDetail.Results.Best.AsCustom()
+ 	if !ok {
+@@ -271,12 +364,11 @@ func (a *VisitFriendsMenuScanTargetFriendOpenAction) Run(ctx *maa.Context, arg *
+ 				},
+ 			},
+ 			"VisitFriendsMenuScanDetailOpen": map[string]any{
+-				"enabled": enableOpen,
+-				"target": maa.Rect{
+-					resultItem.ButtonBox[0],
+-					resultItem.ButtonBox[1],
+-					resultItem.ButtonBox[2],
+-					resultItem.ButtonBox[3],
++				"enabled":       enableOpen,
++				"action":        "Custom",
++				"custom_action": "VisitFriendsMenuScanDetailOpenAction",
++				"custom_action_param": map[string]any{
++					"button_box": resultItem.ButtonBox,
+ 				},
+ 			},
+ 			"VisitFriendsMenuScanDetailSaveAssist": map[string]any{
+@@ -285,9 +377,13 @@ func (a *VisitFriendsMenuScanTargetFriendOpenAction) Run(ctx *maa.Context, arg *
+ 				},
+ 			},
+ 		}
+-		_, err := ctx.RunTask("VisitFriendsMenuScanDetail", override)
+-		if err != nil {
+-			log.Error().Err(err).Msg("VisitFriendsMenuScanTargetFriendOpenAction: failed to run task")
++		detail, err := ctx.RunTask("VisitFriendsMenuScanDetail", override)
++		if err != nil || detail == nil || !detail.Status.Success() {
++			event := log.Error().Err(err).Str("subtask", "VisitFriendsMenuScanDetail")
++			if detail != nil {
++				event = event.Int64("subtask_id", detail.ID).Str("subtask_status", detail.Status.String())
++			}
++			event.Msg("VisitFriendsMenuScanTargetFriendOpenAction: failed to run task")
+ 			return false
+ 		}
+ 	}
+@@ -403,11 +499,10 @@ func (a *VisitFriendsMenuScanTargetFriendOpenAction) Run(ctx *maa.Context, arg *
+ 		lastScrollItemName = "" // 打开好友后重置，避免上次滚动的好友和这次打开的好友名字一样导致误判滚动结束
+ 		override := map[string]any{
+ 			"VisitFriendsEnterShip": map[string]any{
+-				"target": maa.Rect{
+-					resultItem.ButtonBox[0],
+-					resultItem.ButtonBox[1],
+-					resultItem.ButtonBox[2],
+-					resultItem.ButtonBox[3],
++				"action":        "Custom",
++				"custom_action": "VisitFriendsMenuScanDetailOpenAction",
++				"custom_action_param": map[string]any{
++					"button_box": resultItem.ButtonBox,
+ 				},
+ 			},
+ 			"VisitFriendsMenuClueExchange": map[string]any{
+@@ -426,9 +521,13 @@ func (a *VisitFriendsMenuScanTargetFriendOpenAction) Run(ctx *maa.Context, arg *
+ 				"enabled": needGrowthChamberAssist,
+ 			},
+ 		}
+-		_, err := ctx.RunTask("VisitFriendsEnterShip", override)
+-		if err != nil {
+-			log.Error().Err(err).Msg("VisitFriendsMenuScanTargetFriendOpenAction: failed to run task")
++		detail, err := ctx.RunTask("VisitFriendsEnterShip", override)
++		if err != nil || detail == nil || !detail.Status.Success() {
++			event := log.Error().Err(err).Str("subtask", "VisitFriendsEnterShip")
++			if detail != nil {
++				event = event.Int64("subtask_id", detail.ID).Str("subtask_status", detail.Status.String())
++			}
++			event.Msg("VisitFriendsMenuScanTargetFriendOpenAction: failed to run task")
+ 			return false
+ 		}
+ 	}
 diff --git a/agent/go-service/webevent/202605/action.go b/agent/go-service/webevent/202605/action.go
 index a6ff887..674b7b7 100644
 --- a/agent/go-service/webevent/202605/action.go
@@ -3216,15 +3536,73 @@ index 95af0bf..1674d9a 100644
      "mirrorchyan_multiplatform": true,
      "languages": {
          "zh_cn": "locales/interface/zh_cn.json",
+diff --git a/assets/tasks/AutoSell.json b/assets/tasks/AutoSell.json
+index 41ed734..7aaf748 100644
+--- a/assets/tasks/AutoSell.json
++++ b/assets/tasks/AutoSell.json
+@@ -6,7 +6,8 @@
+             "entry": "AutoSellMain",
+             "controller": [
+                 "Win32-Front",
+-                "Wlroots"
++                "Wlroots",
++                "ADB"
+             ],
+             "option": [
+                 "AutoSellValleyIV",
+diff --git a/assets/tasks/AutoStockpile.json b/assets/tasks/AutoStockpile.json
+index 036aa46..e161a5c 100644
+--- a/assets/tasks/AutoStockpile.json
++++ b/assets/tasks/AutoStockpile.json
+@@ -7,7 +7,8 @@
+             "description": "$task.AutoStockpile.description",
+             "controller": [
+                 "Win32-Front",
+-                "Wlroots"
++                "Wlroots",
++                "ADB"
+             ],
+             "group": [
+                 "regional_development"
+diff --git a/assets/tasks/SeizeDeliveryJobs.json b/assets/tasks/SeizeDeliveryJobs.json
+index a3b5cdc..fc286d3 100644
+--- a/assets/tasks/SeizeDeliveryJobs.json
++++ b/assets/tasks/SeizeDeliveryJobs.json
+@@ -11,7 +11,8 @@
+             ],
+             "controller": [
+                 "Win32-Front",
+-                "Wlroots"
++                "Wlroots",
++                "ADB"
+             ],
+             "group": [
+                 "regional_development"
+diff --git a/tools/schema/custom.action.schema.json b/tools/schema/custom.action.schema.json
+index 539af89..deb6447 100644
+--- a/tools/schema/custom.action.schema.json
++++ b/tools/schema/custom.action.schema.json
+@@ -85,7 +85,9 @@
+                 "VisitFriendsMenuClueAssistFullAction",
+                 "VisitFriendsMenuClueExchangeAction",
+                 "VisitFriendsMenuClueExchangeFullAction",
++                "VisitFriendsMenuScanDetailOpenAction",
+                 "VisitFriendsMenuScanTargetFriendOpenAction",
++                "VisitFriendsMenuTerminalExitAction",
+                 "WebEvent202605Action",
+                 "autoEcoFarmInterruptibleSleep",
+                 "autoEcoFarmOverrideTargetTemplate",
 diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.cpp b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
 new file mode 100644
-index 0000000..dcd91c2
+index 0000000..7594c15
 --- /dev/null
 +++ b/agent/cpp-algo/source/Viewport/ViewportSession.cpp
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,470 @@
 +#include "ViewportSession.h"
 +
 +#include <algorithm>
++#include <cstdlib>
++#include <map>
 +#include <mutex>
 +#include <string>
 +#include <string_view>
@@ -3248,6 +3626,24 @@ index 0000000..dcd91c2
 +    return mutex;
 +}
 +
++struct HeadlessViewportState
++{
++    MaaViewportAlignment alignment = MaaViewportAlignment_Center;
++    MaaViewportAlignment cached_alignment = MaaViewportAlignment_Center;
++    std::uint64_t frame_id = 0;
++};
++
++std::map<const MaaController*, HeadlessViewportState>& HeadlessStates()
++{
++    static std::map<const MaaController*, HeadlessViewportState> states;
++    return states;
++}
++
++HeadlessViewportState& HeadlessState(const MaaController* controller)
++{
++    return HeadlessStates()[controller];
++}
++
 +std::optional<MaaViewportAlignment> ParseAlignment(std::string_view value)
 +{
 +    if (value == "center") {
@@ -3267,7 +3663,32 @@ index 0000000..dcd91c2
 +    return alignment == MaaViewportAlignment_Center || alignment == MaaViewportAlignment_Left || alignment == MaaViewportAlignment_Right;
 +}
 +
++std::optional<std::string> ReadEnvironmentVariable(const char* name)
++{
++#ifdef _WIN32
++    char* value = nullptr;
++    std::size_t size = 0;
++    if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) {
++        std::free(value);
++        return std::nullopt;
++    }
++    std::string result(value);
++    std::free(value);
++    return result;
++#else
++    const char* value = std::getenv(name);
++    return value == nullptr ? std::nullopt : std::optional<std::string>(value);
++#endif
++}
++
 +} // namespace
++
++bool UseHeadlessAdaptiveContract()
++{
++    const auto viewport = ReadEnvironmentVariable("MAA_SCREENSHOT_VIEWPORT");
++    const auto client = ReadEnvironmentVariable("PI_CLIENT_NAME");
++    return viewport == "1280x720:adaptive" && client == "MobileProfilerHeadless";
++}
 +
 +bool ViewportFrame::Valid() const
 +{
@@ -3310,6 +3731,7 @@ index 0000000..dcd91c2
 +        if (!WaitForAction(id, "screencap")) {
 +            return std::nullopt;
 +        }
++        NoteCapturedFrame();
 +    }
 +
 +    if (!SetAlignment(alignment)) {
@@ -3350,7 +3772,10 @@ index 0000000..dcd91c2
 +    std::scoped_lock lock(ControllerMutex());
 +    ViewportInfo info;
 +    if (!ReadInfo(&info) || info.frame_id == 0) {
-+        return std::nullopt;
++        if (!UseHeadlessAdaptiveContract()) {
++            return std::nullopt;
++        }
++        info.frame_id = EnsureFrameId();
 +    }
 +
 +    MaaViewportAlignment alignment = preferred;
@@ -3376,7 +3801,14 @@ index 0000000..dcd91c2
 +
 +    std::scoped_lock lock(ControllerMutex());
 +    ViewportInfo info;
-+    if (!ReadInfo(&info) || info.frame_id == 0 || info.alignment != alignment || info.cached_alignment != alignment
++    if (!ReadInfo(&info)) {
++        return std::nullopt;
++    }
++    if (UseHeadlessAdaptiveContract() && info.frame_id == 0 && info.alignment == alignment
++        && info.cached_alignment == alignment) {
++        info.frame_id = EnsureFrameId();
++    }
++    if (info.frame_id == 0 || info.alignment != alignment || info.cached_alignment != alignment
 +        || !IsAlignmentAvailable(info, alignment)) {
 +        return std::nullopt;
 +    }
@@ -3479,6 +3911,20 @@ index 0000000..dcd91c2
 +        return false;
 +    }
 +
++    if (UseHeadlessAdaptiveContract()) {
++        const auto& state = HeadlessState(controller_);
++        *out_info = ViewportInfo {
++            .adaptive = true,
++            .alignment = state.alignment,
++            .cached_alignment = state.cached_alignment,
++            .frame_id = state.frame_id,
++            .center_available = true,
++            .left_available = true,
++            .right_available = true,
++        };
++        return true;
++    }
++
 +    ScopedStringBuffer buffer;
 +    if (!MaaControllerGetInfo(controller_, buffer.Get()) || MaaStringBufferIsEmpty(buffer.Get())) {
 +        return false;
@@ -3530,8 +3976,45 @@ index 0000000..dcd91c2
 +
 +bool ViewportSession::SetAlignment(MaaViewportAlignment alignment) const
 +{
-+    return controller_ != nullptr && IsValidAlignment(alignment)
-+           && MaaControllerSetOption(controller_, MaaCtrlOption_ScreenshotViewportAlignment, &alignment, sizeof(alignment));
++    if (controller_ == nullptr || !IsValidAlignment(alignment)) {
++        return false;
++    }
++
++    LogInfo << "ViewportSession: setting screenshot alignment." << VAR(alignment) << VAR(UseHeadlessAdaptiveContract());
++    const bool succeeded =
++        MaaControllerSetOption(controller_, MaaCtrlOption_ScreenshotViewportAlignment, &alignment, sizeof(alignment));
++    if (succeeded && UseHeadlessAdaptiveContract()) {
++        auto& state = HeadlessState(controller_);
++        state.alignment = alignment;
++        state.cached_alignment = alignment;
++    }
++    LogInfo << "ViewportSession: screenshot alignment result." << VAR(alignment) << VAR(succeeded);
++    return succeeded;
++}
++
++void ViewportSession::NoteCapturedFrame() const
++{
++    if (!UseHeadlessAdaptiveContract() || controller_ == nullptr) {
++        return;
++    }
++    auto& state = HeadlessState(controller_);
++    ++state.frame_id;
++    if (state.frame_id == 0) {
++        state.frame_id = 1;
++    }
++    state.cached_alignment = state.alignment;
++}
++
++std::uint64_t ViewportSession::EnsureFrameId() const
++{
++    if (!UseHeadlessAdaptiveContract() || controller_ == nullptr) {
++        return 0;
++    }
++    auto& state = HeadlessState(controller_);
++    if (state.frame_id == 0) {
++        state.frame_id = 1;
++    }
++    return state.frame_id;
 +}
 +
 +bool ViewportSession::IsAlignmentAvailable(const ViewportInfo& info, MaaViewportAlignment alignment) const
@@ -3587,10 +4070,10 @@ index 0000000..dcd91c2
 +} // namespace maaend::viewport
 diff --git a/agent/cpp-algo/source/Viewport/ViewportSession.h b/agent/cpp-algo/source/Viewport/ViewportSession.h
 new file mode 100644
-index 0000000..c24e708
+index 0000000..b86ba70
 --- /dev/null
 +++ b/agent/cpp-algo/source/Viewport/ViewportSession.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,70 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -3602,6 +4085,8 @@ index 0000000..c24e708
 +
 +namespace maaend::viewport
 +{
++
++bool UseHeadlessAdaptiveContract();
 +
 +struct ViewportInfo
 +{
@@ -3647,6 +4132,8 @@ index 0000000..c24e708
 +private:
 +    bool ReadInfo(ViewportInfo* out_info) const;
 +    bool SetAlignment(MaaViewportAlignment alignment) const;
++    void NoteCapturedFrame() const;
++    std::uint64_t EnsureFrameId() const;
 +    bool IsAlignmentAvailable(const ViewportInfo& info, MaaViewportAlignment alignment) const;
 +    bool PrepareFrame(const ViewportFrame& frame, ViewportInfo* before) const;
 +    bool RestoreAlignment(MaaViewportAlignment alignment) const;

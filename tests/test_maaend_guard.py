@@ -52,7 +52,7 @@ class MaaEndGuardTests(unittest.TestCase):
             }
         ]
 
-    def test_checked_in_policy_covers_41_tasks_and_24_adb_tasks(self) -> None:
+    def test_checked_in_policy_covers_41_tasks_and_27_adb_tasks(self) -> None:
         policy = load_maaend_guard_policy()
         integration = (
             Path(__file__).resolve().parents[1]
@@ -72,7 +72,7 @@ class MaaEndGuardTests(unittest.TestCase):
         self.assertEqual(len(policy["tasks"]), 41)
         self.assertEqual(
             sum(row["adb_supported"] is True for row in policy["tasks"]),
-            24,
+            27,
         )
         baker = next(row for row in policy["tasks"] if row["name"] == "BakerEntry")
         self.assertEqual(baker["authorization"], "baker_entry")

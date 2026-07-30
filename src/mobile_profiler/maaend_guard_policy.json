@@ -4,7 +4,7 @@
     "name": "MaaEnd",
     "version": "v2.20.0",
     "task_count": 41,
-    "adb_task_count": 24
+    "adb_task_count": 27
   },
   "resource_fingerprint": {
     "algorithm": "sha256-tree-v1",
@@ -14,7 +14,7 @@
       "resource",
       "resource_adb"
     ],
-    "expected_sha256": "f64ee629ad9fbff13edbfe7f3e7f91b2612a17cbebbc7d34b83fe4edd1b993f2"
+    "expected_sha256": "068fd1eb1d8d1ee8aa620e204b0cd3a4f48fd7f516ba23ed3656722dda42da87"
   },
   "authorization_contract": {
     "task_field": "authorized_tasks",
@@ -29,8 +29,8 @@
     {"name": "AutoCollect", "entry": "AutoCollectSchedule", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoCollectEnd"]},
     {"name": "AutoEcoFarm", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
     {"name": "AutoEssence", "entry": "AutoEssenceMain", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_entry"},
-    {"name": "AutoSell", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
-    {"name": "AutoStockpile", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "AutoSell", "entry": "AutoSellMain", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoSellFinish"]},
+    {"name": "AutoStockpile", "entry": "AutoStockpileMain", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoStockpileDone"]},
     {"name": "AutoStockStaple", "entry": "AutoStockStapleSchedule", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["AutoStockStapleDone"]},
     {"name": "AutoUseSpMedication", "entry": "AutoUseSpMedicationEntry", "adb_supported": true, "wave": 4, "risk": "resource_consumption", "authorization": "task", "terminal_contract": "pipeline_entry"},
     {"name": "BakerEntry", "entry": "BakerEntry", "adb_supported": true, "wave": "independent_high_risk", "risk": "external_message", "authorization": "baker_entry", "terminal_contract": "pipeline_entry"},
@@ -39,7 +39,7 @@
     {"name": "ClaimSimulationRewards", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
     {"name": "CloseGame", "entry": "CloseGame", "adb_supported": true, "wave": 0, "risk": "app_lifecycle", "authorization": "none", "terminal_contract": "close_game"},
     {"name": "Crafting", "entry": "CraftingStart", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
-    {"name": "CreditShoppingN2", "entry": "CreditShoppingMain", "adb_supported": true, "wave": 4, "risk": "purchase", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["CreditShoppingNothingToBuy"]},
+    {"name": "CreditShoppingN2", "entry": "CreditShoppingMain", "adb_supported": true, "wave": 4, "risk": "purchase", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["CreditShoppingNothingToBuy", "CreditShoppingReserveCredit", "CreditShippingCanNotToBuy"]},
     {"name": "DailyRewards", "entry": "DailyRewardStart", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["DailyRewardEnd"]},
     {"name": "DeliveryJobs", "entry": "DeliveryJobsMain", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["DeliveryJobsFinished"]},
     {"name": "DijiangRewards", "entry": "DijiangRewards", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["FinishDijiangRewards"]},
@@ -56,7 +56,7 @@
     {"name": "RealTimeTask", "adb_supported": false, "wave": "unsupported", "risk": "realtime_unsupported", "authorization": "unsupported", "terminal_contract": "unsupported"},
     {"name": "ReceiveProdManual", "entry": "ProdManualStart", "adb_supported": true, "wave": 3, "risk": "reward_claim", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["ProdManualDone"]},
     {"name": "ResourceRecycleStation", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
-    {"name": "SeizeDeliveryJobs", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
+    {"name": "SeizeDeliveryJobs", "entry": "SeizeDeliveryJobsMain", "adb_supported": true, "wave": 5, "risk": "navigation_combat", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["SeizeDeliveryJobsTaskEnd"]},
     {"name": "SellProduct", "entry": "SellProductSchedule", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_terminal", "terminal_nodes": ["SellProductScheduleEnd", "SellProductTaskEnd"]},
     {"name": "SimpleProductionBatchStart", "entry": "SimpleProductionBatchStart", "adb_supported": true, "wave": 4, "risk": "resource_mutation", "authorization": "task", "terminal_contract": "pipeline_entry"},
     {"name": "StashBackpack", "adb_supported": false, "wave": "unsupported", "risk": "desktop_only", "authorization": "unsupported", "terminal_contract": "unsupported"},
