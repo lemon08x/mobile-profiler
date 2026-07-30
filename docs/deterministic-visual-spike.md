@@ -30,6 +30,18 @@ python tools\deterministic-visual-demo.py --iterations 50
 - `match-overlay.png`：匹配位置和分数；
 - `result.json`：均值、P95 延迟和精确坐标。
 
+也可以启动本地 Dashboard，进入一级导航“开源自动化”（`#opensource`），展开页面底部
+“适配诊断”后运行：
+
+```powershell
+mobile-profiler ui
+```
+
+页面通过 `POST /api/open-source-automation/demo` 复用包内实现，不从 `tools/` 导入；
+`/api/state` 返回依赖、硬盘估算、资源包、运行结果和日志，三张 PNG 证据由受限的
+`/api/open-source-automation/evidence/{frame|template|overlay}` 路由读取。OpenCV 不存在时
+Dashboard 仍可正常启动，页面会显示安装命令并禁用验证按钮。
+
 2026-07-22 在 Windows x64、Python 3.13 下实测，`numpy 2.5.1` 与
 `opencv-python-headless 4.13.0.92` 的清理缓存后安装体积合计为
 167,348,599 字节（约 159.6 MiB）：OpenCV 约 108.3 MiB，NumPy 与其动态库约
@@ -43,6 +55,20 @@ python tools\deterministic-visual-demo.py --iterations 50
 示例资源包结构见
 [`examples/deterministic-visual-spike.json`](../examples/deterministic-visual-spike.json)。模板路径相对
 资源包 JSON 解析，region 使用 `[left, top, right, bottom]` 的 0～1 归一化坐标。
+
+## 与上游流程编排的前端核对
+
+已按上游最新“流程编排”界面逐项核对，并在新页面中展示真实状态：
+
+- 点击/查找图片：已对齐模板、阈值、ROI，并补充多尺度搜索与标注证据；
+- 流程编排：当前用强类型状态图和 transition 上限替代通用脚本，属于部分对齐；
+- 点击坐标/按键：动作 JSON 已强类型化，真机 ADB Gateway 和审批策略尚未接入；
+- 点击/查找文字：当前未引入 OCR 模型；
+- 模板采集、流程导入导出：资源包格式已定义，采集器与管理前端尚未实现；
+- 运行调试：合成验证、耗时、精确坐标、PNG 证据和日志已经可操作。
+
+因此本轮页面没有放置“看起来可点但没有后端”的 OCR、模板采集或真机执行按钮；待主机侧
+效果确认后，再按资源包管理、ADB Gateway、通用控制节点的顺序接入。
 
 ## 接入真机前仍需完成
 

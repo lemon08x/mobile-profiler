@@ -1,0 +1,2750 @@
+diff --git a/resource/tasks/Roguelike/JieGarden.json b/resource/tasks/Roguelike/JieGarden.json
+index 2b8a633..240dc67 100644
+--- a/resource/tasks/Roguelike/JieGarden.json
++++ b/resource/tasks/Roguelike/JieGarden.json
+@@ -1,4 +1,32 @@
+ {
++    "JieGarden@Roguelike@Begin": {
++        "next": [
++            "JieGarden@Roguelike@CloseTutorial",
++            "JieGarden@Roguelike@Continue",
++            "JieGarden@RoguelikeSettlementConfirm",
++            "JieGarden@Roguelike@MissionFailedFlag2",
++            "JieGarden@Roguelike@GamePass",
++            "JieGarden@Roguelike@OperationFailed",
++            "JieGarden@Roguelike@ChooseDifficulty",
++            "JieGarden@Roguelike@StartExplore",
++            "JieGarden@Roguelike@Stages#next",
++            "JieGarden@Roguelike@GetDrops#next",
++            "JieGarden@Roguelike@ChooseOperFlag",
++            "JieGarden@Roguelike@EnterAfterRecruit",
++            "JieGarden@Roguelike@StageEncounterGiveUpRecruitConfirm",
++            "JieGarden@Roguelike@CoppersAbandonConfirm",
++            "JieGarden@Roguelike@NextLevel",
++            "JieGarden@Roguelike@NextLevel#next",
++            "JieGarden@Roguelike@Abandon",
++            "JieGarden@Roguelike@TodoEnter",
++            "JieGarden@Roguelike@StartExploreCD",
++            "(JieGarden@Roguelike@IntegratedStrategies)@QuickSwitch@ToTerminal#next",
++            "JieGarden@Roguelike@ReturnButtons#next",
++            "JieGarden@Roguelike@ReturnConfirm",
++            "JieGarden@Roguelike@StartUpThemes#next",
++            "JieGarden@Roguelike@ExitThenAbandon"
++        ]
++    },
+     "JieGarden@StartExplore@Roguelike@ChooseOper": {
+         "next": [
+             "JieGarden@StartExplore@Roguelike@ChooseOperConfirm",
+@@ -74,9 +102,21 @@
+         "next": ["JieGarden@Roguelike@LeaveBoskyPassage", "#self"]
+     },
+     "JieGarden@Roguelike@ClickToDrops": {
+-        "specificRect": [600, 600, 25, 25]
++        "specificRect": [600, 600, 25, 25],
++        "next": [
++            "JieGarden@Roguelike@CloseTutorial",
++            "JieGarden@Roguelike@DropsFlag",
++            "JieGarden@Roguelike@ChooseOperFlag",
++            "JieGarden@Roguelike@StageEncounterSpecialClose",
++            "JieGarden@Roguelike@TraderRandomShopping",
++            "JieGarden@Roguelike@StageTraderLeave",
++            "JieGarden@Roguelike@Stages#next",
++            "JieGarden@Roguelike@StartUpThemes#next",
++            "JieGarden@Roguelike@ClickToDrops"
++        ]
+     },
+     "JieGarden@Roguelike@ClickToStartPoint": {
++        "specificRect": [620, 625, 40, 50],
+         "next": [
+             "JieGarden@Roguelike@MissionCompletedFlag",
+             "JieGarden@Roguelike@MissionFailedFlag2",
+@@ -139,6 +179,24 @@
+     "JieGarden@Roguelike@CloseInterview": {
+         "template": "JieGarden@Roguelike@CloseCollectionClose.png"
+     },
++    "JieGarden@Roguelike@CloseTutorial": {
++        "template": "JieGarden@Roguelike@CloseCollectionClose.png",
++        "templThreshold": 0.65,
++        "roi": [70, 50, 360, 130],
++        "action": "ClickSelf",
++        "postDelay": 1000,
++        "next": [
++            "JieGarden@Roguelike@DropsFlag",
++            "JieGarden@Roguelike@GetDrops#next",
++            "JieGarden@Roguelike@ChooseOperFlag",
++            "JieGarden@Roguelike@CoppersTakeFlag",
++            "JieGarden@Roguelike@CloseEvent",
++            "JieGarden@Roguelike@NextLevel",
++            "JieGarden@Roguelike@NextLevel#next",
++            "#self",
++            "JieGarden@Roguelike@ClickToDrops"
++        ]
++    },
+     "JieGarden@Roguelike@ConfirmToGiveUp": {
+         "algorithm": "OcrDetect",
+         "text": ["放弃行动"],
+@@ -152,7 +210,9 @@
+         "roi": [867, 406, 242, 160],
+         "next": ["#self", "JieGarden@Roguelike@NextLevel", "JieGarden@Roguelike@NextLevel#next"]
+     },
+-    "JieGarden@Roguelike@Continue": {},
++    "JieGarden@Roguelike@Continue": {
++        "next": ["JieGarden@Roguelike@MissionFailedFlag2", "JieGarden@Roguelike@Begin"]
++    },
+     "JieGarden@Roguelike@CoppersAbandonConfirm": {
+         "Doc": "放弃交换通宝的确认按钮",
+         "baseTask": "JieGarden@Roguelike@CoppersListDialogConfirm",
+@@ -262,7 +322,7 @@
+         "Doc": "通宝列表界面弹出的确认按钮",
+         "template": "JieGarden@Roguelike@CoppersListDialogConfirm.png",
+         "action": "ClickSelf",
+-        "roi": [832, 406, 311, 160],
++        "roi": [700, 400, 540, 190],
+         "postDelay": 1000,
+         "templThreshold": 0.85,
+         "cache": true
+@@ -501,11 +561,13 @@
+             "JieGarden@Roguelike@GetDrops#next",
+             "JieGarden@Roguelike@GetDropCompleted",
+             "JieGarden@Roguelike@GetDropLeave",
++            "JieGarden@Roguelike@StrategyChange",
+             "JieGarden@Roguelike@Stages#next",
+             "JieGarden@Roguelike@StageEncounterOptions#next",
+             "JieGarden@Roguelike@StageEncounterSpecialClose",
+             "JieGarden@Roguelike@StageTraderLeave",
+             "JieGarden@Roguelike@CloseEvent",
++            "JieGarden@Roguelike@EnterAfterRecruit",
+             "JieGarden@Roguelike@RecruitOther"
+         ]
+     },
+@@ -524,6 +586,7 @@
+         ]
+     },
+     "JieGarden@Roguelike@EnterAfterRecruit": {
++        "template": "JieGarden@Roguelike@EnterAfterRecruit.png",
+         "roi": [1040, 240, 240, 179]
+     },
+     "JieGarden@Roguelike@ExitThenAbandon": {
+@@ -569,7 +632,11 @@
+         "roi": [0, 420, 1280, 175],
+         "postDelay": 1000,
+         "templThreshold": 0.85,
+-        "next": ["JieGarden@Roguelike@CoppersTakeFlag", "JieGarden@Roguelike@GetDropSwitch"]
++        "next": [
++            "JieGarden@Roguelike@CloseTutorial",
++            "JieGarden@Roguelike@CoppersTakeFlag",
++            "JieGarden@Roguelike@GetDropSwitch"
++        ]
+     },
+     "JieGarden@Roguelike@GetDrops": {
+         "next": [
+@@ -670,6 +737,7 @@
+         "next": [
+             "JieGarden@Roguelike@RandomPickAfterNextLevel",
+             "JieGarden@Roguelike@NextLevel@(JieGarden@Roguelike@CloseCollectionContinue)",
++            "JieGarden@Roguelike@CloseTutorial",
+             "JieGarden@Roguelike@CloseInterview",
+             "JieGarden@Roguelike@StrategyChange",
+             "JieGarden@Roguelike@NextLevel"
+@@ -707,6 +775,7 @@
+         "next": [
+             "JieGarden@Roguelike@RandomPickAfterNextLevel@NextAfterLoadingText",
+             "JieGarden@Roguelike@RandomPickAfterNextLevel@(JieGarden@Roguelike@CloseCollectionContinue)",
++            "JieGarden@Roguelike@CloseTutorial",
+             "JieGarden@Roguelike@CloseInterview",
+             "JieGarden@Roguelike@StrategyChange",
+             "#self"
+@@ -718,6 +787,10 @@
+     "JieGarden@Roguelike@RecruitOther": {
+         "template": "JieGarden@Roguelike@Recruit.png"
+     },
++    "JieGarden@Roguelike@StageEncounterGiveUpRecruitConfirm": {
++        "template": "Roguelike@StageEncounterGiveUpRecruitConfirm.png",
++        "roi": [520, 410, 720, 180]
++    },
+     "JieGarden@Roguelike@RecruitWithoutButton": {
+         "next": [
+             "JieGarden@Roguelike@RecruitOther",
+@@ -1116,6 +1189,7 @@
+     "JieGarden@Roguelike@StageTrader": {
+         "Doc": "商店 绿色系",
+         "method": "HSVCount",
++        "templThreshold": 0.68,
+         "colorWithClose": false,
+         "colorScales": [
+             [
+@@ -1544,5 +1618,26 @@
+         ],
+         "roi": [891, 648, 58, 58]
+     },
+-    "JieGarden@RoguelikeSettlementConfirm": {}
++    "JieGarden@RoguelikeSettlementConfirm": {},
++    "JieGarden@RoguelikeSettlementOcr-Floor": {
++        "roi": [490, 170, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Step": {
++        "roi": [490, 238, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Combat": {
++        "roi": [490, 304, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Recruit": {
++        "roi": [490, 374, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Collection": {
++        "roi": [1060, 170, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-BOSS": {
++        "roi": [1060, 238, 90, 40]
++    },
++    "JieGarden@RoguelikeSettlementOcr-Emergency": {
++        "roi": [1060, 304, 90, 40]
++    }
+ }
+diff --git a/resource/tasks/Roguelike/base.json b/resource/tasks/Roguelike/base.json
+index 8348d2b..7e6a967 100644
+--- a/resource/tasks/Roguelike/base.json
++++ b/resource/tasks/Roguelike/base.json
+@@ -863,7 +863,7 @@
+     },
+     "Roguelike@IntegratedStrategies": {
+         "action": "ClickSelf",
+-        "roi": [884, 606, 146, 114],
++        "roi": [884, 606, 250, 114],
+         "next": ["Roguelike@IntegratedStrategies", "Roguelike@PreSelectTheme"]
+     },
+     "Roguelike@LastReward": {
+diff --git a/resource/tasks/UiTheme/Friends.json b/resource/tasks/UiTheme/Friends.json
+index 727ab42..9f0aa25 100644
+--- a/resource/tasks/UiTheme/Friends.json
++++ b/resource/tasks/UiTheme/Friends.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "FriendsDefault",
++            "FriendsDefaultAdaptive",
+             "FriendsDark",
+             "FriendsSami",
+             "FriendsMistCity",
+@@ -35,6 +36,12 @@
+         "postDelay": 1000,
+         "next": ["#self", "Stop"]
+     },
++    "FriendsDefaultAdaptive": {
++        "baseTask": "FriendsDefault",
++        "template": "Default/Friends.png",
++        "templThreshold": 0.65,
++        "roi": [250, 500, 300, 200]
++    },
+     "FriendsDark": {
+         "baseTask": "FriendsDefault",
+         "template": "Dark/Friends.png"
+diff --git a/resource/tasks/UiTheme/Mall.json b/resource/tasks/UiTheme/Mall.json
+index 2d7ebce..6ce655b 100644
+--- a/resource/tasks/UiTheme/Mall.json
++++ b/resource/tasks/UiTheme/Mall.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "MallDefault",
++            "MallDefaultAdaptive",
+             "MallDark",
+             "MallSami",
+             "MallMistCity",
+@@ -34,6 +35,12 @@
+         "postDelay": 500,
+         "next": ["#self", "Stop"]
+     },
++    "MallDefaultAdaptive": {
++        "baseTask": "MallDefault",
++        "template": "Default/Mall.png",
++        "templThreshold": 0.7,
++        "roi": [700, 407, 500, 171]
++    },
+     "MallDark": {
+         "baseTask": "MallDefault",
+         "template": "Dark/Mall.png"
+diff --git a/resource/tasks/UiTheme/Recruit.json b/resource/tasks/UiTheme/Recruit.json
+index 9939104..20f1e7f 100644
+--- a/resource/tasks/UiTheme/Recruit.json
++++ b/resource/tasks/UiTheme/Recruit.json
+@@ -8,6 +8,7 @@
+         },
+         "next": [
+             "RecruitDefault",
++            "RecruitDefaultAdaptive",
+             "RecruitDark",
+             "RecruitSami",
+             "RecruitMistCity",
+@@ -34,6 +35,12 @@
+         "postDelay": 500,
+         "next": ["#self", "Stop"]
+     },
++    "RecruitDefaultAdaptive": {
++        "baseTask": "RecruitDefault",
++        "template": "Default/Recruit.png",
++        "templThreshold": 0.6,
++        "roi": [840, 425, 440, 150]
++    },
+     "RecruitDark": {
+         "baseTask": "RecruitDefault",
+         "template": "Dark/Recruit.png"
+diff --git a/resource/tasks/UiTheme/SwitchTheme.json b/resource/tasks/UiTheme/SwitchTheme.json
+index 700e695..8b27cc9 100644
+--- a/resource/tasks/UiTheme/SwitchTheme.json
++++ b/resource/tasks/UiTheme/SwitchTheme.json
+@@ -15,7 +15,11 @@
+         "roi": [0, 99, 430, 180],
+         "maxTimes": 10,
+         "exceededNext": ["SwitchTheme@CancelThemeChange"],
+-        "next": ["SwitchTheme@ConfirmThemeChange", "SwitchTheme@SelectLightTheme"]
++        "next": [
++            "SwitchTheme@ConfirmThemeChange",
++            "SwitchTheme@CancelThemeChange",
++            "SwitchTheme@SelectLightTheme"
++        ]
+     },
+     "SwitchTheme@SwipeToLightTheme": {
+         "algorithm": "JustReturn",
+diff --git a/resource/tasks/UiTheme/Terminal.json b/resource/tasks/UiTheme/Terminal.json
+index 29b8eab..726c7f1 100644
+--- a/resource/tasks/UiTheme/Terminal.json
++++ b/resource/tasks/UiTheme/Terminal.json
+@@ -9,6 +9,7 @@
+         },
+         "next": [
+             "TerminalDefault",
++            "TerminalDefaultAdaptive",
+             "TerminalDark",
+             "TerminalSami",
+             "TerminalMistCity",
+@@ -35,6 +36,12 @@
+         "template": "Default/Terminal.png",
+         "next": ["#self", "Stop"]
+     },
++    "TerminalDefaultAdaptive": {
++        "baseTask": "TerminalDefault",
++        "template": "Default/Terminal.png",
++        "templThreshold": 0.65,
++        "roi": [780, 58, 400, 272]
++    },
+     "TerminalDark": {
+         "baseTask": "TerminalDefault",
+         "template": "Dark/Terminal.png"
+diff --git a/resource/tasks/tasks.json b/resource/tasks/tasks.json
+index 2267c77..eb30263 100644
+--- a/resource/tasks/tasks.json
++++ b/resource/tasks/tasks.json
+@@ -2333,7 +2333,7 @@
+         "roi": [850, 340, 220, 170]
+     },
+     "RecruitRefreshConfirm": {
+-        "template": "PopupConfirm.png",
++        "template": "RecruitNowConfirm.png",
+         "action": "ClickSelf",
+         "roi": [630, 400, 650, 160],
+         "preDelay": 500,
+@@ -3058,8 +3058,8 @@
+     "InfrastOperSelected": {
+         "Doc": "参考 InfrastOperImageAnalyzer",
+         "template": "empty.png",
+-        "specialParams_Doc": "这个任务中作为数色个数阈值",
+-        "specialParams": [800],
++        "specialParams_Doc": "数色个数阈值、向卡片内部搜索选中边框的水平距离",
++        "specialParams": [800, 20],
+         "specificRect_Doc": "selected_move",
+         "specificRect": [-18, -220, 10, 160],
+         "rectMove_Doc": "oper_move",
+diff --git a/src/MaaCore/Assistant.cpp b/src/MaaCore/Assistant.cpp
+index b5efeb3..572bde2 100644
+--- a/src/MaaCore/Assistant.cpp
++++ b/src/MaaCore/Assistant.cpp
+@@ -177,6 +177,8 @@ bool asst::Assistant::set_instance_option(InstanceOptionKey key, const std::stri
+     case InstanceOptionKey::ClientType:
+         m_ctrler->set_client_type(value);
+         return true;
++    case InstanceOptionKey::Viewport:
++        return m_ctrler->set_viewport(value);
+     default:
+         break;
+     }
+diff --git a/src/MaaCore/Common/AsstTypes.h b/src/MaaCore/Common/AsstTypes.h
+index 991bee4..23a22d8 100644
+--- a/src/MaaCore/Common/AsstTypes.h
++++ b/src/MaaCore/Common/AsstTypes.h
+@@ -48,6 +48,7 @@ enum class InstanceOptionKey
+     KillAdbOnExit = 5,       // 退出时是否杀掉 Adb 进程， "0" | "1"
+     ClientType = 6,          // 客户端类型（游戏渠道）。仅当连接配置在 connect 阶段需要 [PackageName] 时使用，
+                              // 当前内置配置为 Androws / WSA；不替代 StartUpTask 的 client_type 参数。
++    Viewport = 7,            // 游戏内容视口， "auto" | "hybrid" | "adaptive" | "[x, y, width, height]"
+ };
+ 
+ enum class TouchMode
+diff --git a/src/MaaCore/Controller/ControlScaleProxy.cpp b/src/MaaCore/Controller/ControlScaleProxy.cpp
+index 15890aa..a9e3ddd 100644
+--- a/src/MaaCore/Controller/ControlScaleProxy.cpp
++++ b/src/MaaCore/Controller/ControlScaleProxy.cpp
+@@ -6,70 +6,60 @@
+ asst::ControlScaleProxy::ControlScaleProxy(
+     std::shared_ptr<ControllerAPI> controller,
+     ControllerType controller_type,
+-    ProxyCallback proxy_callback) :
++    ProxyCallback proxy_callback,
++    std::optional<Rect> viewport,
++    bool hybrid_edges,
++    bool adaptive_viewport) :
+     m_controller(controller),
+     m_controller_type(controller_type),
+     m_callback(proxy_callback),
+-    m_rand_engine(std::random_device {}())
++    m_rand_engine(std::random_device {}()),
++    m_viewport_transform(controller->get_screen_res(), viewport, hybrid_edges, adaptive_viewport)
+ {
+-    auto screen_res = m_controller->get_screen_res();
++    const auto screen_res = m_viewport_transform.display_size();
++    const auto& active_viewport = m_viewport_transform.viewport();
+ 
+-    int width = screen_res.first;
+-    int height = screen_res.second;
++    const int width = screen_res.first;
++    const int height = screen_res.second;
+ 
+     auto info = json::object { {
+         "details",
+         json::object {
+             { "width", width },
+             { "height", height },
++            { "viewport",
++              json::object {
++                  { "x", active_viewport.x },
++                  { "y", active_viewport.y },
++                  { "width", active_viewport.width },
++                  { "height", active_viewport.height },
++              } },
++            { "logical_width", WindowWidthDefault },
++            { "logical_height", WindowHeightDefault },
+         },
+     } };
+ 
+-    if (width < WindowWidthDefault || height < WindowHeightDefault) {
++    if (active_viewport.width < WindowWidthDefault || active_viewport.height < WindowHeightDefault) {
+         info["what"] = "UnsupportedResolution";
+         info["why"] = "Low screen resolution";
+         callback(info);
+         throw std::runtime_error("Unsupported resolution");
+     }
+-    else if (
+-        std::fabs(
+-            static_cast<double>(WindowWidthDefault) / static_cast<double>(WindowHeightDefault) -
+-            static_cast<double>(width) / static_cast<double>(height)) > 1e-7) {
+-        info["what"] = "UnsupportedResolution";
+-        info["why"] = "Not 16:9";
+-        callback(info);
+-        throw std::runtime_error("Unsupported resolution");
+-    }
+-
+-    /* calc ratio */
+-    constexpr double DefaultRatio = static_cast<double>(WindowWidthDefault) / static_cast<double>(WindowHeightDefault);
+-    double cur_ratio = static_cast<double>(width) / static_cast<double>(height);
+-
+-    if (cur_ratio >= DefaultRatio // 说明是宽屏或默认16:9，按照高度计算缩放
+-        || std::fabs(cur_ratio - DefaultRatio) < DoubleDiff) {
+-        int scale_width = static_cast<int>(cur_ratio * WindowHeightDefault);
+-        m_scale_size = std::make_pair(scale_width, WindowHeightDefault);
+-        m_control_scale = static_cast<double>(height) / static_cast<double>(WindowHeightDefault);
+-    }
+-    else { // 否则可能是偏正方形的屏幕，按宽度计算
+-        int scale_height = static_cast<int>(WindowWidthDefault / cur_ratio);
+-        m_scale_size = std::make_pair(WindowWidthDefault, scale_height);
+-        m_control_scale = static_cast<double>(width) / static_cast<double>(WindowWidthDefault);
+-    }
+ 
+     info["what"] = "ResolutionInfo";
+-    info["why"] = "Normal";
++    info["why"] = adaptive_viewport ? "AdaptiveViewport"
++                                      : (hybrid_edges ? "HybridEdgeViewport"
++                                                      : (viewport.has_value() ? "CustomViewport" : "AutoViewport"));
+     callback(info);
+ }
+ 
+ bool asst::ControlScaleProxy::click(const Point& p)
+ {
+-    int x = static_cast<int>(p.x * m_control_scale);
+-    int y = static_cast<int>(p.y * m_control_scale);
++    const Point display_point = m_viewport_transform.logical_to_display(p);
+ 
+-    Log.trace("Click with scaled coordinates", p, m_control_scale);
++    Log.trace("Click with viewport coordinates", p, display_point);
+ 
+-    return m_controller->click(Point(x, y));
++    return m_controller->click(display_point);
+ }
+ 
+ bool asst::ControlScaleProxy::click(const Rect& rect)
+@@ -87,25 +77,15 @@ bool asst::ControlScaleProxy::swipe(
+     bool with_pause,
+     bool high_resolution_swipe_fix)
+ {
+-    int x1 = static_cast<int>(p1.x * m_control_scale);
+-    int y1 = static_cast<int>(p1.y * m_control_scale);
+-    int x2, y2;
++    const auto [display_p1, display_p2] =
++        m_viewport_transform.logical_swipe_to_display(p1, p2, high_resolution_swipe_fix);
+     if (high_resolution_swipe_fix) {
+-        // 保持滑动距离一致：先计算原始的相对偏移，再加到缩放后的起点上
+-        int dx = p2.x - p1.x; // 不缩放
+-        int dy = p2.y - p1.y;
+-        x2 = x1 + dx;
+-        y2 = y1 + dy;
+-        Log.trace("High-resolution swipe fix, offset", Point(dx, dy));
+-    }
+-    else {
+-        x2 = static_cast<int>(p2.x * m_control_scale);
+-        y2 = static_cast<int>(p2.y * m_control_scale);
++        Log.trace("High-resolution swipe fix, offset", p2 - p1);
+     }
+ 
+-    Log.trace("Swipe with scaled coordinates", p1, p2, m_control_scale);
++    Log.trace("Swipe with viewport coordinates", p1, p2, display_p1, display_p2);
+ 
+-    return m_controller->swipe(Point(x1, y1), Point(x2, y2), duration, extra_swipe, slope_in, slope_out, with_pause);
++    return m_controller->swipe(display_p1, display_p2, duration, extra_swipe, slope_in, slope_out, with_pause);
+ }
+ 
+ bool asst::ControlScaleProxy::swipe(
+@@ -154,8 +134,7 @@ bool asst::ControlScaleProxy::inject_input_event(InputEvent event)
+     switch (event.type) {
+     case InputEvent::Type::TOUCH_DOWN:
+     case InputEvent::Type::TOUCH_MOVE:
+-        event.point.x = static_cast<int>(event.point.x * m_control_scale);
+-        event.point.y = static_cast<int>(event.point.y * m_control_scale);
++        event.point = m_viewport_transform.logical_to_display(event.point);
+         break;
+     default:
+         break;
+@@ -169,6 +148,49 @@ std::pair<int, int> asst::ControlScaleProxy::get_scale_size() const noexcept
+     return m_scale_size;
+ }
+ 
++std::pair<int, int> asst::ControlScaleProxy::get_display_size() const noexcept
++{
++    return m_viewport_transform.display_size();
++}
++
++const asst::Rect& asst::ControlScaleProxy::get_viewport() const noexcept
++{
++    return m_viewport_transform.viewport();
++}
++
++asst::Rect asst::ControlScaleProxy::get_active_viewport() const noexcept
++{
++    return m_viewport_transform.active_viewport();
++}
++
++bool asst::ControlScaleProxy::uses_hybrid_edges() const noexcept
++{
++    return m_viewport_transform.uses_hybrid_edges();
++}
++
++bool asst::ControlScaleProxy::uses_adaptive_viewport() const noexcept
++{
++    return m_viewport_transform.uses_adaptive_viewport();
++}
++
++asst::ViewportAlignment asst::ControlScaleProxy::get_viewport_alignment() const noexcept
++{
++    return m_viewport_transform.viewport_alignment();
++}
++
++bool asst::ControlScaleProxy::set_viewport_alignment(ViewportAlignment alignment) noexcept
++{
++    return m_viewport_transform.set_viewport_alignment(alignment);
++}
++
++asst::Point asst::ControlScaleProxy::convert_viewport_point(
++    const Point& point,
++    ViewportAlignment from,
++    ViewportAlignment to) const noexcept
++{
++    return m_viewport_transform.convert_viewport_point(point, from, to);
++}
++
+ asst::Point asst::ControlScaleProxy::rand_point_in_rect(const Rect& r)
+ {
+     // 过小矩形直接返回中心点，避免死循环
+diff --git a/src/MaaCore/Controller/ControlScaleProxy.h b/src/MaaCore/Controller/ControlScaleProxy.h
+index c184505..4f8b874 100644
+--- a/src/MaaCore/Controller/ControlScaleProxy.h
++++ b/src/MaaCore/Controller/ControlScaleProxy.h
+@@ -4,6 +4,7 @@
+ #include <random>
+ 
+ #include "ControllerAPI.h"
++#include "ViewportTransform.h"
+ 
+ #include "Common/AsstMsg.h"
+ 
+@@ -18,7 +19,10 @@ public:
+     ControlScaleProxy(
+         std::shared_ptr<ControllerAPI> controller,
+         ControllerType controller_type,
+-        ProxyCallback proxy_callback);
++        ProxyCallback proxy_callback,
++        std::optional<Rect> viewport = std::nullopt,
++        bool hybrid_edges = false,
++        bool adaptive_viewport = false);
+     ~ControlScaleProxy() = default;
+ 
+     ControlScaleProxy(const ControlScaleProxy&) = delete;
+@@ -51,6 +55,17 @@ public:
+     bool inject_input_event(InputEvent event);
+ 
+     std::pair<int, int> get_scale_size() const noexcept;
++    std::pair<int, int> get_display_size() const noexcept;
++    const Rect& get_viewport() const noexcept;
++    Rect get_active_viewport() const noexcept;
++    bool uses_hybrid_edges() const noexcept;
++    bool uses_adaptive_viewport() const noexcept;
++    ViewportAlignment get_viewport_alignment() const noexcept;
++    bool set_viewport_alignment(ViewportAlignment alignment) noexcept;
++    Point convert_viewport_point(
++        const Point& point,
++        ViewportAlignment from,
++        ViewportAlignment to) const noexcept;
+ 
+ private:
+     Point rand_point_in_rect(const Rect& rect);
+@@ -64,6 +79,6 @@ private:
+     std::mt19937 m_rand_engine;
+ 
+     std::pair<int, int> m_scale_size = { WindowWidthDefault, WindowHeightDefault };
+-    double m_control_scale = 1.0;
++    ViewportTransform m_viewport_transform;
+ };
+ }
+diff --git a/src/MaaCore/Controller/Controller.cpp b/src/MaaCore/Controller/Controller.cpp
+index 0356910..a61f3ca 100644
+--- a/src/MaaCore/Controller/Controller.cpp
++++ b/src/MaaCore/Controller/Controller.cpp
+@@ -97,6 +97,11 @@ std::pair<int, int> asst::Controller::get_scale_size() const noexcept
+     return m_scale_size;
+ }
+ 
++std::pair<int, int> asst::Controller::get_display_size() const noexcept
++{
++    return m_scale_proxy ? m_scale_proxy->get_display_size() : m_scale_size;
++}
++
+ void asst::Controller::clear_info() noexcept
+ {
+     m_uuid.clear();
+@@ -145,8 +150,42 @@ cv::Mat asst::Controller::get_resized_image_cache() const
+         Log.error("image is empty");
+         return { d_size, CV_8UC3 };
+     }
++
++    if (!m_scale_proxy) {
++        Log.error("viewport transform is not initialized");
++        return { d_size, CV_8UC3 };
++    }
++
++    const auto viewport = m_scale_proxy->get_active_viewport();
++    if (viewport.x < 0 || viewport.y < 0 || viewport.width <= 0 || viewport.height <= 0 ||
++        viewport.x + viewport.width > m_cache_image.cols || viewport.y + viewport.height > m_cache_image.rows) {
++        Log.error("viewport is outside the captured image", viewport, m_cache_image.cols, m_cache_image.rows);
++        return { d_size, CV_8UC3 };
++    }
++
+     cv::Mat resized_mat;
+-    cv::resize(m_cache_image, resized_mat, d_size, 0.0, 0.0, cv::INTER_AREA);
++    const cv::Mat viewport_image =
++        m_cache_image(cv::Rect(viewport.x, viewport.y, viewport.width, viewport.height));
++    cv::resize(viewport_image, resized_mat, d_size, 0.0, 0.0, cv::INTER_AREA);
++
++    if (m_scale_proxy->uses_hybrid_edges()) {
++        constexpr int EdgeBand = ViewportTransform::HybridEdgeBand;
++        const int physical_edge_width = static_cast<int>(
++            static_cast<int64_t>(viewport.height) * EdgeBand / WindowHeightDefault);
++        if (physical_edge_width > 0 && physical_edge_width * 2 <= m_cache_image.cols) {
++            cv::Mat left_resized;
++            cv::Mat right_resized;
++            const cv::Mat left_image =
++                m_cache_image(cv::Rect(0, viewport.y, physical_edge_width, viewport.height));
++            const cv::Mat right_image = m_cache_image(
++                cv::Rect(m_cache_image.cols - physical_edge_width, viewport.y, physical_edge_width, viewport.height));
++            cv::resize(left_image, left_resized, cv::Size(EdgeBand, d_size.height), 0.0, 0.0, cv::INTER_AREA);
++            cv::resize(right_image, right_resized, cv::Size(EdgeBand, d_size.height), 0.0, 0.0, cv::INTER_AREA);
++            left_resized.copyTo(resized_mat(cv::Rect(0, 0, EdgeBand, d_size.height)));
++            right_resized.copyTo(
++                resized_mat(cv::Rect(d_size.width - EdgeBand, 0, EdgeBand, d_size.height)));
++        }
++    }
+     return resized_mat;
+ }
+ 
+@@ -211,7 +250,7 @@ bool asst::Controller::swipe(
+ bool asst::Controller::inject_input_event(InputEvent& event)
+ {
+     CHECK_EXIST(m_controller, false);
+-    return m_controller->inject_input_event(event);
++    return m_scale_proxy->inject_input_event(event);
+ }
+ 
+ bool asst::Controller::press_esc()
+@@ -279,7 +318,13 @@ bool asst::Controller::connect(const std::string& adb_path, const std::string& a
+     };
+ 
+     try {
+-        m_scale_proxy = std::make_shared<ControlScaleProxy>(m_controller, m_controller_type, proxy_callback);
++        m_scale_proxy = std::make_shared<ControlScaleProxy>(
++            m_controller,
++            m_controller_type,
++            proxy_callback,
++            m_viewport_override,
++            m_hybrid_viewport,
++            m_adaptive_viewport);
+     }
+     catch (const std::exception& e) {
+         Log.error("Cannot create controller proxy: {}", e.what());
+@@ -338,7 +383,13 @@ bool asst::Controller::attach_window(
+     };
+ 
+     try {
+-        m_scale_proxy = std::make_shared<ControlScaleProxy>(m_controller, m_controller_type, proxy_callback);
++        m_scale_proxy = std::make_shared<ControlScaleProxy>(
++            m_controller,
++            m_controller_type,
++            proxy_callback,
++            m_viewport_override,
++            m_hybrid_viewport,
++            m_adaptive_viewport);
+     }
+     catch (const std::exception& e) {
+         Log.error("Cannot create controller proxy: {}", e.what());
+@@ -412,6 +463,76 @@ void asst::Controller::set_client_type(const std::string& client_type) noexcept
+     m_client_type = client_type;
+ }
+ 
++bool asst::Controller::set_viewport(const std::string& value)
++{
++    if (m_scale_proxy) {
++        Log.error("Viewport must be configured before connecting");
++        return false;
++    }
++
++    if (value.empty() || value == "auto") {
++        m_viewport_override.reset();
++        m_hybrid_viewport = false;
++        m_adaptive_viewport = false;
++        return true;
++    }
++
++    if (value == "hybrid") {
++        m_viewport_override.reset();
++        m_hybrid_viewport = true;
++        m_adaptive_viewport = false;
++        return true;
++    }
++
++    if (value == "adaptive") {
++        m_viewport_override.reset();
++        m_hybrid_viewport = false;
++        m_adaptive_viewport = true;
++        return true;
++    }
++
++    const auto parsed = json::parse(value);
++    if (!parsed) {
++        Log.error("Invalid viewport JSON", value);
++        return false;
++    }
++
++    std::optional<Rect> viewport;
++    if (parsed->is_array()) {
++        const auto& items = parsed->as_array();
++        if (items.size() == 4 && items[0].is<int>() && items[1].is<int>() && items[2].is<int>() &&
++            items[3].is<int>()) {
++            viewport = Rect {
++                items[0].as<int>(),
++                items[1].as<int>(),
++                items[2].as<int>(),
++                items[3].as<int>(),
++            };
++        }
++    }
++    else if (parsed->is_object()) {
++        const auto& object = parsed->as_object();
++        if (object.contains("x") && object.contains("y") && object.contains("width") && object.contains("height")) {
++            viewport = Rect {
++                object.get("x", -1),
++                object.get("y", -1),
++                object.get("width", -1),
++                object.get("height", -1),
++            };
++        }
++    }
++
++    if (!viewport || viewport->x < 0 || viewport->y < 0 || viewport->width <= 0 || viewport->height <= 0) {
++        Log.error("Viewport must be auto, hybrid, adaptive, or [x, y, width, height]", value);
++        return false;
++    }
++
++    m_viewport_override = viewport;
++    m_hybrid_viewport = false;
++    m_adaptive_viewport = false;
++    return true;
++}
++
+ const std::string& asst::Controller::get_client_type() const noexcept
+ {
+     return m_client_type;
+@@ -454,7 +575,8 @@ cv::Mat asst::Controller::get_image(bool raw)
+         };
+         callback(AsstMsg::ConnectionInfo, info);
+ 
+-        const cv::Size d_size(m_scale_size.first, m_scale_size.second);
++        const auto [display_width, display_height] = m_scale_proxy->get_display_size();
++        const cv::Size d_size(display_width, display_height);
+         m_cache_image = cv::Mat(d_size, CV_8UC3);
+ 
+         break;
+@@ -474,6 +596,29 @@ cv::Mat asst::Controller::get_image_cache() const
+     return get_resized_image_cache();
+ }
+ 
++bool asst::Controller::uses_adaptive_viewport() const noexcept
++{
++    return m_scale_proxy && m_scale_proxy->uses_adaptive_viewport();
++}
++
++asst::ViewportAlignment asst::Controller::get_viewport_alignment() const noexcept
++{
++    return m_scale_proxy ? m_scale_proxy->get_viewport_alignment() : ViewportAlignment::Center;
++}
++
++bool asst::Controller::set_viewport_alignment(ViewportAlignment alignment) noexcept
++{
++    return m_scale_proxy && m_scale_proxy->set_viewport_alignment(alignment);
++}
++
++asst::Point asst::Controller::convert_viewport_point(
++    const Point& point,
++    ViewportAlignment from,
++    ViewportAlignment to) const noexcept
++{
++    return m_scale_proxy ? m_scale_proxy->convert_viewport_point(point, from, to) : point;
++}
++
+ bool asst::Controller::screencap(bool allow_reconnect)
+ {
+     CHECK_EXIST(m_controller, false);
+diff --git a/src/MaaCore/Controller/Controller.h b/src/MaaCore/Controller/Controller.h
+index caf1815..5f42a21 100644
+--- a/src/MaaCore/Controller/Controller.h
++++ b/src/MaaCore/Controller/Controller.h
+@@ -53,6 +53,7 @@ public:
+     void set_adb_lite_enabled(bool enable) noexcept;
+     void set_kill_adb_on_exit(bool enable) noexcept;
+     void set_client_type(const std::string& client_type) noexcept;
++    bool set_viewport(const std::string& value);
+     const std::string& get_client_type() const noexcept;
+ 
+     const std::string& get_uuid() const;
+@@ -68,6 +69,13 @@ public:
+     cv::Mat get_image(bool raw = false);
+     cv::Mat get_image_cache() const;
+     bool screencap(bool allow_reconnect = false);
++    bool uses_adaptive_viewport() const noexcept;
++    ViewportAlignment get_viewport_alignment() const noexcept;
++    bool set_viewport_alignment(ViewportAlignment alignment) noexcept;
++    Point convert_viewport_point(
++        const Point& point,
++        ViewportAlignment from,
++        ViewportAlignment to) const noexcept;
+ 
+     bool start_game(const std::string& client_type);
+     bool stop_game(const std::string& client_type);
+@@ -100,6 +108,7 @@ public:
+     ControlFeat::Feat support_features();
+ 
+     std::pair<int, int> get_scale_size() const noexcept;
++    std::pair<int, int> get_display_size() const noexcept;
+ 
+     Controller& operator=(const Controller&) = delete;
+     Controller& operator=(Controller&&) = delete;
+@@ -130,6 +139,9 @@ private:
+     bool m_swipe_with_pause = false;
+     bool m_kill_adb_on_exit = false;
+     std::string m_client_type;
++    std::optional<Rect> m_viewport_override;
++    bool m_hybrid_viewport = false;
++    bool m_adaptive_viewport = false;
+ 
+     mutable std::shared_mutex m_image_mutex;
+     cv::Mat m_cache_image;
+diff --git a/src/MaaCore/Controller/ViewportTransform.cpp b/src/MaaCore/Controller/ViewportTransform.cpp
+new file mode 100644
+index 0000000..358499d
+--- /dev/null
++++ b/src/MaaCore/Controller/ViewportTransform.cpp
+@@ -0,0 +1,234 @@
++#include "ViewportTransform.h"
++
++#include <cstdint>
++#include <stdexcept>
++
++asst::ViewportTransform::ViewportTransform(
++    std::pair<int, int> display_size,
++    std::optional<Rect> viewport,
++    bool hybrid_edges,
++    bool adaptive_viewport) :
++    m_display_size(display_size),
++    m_viewport(viewport.value_or(centered_viewport(display_size))),
++    m_hybrid_edges(hybrid_edges),
++    m_adaptive_viewport(adaptive_viewport)
++{
++    const auto [display_width, display_height] = m_display_size;
++    if (display_width <= 0 || display_height <= 0) {
++        throw std::invalid_argument("Display size must be positive");
++    }
++
++    if (m_viewport.x < 0 || m_viewport.y < 0 || m_viewport.width <= 0 || m_viewport.height <= 0 ||
++        static_cast<int64_t>(m_viewport.x) + m_viewport.width > display_width ||
++        static_cast<int64_t>(m_viewport.y) + m_viewport.height > display_height) {
++        throw std::invalid_argument("Viewport is outside the display");
++    }
++}
++
++asst::Point asst::ViewportTransform::logical_to_display(const Point& point) const noexcept
++{
++    if (uses_adaptive_viewport()) {
++        const Rect current = active_viewport();
++        return {
++            scale_axis(point.x, WindowWidthDefault, current.x, current.width),
++            scale_axis(point.y, WindowHeightDefault, current.y, current.height),
++        };
++    }
++
++    if (m_hybrid_edges && m_display_size.first > m_viewport.width) {
++        const int right_band_start = WindowWidthDefault - HybridEdgeBand;
++        int display_x = 0;
++        if (point.x < HybridEdgeBand) {
++            display_x = scale_axis(point.x, WindowHeightDefault, 0, m_viewport.height);
++        }
++        else if (point.x >= right_band_start) {
++            display_x = m_display_size.first -
++                        scale_axis(WindowWidthDefault - point.x, WindowHeightDefault, 0, m_viewport.height);
++        }
++        else {
++            display_x = scale_axis(point.x, WindowWidthDefault, m_viewport.x, m_viewport.width);
++        }
++        return {
++            display_x,
++            scale_axis(point.y, WindowHeightDefault, m_viewport.y, m_viewport.height),
++        };
++    }
++
++    return {
++        scale_axis(point.x, WindowWidthDefault, m_viewport.x, m_viewport.width),
++        scale_axis(point.y, WindowHeightDefault, m_viewport.y, m_viewport.height),
++    };
++}
++
++asst::Point asst::ViewportTransform::display_to_logical(const Point& point) const noexcept
++{
++    if (uses_adaptive_viewport()) {
++        const Rect current = active_viewport();
++        return {
++            scale_axis(point.x - current.x, current.width, 0, WindowWidthDefault),
++            scale_axis(point.y - current.y, current.height, 0, WindowHeightDefault),
++        };
++    }
++
++    if (m_hybrid_edges && m_display_size.first > m_viewport.width) {
++        const int physical_edge_width =
++            scale_axis(HybridEdgeBand, WindowHeightDefault, 0, m_viewport.height);
++        if (point.x < physical_edge_width) {
++            return {
++                scale_axis(point.x, m_viewport.height, 0, WindowHeightDefault),
++                scale_axis(point.y - m_viewport.y, m_viewport.height, 0, WindowHeightDefault),
++            };
++        }
++        if (point.x >= m_display_size.first - physical_edge_width) {
++            return {
++                WindowWidthDefault -
++                    scale_axis(m_display_size.first - point.x, m_viewport.height, 0, WindowHeightDefault),
++                scale_axis(point.y - m_viewport.y, m_viewport.height, 0, WindowHeightDefault),
++            };
++        }
++    }
++
++    return {
++        scale_axis(point.x - m_viewport.x, m_viewport.width, 0, WindowWidthDefault),
++        scale_axis(point.y - m_viewport.y, m_viewport.height, 0, WindowHeightDefault),
++    };
++}
++
++std::pair<asst::Point, asst::Point> asst::ViewportTransform::logical_swipe_to_display(
++    const Point& start,
++    const Point& end,
++    bool preserve_logical_delta) const noexcept
++{
++    Point display_start = logical_to_display(start);
++    Point display_end = logical_to_display(end);
++    if (preserve_logical_delta) {
++        display_end = display_start + (end - start);
++    }
++    return { display_start, display_end };
++}
++
++std::pair<int, int> asst::ViewportTransform::logical_size() const noexcept
++{
++    return { WindowWidthDefault, WindowHeightDefault };
++}
++
++std::pair<int, int> asst::ViewportTransform::display_size() const noexcept
++{
++    return m_display_size;
++}
++
++const asst::Rect& asst::ViewportTransform::viewport() const noexcept
++{
++    return m_viewport;
++}
++
++asst::Rect asst::ViewportTransform::active_viewport() const noexcept
++{
++    if (!uses_adaptive_viewport()) {
++        return m_viewport;
++    }
++
++    return viewport_for_alignment(m_viewport_alignment);
++}
++
++asst::Rect asst::ViewportTransform::viewport_for_alignment(ViewportAlignment alignment) const noexcept
++{
++    if (!uses_adaptive_viewport()) {
++        return m_viewport;
++    }
++
++    switch (alignment) {
++    case ViewportAlignment::Left:
++        return { 0, m_viewport.y, m_viewport.width, m_viewport.height };
++    case ViewportAlignment::Right:
++        return {
++            m_display_size.first - m_viewport.width,
++            m_viewport.y,
++            m_viewport.width,
++            m_viewport.height,
++        };
++    case ViewportAlignment::Center:
++    default:
++        return m_viewport;
++    }
++}
++
++bool asst::ViewportTransform::uses_hybrid_edges() const noexcept
++{
++    return m_hybrid_edges && m_display_size.first > m_viewport.width;
++}
++
++bool asst::ViewportTransform::uses_adaptive_viewport() const noexcept
++{
++    return m_adaptive_viewport && m_display_size.first > m_viewport.width;
++}
++
++asst::ViewportAlignment asst::ViewportTransform::viewport_alignment() const noexcept
++{
++    return m_viewport_alignment;
++}
++
++bool asst::ViewportTransform::set_viewport_alignment(ViewportAlignment alignment) noexcept
++{
++    if (!uses_adaptive_viewport() && alignment != ViewportAlignment::Center) {
++        return false;
++    }
++    m_viewport_alignment = alignment;
++    return true;
++}
++
++asst::Point asst::ViewportTransform::convert_viewport_point(
++    const Point& point,
++    ViewportAlignment from,
++    ViewportAlignment to) const noexcept
++{
++    if (!uses_adaptive_viewport() || from == to) {
++        return point;
++    }
++
++    const Rect source = viewport_for_alignment(from);
++    const Rect target = viewport_for_alignment(to);
++    return {
++        point.x + scale_axis(source.x - target.x, target.width, 0, WindowWidthDefault),
++        point.y + scale_axis(source.y - target.y, target.height, 0, WindowHeightDefault),
++    };
++}
++
++asst::ViewportAlignment asst::ViewportTransform::preferred_alignment_for_logical_x(int logical_x) noexcept
++{
++    if (logical_x < HybridEdgeBand) {
++        return ViewportAlignment::Left;
++    }
++    if (logical_x >= WindowWidthDefault - HybridEdgeBand) {
++        return ViewportAlignment::Right;
++    }
++    return ViewportAlignment::Center;
++}
++
++asst::Rect asst::ViewportTransform::centered_viewport(std::pair<int, int> display_size) noexcept
++{
++    const auto [display_width, display_height] = display_size;
++    if (display_width <= 0 || display_height <= 0) {
++        return {};
++    }
++
++    if (static_cast<int64_t>(display_width) * WindowHeightDefault >=
++        static_cast<int64_t>(display_height) * WindowWidthDefault) {
++        const int viewport_width = static_cast<int>(
++            static_cast<int64_t>(display_height) * WindowWidthDefault / WindowHeightDefault);
++        return { (display_width - viewport_width) / 2, 0, viewport_width, display_height };
++    }
++
++    const int viewport_height =
++        static_cast<int>(static_cast<int64_t>(display_width) * WindowHeightDefault / WindowWidthDefault);
++    return { 0, (display_height - viewport_height) / 2, display_width, viewport_height };
++}
++
++int asst::ViewportTransform::scale_axis(
++    int coordinate,
++    int source_extent,
++    int target_offset,
++    int target_extent) noexcept
++{
++    return target_offset + static_cast<int>(static_cast<int64_t>(coordinate) * target_extent / source_extent);
++}
+diff --git a/src/MaaCore/Controller/ViewportTransform.h b/src/MaaCore/Controller/ViewportTransform.h
+new file mode 100644
+index 0000000..4571965
+--- /dev/null
++++ b/src/MaaCore/Controller/ViewportTransform.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <optional>
++#include <utility>
++
++#include "Common/AsstTypes.h"
++
++namespace asst
++{
++enum class ViewportAlignment
++{
++    Center,
++    Left,
++    Right,
++};
++
++class ViewportTransform
++{
++public:
++    static constexpr int HybridEdgeBand = 400;
++
++    ViewportTransform(
++        std::pair<int, int> display_size,
++        std::optional<Rect> viewport = std::nullopt,
++        bool hybrid_edges = false,
++        bool adaptive_viewport = false);
++
++    Point logical_to_display(const Point& point) const noexcept;
++    Point display_to_logical(const Point& point) const noexcept;
++
++    std::pair<Point, Point> logical_swipe_to_display(
++        const Point& start,
++        const Point& end,
++        bool preserve_logical_delta) const noexcept;
++
++    std::pair<int, int> logical_size() const noexcept;
++    std::pair<int, int> display_size() const noexcept;
++    const Rect& viewport() const noexcept;
++    Rect active_viewport() const noexcept;
++    bool uses_hybrid_edges() const noexcept;
++    bool uses_adaptive_viewport() const noexcept;
++    ViewportAlignment viewport_alignment() const noexcept;
++    bool set_viewport_alignment(ViewportAlignment alignment) noexcept;
++    Point convert_viewport_point(
++        const Point& point,
++        ViewportAlignment from,
++        ViewportAlignment to) const noexcept;
++    static ViewportAlignment preferred_alignment_for_logical_x(int logical_x) noexcept;
++
++private:
++    static Rect centered_viewport(std::pair<int, int> display_size) noexcept;
++    Rect viewport_for_alignment(ViewportAlignment alignment) const noexcept;
++    static int scale_axis(int coordinate, int source_extent, int target_offset, int target_extent) noexcept;
++
++    std::pair<int, int> m_display_size;
++    Rect m_viewport;
++    bool m_hybrid_edges = false;
++    bool m_adaptive_viewport = false;
++    ViewportAlignment m_viewport_alignment = ViewportAlignment::Center;
++};
++} // namespace asst
+diff --git a/src/MaaCore/Task/BattleHelper.cpp b/src/MaaCore/Task/BattleHelper.cpp
+index 178ceac..794a0ee 100644
+--- a/src/MaaCore/Task/BattleHelper.cpp
++++ b/src/MaaCore/Task/BattleHelper.cpp
+@@ -84,14 +84,20 @@ bool asst::BattleHelper::pause()
+ {
+     LogTraceFunction;
+ 
+-    return ProcessTask(this_task(), { "BattlePause" }).run();
++    const ViewportAlignment alignment = m_inst_helper.ctrler()->get_viewport_alignment();
++    const bool result = ProcessTask(this_task(), { "BattlePause" }).run();
++    m_inst_helper.ctrler()->set_viewport_alignment(alignment);
++    return result;
+ }
+ 
+ bool asst::BattleHelper::speed_up()
+ {
+     LogTraceFunction;
+ 
+-    return ProcessTask(this_task(), { "BattleSpeedUp" }).run();
++    const ViewportAlignment alignment = m_inst_helper.ctrler()->get_viewport_alignment();
++    const bool result = ProcessTask(this_task(), { "BattleSpeedUp" }).run();
++    m_inst_helper.ctrler()->set_viewport_alignment(alignment);
++    return result;
+ }
+ 
+ bool asst::BattleHelper::abandon()
+@@ -220,9 +226,24 @@ bool asst::BattleHelper::update_deployment_(
+ 
+             click_oper_on_deployment(oper_rect);
+ 
+-            name_image = m_inst_helper.ctrler()->get_image();
++            auto ctrler = m_inst_helper.ctrler();
++            const ViewportAlignment alignment = ctrler->get_viewport_alignment();
++
++            cv::Mat detail_image;
++            if (ctrler->uses_adaptive_viewport() && alignment != ViewportAlignment::Left) {
++                // Selecting an operator opens its detail panel at the far-left
++                // edge, outside the center battlefield viewport on ultrawide
++                // devices.  OCR the name from the left viewport, then restore
++                // the battlefield viewport before rematching/clicking avatars.
++                ctrler->set_viewport_alignment(ViewportAlignment::Left);
++                detail_image = ctrler->get_image();
++                ctrler->set_viewport_alignment(alignment);
++            }
++            else {
++                detail_image = ctrler->get_image();
++            }
+ 
+-            std::string name = analyze_detail_page_oper_name(name_image, oper.role);
++            std::string name = analyze_detail_page_oper_name(detail_image, oper.role);
+             // 这时候即使名字不合法也只能凑合用了，但是为空还是不行的
+             if (name.empty()) {
+                 Log.error("name is empty");
+@@ -238,6 +259,17 @@ bool asst::BattleHelper::update_deployment_(
+             // 再点一下部署栏头像取消选择
+             // 注意，点完部署区的干员之后，他的头像会放大；干员的位置都被挤开了，不在原来的位置了
+             // 所以要重新识别一下位置
++            ViewportAlignment avatar_alignment = alignment;
++            if (ctrler->uses_adaptive_viewport() && alignment != ViewportAlignment::Right) {
++                ctrler->set_viewport_alignment(ViewportAlignment::Right);
++                name_image = ctrler->get_image();
++                ctrler->set_viewport_alignment(alignment);
++                avatar_alignment = ViewportAlignment::Right;
++            }
++            else {
++                name_image = ctrler->get_image();
++            }
++
+             MultiMatcher re_matcher(name_image);
+             re_matcher.set_task_info("BattleAvatarReMatch");
+             re_matcher.set_templ(oper.avatar);
+@@ -249,6 +281,14 @@ bool asst::BattleHelper::update_deployment_(
+                     });
+ 
+                     oper_rect = min_rect_iter->rect;
++                    if (avatar_alignment != alignment) {
++                        const Point normalized = ctrler->convert_viewport_point(
++                            { oper_rect.x, oper_rect.y },
++                            avatar_alignment,
++                            alignment);
++                        oper_rect.x = normalized.x;
++                        oper_rect.y = normalized.y;
++                    }
+                 }
+             }
+             click_oper_on_deployment(oper_rect);
+@@ -269,11 +309,22 @@ bool asst::BattleHelper::update_deployment(bool init, const cv::Mat& reusable, b
+         }
+     }
+ 
+-    cv::Mat image = init || reusable.empty() ? m_inst_helper.ctrler()->get_image() : reusable;
++    auto ctrler = m_inst_helper.ctrler();
++    const ViewportAlignment battle_alignment = ctrler->get_viewport_alignment();
++    cv::Mat image = init || reusable.empty() ? ctrler->get_image() : reusable;
+     if (init) {
+         auto draw_future = std::async(std::launch::async, [&]() { save_map(image); });
+     }
+ 
++    cv::Mat battlefield_image = image;
++    const ViewportAlignment deployment_alignment =
++        ctrler->uses_adaptive_viewport() ? ViewportAlignment::Right : battle_alignment;
++    if (deployment_alignment != battle_alignment) {
++        ctrler->set_viewport_alignment(deployment_alignment);
++        image = ctrler->get_image();
++        ctrler->set_viewport_alignment(battle_alignment);
++    }
++
+     BattlefieldMatcher oper_analyzer(image);
+ 
+     // 保全要识别开局费用，先用init判断了，之后别的地方要用的话再做cache
+@@ -284,6 +335,22 @@ bool asst::BattleHelper::update_deployment(bool init, const cv::Mat& reusable, b
+         oper_analyzer.set_object_of_interest({ .deployment = true });
+     }
+     auto oper_result_opt = oper_analyzer.analyze();
++    auto normalize_deployment = [&](auto& result) {
++        if (!result || deployment_alignment == battle_alignment) {
++            return;
++        }
++        for (auto& oper : result->deployment) {
++            const Point normalized = ctrler->convert_viewport_point(
++                { oper.rect.x, oper.rect.y },
++                deployment_alignment,
++                battle_alignment);
++            oper.rect.x = normalized.x;
++            oper.rect.y = normalized.y;
++        }
++        Log.trace("Battle deployment matched adaptive viewport", static_cast<int>(deployment_alignment));
++    };
++    normalize_deployment(oper_result_opt);
++    image = battlefield_image;
+     if (!oper_result_opt) {
+         check_in_battle(image);
+         return false;
+@@ -311,7 +378,13 @@ bool asst::BattleHelper::update_deployment(bool init, const cv::Mat& reusable, b
+         }
+ 
+         // 重新识别
+-        BattlefieldMatcher oper_analyzer2(image);
++        cv::Mat deployment_image = image;
++        if (deployment_alignment != battle_alignment) {
++            ctrler->set_viewport_alignment(deployment_alignment);
++            deployment_image = ctrler->get_image();
++            ctrler->set_viewport_alignment(battle_alignment);
++        }
++        BattlefieldMatcher oper_analyzer2(deployment_image);
+         if (init || need_oper_cost) {
+             oper_analyzer2.set_object_of_interest({ .deployment = true, .oper_cost = true });
+         }
+@@ -319,6 +392,7 @@ bool asst::BattleHelper::update_deployment(bool init, const cv::Mat& reusable, b
+             oper_analyzer2.set_object_of_interest({ .deployment = true });
+         }
+         oper_result_opt = oper_analyzer2.analyze();
++        normalize_deployment(oper_result_opt);
+         if (!oper_result_opt) {
+             check_in_battle(image);
+             return false;
+@@ -594,7 +668,22 @@ bool asst::BattleHelper::use_skill(const Point& loc, bool keep_waiting)
+ 
+ bool asst::BattleHelper::check_pause_button(const cv::Mat& reusable)
+ {
+-    cv::Mat image = reusable.empty() ? m_inst_helper.ctrler()->get_image() : reusable;
++    auto ctrler = m_inst_helper.ctrler();
++    const ViewportAlignment alignment = ctrler->get_viewport_alignment();
++
++    cv::Mat image;
++    if (ctrler->uses_adaptive_viewport() && alignment != ViewportAlignment::Right) {
++        // Both BattleOfficiallyBegin and BattleHasStarted inspect the controls at
++        // the far-right edge.  A center viewport contains the battlefield, but
++        // crops these controls out on ultrawide devices.
++        ctrler->set_viewport_alignment(ViewportAlignment::Right);
++        image = ctrler->get_image();
++        ctrler->set_viewport_alignment(alignment);
++    }
++    else {
++        image = reusable.empty() ? ctrler->get_image() : reusable;
++    }
++
+     Matcher battle_flag_analyzer(image);
+     battle_flag_analyzer.set_task_info("BattleOfficiallyBegin");
+     bool ret = battle_flag_analyzer.analyze().has_value();
+@@ -954,7 +1043,10 @@ bool asst::BattleHelper::click_skill(bool keep_waiting)
+ 
+ bool asst::BattleHelper::cancel_oper_selection()
+ {
+-    return ProcessTask(this_task(), { "BattleCancelSelection" }).run();
++    const ViewportAlignment alignment = m_inst_helper.ctrler()->get_viewport_alignment();
++    const bool result = ProcessTask(this_task(), { "BattleCancelSelection" }).run();
++    m_inst_helper.ctrler()->set_viewport_alignment(alignment);
++    return result;
+ }
+ 
+ void asst::BattleHelper::fix_swipe_out_of_limit(
+diff --git a/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp b/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
+index 9712f27..ca91566 100644
+--- a/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastAbstractTask.cpp
+@@ -1,6 +1,7 @@
+ #include "InfrastAbstractTask.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <boost/regex.hpp>
+ #include <utility>
+ 
+@@ -17,6 +18,30 @@
+ #include "Vision/RegionOCRer.h"
+ #include <ranges>
+ 
++namespace
++{
++asst::ViewportAlignment preferred_facility_alignment(std::string_view facility)
++{
++    if (facility == "Mfg" || facility == "Trade" || facility == "Power") {
++        return asst::ViewportAlignment::Left;
++    }
++    if (facility == "Reception" || facility == "Office" || facility == "Training" ||
++        facility == "Processing") {
++        return asst::ViewportAlignment::Right;
++    }
++    return asst::ViewportAlignment::Center;
++}
++
++double facility_template_scale_hint(std::pair<int, int> display_size)
++{
++    const auto [width, height] = display_size;
++    if (width <= 0 || height <= 0) {
++        return 1.0;
++    }
++    return std::min(1.0, 2.0 * static_cast<double>(height) / static_cast<double>(width));
++}
++} // namespace
++
+ asst::InfrastAbstractTask::InfrastAbstractTask(
+     const AsstCallback& callback,
+     Assistant* inst,
+@@ -205,17 +230,51 @@ bool asst::InfrastAbstractTask::enter_facility(int index)
+         return false;
+     }
+ 
+-    InfrastFacilityImageAnalyzer analyzer(ctrler()->get_image());
+-    analyzer.set_to_be_analyzed({ facility_name() });
+-    if (!analyzer.analyze()) {
+-        Log.info("result is empty");
+-        analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
+-        return false;
++    const std::string name = facility_name();
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const ViewportAlignment preferred_alignment = preferred_facility_alignment(name);
++    std::vector<ViewportAlignment> alignments { preferred_alignment };
++    if (ctrler()->uses_adaptive_viewport()) {
++        for (const ViewportAlignment candidate :
++             std::array { ViewportAlignment::Center, ViewportAlignment::Left, ViewportAlignment::Right }) {
++            if (std::ranges::find(alignments, candidate) == alignments.cend()) {
++                alignments.emplace_back(candidate);
++            }
++        }
++        ctrler()->set_viewport_alignment(preferred_alignment);
++    }
++    else {
++        alignments.front() = original_alignment;
++    }
++
++    const double scale_hint = ctrler()->uses_adaptive_viewport()
++                                  ? facility_template_scale_hint(ctrler()->get_display_size())
++                                  : 1.0;
++    const cv::Mat captured = ctrler()->get_image();
++    Rect rect;
++    for (size_t candidate_index = 0; candidate_index < alignments.size(); ++candidate_index) {
++        const ViewportAlignment alignment = alignments[candidate_index];
++        if (candidate_index != 0) {
++            ctrler()->set_viewport_alignment(alignment);
++        }
++        const cv::Mat image = candidate_index == 0 ? captured : ctrler()->get_image_cache();
++        InfrastFacilityImageAnalyzer analyzer(image);
++        analyzer.set_to_be_analyzed({ name });
++        analyzer.set_template_scale_hint(scale_hint);
++        if (analyzer.analyze()) {
++            rect = analyzer.get_rect(name, index);
++        }
++        if (!rect.empty()) {
++            Log.trace("Infrast facility matched adaptive viewport", name, static_cast<int>(alignment), rect);
++            break;
++        }
++        if (candidate_index + 1 == alignments.size()) {
++            analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
++        }
+     }
+-    Rect rect = analyzer.get_rect(facility_name(), index);
+     if (rect.empty()) {
+-        Log.info("facility index is out of range");
+-        analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("enter_facility"));
++        ctrler()->set_viewport_alignment(original_alignment);
++        Log.info("facility result is empty or index is out of range", name, index);
+         return false;
+     }
+     ctrler()->click(rect);
+@@ -235,6 +294,19 @@ bool asst::InfrastAbstractTask::enter_oper_list_page()
+     return task.run();
+ }
+ 
++cv::Mat asst::InfrastAbstractTask::capture_oper_list_image()
++{
++    // Sort and filter controls live on the physical right edge, so an adaptive
++    // ProcessTask often leaves the controller in the right viewport. Selected
++    // operators are then sorted to the beginning of the list. The operator grid
++    // is anchored to the physical left edge, so the left viewport restores the
++    // coordinate system used by InfrastSkillsUpper/Lower (which start at x=400).
++    if (ctrler()->uses_adaptive_viewport()) {
++        ctrler()->set_viewport_alignment(ViewportAlignment::Left);
++    }
++    return ctrler()->get_image();
++}
++
+ bool asst::InfrastAbstractTask::is_use_custom_opers()
+ {
+     return m_is_custom && (!current_room_config().names.empty() || !current_room_config().candidates.empty());
+@@ -356,12 +428,13 @@ bool asst::InfrastAbstractTask::select_opers_review(
+     auto room_config = origin_room_config;
+ 
+     sleep(500); // 等待干员选择界面稳定
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(
+         InfrastOperImageAnalyzer::ToBeCalced::Selected | InfrastOperImageAnalyzer::ToBeCalced::Doing);
+     if (!oper_analyzer.analyze()) {
+         Log.warn("No oper");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+     oper_analyzer.sort_by_loc();
+@@ -378,6 +451,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+ 
+     if (selected_count < num_of_opers_expect) {
+         Log.warn("select opers review fail: unexpected number of selected operators ");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+     if (facility_name() != "Dorm" && (!m_is_custom || (room_config.names.empty() && room_config.candidates.empty()))) {
+@@ -385,6 +459,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+     }
+     if (selected_count < room_config.names.size()) {
+         Log.warn("select opers review fail: part of custom operators unselected");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+ 
+@@ -410,6 +485,8 @@ bool asst::InfrastAbstractTask::select_opers_review(
+             if (oper.doing == infrast::Doing::Working) {
+                 Log.warn("selected operators at work:", name);
+                 Log.warn("select opers review fail: non-custom configuration, but an operator at work is selected");
++                oper_analyzer.save_img(
++                    utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+                 return false;
+             }
+         }
+@@ -417,6 +494,7 @@ bool asst::InfrastAbstractTask::select_opers_review(
+ 
+     if (room_config.names.size()) {
+         Log.warn("select opers review fail: part of custom operators unselected.");
++        oper_analyzer.save_img(utils::path("debug") / utils::path("infrast") / utils::path("select_opers_review"));
+         return false;
+     }
+ 
+@@ -438,7 +516,7 @@ bool asst::InfrastAbstractTask::select_custom_opers(std::vector<std::string>& pa
+     const auto& ocr_replace = Task.get<OcrTaskInfo>("CharsNameOcrReplace");
+ 
+     // 预检查循环
+-    auto image = ctrler()->get_image();
++    auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer.analyze()) {
+@@ -485,7 +563,7 @@ bool asst::InfrastAbstractTask::select_custom_opers(std::vector<std::string>& pa
+         sleep(500);
+     }
+ 
+-    image = ctrler()->get_image();
++    image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer2(image);
+     oper_analyzer2.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer2.analyze()) {
+@@ -535,7 +613,7 @@ bool asst::InfrastAbstractTask::get_opers(std::vector<std::string>& result, doub
+ {
+     LogTraceFunction;
+ 
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Mood);
+     if (!oper_analyzer.analyze()) {
+@@ -570,7 +648,7 @@ void asst::InfrastAbstractTask::order_opers_selection(const std::vector<std::str
+         return;
+     }
+ 
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+     if (!oper_analyzer.analyze()) {
+@@ -638,7 +716,7 @@ bool asst::InfrastAbstractTask::click_clear_button()
+         // 有可能点快了，清空按钮刚刚出来，实际点上去还不生效，就点了
+         // 所以多识别一次，如果没清掉就再清一下
+         if (ret) {
+-            InfrastOperImageAnalyzer analyzer(ctrler()->get_image());
++            InfrastOperImageAnalyzer analyzer(capture_oper_list_image());
+             analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::Selected);
+             if (!analyzer.analyze()) {
+                 return false;
+diff --git a/src/MaaCore/Task/Infrast/InfrastAbstractTask.h b/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
+index ec16036..0e6704e 100644
+--- a/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
++++ b/src/MaaCore/Task/Infrast/InfrastAbstractTask.h
+@@ -34,6 +34,7 @@ protected:
+     bool enter_facility(int index = 0);
+     // 从刚点进设施的界面，到干员列表页
+     bool enter_oper_list_page();
++    cv::Mat capture_oper_list_image();
+ 
+     virtual int operlist_swipe_times() const noexcept { return 2; }
+ 
+diff --git a/src/MaaCore/Task/Infrast/InfrastDormTask.cpp b/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
+index a861d0a..f3f12cc 100644
+--- a/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastDormTask.cpp
+@@ -122,7 +122,7 @@ bool asst::InfrastDormTask::fill_dorm_slots()
+         if (need_exit()) {
+             return false;
+         }
+-        const auto image = ctrler()->get_image();
++        const auto image = capture_oper_list_image();
+         InfrastOperImageAnalyzer oper_analyzer(image);
+ 
+         constexpr int without_skill = InfrastOperImageAnalyzer::All ^ InfrastOperImageAnalyzer::Skill;
+diff --git a/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp b/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
+index 4f01517..4e55141 100644
+--- a/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastInfoTask.cpp
+@@ -1,5 +1,7 @@
+ #include "InfrastInfoTask.h"
+ 
++#include <algorithm>
++
+ #include "Controller/Controller.h"
+ #include "Status.h"
+ #include "Utils/Logger.hpp"
+@@ -8,20 +10,46 @@
+ bool asst::InfrastInfoTask::_run()
+ {
+     swipe_to_the_left_of_main_ui();
+-    const auto image = ctrler()->get_image();
+ 
+-    InfrastFacilityImageAnalyzer analyzer(image);
++    const bool adaptive = ctrler()->uses_adaptive_viewport();
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    if (adaptive) {
++        ctrler()->set_viewport_alignment(ViewportAlignment::Left);
++    }
++    const cv::Mat captured = ctrler()->get_image();
++    const auto [display_width, display_height] = ctrler()->get_display_size();
++    const double scale_hint = adaptive && display_width > 0 && display_height > 0
++                                  ? std::min(
++                                        1.0,
++                                        2.0 * static_cast<double>(display_height) /
++                                            static_cast<double>(display_width))
++                                  : 1.0;
++
++    const auto analyze_group = [&](ViewportAlignment alignment, const std::vector<std::string>& facilities) {
++        if (adaptive) {
++            ctrler()->set_viewport_alignment(alignment);
++        }
++        const cv::Mat image = alignment == ViewportAlignment::Left ? captured : ctrler()->get_image_cache();
++        InfrastFacilityImageAnalyzer analyzer(image);
++        analyzer.set_to_be_analyzed(facilities);
++        analyzer.set_template_scale_hint(scale_hint);
++        if (!analyzer.analyze()) {
++            return false;
++        }
++        for (const std::string& name : facilities) {
++            const std::string key = "NumOf" + name;
++            const size_t quantity = analyzer.get_quantity(name);
++            status()->set_number(key, quantity);
++            Log.trace("InfrastInfoTask | ", key, quantity);
++        }
++        return true;
++    };
+ 
+-    analyzer.set_to_be_analyzed({ "Mfg", "Trade", "Power", "Dorm" });
+-    if (!analyzer.analyze()) {
++    if (!analyze_group(ViewportAlignment::Left, { "Mfg", "Trade", "Power" }) ||
++        !analyze_group(ViewportAlignment::Center, { "Dorm" })) {
++        ctrler()->set_viewport_alignment(original_alignment);
+         return false;
+     }
+-    for (auto&& [name, res] : analyzer.get_result()) {
+-        std::string key = "NumOf" + name;
+-        // int size = static_cast<int>(res.size());
+-        status()->set_number(key, res.size());
+-        Log.trace("InfrastInfoTask | ", key, res.size());
+-    }
+ 
+     return true;
+ }
+diff --git a/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp b/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
+index 6542785..26ec1f2 100644
+--- a/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
++++ b/src/MaaCore/Task/Infrast/InfrastProductionTask.cpp
+@@ -476,7 +476,7 @@ bool asst::InfrastProductionTask::opers_detect_with_swipe()
+ size_t asst::InfrastProductionTask::opers_detect()
+ {
+     LogTraceFunction;
+-    const auto image = ctrler()->get_image();
++    const auto image = capture_oper_list_image();
+ 
+     InfrastOperImageAnalyzer oper_analyzer(image);
+     oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::All);
+@@ -786,7 +786,7 @@ bool asst::InfrastProductionTask::opers_choose()
+         if (need_exit()) {
+             return false;
+         }
+-        const auto image = ctrler()->get_image();
++        const auto image = capture_oper_list_image();
+         InfrastOperImageAnalyzer oper_analyzer(image);
+         oper_analyzer.set_to_be_calced(InfrastOperImageAnalyzer::ToBeCalced::All);
+         oper_analyzer.set_facility(facility_name());
+diff --git a/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp b/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp
+index c22b580..9c81e3c 100644
+--- a/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp
++++ b/src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp
+@@ -30,21 +30,44 @@ bool asst::DepotRecognitionTask::analyze_basic_items()
+ {
+     LogTraceFunction;
+ 
++    // The depot tabs are anchored to the physical right edge on ultrawide devices.
++    // The material swipe is a JustReturn action and therefore selects the center
++    // viewport, so direct matching here must explicitly restore the right view.
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const bool adaptive_viewport = ctrler()->uses_adaptive_viewport();
++    const auto restore_viewport = [&]() {
++        if (adaptive_viewport) {
++            ctrler()->set_viewport_alignment(original_alignment);
++        }
++    };
++    if (adaptive_viewport && !ctrler()->set_viewport_alignment(ViewportAlignment::Right)) {
++        return false;
++    }
++
+     // 识别并点击「全部」标签页（此时在材料页，「全部」为白色可选状态）
+     Matcher all_tab_matcher(ctrler()->get_image());
+     all_tab_matcher.set_task_info("DepotAllTab");
+     auto all_tab_result = all_tab_matcher.analyze();
+     if (!all_tab_result) {
+         Log.error(__FUNCTION__, "failed to match DepotAllTab");
++        restore_viewport();
+         return false;
+     }
+     ctrler()->click(all_tab_result->rect);
+     sleep(500);
+ 
++    // The basic-item list starts at the physical left edge even though its tab is
++    // on the right. Match the list in the left viewport after clicking in Right.
++    if (adaptive_viewport && !ctrler()->set_viewport_alignment(ViewportAlignment::Left)) {
++        restore_viewport();
++        return false;
++    }
++
+     DepotImageAnalyzer analyzer(ctrler()->get_image());
+     analyzer.set_item_ids({ "4002", "4003", "4001", "3003", "4006" }); // 源石 合成玉 龙门币 赤金 采购凭证（红票）
+     analyzer.set_is_basic(true);
+     if (!analyzer.analyze()) {
++        restore_viewport();
+         return false;
+     }
+ 
+@@ -55,6 +78,7 @@ bool asst::DepotRecognitionTask::analyze_basic_items()
+ 
+     DepotImageAnalyzer::clear_cached_templates();
+     callback_analyze_result(false);
++    restore_viewport();
+     return true;
+ }
+ 
+diff --git a/src/MaaCore/Task/ProcessTask.cpp b/src/MaaCore/Task/ProcessTask.cpp
+index 1a82960..f349359 100644
+--- a/src/MaaCore/Task/ProcessTask.cpp
++++ b/src/MaaCore/Task/ProcessTask.cpp
+@@ -1,8 +1,10 @@
+ #include "ProcessTask.h"
+ 
++#include <array>
+ #include <chrono>
+ #include <random>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include <meojson/json.hpp>
+ 
+@@ -150,49 +152,166 @@ ProcessTask::HitDetail ProcessTask::find_first(const TaskList& list) /* const, e
+         return { .task_ptr = std::move(task_ptr) };
+     }
+ 
+-    cv::Mat image = m_reusable.empty() ? ctrler()->get_image() : m_reusable;
+-    m_reusable = cv::Mat();
+-    PipelineAnalyzer analyzer(image, Rect(), m_inst);
+-    analyzer.set_tasks(list);
++    auto analyze_image = [&](const cv::Mat& image, const TaskList& tasks) -> HitDetail {
++        PipelineAnalyzer analyzer(image, Rect(), m_inst);
++        analyzer.set_tasks(tasks);
+ 
+-    auto res_opt = analyzer.analyze();
+-    if (!res_opt) {
+-        return { .image = std::make_shared<cv::Mat>(std::move(image)), .task_ptr = nullptr };
++        auto res_opt = analyzer.analyze();
++        if (!res_opt) {
++            return { .image = std::make_shared<cv::Mat>(image), .task_ptr = nullptr };
++        }
++
++        task_ptr = std::move(res_opt->task_ptr);
++
++        if (task_ptr->algorithm == AlgorithmType::MatchTemplate) {
++            auto& raw_result = std::get<Matcher::Result>(res_opt->result);
++            return { .image = std::make_shared<cv::Mat>(image),
++                     .rect = res_opt->rect,
++                     .reco_detail = std::make_shared<Matcher::Result>(std::move(raw_result)),
++                     .task_ptr = task_ptr };
++        }
++
++        if (task_ptr->algorithm == AlgorithmType::OcrDetect) {
++            auto& raw_result = std::get<OCRer::Result>(res_opt->result);
++            return { .image = std::make_shared<cv::Mat>(image),
++                     .rect = res_opt->rect,
++                     .reco_detail = std::make_shared<OCRer::Result>(std::move(raw_result)),
++                     .task_ptr = task_ptr };
++        }
++
++        if (task_ptr->algorithm == AlgorithmType::FeatureMatch) {
++            auto& raw_result = std::get<FeatureMatcher::Result>(res_opt->result);
++            return { .image = std::make_shared<cv::Mat>(image),
++                     .rect = res_opt->rect,
++                     .reco_detail = std::make_shared<FeatureMatcher::Result>(std::move(raw_result)),
++                     .task_ptr = task_ptr };
++        }
++
++        return {
++            .image = std::make_shared<cv::Mat>(image),
++            .rect = res_opt->rect,
++            .task_ptr = task_ptr,
++        };
++    };
++
++    if (!m_reusable.empty()) {
++        cv::Mat reusable = std::move(m_reusable);
++        m_reusable = cv::Mat();
++        return analyze_image(reusable, list);
+     }
+ 
+-    task_ptr = std::move(res_opt->task_ptr);
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const cv::Mat original_image = ctrler()->get_image();
++    if (!ctrler()->uses_adaptive_viewport()) {
++        return analyze_image(original_image, list);
++    }
++
++    struct ViewCandidate
++    {
++        ViewportAlignment alignment = ViewportAlignment::Center;
++        cv::Mat image;
++    };
++
++    std::vector<ViewCandidate> candidates;
++    candidates.emplace_back(original_alignment, original_image);
++
++    constexpr std::array CandidateAlignments {
++        ViewportAlignment::Center,
++        ViewportAlignment::Left,
++        ViewportAlignment::Right,
++    };
++    for (const ViewportAlignment alignment : CandidateAlignments) {
++        if (alignment == original_alignment) {
++            continue;
++        }
++        if (!ctrler()->set_viewport_alignment(alignment)) {
++            continue;
++        }
++        candidates.emplace_back(alignment, ctrler()->get_image_cache());
++    }
+ 
+-    if (task_ptr->algorithm == AlgorithmType::MatchTemplate) {
+-        auto& raw_result = std::get<Matcher::Result>(res_opt->result);
+-        return { .image = std::make_shared<cv::Mat>(std::move(image)),
+-                 .rect = res_opt->rect,
+-                 .reco_detail = std::make_shared<Matcher::Result>(std::move(raw_result)),
+-                 .task_ptr = task_ptr };
++    // PipelineAnalyzer returns the first matching task in list order. Analyze
++    // each viewport once, then choose the earliest of those viewport winners.
++    // This is equivalent to trying every task against every viewport, while
++    // bounding recognition work to the number of viewports instead of
++    // list.size() * viewports.
++    std::unordered_map<const TaskInfo*, size_t> priorities;
++    for (size_t index = 0; index < list.size(); ++index) {
++        if (const auto priority_task = Task.get(list[index])) {
++            priorities.try_emplace(priority_task.get(), index);
++        }
+     }
+ 
+-    if (task_ptr->algorithm == AlgorithmType::OcrDetect) {
+-        auto& raw_result = std::get<OCRer::Result>(res_opt->result);
+-        return { .image = std::make_shared<cv::Mat>(std::move(image)),
+-                 .rect = res_opt->rect,
+-                 .reco_detail = std::make_shared<OCRer::Result>(std::move(raw_result)),
+-                 .task_ptr = task_ptr };
++    std::optional<HitDetail> best_hit;
++    ViewportAlignment best_alignment = original_alignment;
++    size_t best_priority = list.size();
++    for (const auto& candidate : candidates) {
++        HitDetail hit = analyze_image(candidate.image, list);
++        if (!hit.task_ptr) {
++            continue;
++        }
++
++        const auto priority_iter = priorities.find(hit.task_ptr.get());
++        const size_t priority = priority_iter == priorities.cend() ? list.size() : priority_iter->second;
++        if (!best_hit || priority < best_priority) {
++            best_hit = std::move(hit);
++            best_alignment = candidate.alignment;
++            best_priority = priority;
++        }
++        if (best_priority == 0) {
++            break;
++        }
+     }
+ 
+-    if (task_ptr->algorithm == AlgorithmType::FeatureMatch) {
+-        auto& raw_result = std::get<FeatureMatcher::Result>(res_opt->result);
+-        return { .image = std::make_shared<cv::Mat>(std::move(image)),
+-                 .rect = res_opt->rect,
+-                 .reco_detail = std::make_shared<FeatureMatcher::Result>(std::move(raw_result)),
+-                 .task_ptr = task_ptr };
++    if (best_hit) {
++        ctrler()->set_viewport_alignment(best_alignment);
++        Log.trace("Adaptive viewport matched with alignment", static_cast<int>(best_alignment));
++        return std::move(*best_hit);
+     }
+ 
+-    return { .image = std::make_shared<cv::Mat>(std::move(image)), .rect = res_opt->rect, .task_ptr = task_ptr };
++    ctrler()->set_viewport_alignment(original_alignment);
++    return { .image = std::make_shared<cv::Mat>(original_image), .task_ptr = nullptr };
+ }
+ 
+ // action 为 Stop 时返回 Interrupted, 其它返回 Success
+ ProcessTask::NodeStatus ProcessTask::run_action(const HitDetail& hits) const
+ {
+     const auto& task = hits.task_ptr;
++
++    // JustReturn carries no visual evidence, so an adaptive viewport cannot
++    // inherit a meaningful alignment from recognition. Infer the intended
++    // crop from the hard-coded action coordinate instead: left and right edge
++    // controls stay attached to their physical edges, while content actions
++    // use the centered viewport.
++    if (ctrler()->uses_adaptive_viewport() && task->algorithm == AlgorithmType::JustReturn) {
++        std::optional<int> logical_x;
++        switch (task->action) {
++        case ProcessTaskAction::ClickRect:
++            logical_x = task->specific_rect.x + task->specific_rect.width / 2;
++            break;
++        case ProcessTaskAction::ClickSelf:
++            if (!hits.rect.empty()) {
++                logical_x = hits.rect.x + hits.rect.width / 2;
++            }
++            break;
++        case ProcessTaskAction::Swipe: {
++            const int start_x = task->specific_rect.x + task->specific_rect.width / 2;
++            const int end_x = task->rect_move.x + task->rect_move.width / 2;
++            logical_x = (start_x + end_x) / 2;
++            break;
++        }
++        default:
++            break;
++        }
++
++        if (logical_x) {
++            const ViewportAlignment alignment =
++                ViewportTransform::preferred_alignment_for_logical_x(*logical_x);
++            ctrler()->set_viewport_alignment(alignment);
++            Log.trace("Adaptive viewport inferred action alignment", static_cast<int>(alignment), *logical_x);
++        }
++    }
++
+     switch (task->action) {
+     case ProcessTaskAction::ClickRect:
+         exec_click_task(task->specific_rect);
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeBattleTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeBattleTaskPlugin.cpp
+index 72b1f22..617d2a5 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeBattleTaskPlugin.cpp
++++ b/src/MaaCore/Task/Roguelike/RoguelikeBattleTaskPlugin.cpp
+@@ -63,6 +63,13 @@ bool asst::RoguelikeBattleTaskPlugin::_run()
+         return false;
+     }
+ 
++    // Battle tiles and the deployment bar are analyzed in a centered 16:9
++    // projection. Edge controls such as pause and speed-up temporarily choose
++    // the right viewport, but BattleHelper restores this alignment afterwards.
++    if (ctrler()->uses_adaptive_viewport()) {
++        ctrler()->set_viewport_alignment(ViewportAlignment::Center);
++    }
++
+     if (!update_deployment(true)) {
+         Log.error("update deployment failed");
+         return false;
+@@ -75,6 +82,9 @@ bool asst::RoguelikeBattleTaskPlugin::_run()
+     cv::Mat image, image_prev;
+     while (!need_exit()) {
+         // 不在战斗场景，且已使用过了干员，说明已经打完了，就结束循环
++        if (ctrler()->uses_adaptive_viewport()) {
++            ctrler()->set_viewport_alignment(ViewportAlignment::Center);
++        }
+         image = ctrler()->get_image();
+         if (!do_once(image, image_prev) && !m_first_deploy) {
+             break;
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.cpp
+index 2003c84..a57c947 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.cpp
++++ b/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.cpp
+@@ -5,6 +5,8 @@
+ #include "Controller/Controller.h"
+ #include "Task/ProcessTask.h"
+ #include "Utils/Logger.hpp"
++#include <array>
++#include <memory>
+ #include <ranges>
+ 
+ bool asst::RoguelikeFormationTaskPlugin::verify(AsstMsg msg, const json::value& details) const
+@@ -35,14 +37,14 @@ bool asst::RoguelikeFormationTaskPlugin::_run()
+ {
+     LogTraceFunction;
+ 
+-    RoguelikeFormationImageAnalyzer formation_analyzer(ctrler()->get_image());
+-    if (!formation_analyzer.analyze()) {
++    auto formation_analyzer = analyze_formation_viewports();
++    if (!formation_analyzer) {
+         return false;
+     }
+ 
+     size_t pre_selected = 0;
+     size_t select_count = 0;
+-    for (const auto& oper : formation_analyzer.get_result()) {
++    for (const auto& oper : formation_analyzer->get_result()) {
+         if (oper.selected) {
+             ++pre_selected;
+             continue;
+@@ -62,14 +64,14 @@ bool asst::RoguelikeFormationTaskPlugin::_run()
+     }
+     if (!reselect && select_count != 0) {
+         sleep(Task.get("RoguelikeQuickFormationDelay")->post_delay);
+-        formation_analyzer.set_image(ctrler()->get_image());
++        formation_analyzer->set_image(ctrler()->get_image());
+ 
+-        if (!formation_analyzer.analyze()) {
++        if (!formation_analyzer->analyze()) {
+             Log.warn("RoguelikeFormationImageAnalyzer re analyze failed");
+             return true;
+         }
+ 
+-        auto& new_result = formation_analyzer.get_result();
++        auto& new_result = formation_analyzer->get_result();
+         size_t new_selected_count = std::ranges::count_if(new_result, [](const auto& oper) { return oper.selected; });
+         // 说明 select_count 计数没生效，即都没点上
+         if (new_selected_count == pre_selected) {
+@@ -84,6 +86,46 @@ bool asst::RoguelikeFormationTaskPlugin::_run()
+     return true;
+ }
+ 
++std::unique_ptr<asst::RoguelikeFormationImageAnalyzer>
++    asst::RoguelikeFormationTaskPlugin::analyze_formation_viewports()
++{
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const cv::Mat original_image = ctrler()->get_image();
++
++    auto try_image = [](const cv::Mat& image) -> std::unique_ptr<RoguelikeFormationImageAnalyzer> {
++        auto analyzer = std::make_unique<RoguelikeFormationImageAnalyzer>(image);
++        if (!analyzer->analyze()) {
++            return nullptr;
++        }
++        return analyzer;
++    };
++
++    if (auto analyzer = try_image(original_image)) {
++        return analyzer;
++    }
++    if (!ctrler()->uses_adaptive_viewport()) {
++        return nullptr;
++    }
++
++    constexpr std::array CandidateAlignments {
++        ViewportAlignment::Center,
++        ViewportAlignment::Left,
++        ViewportAlignment::Right,
++    };
++    for (const ViewportAlignment alignment : CandidateAlignments) {
++        if (alignment == original_alignment || !ctrler()->set_viewport_alignment(alignment)) {
++            continue;
++        }
++        if (auto analyzer = try_image(ctrler()->get_image_cache())) {
++            Log.trace("Roguelike formation matched adaptive viewport", static_cast<int>(alignment));
++            return analyzer;
++        }
++    }
++
++    ctrler()->set_viewport_alignment(original_alignment);
++    return nullptr;
++}
++
+ void asst::RoguelikeFormationTaskPlugin::clear_and_reselect()
+ {
+     LogTraceFunction;
+@@ -147,14 +189,14 @@ bool asst::RoguelikeFormationTaskPlugin::analyze()
+ {
+     LogTraceFunction;
+ 
+-    RoguelikeFormationImageAnalyzer formation_analyzer(ctrler()->get_image());
+-    if (!formation_analyzer.analyze()) {
++    auto formation_analyzer = analyze_formation_viewports();
++    if (!formation_analyzer) {
+         return false;
+     }
+ 
+     // 比较在新一页识别到的干员名 （detected_oper_names） 与 上一页识别到的干员名 (m_last_detected_oper_names)
+     // 若完全相同则认为已到达尾页
+-    auto formation_analyze_result = formation_analyzer.get_result();
++    auto formation_analyze_result = formation_analyzer->get_result();
+     auto oper_name_view = formation_analyze_result | std::views::transform([&](auto oper) { return oper.name; });
+     std::vector<std::string> detected_oper_names(oper_name_view.begin(), oper_name_view.end());
+     const bool reach_last_column = (detected_oper_names == m_last_detected_oper_names);
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.h b/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.h
+index feb9752..e93acf5 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.h
++++ b/src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <memory>
++
+ #include "AbstractRoguelikeTaskPlugin.h"
+ #include "Vision/Roguelike/RoguelikeFormationImageAnalyzer.h"
+ 
+@@ -20,6 +22,7 @@ public:
+ protected:
+     virtual bool _run() override;
+ 
++    std::unique_ptr<RoguelikeFormationImageAnalyzer> analyze_formation_viewports();
+     void clear_and_reselect();
+     bool analyze();
+     bool select(RoguelikeFormationImageAnalyzer::FormationOper oper);
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
+index bf83f02..1c4b7e7 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
++++ b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp
+@@ -17,10 +17,16 @@ bool asst::RoguelikeSettlementTaskPlugin::verify(AsstMsg msg, const json::value&
+     const auto task_name = details.get("details", "task", "");
+     if (task_name.ends_with("Roguelike@GamePass")) {
+         m_game_pass = true;
++        m_resume_page2 = false;
+         return m_config->get_mode() == RoguelikeMode::Exp;
+     }
+     else if (task_name.ends_with("Roguelike@MissionFailedFlag2")) {
+         m_game_pass = false;
++        m_resume_page2 = false;
++        return m_config->get_mode() == RoguelikeMode::Exp;
++    }
++    else if (task_name.ends_with("RoguelikeSettlementConfirm")) {
++        m_resume_page2 = true;
+         return m_config->get_mode() == RoguelikeMode::Exp;
+     }
+     else {
+@@ -33,7 +39,30 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     LogTraceFunction;
+     const auto& task = Task.get("RoguelikeSettlementConfirm");
+     auto json_msg = basic_info_with_what("RoguelikeSettlement");
+-    json_msg["details"]["game_pass"] = m_game_pass;
++    if (m_resume_page2) {
++        json_msg["details"]["resumed_page2"] = true;
++    }
++    else {
++        json_msg["details"]["game_pass"] = m_game_pass;
++    }
++
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const bool restore_alignment =
++        ctrler()->uses_adaptive_viewport() && original_alignment != ViewportAlignment::Center &&
++        ctrler()->set_viewport_alignment(ViewportAlignment::Center);
++    const auto restore_original_alignment = [&]() {
++        if (restore_alignment) {
++            ctrler()->set_viewport_alignment(original_alignment);
++        }
++    };
++
++    if (m_resume_page2) {
++        auto image = ctrler()->get_image();
++        get_settlement_info(json_msg, image);
++        callback(AsstMsg::SubTaskExtraInfo, json_msg);
++        restore_original_alignment();
++        return true;
++    }
+ 
+     sleep(task->special_params[0]);
+     if (m_game_pass) {
+@@ -47,6 +76,7 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     if (!wait_for_whole_page()) {
+         Log.error(__FUNCTION__, "wait for whole page failed");
+         save_img(ctrler()->get_image(), utils::path("debug") / utils::path("roguelike"), "Page2_Error");
++        restore_original_alignment();
+         return true;
+     }
+     sleep(task->post_delay);
+@@ -57,6 +87,7 @@ bool asst::RoguelikeSettlementTaskPlugin::_run()
+     }
+     get_settlement_info(json_msg, image);
+     callback(AsstMsg::SubTaskExtraInfo, json_msg);
++    restore_original_alignment();
+     return true;
+ }
+ 
+@@ -76,7 +107,7 @@ bool asst::RoguelikeSettlementTaskPlugin::get_settlement_info(json::value& info,
+ 
+     auto analyze_battle_data = [&](const std::string& task_name) {
+         RegionOCRer ocr(image);
+-        ocr.set_task_info("RoguelikeSettlementOcr-" + task_name);
++        ocr.set_task_info(m_config->get_theme() + "@RoguelikeSettlementOcr-" + task_name);
+         ocr.set_bin_threshold(0, 160);
+         auto merge_map = number_replace;
+         merge_map.emplace_back("[^\\d]+", "");
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
+index 5d164cf..01cabbf 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
++++ b/src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.h
+@@ -18,5 +18,6 @@ private:
+     void save_img(const cv::Mat& image, const std::filesystem::path& path, std::string name);
+ 
+     mutable bool m_game_pass = false;
++    mutable bool m_resume_page2 = false;
+ };
+ } // namespace asst
+diff --git a/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp b/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp
+index 341f695..d706113 100644
+--- a/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp
++++ b/src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp
+@@ -1,5 +1,8 @@
+ #include "RoguelikeSkillSelectionTaskPlugin.h"
+ 
++#include <array>
++#include <memory>
++
+ #include "Config/Roguelike/RoguelikeRecruitConfig.h"
+ #include "Config/TaskData.h"
+ #include "Controller/Controller.h"
+@@ -34,16 +37,44 @@ bool asst::RoguelikeSkillSelectionTaskPlugin::_run()
+ {
+     LogTraceFunction;
+ 
+-    auto image = ctrler()->get_image();
+-    RoguelikeSkillSelectionImageAnalyzer analyzer(image);
++    const ViewportAlignment original_alignment = ctrler()->get_viewport_alignment();
++    const cv::Mat original_image = ctrler()->get_image();
++
++    auto try_image = [](const cv::Mat& image) -> std::unique_ptr<RoguelikeSkillSelectionImageAnalyzer> {
++        auto analyzer = std::make_unique<RoguelikeSkillSelectionImageAnalyzer>(image);
++        if (!analyzer->analyze()) {
++            return nullptr;
++        }
++        return analyzer;
++    };
++
++    auto analyzer = try_image(original_image);
++    if (!analyzer && ctrler()->uses_adaptive_viewport()) {
++        constexpr std::array CandidateAlignments {
++            ViewportAlignment::Center,
++            ViewportAlignment::Left,
++            ViewportAlignment::Right,
++        };
++        for (const ViewportAlignment alignment : CandidateAlignments) {
++            if (alignment == original_alignment || !ctrler()->set_viewport_alignment(alignment)) {
++                continue;
++            }
++            analyzer = try_image(ctrler()->get_image_cache());
++            if (analyzer) {
++                Log.trace("Roguelike skill selection matched adaptive viewport", static_cast<int>(alignment));
++                break;
++            }
++        }
++    }
+ 
+-    if (!analyzer.analyze()) {
++    if (!analyzer) {
++        ctrler()->set_viewport_alignment(original_alignment);
+         return false;
+     }
+ 
+     int delay = Task.get("RoguelikeSkillSelectionMove1")->post_delay;
+     bool has_rookie = false;
+-    for (const auto& [name, skill_vec] : analyzer.get_result()) {
++    for (const auto& [name, skill_vec] : analyzer->get_result()) {
+         const auto& oper_info = RoguelikeRecruit.get_oper_info(m_config->get_theme(), name);
+         if (oper_info.name.empty()) {
+             Log.warn("Unknown oper", name);
+@@ -68,14 +99,14 @@ bool asst::RoguelikeSkillSelectionTaskPlugin::_run()
+ 
+     if (m_config->status().opers.empty()) {
+         std::unordered_map<std::string, RoguelikeOper> opers;
+-        for (const auto& [name, skill_vec] : analyzer.get_result()) {
++        for (const auto& [name, skill_vec] : analyzer->get_result()) {
+             opers[name] = { .elite = 1, .level = 80 };
+             // 不知道是啥等级随便填一个
+         }
+         m_config->status().opers = std::move(opers);
+     }
+ 
+-    if (analyzer.get_team_full() && !has_rookie) {
++    if (analyzer->get_team_full() && !has_rookie) {
+         Log.info("Team full and no rookie");
+         m_config->status().team_full_without_rookie = true;
+     }
+@@ -83,5 +114,8 @@ bool asst::RoguelikeSkillSelectionTaskPlugin::_run()
+         Log.info("Team not full or has rookie");
+         m_config->status().team_full_without_rookie = false;
+     }
++    // The parent ProcessTask still has to click StartAction using the viewport
++    // in which that button was recognized.
++    ctrler()->set_viewport_alignment(original_alignment);
+     return true;
+ }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
+index 15b7d81..57ea471 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
++++ b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.cpp
+@@ -1,11 +1,72 @@
+ #include "InfrastFacilityImageAnalyzer.h"
+ 
++#include <algorithm>
++#include <array>
++#include <cmath>
++
+ #include "MaaUtils/NoWarningCV.hpp"
+ 
+ #include "Config/TaskData.h"
++#include "Config/TemplResource.h"
+ #include "Utils/Logger.hpp"
+ #include "Vision/MultiMatcher.h"
+ 
++namespace
++{
++std::vector<double> template_scale_candidates(double hint)
++{
++    std::vector<double> candidates { 1.0 };
++    if (hint <= 0.0 || hint >= 0.995) {
++        return candidates;
++    }
++
++    for (const double multiplier : std::array { 0.99, 1.0, 1.01 }) {
++        const double candidate = std::clamp(hint * multiplier, 0.5, 1.0);
++        const bool duplicate = std::ranges::any_of(candidates, [candidate](double existing) {
++            return std::abs(existing - candidate) < 0.001;
++        });
++        if (!duplicate) {
++            candidates.emplace_back(candidate);
++        }
++    }
++    return candidates;
++}
++
++bool set_scaled_task(asst::MultiMatcher& matcher, const std::string& task_name, double scale)
++{
++    matcher.set_task_info(task_name);
++    if (std::abs(scale - 1.0) < 0.001) {
++        return true;
++    }
++
++    const auto task = asst::Task.get<asst::MatchTaskInfo>(task_name);
++    if (!task || task->templ_names.size() != 1) {
++        Log.warn(
++            "Cannot scale facility template",
++            task_name,
++            "template count",
++            task ? task->templ_names.size() : 0);
++        return false;
++    }
++
++    const cv::Mat& source = asst::TemplResource::get_instance().get_templ(task->templ_names.front());
++    if (source.empty()) {
++        return false;
++    }
++
++    cv::Mat resized;
++    cv::resize(
++        source,
++        resized,
++        cv::Size(),
++        scale,
++        scale,
++        scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC);
++    matcher.set_templ(std::move(resized));
++    return true;
++}
++} // namespace
++
+ bool asst::InfrastFacilityImageAnalyzer::analyze()
+ {
+     const static std::unordered_map<std::string, std::string> facility_task_name = {
+@@ -16,8 +77,10 @@ bool asst::InfrastFacilityImageAnalyzer::analyze()
+     // 因为基建的缩放是不确定的，有可能是正常大小，也可能是最小化的
+     // 所以对每种情况都进行一下识别，取其中得分最高的
+     const static std::vector<std::string> task_name_suffix = { "", "Mini" };
++    const std::vector<double> scales = template_scale_candidates(m_template_scale_hint);
+ 
+     int cor_suffix_index = -1;
++    m_result.clear();
+ 
+     for (const auto& key : m_to_be_analyzed) {
+         auto find_iter = facility_task_name.find(key);
+@@ -30,30 +93,42 @@ bool asst::InfrastFacilityImageAnalyzer::analyze()
+         // 已知基建缩放状态的时候，只识别这个缩放状态下的就行了
+         // 否则识别所有状态，直到找出正确的当前缩放状态
+         if (cor_suffix_index >= 0) {
+-            MultiMatcher mm_analyzer(m_image);
+-            mm_analyzer.set_task_info(task_name + task_name_suffix.at(cor_suffix_index));
+-            if (!mm_analyzer.analyze()) {
+-                continue;
+-            }
+-            cur_facility_result = mm_analyzer.get_result();
+-        }
+-        else {
+             double max_score = 0;
+-            for (size_t i = 0; i != task_name_suffix.size(); ++i) {
++            for (const double scale : scales) {
+                 MultiMatcher mm_analyzer(m_image);
+-                mm_analyzer.set_task_info(task_name + task_name_suffix.at(i));
+-                if (!mm_analyzer.analyze()) {
++                const std::string scaled_task_name = task_name + task_name_suffix.at(cor_suffix_index);
++                if (!set_scaled_task(mm_analyzer, scaled_task_name, scale) || !mm_analyzer.analyze()) {
+                     continue;
+                 }
+                 const auto& cur_res = mm_analyzer.get_result();
+-                auto cur_max_iter = std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
+-                if (cur_max_iter == cur_res.cend()) {
+-                    continue;
+-                }
+-                if (double cur_score = cur_max_iter->score; max_score < cur_score) {
+-                    max_score = cur_score;
++                const auto cur_max_iter =
++                    std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
++                if (cur_max_iter != cur_res.cend() && max_score < cur_max_iter->score) {
++                    max_score = cur_max_iter->score;
+                     cur_facility_result = cur_res;
+-                    cor_suffix_index = static_cast<int>(i);
++                }
++            }
++        }
++        else {
++            double max_score = 0;
++            for (size_t i = 0; i != task_name_suffix.size(); ++i) {
++                for (const double scale : scales) {
++                    MultiMatcher mm_analyzer(m_image);
++                    const std::string scaled_task_name = task_name + task_name_suffix.at(i);
++                    if (!set_scaled_task(mm_analyzer, scaled_task_name, scale) || !mm_analyzer.analyze()) {
++                        continue;
++                    }
++                    const auto& cur_res = mm_analyzer.get_result();
++                    const auto cur_max_iter =
++                        std::ranges::max_element(cur_res, std::less {}, std::mem_fn(&MatchRect::score));
++                    if (cur_max_iter == cur_res.cend()) {
++                        continue;
++                    }
++                    if (const double cur_score = cur_max_iter->score; max_score < cur_score) {
++                        max_score = cur_score;
++                        cur_facility_result = cur_res;
++                        cor_suffix_index = static_cast<int>(i);
++                    }
+                 }
+             }
+         }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
+index ed5a200..2e9daf8 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
++++ b/src/MaaCore/Vision/Infrast/InfrastFacilityImageAnalyzer.h
+@@ -13,6 +13,7 @@ public:
+     bool analyze();
+ 
+     void set_to_be_analyzed(std::vector<std::string> facilities) noexcept { m_to_be_analyzed = std::move(facilities); }
++    void set_template_scale_hint(double scale) noexcept { m_template_scale_hint = scale; }
+ 
+     size_t get_quantity(const std::string& name) const
+     {
+@@ -49,5 +50,6 @@ private:
+     std::unordered_map<std::string, std::vector<MatchRect>> m_result;
+     // 需要识别的设施名
+     std::vector<std::string> m_to_be_analyzed;
++    double m_template_scale_hint = 1.0;
+ };
+ }
+diff --git a/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp b/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
+index 3daf26a..ec46ee6 100644
+--- a/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
++++ b/src/MaaCore/Vision/Infrast/InfrastOperImageAnalyzer.cpp
+@@ -356,18 +356,45 @@ void asst::InfrastOperImageAnalyzer::selected_analyze()
+         return;
+     }
+     const auto& color_scale = std::get<MatchTaskInfo::ColorRange>(selected_task_ptr->color_scales.front());
++    const int horizontal_search_distance =
++        selected_task_ptr->special_params.size() > 1 ? selected_task_ptr->special_params[1] : 0;
++    const cv::Scalar lower(
++        color_scale.first[0],
++        color_scale.first[1],
++        color_scale.first[2]);
++    const cv::Scalar upper(
++        color_scale.second[0],
++        color_scale.second[1],
++        color_scale.second[2]);
+ 
+     for (auto&& oper : m_result) {
+         Rect selected_rect = oper.smiley.rect.move(selected_move);
+-        cv::Mat roi = m_image(make_rect<cv::Rect>(selected_rect));
++        int max_count = 0;
++        int best_shift = 0;
++        // Search only towards the card interior. Searching left can reach the
++        // right border of a selected card in the preceding column and mark the
++        // current, unselected operator as selected as well.
++        for (int shift = 0; shift <= horizontal_search_distance; ++shift) {
++            Rect candidate = selected_rect;
++            candidate.x += shift;
++            if (candidate.x < 0 || candidate.y < 0 || candidate.x + candidate.width > m_image.cols ||
++                candidate.y + candidate.height > m_image.rows) {
++                continue;
++            }
+ 
+-        cv::Mat hsv, bin;
+-        cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+-        cv::inRange(hsv, color_scale.first, color_scale.second, bin);
+-        int count = cv::countNonZero(bin);
++            const cv::Mat roi = m_image(make_rect<cv::Rect>(candidate));
++            cv::Mat hsv, bin;
++            cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
++            cv::inRange(hsv, lower, upper, bin);
++            const int count = cv::countNonZero(bin);
++            if (count > max_count) {
++                max_count = count;
++                best_shift = shift;
++            }
++        }
+ 
+-        Log.trace("selected_analyze |", count);
+-        oper.selected = count >= selected_task_ptr->special_params.front();
++        Log.trace("selected_analyze |", max_count, "shift", best_shift);
++        oper.selected = max_count >= selected_task_ptr->special_params.front();
+         oper.rect = selected_rect.move(oper_move);
+     }
+ }
+diff --git a/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp b/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp
+index e710bb4..833fbee 100644
+--- a/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp
++++ b/src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp
+@@ -259,8 +259,14 @@ size_t asst::DepotImageAnalyzer::match_item(
+     }
+ 
+     // 用颜色过滤得到候选模板 ID，传入缓存的模板均值和阈值
+-    const auto candidates =
+-        filter_candidates_by_color(m_image_resized(make_rect<cv::Rect>(roi)), m_template_mean_colors);
++    // The LMD icon on the physical device has a center-color squared difference
++    // around 441 after viewport resizing. Keep the stricter material threshold,
++    // but allow the small known shift for the five explicitly requested basics.
++    const double color_diff_threshold = m_is_basic ? 500.0 : 400.0;
++    const auto candidates = filter_candidates_by_color(
++        m_image_resized(make_rect<cv::Rect>(roi)),
++        m_template_mean_colors,
++        color_diff_threshold);
+     Log.info("Candidate templates count:", candidates.size());
+ 
+     Matcher analyzer(m_image_resized);
+diff --git a/src/MaaWpfGui/Main/AsstProxy.cs b/src/MaaWpfGui/Main/AsstProxy.cs
+index 7a57bb0..160f55a 100644
+--- a/src/MaaWpfGui/Main/AsstProxy.cs
++++ b/src/MaaWpfGui/Main/AsstProxy.cs
+@@ -3283,4 +3283,9 @@ public enum InstanceOptionKey
+     /// Indicates the client type (game channel) used for resolving PackageName on connect.
+     /// </summary>
+     ClientType = 6,
++
++    /// <summary>
++    /// Indicates the game-content viewport in physical display coordinates.
++    /// </summary>
++    Viewport = 7,
+ }
+diff --git a/unit_test/CMakeLists.txt b/unit_test/CMakeLists.txt
+index e111eae..87e2410 100644
+--- a/unit_test/CMakeLists.txt
++++ b/unit_test/CMakeLists.txt
+@@ -34,4 +34,22 @@ target_compile_features(maa-algorithm-test PRIVATE cxx_std_20)
+ target_link_libraries(maa-algorithm-test PRIVATE Catch2::Catch2WithMain)
+ target_include_directories(maa-algorithm-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/MaaCore)
+ 
+-catch_discover_tests(maa-algorithm-test TEST_PREFIX "algorithm::")
+\ No newline at end of file
++catch_discover_tests(maa-algorithm-test TEST_PREFIX "algorithm::")
++
++add_executable(maa-viewport-transform-test
++    MaaCore/ViewportTransformTest.cpp
++    ../src/MaaCore/Controller/ViewportTransform.cpp
++)
++
++target_compile_features(maa-viewport-transform-test PRIVATE cxx_std_20)
++target_link_libraries(maa-viewport-transform-test PRIVATE Catch2::Catch2WithMain)
++target_include_directories(maa-viewport-transform-test PRIVATE
++    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MaaCore
++    ${CMAKE_CURRENT_SOURCE_DIR}/../src/MaaUtils/include
++    ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/include
++)
++if(MSVC)
++    target_compile_options(maa-viewport-transform-test PRIVATE /utf-8)
++endif()
++
++catch_discover_tests(maa-viewport-transform-test TEST_PREFIX "viewport::")
+diff --git a/unit_test/MaaCore/ViewportTransformTest.cpp b/unit_test/MaaCore/ViewportTransformTest.cpp
+new file mode 100644
+index 0000000..e2ec1a2
+--- /dev/null
++++ b/unit_test/MaaCore/ViewportTransformTest.cpp
+@@ -0,0 +1,133 @@
++#include <catch2/catch_test_macros.hpp>
++
++#include <cmath>
++#include <stdexcept>
++
++#include "Controller/ViewportTransform.h"
++
++TEST_CASE("Viewport transform is identity at the canonical resolution")
++{
++    const asst::ViewportTransform transform({ 1280, 720 });
++
++    REQUIRE(transform.logical_size() == std::pair { 1280, 720 });
++    REQUIRE(transform.display_size() == std::pair { 1280, 720 });
++    REQUIRE(transform.viewport() == asst::Rect { 0, 0, 1280, 720 });
++    REQUIRE(transform.logical_to_display({ 321, 654 }) == asst::Point { 321, 654 });
++    REQUIRE(transform.display_to_logical({ 321, 654 }) == asst::Point { 321, 654 });
++}
++
++TEST_CASE("Viewport transform scales a 16 by 9 display uniformly")
++{
++    const asst::ViewportTransform transform({ 1920, 1080 });
++
++    REQUIRE(transform.viewport() == asst::Rect { 0, 0, 1920, 1080 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 960, 540 });
++    REQUIRE(transform.display_to_logical({ 960, 540 }) == asst::Point { 640, 360 });
++}
++
++TEST_CASE("Viewport transform centers a canonical viewport on an ultrawide phone")
++{
++    const asst::ViewportTransform transform({ 2800, 1260 });
++
++    REQUIRE(transform.viewport() == asst::Rect { 280, 0, 2240, 1260 });
++    REQUIRE(transform.logical_to_display({ 0, 0 }) == asst::Point { 280, 0 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 1400, 630 });
++}
++
++TEST_CASE("Viewport transform supports asymmetric custom content bounds")
++{
++    const asst::Rect viewport { 300, 20, 2160, 1215 };
++    const asst::ViewportTransform transform({ 2800, 1260 }, viewport);
++
++    REQUIRE(transform.viewport() == viewport);
++    REQUIRE(transform.logical_to_display({ 0, 0 }) == asst::Point { 300, 20 });
++
++    const asst::Point logical { 923, 517 };
++    const asst::Point round_trip = transform.display_to_logical(transform.logical_to_display(logical));
++    REQUIRE(std::abs(round_trip.x - logical.x) <= 1);
++    REQUIRE(std::abs(round_trip.y - logical.y) <= 1);
++}
++
++TEST_CASE("Hybrid edge transform keeps edge UI and center content in their native scale")
++{
++    const asst::ViewportTransform transform({ 2800, 1260 }, std::nullopt, true);
++
++    REQUIRE(transform.uses_hybrid_edges());
++    REQUIRE(transform.logical_to_display({ 200, 360 }) == asst::Point { 350, 630 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 1400, 630 });
++    REQUIRE(transform.logical_to_display({ 1080, 360 }) == asst::Point { 2450, 630 });
++}
++
++TEST_CASE("Adaptive viewport switches between left center and right canonical crops")
++{
++    asst::ViewportTransform transform({ 2800, 1260 }, std::nullopt, false, true);
++
++    REQUIRE(transform.uses_adaptive_viewport());
++    REQUIRE(transform.viewport_alignment() == asst::ViewportAlignment::Center);
++    REQUIRE(transform.active_viewport() == asst::Rect { 280, 0, 2240, 1260 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 1400, 630 });
++
++    REQUIRE(transform.set_viewport_alignment(asst::ViewportAlignment::Left));
++    REQUIRE(transform.active_viewport() == asst::Rect { 0, 0, 2240, 1260 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 1120, 630 });
++    REQUIRE(transform.display_to_logical({ 1120, 630 }) == asst::Point { 640, 360 });
++
++    REQUIRE(transform.set_viewport_alignment(asst::ViewportAlignment::Right));
++    REQUIRE(transform.active_viewport() == asst::Rect { 560, 0, 2240, 1260 });
++    REQUIRE(transform.logical_to_display({ 640, 360 }) == asst::Point { 1680, 630 });
++    REQUIRE(transform.display_to_logical({ 1680, 630 }) == asst::Point { 640, 360 });
++}
++
++TEST_CASE("Adaptive viewport points can be normalized to the battlefield viewport")
++{
++    asst::ViewportTransform transform({ 2800, 1260 }, std::nullopt, false, true);
++
++    const asst::Point right_point { 1146, 658 };
++    const asst::Point center_point = transform.convert_viewport_point(
++        right_point,
++        asst::ViewportAlignment::Right,
++        asst::ViewportAlignment::Center);
++
++    REQUIRE(center_point == asst::Point { 1306, 658 });
++
++    transform.set_viewport_alignment(asst::ViewportAlignment::Right);
++    const asst::Point display_from_right = transform.logical_to_display(right_point);
++    transform.set_viewport_alignment(asst::ViewportAlignment::Center);
++    REQUIRE(transform.logical_to_display(center_point) == display_from_right);
++    REQUIRE(transform.convert_viewport_point(
++                center_point,
++                asst::ViewportAlignment::Center,
++                asst::ViewportAlignment::Right) == right_point);
++}
++
++TEST_CASE("High resolution swipe fix preserves the unscaled logical delta")
++{
++    const asst::ViewportTransform transform({ 1920, 1080 });
++
++    const auto [normal_start, normal_end] =
++        transform.logical_swipe_to_display({ 100, 200 }, { 500, 350 }, false);
++    REQUIRE(normal_start == asst::Point { 150, 300 });
++    REQUIRE(normal_end == asst::Point { 750, 525 });
++
++    const auto [fixed_start, fixed_end] =
++        transform.logical_swipe_to_display({ 100, 200 }, { 500, 350 }, true);
++    REQUIRE(fixed_start == asst::Point { 150, 300 });
++    REQUIRE(fixed_end == asst::Point { 550, 450 });
++}
++
++TEST_CASE("Hard-coded edge actions choose their matching adaptive viewport")
++{
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(0) == asst::ViewportAlignment::Left);
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(399) == asst::ViewportAlignment::Left);
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(400) == asst::ViewportAlignment::Center);
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(879) == asst::ViewportAlignment::Center);
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(880) == asst::ViewportAlignment::Right);
++    REQUIRE(asst::ViewportTransform::preferred_alignment_for_logical_x(1279) == asst::ViewportAlignment::Right);
++}
++
++TEST_CASE("Viewport transform rejects bounds outside the display")
++{
++    REQUIRE_THROWS_AS((asst::ViewportTransform({ 2800, 1260 }, asst::Rect { 700, 0, 2240, 1260 })),
++                      std::invalid_argument);
++    REQUIRE_THROWS_AS((asst::ViewportTransform({ 0, 1260 })), std::invalid_argument);
++}

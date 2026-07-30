@@ -1,0 +1,447 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-30T18:43:30.141855+08:00",
+  "issues": [
+    {
+      "id": "MAAEND-VIEW-001",
+      "fingerprint": "maaend:portrait-launch-viewport-gate:v1",
+      "title": "ADB 竖屏连接阶段会被 1280×720 精确分辨率门禁提前终止",
+      "area": "viewport-gate",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-27T00:00:00+08:00",
+      "last_seen": "2026-07-27T20:40:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "1260×2800 真机在 AndroidOpenGame 启动游戏前仍为竖屏，原门禁要求控制器立即等于 1280×720"
+      ],
+      "observations": [
+        {
+          "source": "MaaEnd v2.20.0 aspectratio checker",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-27T20:40:00+08:00"
+        }
+      ],
+      "fix": "只允许经运行时验证的 AndroidOpenGame→渠道 StartApp→OpenGame 无坐标链进入 20 秒竖屏过渡，并在任何识别或坐标动作前等待 adaptive viewport active。",
+      "regression": [
+        "go test ./taskersink/aspectratio",
+        "tools/maaend-iteration.py source-audit"
+      ]
+    },
+    {
+      "id": "MAAEND-CAP-001",
+      "fingerprint": "maaend:screencap-single-backend-runtime-failure:v1",
+      "title": "初始化选中的 RawWithGzip 运行时失败后没有截图后端故障转移",
+      "area": "screencap",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-27T00:00:00+08:00",
+      "last_seen": "2026-07-27T20:40:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "真机截图方法测速成功后偶发失败，旧 ScreencapAgent 已丢弃其它已初始化后端"
+      ],
+      "observations": [
+        {
+          "source": "MaaFramework v5.12.1 ScreencapAgent",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-27T20:40:00+08:00"
+        }
+      ],
+      "fix": "保留并排序所有初始化成功的后端，运行时立即故障转移，成功者成为 active；失败候选按 1/2/4/8/16/32 帧退避。",
+      "regression": [
+        "ctest -R screencap::failover",
+        "tools/maaend-iteration.py source-audit"
+      ]
+    },
+    {
+      "id": "MAAEND-ENV-001",
+      "fingerprint": "maaend:device-asleep-before-preflight:v1",
+      "title": "试跑等待期间手机自动熄屏并进入系统锁屏",
+      "area": "environment",
+      "status": "mitigated",
+      "severity": "medium",
+      "first_seen": "2026-07-27T20:28:00+08:00",
+      "last_seen": "2026-07-28T17:01:53+08:00",
+      "occurrences": 3,
+      "symptoms": [
+        "预检读取 mWakefulness=Asleep 并按安全门禁拒绝启动",
+        "设备没有密码或其它安全锁，不能把普通 Keyguard 一概当作人工阻塞"
+      ],
+      "observations": [
+        {
+          "source": "debug/maaend-viewport-trial preflight",
+          "occurrence_count": 3,
+          "last_seen": "2026-07-28T17:01:53+08:00"
+        }
+      ],
+      "fix": "读取 showing/secure；仅对 secure=false 的普通熄屏或滑动锁屏自动发送 KEYCODE_WAKEUP、wm dismiss-keyguard，必要时按实际 display 尺寸上滑。secure=true 或状态未知继续 fail-closed，且不调用 wm size。",
+      "regression": [
+        "non-secure Keyguard is dismissed before MaaEnd preflight",
+        "secure or unknown Keyguard remains fail-closed",
+        "display resolution is never changed"
+      ]
+    },
+    {
+      "id": "MAAEND-TOOL-001",
+      "fingerprint": "maaend:trial-console-gbk-emoji:v1",
+      "title": "试跑器完整 snapshot 在 Windows GBK 控制台打印失败",
+      "area": "trial-runner",
+      "status": "fixed",
+      "severity": "low",
+      "first_seen": "2026-07-27T20:48:00+08:00",
+      "last_seen": "2026-07-27T20:49:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游任务目录中的 emoji 触发 UnicodeEncodeError，掩盖了预期的锁屏退出码"
+      ],
+      "observations": [
+        {
+          "source": "debug/maaend-open-game-locked-20260727/result.json",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-27T20:49:00+08:00"
+        }
+      ],
+      "fix": "控制台显式使用 UTF-8 并只打印精简终态；完整 snapshot 继续原子写入 result.json。",
+      "regression": [
+        "locked-device trial returns exit code 2 after writing result.json"
+      ]
+    },
+    {
+      "id": "MAAEND-CPP-001",
+      "fingerprint": "maaend:viewport-test-json-as-int64:v1",
+      "title": "viewport 序列化测试调用了不存在的 Maa JSON as_int64 API",
+      "area": "offline-tests",
+      "status": "fixed",
+      "severity": "low",
+      "first_seen": "2026-07-28T13:40:00+08:00",
+      "last_seen": "2026-07-28T13:45:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "MaaFramework viewport 测试无法编译，RecoResult frame_id 断言误用 as_int64()"
+      ],
+      "observations": [
+        {
+          "source": "MaaFramework test/viewport/main.cpp",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T13:45:00+08:00"
+        }
+      ],
+      "fix": "按 Maa JSON API 改用 as_integer()；不改变生产序列化格式。",
+      "regression": [
+        "ctest -R viewport::transform",
+        "ctest -R viewport::controller"
+      ]
+    },
+    {
+      "id": "MAAEND-GO-001",
+      "fingerprint": "maaend:captureuid-dynamic-format-go-vet:v1",
+      "title": "CaptureUid 动态格式错误包装无法通过 Go vet",
+      "area": "go-agent-build",
+      "status": "fixed",
+      "severity": "medium",
+      "first_seen": "2026-07-28T13:45:00+08:00",
+      "last_seen": "2026-07-28T13:55:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "全量 go test ./... 在 captureuid 的四个动态 %w 调用处被 vet 拒绝"
+      ],
+      "observations": [
+        {
+          "source": "MaaEnd agent/go-service/captureuid/capture.go",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T13:55:00+08:00"
+        }
+      ],
+      "fix": "四处动态错误格式从 %w 改为 %v，保留原有错误文本和 fail-closed 返回；构建恢复普通 go test ./...。",
+      "regression": [
+        "go test ./...",
+        "tools/build-maaend-viewport.ps1"
+      ]
+    },
+    {
+      "id": "MAAEND-UPD-001",
+      "fingerprint": "maaend:auto-update-runtime-drift:v1",
+      "title": "MXU 自动更新在任务运行中覆盖固定版本并重启宿主",
+      "area": "runtime-integrity",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-28T15:15:59+08:00",
+      "last_seen": "2026-07-28T15:16:02+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "AndroidOpenGame 已提交后 MaaEnd API 父进程以退出码 0 结束，同路径子进程改用新端口且实例为空",
+        "interface.json、MaaEnd.exe、Framework DLL 和 Agent 在 15:15:59 至 15:16:00 被 v2.21.0 覆盖"
+      ],
+      "observations": [
+        {
+          "source": "debug/maaend-live-20260728/03-android-open-game-time-window",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T15:16:02+08:00"
+        }
+      ],
+      "fix": "已隔离 v2.21 资源树和 WebView 更新状态并从固定 staging 恢复 v2.20.0；受管 interface.json 清空 mirrorchyan_rid，部署和回滚纳入第十个哈希文件；运行时冻结 MaaEnd.exe、interface、六个 DLL、两个 Agent 和资源树，周期检查并在终态全量重哈希。",
+      "regression": [
+        "validate_maaend_runtime rejects a non-empty mirrorchyan_rid",
+        "restore-maaend-runtime.ps1 quarantines the old tree and WebView cache before a verified restore",
+        "deploy-maaend-viewport.ps1 backs up and verifies interface.json",
+        "runtime integrity watchdog emits maaend_runtime_drift and stops on binary or resource drift",
+        "terminal integrity verification rehashes the complete resource tree without metadata cache",
+        "AndroidOpenGame must complete without an API PID/port handoff"
+      ]
+    },
+    {
+      "id": "MAAEND-LAUNCH-001",
+      "fingerprint": "maaend:android-open-game-returns-before-in-world:v1",
+      "title": "AndroidOpenGame 在游戏加载完成前返回 succeeded",
+      "area": "business-terminal",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-28T17:02:00+08:00",
+      "last_seen": "2026-07-28T17:03:30+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "AndroidOpenGame 已 succeeded 并激活 1280×720 viewport，但后续 PullCountCalculator 在加载画面尚未结束时立即开始"
+      ],
+      "observations": [
+        {
+          "source": "debug/maaend-open-pull-count-20260728-170153/result.json",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T17:03:30+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "AndroidOpenGame must be followed by labeled InWorld or equivalent actionable-scene evidence",
+        "a loading frame must not release the next business task"
+      ]
+    },
+    {
+      "id": "MAAEND-PULL-001",
+      "fingerprint": "maaend:pull-count-missing-recruitment-screen-gate:v1",
+      "title": "PullCountCalculator 缺少寻访页面门禁并在无关画面误识别资源",
+      "area": "pipeline-precondition",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-28T17:02:00+08:00",
+      "last_seen": "2026-07-28T17:03:30+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游 PullCountCalculatorMain 使用无条件 DirectHit，并隐含要求用户先手动进入目标寻访页面",
+        "PullCountCalculatorOriginiumOCR 在加载页或大世界 HUD 上误识别数字 6，随后 Oroberyl OCR 失败"
+      ],
+      "observations": [
+        {
+          "source": "debug/maaend-open-pull-count-20260728-170153/open-source-automation/maaend/runs/20260728-170158-411500/incidents/maa-maaend_task_failed-0b4b701d5a9fc01f",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T17:03:30+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "starting from InWorld must fail before PullCountCalculatorAction init and before recording any resource",
+        "the positive path must identify the recruitment screen before OCR",
+        "PullCountCalculatorFinish must correlate with the same Maa task id"
+      ]
+    },
+    {
+      "id": "MAAEND-PROBE-001",
+      "fingerprint": "maaend:internal-probes-physical-device-unverified:v1",
+      "title": "Scene、CaptureUid 和 ViewportInput Probe 尚无真机证据",
+      "area": "probe-verification",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-28T14:00:00+08:00",
+      "last_seen": "2026-07-28T14:25:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "三个内部 Probe 已有风险门禁、结构化证据和离线自然终点测试，但尚未在当前真机执行"
+      ],
+      "observations": [
+        {
+          "source": "codex/open-source-automation-draft offline probe verification",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-28T14:25:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "SceneProbe must end without coordinate input and report labeled InWorld recognition",
+        "CaptureUidProbe must report only hashed UID evidence with Left alignment",
+        "ViewportInputProbe must report reversible Left/Right contacts and no active touch"
+      ]
+    },
+    {
+      "id": "MAAEND-E2E-001",
+      "fingerprint": "maaend:end-to-end-physical-device-unverified:v1",
+      "title": "终末地完整真机自动化流程尚未端到端验收",
+      "area": "verification",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-27T00:00:00+08:00",
+      "last_seen": "2026-07-30T18:40:00+08:00",
+      "occurrences": 5,
+      "symptoms": [
+        "底层 alignment、Agent session、风险清单、Probe、watchdog 和可回滚构建已完成离线验证",
+        "AndroidOpenGame、DailyRewards、DijiangRewards、VisitFriends、ReceiveProdManual、SellProduct、DeliveryJobs、AutoStockStaple 和 CreditShoppingN2 已分别达到真机自然终点",
+        "AutoCollect、EnvironmentMonitoring 及 12 项 DailyFull 组合尚未取得完整自然终点证据",
+        "ProtocolSpace 已在真机手工触控闭环中完成一次战斗，但尚未由 headless Pipeline 自主完成入场、战斗、领奖、体力扣除和活跃度核验"
+      ],
+      "observations": [
+        {
+          "source": "codex/open-source-automation-draft verification gate",
+          "occurrence_count": 5,
+          "last_seen": "2026-07-30T18:40:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "tools/maaend-viewport-trial.py must return successful=true",
+        "A complete guarded physical-device task must reach its natural terminal state"
+      ]
+    },
+    {
+      "id": "MAAEND-GO-002",
+      "fingerprint": "maaend:maptracker-big-map-stale-adaptive-alignment:v1",
+      "title": "Go 地图追踪在异形屏上使用错误 viewport 导致大地图坐标错位",
+      "area": "go-agent-viewport",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-30T02:18:28+08:00",
+      "last_seen": "2026-07-30T02:21:39+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "AutoCollect 已通过 Backpack 前置门禁，但大地图识别与 pick/find/zoom 没有固定 Center，点击和拖动会继承先前 Left/Right alignment",
+        "画面识别本身可成功，映射后的物理坐标却落在错误地图位置，无法继续导航"
+      ],
+      "observations": [
+        {
+          "source": "profiler-runs/maaend-headless/auto-collect-route1-backpack-single-20260730",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T02:21:39+08:00"
+        }
+      ],
+      "fix": "新增 NewControlAdaptorPinned，并将 MapTracker 大地图截图、识别、pick、find 和 zoom 全部固定到 Center；左摇杆继续固定 Left，右相机继续固定 Right。Go 全量测试通过且新二进制已哈希部署，仍需恢复 ADB 后完成 AutoCollect 真机回归。",
+      "regression": [
+        "go test ./...",
+        "AutoCollect big-map actions must report center alignment",
+        "AutoCollect movement must report left joystick and right camera alignment",
+        "AutoCollect must reach AutoCollectEnd with no active contacts"
+      ]
+    },
+    {
+      "id": "MAAEND-HOST-001",
+      "fingerprint": "maaend:headless-stop-file-terminal-race:v1",
+      "title": "headless stop-file 竞争会把被中止任务误记为 Framework succeeded",
+      "area": "headless-business-terminal",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-30T02:03:07+08:00",
+      "last_seen": "2026-07-30T02:06:47+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "EnvironmentMonitoring 尚在任务循环时收到 stop.requested，MaaTaskerPostStop 促使 Tasker.Task.Succeeded 回调出现",
+        "旧 host 会把队列终态直接当作业务完成，虽然事件中从未出现 EnvironmentMonitoringFinish"
+      ],
+      "observations": [
+        {
+          "source": "profiler-runs/maaend-headless/environment-monitoring-rpc-safe-20260730-0205",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T02:06:47+08:00"
+        }
+      ],
+      "fix": "_wait_job 在 stop-file 竞争时只给终态回调 0.5 秒宽限，并对 DailyFull 每一项独立要求明确 Pipeline 自然终点；Framework succeeded 但缺少终点节点时强制失败。",
+      "regression": [
+        "test_wait_job_prefers_terminal_state_during_stop_race",
+        "test_daily_task_terminal_rejects_framework_only_success",
+        "EnvironmentMonitoring must reach EnvironmentMonitoringFinish"
+      ]
+    },
+    {
+      "id": "MAAEND-USB-001",
+      "fingerprint": "maaend:physical-device-usb-midi-without-adb-interface:v1",
+      "title": "真机 USB 用途切到 MIDI 后不再枚举 ADB 接口",
+      "area": "device-transport",
+      "status": "open",
+      "severity": "medium",
+      "first_seen": "2026-07-30T02:32:43+08:00",
+      "last_seen": "2026-07-30T03:00:02+08:00",
+      "occurrences": 2,
+      "symptoms": [
+        "Windows 只能看到 vivo X200s 的 USB Composite Device VID_0E8D:PID_2046 与单一 MIDI function 子接口",
+        "adb devices 为空；不存在可通过驱动重绑恢复的 ADB 子接口，旧无线 ADB 地址和 mDNS 服务也不可达"
+      ],
+      "observations": [
+        {
+          "source": "Windows PnP and adb preflight 2026-07-30",
+          "occurrence_count": 2,
+          "last_seen": "2026-07-30T03:00:02+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "preflight must distinguish missing USB ADB interface from a driver-binding failure",
+        "the operator recovery instruction must request File Transfer or Android Auto without changing display resolution",
+        "ro.serialno must match the expected device identity in the managed run manifest before resuming automation"
+      ]
+    },
+    {
+      "id": "MAAEND-PROTOCOL-001",
+      "fingerprint": "maaend:protocol-space-desktop-character-controller-on-adb:v1",
+      "title": "协议空间寻点流程仍使用桌面角色控制语义，ADB 无法自主进入战斗",
+      "area": "protocol-space-navigation",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-30T17:54:00+08:00",
+      "last_seen": "2026-07-30T18:25:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游 ProtocolSpaceEnterSpaceMove1..8 调用 CharacterControllerForwardAxisAction，后续找点依赖桌面相对鼠标与键盘移动；ADB 路径没有对应的 Left 摇杆和 Right 相机动作",
+        "真机可用上游 ProtocolSpace/best.onnx 稳定识别 class 1 光点；Right 相机对齐后，以 Left 摇杆 200 ms 步进靠近，在第 9 至 10 步出现“触碰”交互条",
+        "持续移动会越过光点并丢失交互提示，因此动作终点必须以提示出现为准，不能只依赖固定时长或检测框距离"
+      ],
+      "observations": [
+        {
+          "source": ".codex-research/captures/protocol-point-found.png and protocol-approach9.png",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T18:25:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "ProtocolSpace entry must use Right camera and Left joystick viewport-labelled touch actions on ADB",
+        "the point-search loop must stop on the mobile Touch prompt before advancing another movement step",
+        "the headless Pipeline must reach ProtocolSpaceFightStartSuccess without raw ADB input outside the wrapper"
+      ]
+    },
+    {
+      "id": "MAAEND-FIGHT-001",
+      "fingerprint": "maaend:autofight-desktop-keymap-on-adb:v1",
+      "title": "AutoFight 仍绑定桌面键鼠，手机战斗缺少可审计的触控动作与终点",
+      "area": "autofight-adb",
+      "status": "open",
+      "severity": "high",
+      "first_seen": "2026-07-30T18:25:00+08:00",
+      "last_seen": "2026-07-30T18:40:00+08:00",
+      "occurrences": 1,
+      "symptoms": [
+        "上游 AutoFight 的锁定、普攻、技能、切人、闪避和追敌动作仍落到桌面 KeyDown、KeyUp、Click 与 RelativeMove",
+        "真机 HUD 上用锁定、普攻、两个可用技能和闪避的触控循环可在本轮击败 4 名敌人并进入奖励组选择页，证明战斗可行，但该序列尚未进入 Agent wrapper，也没有技能就绪识别和低血量策略",
+        "本轮未完成奖励领取、体力扣除与活跃度回读，因此不能把战斗胜利或奖励组弹窗记为完整 ProtocolSpace 自然终点"
+      ],
+      "observations": [
+        {
+          "source": ".codex-research/captures/protocol-battle-start.png and protocol-converge.png",
+          "occurrence_count": 1,
+          "last_seen": "2026-07-30T18:40:00+08:00"
+        }
+      ],
+      "fix": null,
+      "regression": [
+        "ADB AutoFight actions must be emitted by a Right-viewport touch wrapper and must not use the desktop keymap",
+        "battle watchdog must sample the timer and objective progress while preserving time for input",
+        "ProtocolSpace terminal success requires battle victory, reward claim confirmation, stamina delta and released contacts"
+      ]
+    }
+  ]
+}

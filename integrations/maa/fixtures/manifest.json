@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "logical_image_size": [
+    1280,
+    720
+  ],
+  "description": "经人工脱敏并确认后，从 incident bundle 提升为离线识别回归样本。",
+  "fixtures": []
+}

@@ -54,6 +54,10 @@ is easier to audit after a one-hour robotic workflow:
   selected multimodal endpoint, translates its native tool/function response
   into one `phone_action`, executes a validated ADB action, and advances tasks
   under per-task step, timeout, and failure policies.
+- An optional **Open Source Automation** dashboard view for deterministic visual
+  verification. It reports the image-runtime/disk cost, renders a typed screen
+  graph, runs an OpenCV synthetic benchmark, and exposes frame/template/overlay
+  evidence without loading a model or accepting executable workflow strings.
 - Offline alignment of arbitrary timestamped logs through JSON regex rules.
 - Measured energy by foreground app, imported phase/state, per-test item, and
   five-minute window. Each test item includes average/P95/peak power, CPU/GPU,
@@ -95,15 +99,27 @@ Do not copy `.venv` to another computer; Windows virtual environments are not
 reliably relocatable. Build a self-contained Embedded Python bundle instead:
 
 ```powershell
-.\build-portable.bat
-# or
-powershell -ExecutionPolicy Bypass -File .\tools\build-portable.ps1
+# Full edition: all Mobile Profiler features, including Open Source Automation
+.\build-portable.bat -Edition Full
+
+# Standard edition: profiling and AI automation, without Open Source Automation
+.\build-portable.bat -Edition Standard
 ```
 
-The output under `dist/` contains Python, the installed profiler package,
-launchers, documentation, and (when found) the required ADB Platform Tools
-files. HDC is not redistributed; install DevEco Studio or pass an existing
-`hdc.exe` path. On the target computer, extract the ZIP and run `start-ui.bat`.
+The default is `Full`. Outputs use edition-specific names under `dist/`, for
+example `mobile-profiler-v1.0.0-full-portable.zip` and
+`mobile-profiler-v1.0.0-standard-portable.zip`. Both editions contain Python,
+the installed profiler package, `uiautomator2`, launchers, documentation, and
+(when found) the required ADB Platform Tools files. `Full` also contains NumPy,
+OpenCV, and the Open Source Automation adapters. `Standard` removes those
+adapters and hides/rejects their UI and API routes.
+
+Third-party game runtimes are not redistributed in either edition. Configure
+separately obtained MAA, StarRailCopilot, and MaaEnd directories in the Full
+edition after launch. HDC is also not redistributed; install DevEco Studio or
+pass an existing `hdc.exe` path. On the target computer, extract the ZIP and
+run `start-ui.bat`. Every artifact includes `BUILD-MANIFEST.json` describing
+its edition, Python version, bundled extras, and ADB status.
 The current portable builder does not bundle `pymobiledevice3`; point
 `--ios-python` at a separately prepared iOS runtime when iOS collection is
 needed.
@@ -112,13 +128,15 @@ After future source changes, run the full tests and rebuild the same bundle:
 
 ```powershell
 python -m unittest discover -s tests -v
-.\build-portable.bat
+.\build-portable.bat -Edition Full
+.\build-portable.bat -Edition Standard
 ```
 
-The **Tools & Delivery** UI view can invoke the same build script when the UI
-is running from a complete source checkout. Portable installations deliberately
-disable software rebuilding; use them for collection, import, recovery,
-archiving, and comparison, then return to the source computer for a new ZIP.
+The **Tools & Delivery** UI view can select either edition and invoke the same
+build script when the UI is running from a complete source checkout. Portable
+installations deliberately disable software rebuilding; use them for
+collection, import, recovery, archiving, and comparison, then return to the
+source computer for a new ZIP.
 
 ## Runtime UI
 
@@ -251,6 +269,82 @@ ports standard-library-only. The dashboard agent now consumes the optional
 deterministic verifiers, watchers, skills, and the scenario graph remain separate
 future integration points. See [`docs/automation-kernel.md`](docs/automation-kernel.md)
 for the mechanism mapping and safety boundary.
+
+### Open source automation hub
+
+The **Open Source Automation** view (`#opensource`) is a data-driven catalog for
+selecting one open-source project and its automation entry. MaaAssistantArknights
+is now the default and the first project marked end-to-end verified: the patched
+v6.14.2 MaaCore has completed physical-device `StartUp`, `Depot`, `OperBox`, the
+explicitly authorized `Award` path, and one guarded JieGarden roguelike run through
+natural settlement on a 2800×1260 phone. Its runtime panel performs a read-only
+adaptive viewport preflight before enabling Start, retains all evidence locally,
+and never persists Award consent. The core and release directories default from
+the current research checkout and Downloads folder, or can be supplied with
+`MOBILE_PROFILER_MAA_CORE_ROOT` and `MOBILE_PROFILER_MAA_RUNTIME_ROOT`.
+The smoke probe, feature runner, guarded roguelike runner, and default guard policy
+are packaged inside `mobile_profiler`; the scripts under `tools/` are compatibility
+entry points, so wheel and portable installs do not depend on a repository checkout.
+
+The Star Rail adapter now launches a separate
+[StarRailCopilot](https://github.com/LmeSzinc/StarRailCopilot) checkout instead of
+the former M7A/Auto_Simulated_Universe compatibility layer. It uses SRC's native
+ADB/scrcpy screenshot and MaaTouch/minitouch control stack, with a read-only host
+ADB preflight and no pyautogui/win32 emulation. The checkout defaults to
+`open-source-runtimes/StarRailCopilot` and can be supplied through
+`MOBILE_PROFILER_STAR_RAIL_COPILOT_ROOT`. Upstream SRC still rejects captures and
+devices outside `1280×720`; Mobile Profiler therefore requires the complete v2
+adaptive patch before enabling wider phones. That patch has completed World 8 and
+two-pass daily verification on one 2800×1260 Android device; unpatched or partial
+checkouts still report `unsupported_resolution`. Architecture and the phone-resolution
+work plan are documented in
+[`integrations/starrailcopilot/README.md`](integrations/starrailcopilot/README.md)
+and
+[`integrations/starrailcopilot/RESOLUTION-PLAN.md`](integrations/starrailcopilot/RESOLUTION-PLAN.md).
+
+The StarRailCopilot adapter defaults to the bounded daily queue. An explicit `rewards`
+workflow rechecks only Battle Pass, daily-training, support, code, and mail reward
+pages after another activity; it never dispatches a resource-consuming task. It does not create a
+model client or contact the AI-agent endpoint: recognition, OCR, scheduling, screenshots,
+and touch input all stay inside SRC's local runtime. Select `rogue` explicitly when a
+Simulated Universe run is intended. Preflight also verifies that the selected Python
+interpreter contains the SRC ADB/OCR stack before enabling a run.
+
+StarRailCopilot is now a single-reference-device verified adaptation. MaaEnd remains
+visible as a restructuring input, is explicitly marked **end-to-end unverified**, and
+cannot be preflighted or started from this page or through the controller API.
+Verification is fail-closed: an adapter is runnable only when it explicitly reports
+`end_to_end_verified=true`; a missing flag is treated as unverified. New adapters must
+adopt the contract proven by MAA and SRC: separate physical/viewport/logical
+coordinates, route every coordinate-bearing input through one transform, audit
+analyzers that bypass the common recognition path, guard destructive fallbacks before
+execution, and turn every failure into an environment/callback/screenshot incident
+plus a reproducible regression. The MAA
+patch, issue ledger, fixture promotion, source/resource/patch drift checks, and
+maintenance workflow are documented in
+[`integrations/maa/README.md`](integrations/maa/README.md) and
+[`integrations/maa/ITERATION-RUNBOOK.md`](integrations/maa/ITERATION-RUNBOOK.md).
+MaaEnd 的迁移实验现已具备独立的 MaaFramework viewport、截图后端故障转移、
+竖屏 `AndroidOpenGame` 门禁、可回滚十文件部署、自动更新恢复和运行时完整性锁，但
+完整真机流程仍未验收，
+因此继续保持不可运行状态。实现与当前证据见
+[`integrations/maaend/README.md`](integrations/maaend/README.md) 和
+[`integrations/maaend/ITERATION-RUNBOOK.md`](integrations/maaend/ITERATION-RUNBOOK.md)。
+
+The earlier deterministic visual spike is retained under the collapsed adapter
+diagnostics section. Install the optional image runtime only when using that
+diagnostic:
+
+```powershell
+python -m pip install -e ".[image]"
+mobile-profiler ui
+```
+
+The optional OpenCV/NumPy runtime adds a measured ~159.6 MiB; selecting and saving
+a project plan itself adds no heavyweight runtime. The diagnostic still exposes
+the typed graph, exact match coordinates, latency, PNG evidence, and adapter
+capability alignment. See
+[`docs/deterministic-visual-spike.md`](docs/deterministic-visual-spike.md).
 
 ### Two-stage Android endurance campaign
 

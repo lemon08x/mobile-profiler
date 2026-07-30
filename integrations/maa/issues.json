@@ -1,0 +1,691 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-27T19:25:00+08:00",
+  "issues": [
+    {
+      "id": "MAA-DEVICE-001",
+      "fingerprint": "connection:unsupported-resolution:not-16-by-9",
+      "title": "原版 MaaCore 拒绝连接非 16:9 真机",
+      "area": "controller",
+      "status": "fixed",
+      "severity": "blocker",
+      "first_seen": "2026-07-24",
+      "last_seen": "2026-07-24",
+      "symptoms": [
+        "2800×1260 真机在 ControlScaleProxy 构造阶段报告 UnsupportedResolution。"
+      ],
+      "root_cause": "原实现把整机 display 的宽高比直接当作游戏内容宽高比，并要求精确为 16:9。",
+      "fix": {
+        "summary": "新增 ViewportTransform，按物理 display 计算最大 16:9 内容视口。",
+        "files": [
+          "src/MaaCore/Controller/ViewportTransform.cpp",
+          "src/MaaCore/Controller/ControlScaleProxy.cpp"
+        ]
+      },
+      "regression": [
+        "Viewport transform centers a canonical viewport on an ultrawide phone"
+      ],
+      "evidence": [
+        "viewport unit tests",
+        "2800×1260 physical-device smoke"
+      ]
+    },
+    {
+      "id": "MAA-VIEWPORT-001",
+      "fingerprint": "viewport:center-crop:edge-ui-missing",
+      "title": "中央 16:9 裁剪会丢失物理屏幕两侧 UI",
+      "area": "viewport",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-24",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "加载页、公告、暂停、加速、部署栏或详情面板可能锚定物理边缘，中央截图看不到。"
+      ],
+      "root_cause": "游戏不同页面使用了内容安全区、物理左边缘和物理右边缘三套锚点。",
+      "fix": {
+        "summary": "提供 hybrid 和 adaptive；当前主路径使用 Left/Center/Right adaptive viewport。",
+        "files": [
+          "src/MaaCore/Controller/ViewportTransform.cpp",
+          "src/MaaCore/Controller/Controller.cpp",
+          "src/MaaCore/Task/ProcessTask.cpp"
+        ]
+      },
+      "regression": [
+        "Adaptive viewport switches between left center and right canonical crops",
+        "fixture manifest must record expected alignment"
+      ],
+      "evidence": [
+        "physical-device pages across roguelike-run-09..22"
+      ]
+    },
+    {
+      "id": "MAA-VIEWPORT-002",
+      "fingerprint": "viewport:full-display:template-horizontal-distortion",
+      "title": "把整块超宽屏缩放到 1280×720 会横向压缩模板",
+      "area": "viewport",
+      "status": "known_limit",
+      "severity": "high",
+      "first_seen": "2026-07-24",
+      "last_seen": "2026-07-24",
+      "symptoms": [
+        "两侧 UI 保留了，但 16:9 模板与游戏内容的几何比例不再一致。"
+      ],
+      "root_cause": "非等比整屏缩放改变了模板的横纵比。",
+      "fix": {
+        "summary": "保留自定义整屏 viewport 仅供诊断；生产路径使用等比 16:9 viewport。",
+        "files": [
+          "src/MaaCore/Controller/ViewportTransform.cpp"
+        ]
+      },
+      "regression": [
+        "custom viewport coordinate round trip"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "MAA-INPUT-001",
+      "fingerprint": "input:inject-input-event:bypassed-scale-proxy",
+      "title": "inject_input_event 与多点触控曾绕过坐标代理",
+      "area": "input",
+      "status": "fixed",
+      "severity": "blocker",
+      "first_seen": "2026-07-24",
+      "last_seen": "2026-07-24",
+      "symptoms": [
+        "click 和 swipe 正确时，多点触控 DOWN/MOVE 仍可能落到未变换的逻辑坐标。"
+      ],
+      "root_cause": "Controller::inject_input_event 直接调用底层 ControllerAPI。",
+      "fix": {
+        "summary": "统一经 ControlScaleProxy；只变换携带坐标的 TOUCH_DOWN/TOUCH_MOVE。",
+        "files": [
+          "src/MaaCore/Controller/Controller.cpp",
+          "src/MaaCore/Controller/ControlScaleProxy.cpp"
+        ]
+      },
+      "regression": [
+        "architecture invariant: all public coordinate input enters ControlScaleProxy"
+      ],
+      "evidence": [
+        "source call-chain audit"
+      ]
+    },
+    {
+      "id": "MAA-VIEWPORT-003",
+      "fingerprint": "viewport:recognition-action:alignment-mismatch",
+      "title": "识别视口与点击视口不一致会识别正确但点击错误",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "blocker",
+      "first_seen": "2026-07-25",
+      "last_seen": "2026-07-25",
+      "symptoms": [
+        "模板在 Left 或 Right 命中后，动作仍按 Center 映射。"
+      ],
+      "root_cause": "识别结果没有携带或恢复 viewport alignment。",
+      "fix": {
+        "summary": "ProcessTask 命中时保存对应 alignment，动作沿用同一 transform。",
+        "files": [
+          "src/MaaCore/Task/ProcessTask.cpp",
+          "src/MaaCore/Controller/Controller.cpp"
+        ]
+      },
+      "regression": [
+        "fixtures require expected task and expected alignment"
+      ],
+      "evidence": [
+        "physical-device click verification"
+      ]
+    },
+    {
+      "id": "MAA-VIEWPORT-004",
+      "fingerprint": "viewport:just-return:no-visual-alignment",
+      "title": "JustReturn 动作没有视觉证据可继承视口",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-25",
+      "last_seen": "2026-07-25",
+      "symptoms": [
+        "硬编码边缘点击或 swipe 会继承上一个页面的随机 alignment。"
+      ],
+      "root_cause": "JustReturn 不截图、不产生匹配矩形。",
+      "fix": {
+        "summary": "按动作逻辑 X 坐标推断 Left/Center/Right。",
+        "files": [
+          "src/MaaCore/Task/ProcessTask.cpp",
+          "src/MaaCore/Controller/ViewportTransform.cpp"
+        ]
+      },
+      "regression": [
+        "Hard-coded edge actions choose their matching adaptive viewport"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "MAA-BATTLE-001",
+      "fingerprint": "battle:direct-analyzer:adaptive-bypass",
+      "title": "战斗与编队插件直接取图，绕过通用 adaptive 识别",
+      "area": "battle",
+      "status": "mitigated",
+      "severity": "high",
+      "first_seen": "2026-07-25",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "战场、部署栏、干员详情、暂停按钮、编队与技能选择分别需要不同视口。"
+      ],
+      "root_cause": "这些 analyzer 不经过 ProcessTask::find_first。",
+      "fix": {
+        "summary": "战场固定 Center；详情用 Left；部署栏和右侧控制用 Right；结果归一化回战场坐标。",
+        "files": [
+          "src/MaaCore/Task/BattleHelper.cpp",
+          "src/MaaCore/Task/Roguelike/RoguelikeBattleTaskPlugin.cpp",
+          "src/MaaCore/Task/Roguelike/RoguelikeFormationTaskPlugin.cpp",
+          "src/MaaCore/Task/Roguelike/RoguelikeSkillSelectionTaskPlugin.cpp"
+        ]
+      },
+      "regression": [
+        "Adaptive viewport points can be normalized to the battlefield viewport",
+        "battle-page fixtures still required"
+      ],
+      "evidence": [
+        "roguelike-run-22 deployment, 2× speed and pause landed correctly"
+      ]
+    },
+    {
+      "id": "MAA-PERF-001",
+      "fingerprint": "recognition:adaptive:tasks-times-viewports",
+      "title": "adaptive 识别曾按任务数乘以视口数重复执行",
+      "area": "performance",
+      "status": "mitigated",
+      "severity": "medium",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "长任务列表在三个视口上产生大量重复模板/OCR 调用。"
+      ],
+      "root_cause": "为保持任务优先级，旧实现逐任务再逐视口分析。",
+      "fix": {
+        "summary": "每个视口只分析一次，再选三个首命中中任务优先级最高者；最多三次且语义等价。",
+        "files": [
+          "src/MaaCore/Task/ProcessTask.cpp"
+        ]
+      },
+      "regression": [
+        "next physical run must compare recognition latency and task sequence"
+      ],
+      "evidence": [
+        "source complexity audit"
+      ]
+    },
+    {
+      "id": "MAA-STATE-001",
+      "fingerprint": "jiegarden:continue:dead-end",
+      "title": "Continue 后原状态机无法重新回到地图识别链",
+      "area": "resource-state-machine",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "恢复探索后反复重试，最终走向退出兜底。"
+      ],
+      "root_cause": "Continue 的 next 只覆盖失败/退出页面。",
+      "fix": {
+        "summary": "Continue 重新接回 Begin；Begin 把 Continue 提升到前部并把退出兜底放到末尾。",
+        "files": [
+          "resource/tasks/Roguelike/JieGarden.json"
+        ]
+      },
+      "regression": [
+        "resume-from-current-exploration fixture required"
+      ],
+      "evidence": [
+        "roguelike-run-19 retry loop",
+        "later runs resumed successfully"
+      ]
+    },
+    {
+      "id": "MAA-RECOG-001",
+      "fingerprint": "jiegarden:stage-trader:hsv-below-default",
+      "title": "StageTrader 真机 HSV 分数略低于默认阈值",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "商店页面分数约 0.692–0.696，默认约 0.70 时无法进入商店链路。"
+      ],
+      "root_cause": "真机色彩/缩放后的 HSVCount 分数处在默认阈值下方。",
+      "fix": {
+        "summary": "JieGarden StageTrader templThreshold 调整为 0.68。",
+        "files": [
+          "resource/tasks/Roguelike/JieGarden.json"
+        ]
+      },
+      "regression": [
+        "trader positive fixture and visually similar negative fixture required"
+      ],
+      "evidence": [
+        "six successful investments in long run"
+      ]
+    },
+    {
+      "id": "MAA-RECOG-002",
+      "fingerprint": "jiegarden:drops-flag:false-positive:strategy-bar",
+      "title": "是非境底栏误命中 DropsFlag",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "底栏图标以约 0.979 命中奖励标记，随后耗尽错误重试。"
+      ],
+      "root_cause": "StrategyChange 页面在 DropsFlag 后才有机会参与路由。",
+      "fix": {
+        "summary": "在奖励处理后、普通地图路由前加入 StrategyChange。",
+        "files": [
+          "resource/tasks/Roguelike/JieGarden.json"
+        ]
+      },
+      "regression": [
+        "fixture must require StrategyChange and forbid DropsFlag"
+      ],
+      "evidence": [
+        "roguelike-run-18 and run-20 ExitThenAbandon precursors"
+      ]
+    },
+    {
+      "id": "MAA-SAFETY-001",
+      "fingerprint": "safety:exit-then-abandon:destructive-fallback",
+      "title": "ExitThenAbandon 是识别失败后的破坏性兜底",
+      "area": "safety",
+      "status": "mitigated",
+      "severity": "critical",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "未知页面或误识别可能在留证前退出并放弃当前探索。"
+      ],
+      "root_cause": "多个 onErrorNext 最终连接到带 ClickSelf 的退出任务。",
+      "fix": {
+        "summary": "正式 runner 默认加载资源 overlay，把该任务 action 改为 Stop，并生成 incident；只有显式 --allow-destructive-actions 才放行。",
+        "files": [
+          "integrations/maa/guard-policy.json",
+          "tools/maa-roguelike-run.py",
+          "src/mobile_profiler/maa_iteration.py"
+        ]
+      },
+      "regression": [
+        "test_destructive_task_is_guarded_by_resource_overlay_and_callback"
+      ],
+      "evidence": [
+        "roguelike-run-18 event 117",
+        "roguelike-run-20 event 130"
+      ]
+    },
+    {
+      "id": "MAA-RUNNER-001",
+      "fingerprint": "runner:all-tasks-completed:not-game-outcome",
+      "title": "AllTasksCompleted 与 TaskChainCompleted 不能代表自然结算",
+      "area": "runner",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "识别失败退出也会得到 AllTasksCompleted；StartUp 的 TaskChainCompleted 更不是肉鸽终点。"
+      ],
+      "root_cause": "临时 runner 把任务调度生命周期误当作游戏状态。",
+      "fix": {
+        "summary": "只以 what=RoguelikeSettlement 判断自然一轮终点，并单列无结算的任务完成。",
+        "files": [
+          "tools/maa-roguelike-run.py",
+          "src/mobile_profiler/maa_iteration.py"
+        ]
+      },
+      "regression": [
+        "test_settlement_not_task_chain_completion_is_one_round_terminal",
+        "test_no_progress_watchdog_ignores_task_chain_completed_as_terminal"
+      ],
+      "evidence": [
+        "roguelike-run-14..20 lifecycle callbacks"
+      ]
+    },
+    {
+      "id": "MAA-RUNNER-002",
+      "fingerprint": "runner:starts-count-one:next-run-started",
+      "title": "starts_count=1 仍可能在结算后立即开始下一轮",
+      "area": "runner",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "自然失败结算后 runner 已进入第二轮初始招募页。"
+      ],
+      "root_cause": "MAA 肉鸽任务内部循环语义与外部 starts_count 的直觉不一致。",
+      "fix": {
+        "summary": "默认收到 RoguelikeSettlement 后主动 AsstStop。",
+        "files": [
+          "tools/maa-roguelike-run.py"
+        ]
+      },
+      "regression": [
+        "test_settlement_not_task_chain_completion_is_one_round_terminal"
+      ],
+      "evidence": [
+        "roguelike-run-22 settlement followed by second-run recruit page"
+      ]
+    },
+    {
+      "id": "MAA-OCR-001",
+      "fingerprint": "jiegarden:settlement:statistics-ocr-incomplete",
+      "title": "界园结算统计 OCR 在部分 adaptive 布局下不完整",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "medium",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-29",
+      "symptoms": [
+        "部分运行只返回 difficulty、emergency、game_pass，Floor/Step/Combat/Recruit/Collection/BOSS/Score/Exp/Skill 缺失。",
+        "界园失败结算画面显示获得物品数 5，旧回调却返回 collection=1。"
+      ],
+      "root_cause": "RoguelikeSettlementTaskPlugin 对战斗统计强制使用跨主题通用 ROI，并继承调用方当前 viewport；界园布局中的通用 ROI 命中了字段左侧装饰数字，而不是右侧真实值。",
+      "fix": {
+        "summary": "结算插件固定使用 Center viewport 并在结束后恢复调用方 alignment；战斗统计改用主题前缀任务，界园为 7 个统计字段提供独立 ROI；Begin 恢复矩阵补齐失败、成功及最终统计结算入口，直接从统计页恢复时保留未知 game_pass 语义。",
+        "files": [
+          "src/MaaCore/Task/Roguelike/RoguelikeSettlementTaskPlugin.cpp",
+          "resource/tasks/Roguelike/JieGarden.json",
+          "src/mobile_profiler/maa_iteration.py"
+        ]
+      },
+      "regression": [
+        "source-audit verifies theme-prefixed settlement OCR and Center viewport restoration",
+        "source-audit verifies all seven JieGarden battle-stat ROIs",
+        "test_jiegarden_recovery_matrix_is_complete_and_fail_closed",
+        "test_resumed_settlement_page_preserves_unknown_game_pass"
+      ],
+      "evidence": [
+        "roguelike-run-09 events 116..118",
+        "roguelike-run-11 events 243..245",
+        "roguelike-run-22 events 246..248",
+        "private physical-device round-08 settlement: visible collection=5 versus callback collection=1",
+        "offline Char OCR replay of private SHA256 eea171dbfa1245b25101821f5956316477a82d96134928025edc0b442b4f71c1 with the patched ROIs: floor/step/combat/recruit/collection/boss/emergency=0/2/0/0/5/0/0"
+      ]
+    },
+    {
+      "id": "MAA-PERF-002",
+      "fingerprint": "screencap:adb:slow-latency",
+      "title": "ADB 截图单次耗时约 0.9–1.8 秒",
+      "area": "performance",
+      "status": "open",
+      "severity": "medium",
+      "first_seen": "2026-07-24",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "页面重试叠加截图延迟后，动作响应明显变慢。"
+      ],
+      "root_cause": "当前截图传输/解码路径和真机 ADB 链路本身耗时较高；仅降低传给识别器的分辨率不会消除全屏抓取成本。",
+      "fix": null,
+      "regression": [
+        "runner environment/result must retain screenshot p50/p95/max",
+        "compare raw ADB, adb-lite and device-side client before changing backend"
+      ],
+      "evidence": [
+        "physical-device timing observations"
+      ]
+    },
+    {
+      "id": "MAA-STRATEGY-001",
+      "fingerprint": "battle:jiegarden:you-jiao-wu-lei:leak",
+      "title": "有教无类战斗因阵容/策略漏怪失败",
+      "area": "strategy",
+      "status": "known_limit",
+      "severity": "medium",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "自动部署 4 名干员后仍失败，game_pass=false。"
+      ],
+      "root_cause": "当前肉鸽策略和可用阵容强度不足；不是坐标漂移。",
+      "fix": null,
+      "regression": [
+        "将坐标正确性和战斗胜率分开判定"
+      ],
+      "evidence": [
+        "roguelike-run-22 battle and settlement"
+      ]
+    },
+    {
+      "id": "MAA-EVIDENCE-001",
+      "fingerprint": "runner:temporary:evidence-and-watchdogs-missing",
+      "title": "临时 runner 缺少环境、护栏、watchdog 和问题去重",
+      "area": "iteration-system",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "只能保存 callbacks 和周期截图，难以稳定复现、归因和转成回归。"
+      ],
+      "root_cause": "长跑脚本位于临时研究目录，终点和证据模型未正式设计。",
+      "fix": {
+        "summary": "正式化 runner、guard policy、incident bundle、fingerprint 去重、issue triage、fixture promotion 与资源/补丁校验。",
+        "files": [
+          "tools/maa-roguelike-run.py",
+          "tools/maa-iteration.py",
+          "src/mobile_profiler/maa_iteration.py",
+          "integrations/maa/issues.json",
+          "integrations/maa/fixtures/manifest.json"
+        ]
+      },
+      "regression": [
+        "tests/test_maa_iteration.py"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "MAA-RESOURCE-001",
+      "fingerprint": "resource:source-runtime:hash-drift",
+      "title": "源码资源与下载运行目录可能不同步",
+      "area": "delivery",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "源码 JSON 已修复但实际运行仍加载旧资源，会产生无法解释的回归。"
+      ],
+      "root_cause": "MaaCore 构建目录与官方 runtime/resource 是两个独立来源。",
+      "fix": {
+        "summary": "运行清单记录关键资源 hash，并提供 resource-check 非写入校验。",
+        "files": [
+          "tools/maa-iteration.py",
+          "src/mobile_profiler/maa_iteration.py"
+        ]
+      },
+      "regression": [
+        "test_resource_check_reports_hash_drift"
+      ],
+      "evidence": [
+        "本轮曾人工确认 JieGarden.json SHA256 一致"
+      ]
+    },
+    {
+      "id": "MAA-DEPOT-001",
+      "fingerprint": "viewport:depot:tab-and-content-opposite-edges",
+      "title": "仓库基础物品页签与内容锚定在相反物理边缘",
+      "area": "recognition",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "普通材料滑动识别完成后，基础物品阶段找不到“全部”页签或识别不到龙门币。"
+      ],
+      "root_cause": "材料滑动的 JustReturn 把 active viewport 改回 Center；“全部”页签锚定物理右边缘，而切换后的基础物品又从物理左边缘排列。龙门币颜色平方差约 441，也略高于原基础物品预筛阈值 400。",
+      "fix": {
+        "summary": "基础物品流程用 Right 点击“全部”、用 Left 识别内容并恢复原 alignment；仅基础物品颜色预筛阈值提高到 500，普通材料仍为 400。",
+        "files": [
+          "src/MaaCore/Task/Miscellaneous/DepotRecognitionTask.cpp",
+          "src/MaaCore/Vision/Miscellaneous/DepotImageAnalyzer.cpp"
+        ]
+      },
+      "regression": [
+        "source-audit requires explicit Right-tab and Left-content viewports",
+        "viewport C++ tests and physical Depot probe"
+      ],
+      "evidence": [
+        "本机私密运行 depot-01..04；depot-04 完成且回调返回 61 类物品"
+      ]
+    },
+    {
+      "id": "MAA-RUNNER-003",
+      "fingerprint": "runner:operbox:all-opers-field-name",
+      "title": "OperBox 汇总器误用了不存在的 all_oper 字段",
+      "area": "runner",
+      "status": "fixed",
+      "severity": "low",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "OperBox 任务成功且 own_opers 有数据，但 result.json 的 all_operators 始终为 null。"
+      ],
+      "root_cause": "runner 读取 all_oper，MaaCore 回调协议和源码实际字段为 all_opers。",
+      "fix": {
+        "summary": "使用协议字段 all_opers，并把去敏后的回调汇总提取为可单测函数。",
+        "files": [
+          "src/mobile_profiler/maa_iteration.py",
+          "tools/maa-feature-run.py",
+          "tests/test_maa_iteration.py"
+        ]
+      },
+      "regression": [
+        "test_feature_extra_summary_uses_documented_operbox_fields"
+      ],
+      "evidence": [
+        "OperBoxInfo 最终回调字段为 all_opers、done、own_opers"
+      ]
+    },
+    {
+      "id": "MAA-UI-001",
+      "fingerprint": "ui-adapter:startup:sleep-and-unconditional-restart",
+      "title": "开源自动化预检后熄屏且 StartUp 无条件重启导致黑屏等待",
+      "area": "open-source-automation-adapter",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "patched MaaCore 预检成功后，UI 启动的 StartUp 超过 90 秒仍未完成，callbacks 只持续报告截图成本。"
+      ],
+      "root_cause": "预检只检查前台包和横屏，没有检查设备是否仍为 Awake；同时 UI 适配器总是传 start_game_enabled=true，即使预检已确认游戏在前台，也会额外重启进程。长预检叠加屏幕超时后进入黑屏识别。",
+      "fix": {
+        "summary": "预检增加 dumpsys power Awake 门禁；StartUp 仅在预检未发现游戏前台包时启动游戏进程。",
+        "files": [
+          "src/mobile_profiler/maa_arknights_runtime.py",
+          "tests/test_maa_arknights_runtime.py"
+        ]
+      },
+      "regression": [
+        "test_preflight_rejects_a_sleeping_screen_even_when_game_is_foreground",
+        "test_startup_does_not_restart_a_game_already_confirmed_in_foreground"
+      ],
+      "evidence": [
+        "本机私密 open-source-ui-live-verify 首次运行卡住",
+        "open-source-ui-live-verify-02 预检通过且 StartUp 8.2 秒完成"
+      ]
+    },
+    {
+      "id": "MAA-PATCH-001",
+      "fingerprint": "delivery:patch:worktree-drift",
+      "title": "可复现补丁曾落后于实际 MAA 工作树改动",
+      "area": "delivery",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "旧补丁只有 11 个文件约 345 行新增，工作树已有 18 个文件约 1100 行新增。"
+      ],
+      "root_cause": "长跑期间的 adaptive、battle 和 JieGarden 修复没有同步回交付补丁。",
+      "fix": {
+        "summary": "重新生成完整补丁，并提供 patch-check 比较规范化 worktree diff。",
+        "files": [
+          "integrations/maa/patches/v6.14.2-viewport-transform.patch",
+          "tools/maa-iteration.py"
+        ]
+      },
+      "regression": [
+        "patch-check must pass before delivery"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "MAA-GATE-001",
+      "fingerprint": "open-source-hub:verification:missing-flag-default-allowed",
+      "title": "未声明端到端验收状态的适配器曾被默认视为可运行",
+      "area": "open-source-automation-gateway",
+      "status": "fixed",
+      "severity": "blocker",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "适配器只要省略 end_to_end_verified 字段，就会进入可预检、可启动分支。",
+        "页面按钮虽可依赖显式 false 禁用，但直接调用后端 preflight API 仍能绕过产品门禁。"
+      ],
+      "root_cause": "目录层和前端使用 ‘is not false’ 的宽松判定，后端 preflight 没有独立验收检查；这会把接入适配器误当成完整流程已经跑通。",
+      "fix": {
+        "summary": "验收改为 fail-closed；只有适配器显式返回 end_to_end_verified=true，目录、页面和服务端才允许预检或启动。MAA 是当前唯一满足条件的参考实现。",
+        "files": [
+          "src/mobile_profiler/open_source_automation.py",
+          "src/mobile_profiler/web/app.js",
+          "tests/test_open_source_automation.py",
+          "tests/test_ui.py"
+        ]
+      },
+      "regression": [
+        "test_unverified_adapter_is_visible_but_cannot_preflight_or_start",
+        "test_adapter_without_explicit_verification_fails_closed"
+      ],
+      "evidence": [
+        "Open Source Automation controller and UI static regression suite"
+      ]
+    },
+    {
+      "id": "MAA-PACKAGE-001",
+      "fingerprint": "delivery:wheel:maa-runner-scripts-missing",
+      "title": "MAA UI 适配器曾依赖不会进入 wheel 的仓库 tools 脚本",
+      "area": "delivery",
+      "status": "fixed",
+      "severity": "high",
+      "first_seen": "2026-07-27",
+      "last_seen": "2026-07-27",
+      "symptoms": [
+        "源码检出目录可运行，但 wheel 或便携安装中找不到 tools/maa-*.py，适配器显示运行时缺失。"
+      ],
+      "root_cause": "生命周期适配器把仓库根目录当作运行时依赖，而 setuptools 只分发 mobile_profiler 包和声明的 package data。",
+      "fix": {
+        "summary": "smoke、feature、roguelike runner 移入 mobile_profiler 包；tools 脚本降为兼容入口，危险动作策略作为 package data 分发并做源/包一致性回归。",
+        "files": [
+          "src/mobile_profiler/maa_viewport_smoke.py",
+          "src/mobile_profiler/maa_feature_runner.py",
+          "src/mobile_profiler/maa_roguelike_runner.py",
+          "src/mobile_profiler/maa_guard_policy.json",
+          "src/mobile_profiler/maa_arknights_runtime.py",
+          "pyproject.toml"
+        ]
+      },
+      "regression": [
+        "test_packaged_runners_and_guard_policy_are_self_contained",
+        "wheel contents and isolated import smoke"
+      ],
+      "evidence": [
+        "mobile_profiler-1.0.0 wheel 内容检查与无仓库 tools 的隔离导入/CLI smoke"
+      ]
+    }
+  ]
+}

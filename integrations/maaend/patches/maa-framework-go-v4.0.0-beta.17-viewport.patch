@@ -1,0 +1,250 @@
+diff --git a/controller.go b/controller.go
+index 7652998..bec8f57 100644
+--- a/controller.go
++++ b/controller.go
+@@ -326,6 +326,15 @@ const (
+ 	ScreenshotResizeMethodLanczos4        ScreenshotResizeMethod = 4 // cv::INTER_LANCZOS4
+ )
+ 
++// ViewportAlignment selects a logical 16:9 viewport from an adaptive raw screenshot frame.
++type ViewportAlignment int32
++
++const (
++	ViewportAlignmentCenter ViewportAlignment = 0
++	ViewportAlignmentLeft   ViewportAlignment = 1
++	ViewportAlignmentRight  ViewportAlignment = 2
++)
++
+ // ScreenshotOption configures how the screenshot is resized.
+ // If multiple options are provided, only the last one is applied.
+ type ScreenshotOption func(*screenshotOptionConfig)
+@@ -414,6 +423,21 @@ func (c *Controller) SetScreenshot(opts ...ScreenshotOption) error {
+ 	}
+ }
+ 
++// SetScreenshotViewportAlignment re-renders the current cached raw screenshot using alignment.
++// It does not capture a new raw frame. Left and Right require an active adaptive viewport, and
++// every alignment requires a valid cached raw frame.
++func (c *Controller) SetScreenshotViewportAlignment(alignment ViewportAlignment) error {
++	if alignment < ViewportAlignmentCenter || alignment > ViewportAlignmentRight {
++		return fmt.Errorf("invalid screenshot viewport alignment: %d", alignment)
++	}
++	value := int32(alignment)
++	return c.setOption(
++		native.MaaCtrlOption_ScreenshotViewportAlignment,
++		unsafe.Pointer(&value),
++		unsafe.Sizeof(value),
++	)
++}
++
+ // SetMouseLockFollow enables or disables mouse-lock-follow mode.
+ // This is designed for TPS/FPS games that lock the mouse to their window in the background.
+ // Only valid for Win32 controllers using message-based input methods.
+diff --git a/controller_test.go b/controller_test.go
+index 2f156a8..0935cb2 100644
+--- a/controller_test.go
++++ b/controller_test.go
+@@ -66,6 +66,16 @@ func TestController_SetScreenshotUseRawSize(t *testing.T) {
+ 	}
+ }
+ 
++func TestController_SetScreenshotViewportAlignment(t *testing.T) {
++	ctrl := createBlankController(t)
++	defer ctrl.Destroy()
++
++	require.True(t, ctrl.PostScreencap().Wait().Success())
++	require.NoError(t, ctrl.SetScreenshotViewportAlignment(ViewportAlignmentCenter))
++	require.Error(t, ctrl.SetScreenshotViewportAlignment(ViewportAlignmentLeft))
++	require.Error(t, ctrl.SetScreenshotViewportAlignment(ViewportAlignment(99)))
++}
++
+ func TestController_PostConnect(t *testing.T) {
+ 	ctrl := createBlankController(t)
+ 	defer ctrl.Destroy()
+diff --git a/event.go b/event.go
+index cc24f04..9f55681 100644
+--- a/event.go
++++ b/event.go
+@@ -87,11 +87,34 @@ type ResourceLoadingDetail struct {
+ 
+ // ControllerActionDetail contains information about controller action events
+ type ControllerActionDetail struct {
+-	CtrlID uint64         `json:"ctrl_id"`
+-	UUID   string         `json:"uuid"`
+-	Action string         `json:"action"`
+-	Param  map[string]any `json:"param"`
+-	Info   map[string]any `json:"info"`
++	CtrlID   uint64                         `json:"ctrl_id"`
++	UUID     string                         `json:"uuid"`
++	Action   string                         `json:"action"`
++	Param    map[string]any                 `json:"param"`
++	Viewport ControllerActionViewportDetail `json:"viewport"`
++	Info     map[string]any                 `json:"info"`
++}
++
++// ControllerActionViewportDetail is the coordinate evidence captured when an action is queued.
++type ControllerActionViewportDetail struct {
++	Alignment             string            `json:"alignment"`
++	AlignmentValue        ViewportAlignment `json:"alignment_value"`
++	FrameID               uint64            `json:"frame_id"`
++	LogicalParam          map[string]any    `json:"logical_param"`
++	DisplayParam          map[string]any    `json:"display_param,omitempty"`
++	DisplayParamAvailable bool              `json:"display_param_available"`
++}
++
++// NodeRecognitionResultDetail contains the recognition evidence embedded in node events.
++// It is nil on event stages that do not carry reco_details, such as Starting.
++type NodeRecognitionResultDetail struct {
++	RecognitionID     uint64 `json:"reco_id"`
++	Name              string `json:"name"`
++	Algorithm         string `json:"algorithm"`
++	Box               *Rect  `json:"box"`
++	ViewportAlignment string `json:"viewport_alignment"`
++	FrameID           uint64 `json:"frame_id"`
++	Detail            any    `json:"detail"`
+ }
+ 
+ // TaskerTaskDetail contains information about tasker task events
+@@ -104,26 +127,29 @@ type TaskerTaskDetail struct {
+ 
+ // NodePipelineNodeDetail contains information about pipeline node events
+ type NodePipelineNodeDetail struct {
+-	TaskID uint64 `json:"task_id"`
+-	NodeID uint64 `json:"node_id"`
+-	Name   string `json:"name"`
+-	Focus  any    `json:"focus"`
++	TaskID             uint64                       `json:"task_id"`
++	NodeID             uint64                       `json:"node_id"`
++	Name               string                       `json:"name"`
++	RecognitionDetails *NodeRecognitionResultDetail `json:"reco_details"`
++	Focus              any                          `json:"focus"`
+ }
+ 
+ // NodeRecognitionNodeDetail contains information about recognition node events
+ type NodeRecognitionNodeDetail struct {
+-	TaskID uint64 `json:"task_id"`
+-	NodeID uint64 `json:"node_id"`
+-	Name   string `json:"name"`
+-	Focus  any    `json:"focus"`
++	TaskID             uint64                       `json:"task_id"`
++	NodeID             uint64                       `json:"node_id"`
++	Name               string                       `json:"name"`
++	RecognitionDetails *NodeRecognitionResultDetail `json:"reco_details"`
++	Focus              any                          `json:"focus"`
+ }
+ 
+ // NodeActionNodeDetail contains information about action node events
+ type NodeActionNodeDetail struct {
+-	TaskID uint64 `json:"task_id"`
+-	NodeID uint64 `json:"node_id"`
+-	Name   string `json:"name"`
+-	Focus  any    `json:"focus"`
++	TaskID             uint64                       `json:"task_id"`
++	NodeID             uint64                       `json:"node_id"`
++	Name               string                       `json:"name"`
++	RecognitionDetails *NodeRecognitionResultDetail `json:"reco_details"`
++	Focus              any                          `json:"focus"`
+ }
+ 
+ // NodeNextListDetail contains information about node next list events
+@@ -136,10 +162,11 @@ type NodeNextListDetail struct {
+ 
+ // NodeRecognitionDetail contains information about node recognition events
+ type NodeRecognitionDetail struct {
+-	TaskID        uint64 `json:"task_id"`
+-	RecognitionID uint64 `json:"reco_id"`
+-	Name          string `json:"name"`
+-	Focus         any    `json:"focus"`
++	TaskID             uint64                       `json:"task_id"`
++	RecognitionID      uint64                       `json:"reco_id"`
++	Name               string                       `json:"name"`
++	RecognitionDetails *NodeRecognitionResultDetail `json:"reco_details"`
++	Focus              any                          `json:"focus"`
+ }
+ 
+ // NodeActionDetail contains information about node action events
+diff --git a/event_test.go b/event_test.go
+index 7218506..0e5ca92 100644
+--- a/event_test.go
++++ b/event_test.go
+@@ -1,8 +1,9 @@
+ package maa
+ 
+ import (
+-	"github.com/stretchr/testify/require"
+ 	"testing"
++
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestEvent_String(t *testing.T) {
+@@ -143,3 +144,54 @@ func TestEvent_Failed(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestNodeRecognitionDetail_ViewportEvidence(t *testing.T) {
++	const payload = `{
++		"task_id": 200000001,
++		"reco_id": 400000001,
++		"name": "InWorld",
++		"focus": null,
++		"reco_details": {
++			"reco_id": 400000001,
++			"name": "InWorld",
++			"algorithm": "TemplateMatch",
++			"box": [10, 20, 30, 40],
++			"viewport_alignment": "left",
++			"frame_id": 42,
++			"detail": {"score": 0.99}
++		}
++	}`
++
++	var detail NodeRecognitionDetail
++	require.NoError(t, unmarshalJSON([]byte(payload), &detail))
++	require.NotNil(t, detail.RecognitionDetails)
++	require.Equal(t, uint64(400000001), detail.RecognitionDetails.RecognitionID)
++	require.Equal(t, "left", detail.RecognitionDetails.ViewportAlignment)
++	require.Equal(t, uint64(42), detail.RecognitionDetails.FrameID)
++	require.Equal(t, &Rect{10, 20, 30, 40}, detail.RecognitionDetails.Box)
++}
++
++func TestNodePipelineNodeDetail_RecognitionDetailsLifecycle(t *testing.T) {
++	var starting NodePipelineNodeDetail
++	require.NoError(t, unmarshalJSON([]byte(`{"task_id":1,"node_id":2,"name":"InWorld"}`), &starting))
++	require.Nil(t, starting.RecognitionDetails)
++
++	var succeeded NodePipelineNodeDetail
++	require.NoError(t, unmarshalJSON([]byte(`{
++		"task_id":1,
++		"node_id":2,
++		"name":"InWorld",
++		"reco_details":{
++			"reco_id":3,
++			"name":"InWorld",
++			"algorithm":"DirectHit",
++			"box":[0,0,1280,720],
++			"viewport_alignment":"right",
++			"frame_id":7,
++			"detail":null
++		}
++	}`), &succeeded))
++	require.NotNil(t, succeeded.RecognitionDetails)
++	require.Equal(t, "right", succeeded.RecognitionDetails.ViewportAlignment)
++	require.Equal(t, uint64(7), succeeded.RecognitionDetails.FrameID)
++}
+diff --git a/internal/native/framework.go b/internal/native/framework.go
+index a1e80c8..a871e25 100644
+--- a/internal/native/framework.go
++++ b/internal/native/framework.go
+@@ -178,6 +178,10 @@ const (
+ 	//
+ 	// value: int, eg: 3; val_size: sizeof(int)
+ 	MaaCtrlOption_ScreenshotResizeMethod MaaCtrlOption = 6
++
++	// MaaCtrlOption_ScreenshotViewportAlignment selects the logical viewport rendered from the
++	// current cached raw frame. The value is MaaViewportAlignment (int32).
++	MaaCtrlOption_ScreenshotViewportAlignment MaaCtrlOption = 8
+ )
+ 
+ type MaaGamepadType uint64

@@ -30,6 +30,11 @@ from urllib.parse import quote, unquote, urlparse
 
 from . import __version__ as APP_VERSION
 from .adb_agent import AdbAgentController
+from .build_profile import (
+    current_build_profile,
+    normalize_build_profile,
+    open_source_automation_enabled,
+)
 from .campaign_controller import CampaignController
 from .analysis import (
     analyze_brightness_throttling,
@@ -80,6 +85,15 @@ from .storage import (
     read_samples_csv,
     write_report_excluded_ranges,
 )
+
+if open_source_automation_enabled():
+    from .open_source_automation import (
+        MAAEND_PROFILE_FEATURE_ID,
+        OpenSourceAutomationController,
+    )
+else:
+    MAAEND_PROFILE_FEATURE_ID = "maaend-profile"
+    OpenSourceAutomationController = None  # type: ignore[assignment,misc]
 
 
 MAX_LIVE_POINTS = 900
@@ -2502,6 +2516,63 @@ class ActiveRun:
         }
 
 
+class DisabledOpenSourceAutomationController:
+    """Fail-closed placeholder used by the Standard portable edition."""
+
+    _ERROR = "Open-source automation is not included in this build edition"
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "running": False,
+            "catalog_version": 0,
+            "projects": [],
+            "selection": {
+                "schema_version": 2,
+                "projects": [],
+                "project_ids": [],
+                "feature_ids": [],
+                "saved_at": 0.0,
+            },
+            "execution": {
+                "status": "disabled",
+                "label": "当前构建版本未包含开源自动化",
+                "selected_feature_count": 0,
+                "runnable_feature_ids": [],
+                "running_feature_ids": [],
+            },
+            "adapters": {},
+            "dependency": {
+                "available": False,
+                "detail": self._ERROR,
+                "estimated_additional_bytes": 0,
+                "estimated_additional_mib": 0.0,
+            },
+            "bundle": {"available": False, "error": self._ERROR},
+            "alignment": [],
+            "verification_policy": {"mode": "disabled"},
+            "demo": {},
+            "logs": [],
+        }
+
+    def _unavailable(self, _payload: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        raise RuntimeError(self._ERROR)
+
+    run_demo = _unavailable
+    update_selection = _unavailable
+    configure = _unavailable
+    preflight = _unavailable
+    start = _unavailable
+    stop = _unavailable
+
+    def latest_evidence(self, _kind: str) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class DashboardManager:
     def __init__(
         self,
@@ -2510,6 +2581,7 @@ class DashboardManager:
         demo_mode: bool = False,
         ios_python: Optional[str] = None,
         hdc: Optional[str] = None,
+        build_profile: Optional[Dict[str, object]] = None,
     ) -> None:
         self.adb = adb
         self.hdc = hdc or DEFAULT_HDC
@@ -2517,6 +2589,14 @@ class DashboardManager:
         self.output_root = output_root.resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.demo_mode = demo_mode
+        self.build_profile = (
+            normalize_build_profile(build_profile)
+            if build_profile is not None
+            else current_build_profile()
+        )
+        self._open_source_automation_enabled = open_source_automation_enabled(
+            self.build_profile
+        )
         self.active: Optional[ActiveRun] = None
         self.adb_agent = AdbAgentController(self.adb, self.output_root)
         self.probe_cache: Dict[str, Dict[str, object]] = {}
@@ -2558,6 +2638,16 @@ class DashboardManager:
             self.output_root,
             self._discover_campaign_config_path(),
         )
+        if self._open_source_automation_enabled:
+            if OpenSourceAutomationController is None:
+                raise RuntimeError("Full build profile requires open-source automation modules")
+            self.open_source_automation = OpenSourceAutomationController(
+                self.output_root,
+                self._discover_open_source_automation_bundle_path(),
+                adb=self.adb,
+            )
+        else:
+            self.open_source_automation = DisabledOpenSourceAutomationController()
         self._automation_surface = "agent"
 
     def _harmony_brightness_calibration(
@@ -2649,6 +2739,31 @@ class DashboardManager:
                 Path(__file__).resolve().parents[2]
                 / "examples"
                 / "android-two-stage-campaign.json",
+            ]
+        )
+        seen = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if resolved.is_file():
+                return resolved
+        return None
+
+    def _discover_open_source_automation_bundle_path(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self.source_root is not None:
+            candidates.append(self.source_root / "examples" / "deterministic-visual-spike.json")
+        candidates.extend(
+            [
+                Path.cwd() / "examples" / "deterministic-visual-spike.json",
+                Path(__file__).resolve().parents[2]
+                / "examples"
+                / "deterministic-visual-spike.json",
             ]
         )
         seen = set()
@@ -3113,6 +3228,82 @@ class DashboardManager:
 
     def stop_campaign(self) -> Dict[str, object]:
         return self.campaign.stop()
+
+    def run_open_source_automation_demo(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        return self.open_source_automation.run_demo(payload)
+
+    def update_open_source_automation_selection(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        return self.open_source_automation.update_selection(payload)
+
+    def _require_open_source_automation_enabled(self) -> None:
+        if not self._open_source_automation_enabled:
+            raise RuntimeError(
+                "Open-source automation is not included in this build edition"
+            )
+
+    def _require_open_source_android_device(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, str]:
+        device = str(payload.get("device") or "").strip()
+        selected = self._require_ready_android_device(device)
+        if (
+            str(payload.get("feature_id") or "") == MAAEND_PROFILE_FEATURE_ID
+            and selected.get("connection_type") != "usb"
+        ):
+            raise RuntimeError("MaaEnd 任务必须显式选择 USB ADB 真机")
+        return selected
+
+    def configure_open_source_automation(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        if str(payload.get("feature_id") or "") == MAAEND_PROFILE_FEATURE_ID:
+            self._require_open_source_android_device(payload)
+        return self.open_source_automation.configure(payload)
+
+    def preflight_open_source_automation(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        self._require_open_source_android_device(payload)
+        return self.open_source_automation.preflight(payload)
+
+    def start_open_source_automation(
+        self,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        if self.adb_agent.snapshot().get("running"):
+            raise RuntimeError("请先停止当前 ADB Agent 任务")
+        if self.campaign.snapshot().get("running"):
+            raise RuntimeError("请先停止当前 Campaign 阶段")
+        with self._lock:
+            active = self.active
+        if active is not None and active.running:
+            raise RuntimeError("请先停止当前性能或功耗采集")
+        self._require_open_source_android_device(payload)
+        result = self.open_source_automation.start(payload)
+        with self._lock:
+            self._automation_surface = "opensource"
+        return result
+
+    def stop_open_source_automation(
+        self,
+        payload: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        self._require_open_source_automation_enabled()
+        return self.open_source_automation.stop(payload)
 
     def connect_harmony(self, payload: Dict[str, object]) -> Dict[str, object]:
         address = str(payload.get("address") or "").strip()
@@ -4909,14 +5100,18 @@ class DashboardManager:
             active = self.active
         if active is not None and active.running:
             raise RuntimeError("Stop the active phone recording before building software")
+        edition = str(payload.get("edition") or "full").strip().lower()
+        if edition not in {"standard", "full"}:
+            raise ValueError("Portable edition must be standard or full")
         dist_root = (self.source_root / "dist").resolve()
         raw_output = str(payload.get("output_directory") or "").strip().strip('"')
+        default_name = f"dist/mobile-profiler-v{APP_VERSION}-{edition}-portable"
         output_dir = (
             Path(raw_output).expanduser().resolve()
             if raw_output and Path(raw_output).expanduser().is_absolute()
             else (
                 self.source_root
-                / (raw_output or f"dist/mobile-profiler-v{APP_VERSION}-portable")
+                / (raw_output or default_name)
             ).resolve()
         )
         try:
@@ -4941,6 +5136,8 @@ class DashboardManager:
             str(output_dir),
             "-PythonVersion",
             version,
+            "-Edition",
+            edition.capitalize(),
         ]
         include_adb = bool(payload.get("include_adb", True))
         if include_adb:
@@ -4963,6 +5160,8 @@ class DashboardManager:
             "bundle_dir": str(output_dir),
             "zip_path": str(zip_path),
             "include_adb": include_adb,
+            "edition": edition,
+            "open_source_automation": edition == "full",
             "output": output,
         }
 
@@ -4997,18 +5196,35 @@ class DashboardManager:
         }
 
     def tooling_state(self) -> Dict[str, object]:
-        default_output = (
-            self.source_root / "dist" / f"mobile-profiler-v{APP_VERSION}-portable"
-            if self.source_root is not None
-            else None
-        )
+        default_outputs = {
+            edition: str(
+                self.source_root
+                / "dist"
+                / f"mobile-profiler-v{APP_VERSION}-{edition}-portable"
+            )
+            for edition in ("standard", "full")
+        } if self.source_root is not None else {}
         with self._lock:
             maintenance_operation = self._maintenance_operation
         return {
             "source_mode": self.source_root is not None,
             "source_root": str(self.source_root) if self.source_root is not None else None,
             "portable_build_available": self.source_root is not None,
-            "portable_output_default": str(default_output) if default_output is not None else None,
+            "portable_default_edition": "full",
+            "portable_editions": [
+                {
+                    "id": "standard",
+                    "label": "Standard · 不含开源自动化",
+                    "open_source_automation": False,
+                },
+                {
+                    "id": "full",
+                    "label": "Full · 全功能",
+                    "open_source_automation": True,
+                },
+            ],
+            "portable_output_defaults": default_outputs,
+            "portable_output_default": default_outputs.get("full"),
             "default_rules_path": (
                 str(self.default_rules_path) if self.default_rules_path is not None else None
             ),
@@ -5075,6 +5291,7 @@ class DashboardManager:
             automation_surface = self._automation_surface
         return {
             "version": APP_VERSION,
+            "build_profile": dict(self.build_profile),
             "server_time": time.time(),
             "adb": self.adb,
             "hdc": self.hdc,
@@ -5088,6 +5305,7 @@ class DashboardManager:
             "active": self.active_snapshot(),
             "adb_agent": self.adb_agent.snapshot(),
             "campaign": self.campaign.snapshot(),
+            "open_source_automation": self.open_source_automation.snapshot(),
             "automation_surface": automation_surface,
             "history": self.history(),
             "tooling": self.tooling_state(),
@@ -5566,6 +5784,7 @@ class DashboardManager:
     def close(self) -> None:
         self.adb_agent.stop()
         self.campaign.close()
+        self.open_source_automation.close()
         with self._lock:
             active = self.active
         if active is None or not active.running:
@@ -5685,6 +5904,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self._send_bytes(screenshot, "image/png")
             return
+        match = re.fullmatch(
+            r"/api/open-source-automation/evidence/(frame|template|overlay)",
+            path,
+        )
+        if match:
+            evidence = self.server.manager.open_source_automation.latest_evidence(
+                match.group(1)
+            )
+            if evidence is None:
+                self._send_json(
+                    {"error": "Open-source automation evidence not available"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._send_bytes(evidence, "image/png")
+            return
         match = re.fullmatch(r"/runs/([^/]+)/report\.html", path)
         if match:
             report = self.server.manager.report_path(match.group(1))
@@ -5733,6 +5968,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.manager.campaign_software_assets(payload)
             elif path == "/api/campaign/software/install":
                 result = self.server.manager.install_campaign_software(payload)
+            elif path == "/api/open-source-automation/demo":
+                result = self.server.manager.run_open_source_automation_demo(payload)
+            elif path == "/api/open-source-automation/selection":
+                result = self.server.manager.update_open_source_automation_selection(
+                    payload
+                )
+            elif path == "/api/open-source-automation/configure":
+                result = self.server.manager.configure_open_source_automation(payload)
+            elif path == "/api/open-source-automation/preflight":
+                result = self.server.manager.preflight_open_source_automation(payload)
+            elif path == "/api/open-source-automation/start":
+                result = self.server.manager.start_open_source_automation(payload)
+            elif path == "/api/open-source-automation/stop":
+                result = self.server.manager.stop_open_source_automation(payload)
             elif path == "/api/connect":
                 result = self.server.manager.connect_device(payload)
             elif path == "/api/harmony/connect":
